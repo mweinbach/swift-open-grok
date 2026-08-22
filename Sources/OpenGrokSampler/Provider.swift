@@ -507,6 +507,86 @@ public struct ZaiProvider: ProviderAdapter {
     }
 }
 
+/// RunInfra keeps hosted-model reasoning while stripping xAI-only routing.
+public struct RuninfraProvider: ProviderAdapter {
+    public init() {}
+    public var provider: ModelProvider { .runinfra }
+
+    public func sanitizeChatRequest(_ request: inout ChatCompletionWireRequest) {
+        request.serviceTier = nil
+        for index in request.messages.indices {
+            request.messages[index].modelId = nil
+        }
+
+        guard request.model == "deepseek-v4-flash",
+              let effort = request.reasoningEffort else { return }
+        switch effort {
+        case .high, .xhigh, .max, .ultra:
+            request.reasoningEffort = .max
+        case .none, .minimal, .low, .medium:
+            break
+        }
+    }
+}
+
+/// Gemini's OpenAI-compatible endpoint accepts reasoning effort, not Z AI thinking.
+public struct GeminiProvider: ProviderAdapter {
+    public init() {}
+    public var provider: ModelProvider { .gemini }
+
+    public func sanitizeChatRequest(_ request: inout ChatCompletionWireRequest) {
+        request.serviceTier = nil
+        request.thinking = nil
+        for index in request.messages.indices {
+            request.messages[index].modelId = nil
+        }
+
+        guard let effort = request.reasoningEffort else { return }
+        switch effort {
+        case .none:
+            request.reasoningEffort = nil
+        case .minimal where request.model == "gemini-3.7-flash"
+            || request.model == "gemini-3.1-pro-preview":
+            request.reasoningEffort = .low
+        case .xhigh, .max, .ultra:
+            request.reasoningEffort = .high
+        case .minimal, .low, .medium, .high:
+            break
+        }
+    }
+}
+
+/// OpenRouter owns attribution while retaining ordinary client-side tools.
+public struct OpenRouterProvider: ProviderAdapter {
+    public static let httpReferer = "https://github.com/mweinbach/open-grok"
+    public static let appTitle = "Open Grok"
+
+    public init() {}
+    public var provider: ModelProvider { .openRouter }
+
+    public func applyDefaultHeaders(_ headers: inout [String: String], config: SamplerConfig) {
+        sanitizeHeaders(&headers)
+        if !headers.keys.contains(where: {
+            $0.caseInsensitiveCompare("HTTP-Referer") == .orderedSame
+        }) {
+            headers["HTTP-Referer"] = Self.httpReferer
+        }
+        if !headers.keys.contains(where: {
+            $0.caseInsensitiveCompare("X-Title") == .orderedSame
+        }) {
+            headers["X-Title"] = Self.appTitle
+        }
+    }
+
+    public func sanitizeChatRequest(_ request: inout ChatCompletionWireRequest) {
+        request.serviceTier = nil
+        request.thinking = nil
+        for index in request.messages.indices {
+            request.messages[index].modelId = nil
+        }
+    }
+}
+
 // MARK: - Registry
 
 public struct ProviderRegistration: Sendable {
@@ -528,6 +608,9 @@ private let metaProvider = MetaProvider()
 private let openCodeGoProvider = OpenCodeGoProvider()
 private let waferProvider = WaferProvider()
 private let zaiProvider = ZaiProvider()
+private let runinfraProvider = RuninfraProvider()
+private let geminiProvider = GeminiProvider()
+private let openRouterProvider = OpenRouterProvider()
 
 /// Complete registry for the built-in providers.
 public let PROVIDER_REGISTRY: [ProviderRegistration] = [
@@ -540,6 +623,9 @@ public let PROVIDER_REGISTRY: [ProviderRegistration] = [
     ProviderRegistration(provider: .openCodeGo, adapter: openCodeGoProvider),
     ProviderRegistration(provider: .wafer, adapter: waferProvider),
     ProviderRegistration(provider: .zai, adapter: zaiProvider),
+    ProviderRegistration(provider: .runinfra, adapter: runinfraProvider),
+    ProviderRegistration(provider: .gemini, adapter: geminiProvider),
+    ProviderRegistration(provider: .openRouter, adapter: openRouterProvider),
 ]
 
 /// Look up the stateless transport adapter for a built-in provider.
@@ -554,6 +640,9 @@ public func providerAdapter(_ provider: ModelProvider) -> any ProviderAdapter {
     case .openCodeGo: return openCodeGoProvider
     case .wafer: return waferProvider
     case .zai: return zaiProvider
+    case .runinfra: return runinfraProvider
+    case .gemini: return geminiProvider
+    case .openRouter: return openRouterProvider
     }
 }
 

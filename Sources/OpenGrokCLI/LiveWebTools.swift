@@ -188,7 +188,8 @@ enum LiveWebToolComposition {
         // no client search tool, so Meta stays inert here.
         case .meta:
             return .native
-        case .xai, .fireworks, .deepseek, .wafer, .openCodeGo, .zai:
+        case .xai, .fireworks, .deepseek, .wafer, .openCodeGo, .zai,
+             .runinfra, .gemini, .openRouter:
             return .xai
         }
     }
@@ -216,6 +217,9 @@ enum LiveWebToolComposition {
         case .wafer: key = "wafer"
         case .openCodeGo: key = "opencode_go"
         case .zai: key = "zai"
+        case .runinfra: key = "runinfra"
+        case .gemini: key = "gemini"
+        case .openRouter: key = "openrouter"
         }
         guard let raw = configString(
             path: ["toolset", "web_search_source", key],
@@ -252,11 +256,16 @@ enum LiveWebToolComposition {
             environment: environment
         ) else { return .disabled }
 
-        let baseURL = OpenGrokLiveApplicationLauncher.configuredXaiAPIBaseURL(
-            workingDirectory: workingDirectory,
-            openGrokHome: openGrokHome,
+        let baseURL = LiveImageToolComposition.xaiMediaBaseURL(
+            samplingProvider: samplingProvider,
+            samplingBaseURL: samplingBaseURL,
+            configuredXaiBaseURL: OpenGrokLiveApplicationLauncher.configuredXaiAPIBaseURL(
+                workingDirectory: workingDirectory,
+                openGrokHome: openGrokHome,
+                environment: environment
+            ),
             environment: environment
-        ) ?? samplingBaseURL
+        )
 
         let model = environment["GROK_WEB_SEARCH_MODEL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty

@@ -49,6 +49,7 @@ public struct ModelsSectionConfig: Sendable, Equatable {
     public var hiddenModels: [String]?
     public var disabledModels: [String]?
     public var opencodeGoEnabledModels: [String]
+    public var openRouterEnabledModels: [String]
     public var agentType: String?
     public var extraHeaders: [(String, String)]
     public var temperature: Float?
@@ -74,6 +75,7 @@ public struct ModelsSectionConfig: Sendable, Equatable {
         hiddenModels: [String]? = nil,
         disabledModels: [String]? = nil,
         opencodeGoEnabledModels: [String] = [],
+        openRouterEnabledModels: [String] = [],
         agentType: String? = nil,
         extraHeaders: [(String, String)] = [],
         temperature: Float? = nil,
@@ -98,6 +100,7 @@ public struct ModelsSectionConfig: Sendable, Equatable {
         self.hiddenModels = hiddenModels
         self.disabledModels = disabledModels
         self.opencodeGoEnabledModels = opencodeGoEnabledModels
+        self.openRouterEnabledModels = openRouterEnabledModels
         self.agentType = agentType
         self.extraHeaders = extraHeaders
         self.temperature = temperature
@@ -169,6 +172,7 @@ extension ModelsSectionConfig {
         lhs.hiddenModels == rhs.hiddenModels &&
         lhs.disabledModels == rhs.disabledModels &&
         lhs.opencodeGoEnabledModels == rhs.opencodeGoEnabledModels &&
+        lhs.openRouterEnabledModels == rhs.openRouterEnabledModels &&
         lhs.agentType == rhs.agentType &&
         equalStringPairs(lhs.extraHeaders, rhs.extraHeaders) &&
         lhs.temperature == rhs.temperature &&

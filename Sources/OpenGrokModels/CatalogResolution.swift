@@ -215,6 +215,9 @@ public func resolveModelCatalog(
     openCodeGoCatalog: OpenCodeGoModelsCatalog? = nil,
     waferCatalog: WaferModelsCatalog? = nil,
     zaiCatalog: ZaiModelsCatalog? = nil,
+    runInfraCatalog: RunInfraModelsCatalog? = nil,
+    geminiCatalog: GeminiModelsCatalog? = nil,
+    openRouterCatalog: OpenRouterModelsCatalog? = nil,
     customModels: [CustomModelEntry]? = nil
 ) -> OrderedModelMap {
     var catalog = resolveModelListWithProviderCatalogs(
@@ -234,28 +237,40 @@ public func resolveModelCatalog(
         openCodeGoAuthoritative: openCodeGoCatalog?.isAuthoritative ?? false
     )
 
-    // Wafer is applied *after* `[model.*]`, not with the other partitions.
-    //
-    // This is a deliberate upstream asymmetry, not an oversight: Wafer's
-    // `/models` response is unconditionally authoritative
-    // (`wafer_models.rs:106-108` returns a bare `true`), and the wipe-and-extend
-    // runs after `resolve_model_list_with_provider_catalogs` returns
-    // (`agent/models/resolution.rs:364-369`). Every other provider partition is
-    // merged *before* the override loop, so a `[model."wafer:…"]` override is
-    // the one override a live catalog can still overwrite. Moving this earlier
-    // would silently change which side wins.
+    // These provider catalogs replace their own partition after initial list
+    // assembly. User overrides are reapplied below so refresh cannot erase a
+    // configured model, including an override for an existing remote entry.
     if let waferCatalog {
-        catalog.retain { _, entry in entry.info.provider != .wafer }
-        for (key, entry) in waferCatalog.entries.pairs() {
-            catalog[key] = entry
-        }
+        replaceLiveProviderPartition(&catalog, provider: .wafer, entries: waferCatalog.entries)
     }
 
     if let zaiCatalog {
-        catalog.retain { _, entry in entry.info.provider != .zai }
-        for (key, entry) in zaiCatalog.entries.pairs() {
-            catalog[key] = entry
-        }
+        replaceLiveProviderPartition(&catalog, provider: .zai, entries: zaiCatalog.entries)
+    }
+
+    if let runInfraCatalog {
+        replaceLiveProviderPartition(
+            &catalog,
+            provider: .runinfra,
+            entries: runInfraCatalog.entries
+        )
+    }
+
+    if let geminiCatalog {
+        replaceLiveProviderPartition(&catalog, provider: .gemini, entries: geminiCatalog.entries)
+    }
+
+    if let openRouterCatalog {
+        replaceLiveProviderPartition(
+            &catalog,
+            provider: .openRouter,
+            entries: openRouterCatalog.entries
+        )
+    }
+
+    for (key, modelOverride) in input.configModels {
+        let base = catalog.shiftRemove(key)
+        catalog[key] = modelOverride.apply(key: key, base: base, endpoints: input.endpoints)
     }
 
     // Merge custom models into the catalog before user filters are evaluated.
@@ -268,6 +283,13 @@ public func resolveModelCatalog(
         entry.info.provider != .openCodeGo
             || enabledOpenCodeGo.contains(key)
             || enabledOpenCodeGo.contains(entry.model)
+    }
+
+    let enabledOpenRouter = Set(input.models.openRouterEnabledModels)
+    catalog.retain { key, entry in
+        entry.info.provider != .openRouter
+            || enabledOpenRouter.contains(key)
+            || enabledOpenRouter.contains(entry.model)
     }
 
     switch ModelGlobSet.compile(input.models.disabledModels) {
@@ -379,6 +401,20 @@ public func validateSelectable(
 }
 
 // MARK: - Provider partition merge
+
+private func replaceLiveProviderPartition(
+    _ catalog: inout OrderedModelMap,
+    provider: ModelProvider,
+    entries: OrderedModelMap
+) {
+    catalog.retain { _, entry in entry.info.provider != provider }
+    for (key, entry) in entries.pairs() where entry.info.provider == provider {
+        guard catalog[key].map({ $0.info.provider == provider }) ?? true else {
+            continue
+        }
+        catalog[key] = entry
+    }
+}
 
 func mergeRemoteProviderPartition(
     resolved: inout OrderedModelMap,
@@ -544,6 +580,15 @@ public func trustedBuiltInSessionEndpoint(provider: ModelProvider, baseURL: Stri
         }
         if provider == .zai {
             return ZaiModels.isTrustedAPIBaseURL(baseURL)
+        }
+        if provider == .runinfra {
+            return RunInfraModels.isTrustedAPIBaseURL(baseURL)
+        }
+        if provider == .gemini {
+            return GeminiModels.isTrustedAPIBaseURL(baseURL)
+        }
+        if provider == .openRouter {
+            return OpenRouterModels.isTrustedAPIBaseURL(baseURL)
         }
         return false
     case .xaiSession:

@@ -154,6 +154,11 @@ private func parseProvider(_ value: String?) -> ModelProvider? {
     case "meta", "meta_ai", "meta_api": return .meta
     case "opencode_go", "opencode-go": return .openCodeGo
     case "wafer", "wafer_ai": return .wafer
+    case "zai", "z_ai", "z-ai", "zai_api", "glm": return .zai
+    case "runinfra", "run_infra", "run-infra": return .runinfra
+    case "gemini", "google", "google_gemini", "ai_studio", "aistudio", "gemini_api":
+        return .gemini
+    case "openrouter", "open_router", "open-router": return .openRouter
     default: return nil
     }
 }

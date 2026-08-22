@@ -151,8 +151,10 @@ func applyLiveModelCatalogReconcile(
     modelSwitch: LiveModelSwitchCoordinator
 ) async -> LiveModelReconcileResult? {
     let snapshot = await modelSwitch.snapshot()
-    let catalogID = catalogStore.entryForWireModel(snapshot.modelID)?.id
-        ?? catalogStore.currentModelID()
+    let catalogID = catalogStore.entryForWireModel(
+        snapshot.modelID,
+        provider: snapshot.provider
+    )?.id ?? snapshot.modelID
     let previous = LiveModelReconcileInput(
         currentModelID: catalogID.isEmpty ? nil : catalogID,
         reasoningEffort: snapshot.configuration.reasoningEffort,

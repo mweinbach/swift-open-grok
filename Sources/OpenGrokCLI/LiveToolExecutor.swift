@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokAgentControlTools
 import OpenGrokAgentCoordinator
 import OpenGrokAgentDefinitions
 import OpenGrokACPRuntime
@@ -16,6 +17,7 @@ import OpenGrokHooksPluginTypes
 import OpenGrokHunkTracker
 import OpenGrokInterjection
 import OpenGrokLSP
+import OpenGrokMCP
 import OpenGrokModels
 import OpenGrokPager
 import OpenGrokPagerCommandUI
@@ -52,6 +54,8 @@ struct LiveToolExecutor: Sendable {
     private let composition: OpenGrokShellToolRuntimeComposition
     private let fileToolBridge: ToolBridge
     private let registryToolNames: Set<String>
+    private let initiallyAdvertisedMCPToolNames: Set<String>
+    private let sessionToolPolicy: LiveAgentToolPolicy?
     /// The same gate the file tools run through. `run_terminal_cmd` used to
     /// dispatch straight to `composition.invoke`, so shell execution never saw
     /// a deny rule, a PreToolUse hook, or the permission modal.
@@ -183,6 +187,11 @@ struct LiveToolExecutor: Sendable {
     /// reachability rule as the spawn/swarm surfaces: only an advertised
     /// name dispatches.
     private let collaborationToolNames: Set<String>
+    /// Machine-local peer sessions are separate from the root/subagent team
+    /// mailbox. A disabled bus still has a real backend so listing can report
+    /// `bus_enabled: false`; only a missing backend removes the tool surface.
+    let sessionCollaborationBackend: (any SessionCollaborationBackend)?
+    private let sessionCollaborationToolNames: Set<String>
     /// The session's scheduler runtime: task store + sleep-until-due timer +
     /// the in-session fire seam. `nil` when the composition has no fire path
     /// (headless, ACP, children), which also strips the `scheduler_*` tools
@@ -301,6 +310,10 @@ struct LiveToolExecutor: Sendable {
         // (task/types.rs:484-573), and the nested strip keeps them
         // ("mailbox collaboration must remain", task/types.rs:1407-1434).
         agentCollaboration: LiveAgentCollaboration? = nil,
+        // Cross-process collaboration requires the actual session bus, even
+        // when that bus was deliberately disabled. Older launch seams without
+        // a backend advertise none of its three tools.
+        sessionCollaborationBackend: (any SessionCollaborationBackend)? = nil,
         // The `ask_user_question` surface. Defaulted to nil so headless, ACP
         // and subagent-child constructions simply never advertise the tool —
         // absence of the surface must mean absence of the tool, never a tool
@@ -606,6 +619,15 @@ struct LiveToolExecutor: Sendable {
         )
         toolset.resources.extras.insert(EnabledNativeToolNames(nativeNames))
         let mcpConnections = MCPSessionConnections()
+        let mcpDeclarations = MCPConfigLoader.load(from: security.document)
+        let mcpDisabledTools = allDisabledMCPTools(in: security.document)
+        await mcpConnections.startLifecycle(
+            sessionID: sessionID,
+            toolset: toolset,
+            declarations: { mcpDeclarations },
+            environment: environment,
+            disabledTools: { mcpDisabledTools[$0] ?? [] }
+        )
         // `security.document` already excludes the project tier when the folder
         // is untrusted, so a hostile repo's `.opengrok/config.toml` servers are
         // simply not present here — they never reach `makeTransport`, which is
@@ -685,6 +707,15 @@ struct LiveToolExecutor: Sendable {
             collaborationTools = []
         }
         self.collaborationToolNames = Set(collaborationTools.map(\.name))
+        self.sessionCollaborationBackend = sessionCollaborationBackend
+        let sessionCollaborationTools: [ToolSpec]
+        if sessionCollaborationBackend != nil {
+            sessionCollaborationTools = LiveSessionCollaborationTools.toolSpecs()
+                .filter { toolPolicy?.allows(liveToolName: $0.name) ?? true }
+        } else {
+            sessionCollaborationTools = []
+        }
+        self.sessionCollaborationToolNames = Set(sessionCollaborationTools.map(\.name))
         // The background-task consumers only make sense alongside the producer:
         // without `run_terminal_cmd` there is no task for them to read, wait on
         // or kill. Upstream registers all three in every preset that has bash
@@ -758,6 +789,12 @@ struct LiveToolExecutor: Sendable {
         self.mcpServerConnections = mcpServerConnections
         self.lspPullSession = lspPullSession
         self.registryToolNames = Set(allowedFileToolDefinitions.map(\.name))
+        self.initiallyAdvertisedMCPToolNames = Set(
+            allowedFileToolDefinitions.compactMap { definition in
+                toolset.tool(named: definition.name)?.namespace == .mcp ? definition.name : nil
+            }
+        )
+        self.sessionToolPolicy = toolPolicy
         self.workingDirectory = standardizedWorkingDirectory
         self.sessionDirectories = LiveSessionDirectoryRegistry(
             sessionID: sessionID,
@@ -792,6 +829,7 @@ struct LiveToolExecutor: Sendable {
             .union(subagentToolNames)
             .union(swarmToolNames)
             .union(collaborationToolNames)
+            .union(sessionCollaborationToolNames)
             .union(schedulerToolNames)
             .union(monitorToolNames)
             .union([Self.runTerminalTool.name])
@@ -818,6 +856,7 @@ struct LiveToolExecutor: Sendable {
         advertisedTools.append(contentsOf: monitorTools)
         advertisedTools.append(contentsOf: spawnTools)
         advertisedTools.append(contentsOf: collaborationTools)
+        advertisedTools.append(contentsOf: sessionCollaborationTools)
         advertisedTools.append(contentsOf: schedulerTools)
         advertisedTools.append(contentsOf: sessionTools)
         for definition in allowedFileToolDefinitions {
@@ -830,6 +869,37 @@ struct LiveToolExecutor: Sendable {
             ))
         }
         self.tools = advertisedTools
+    }
+
+    /// Re-snapshot only the mutable MCP surface. Built-ins and their launch
+    /// gates remain immutable; newly connected servers inherit the original
+    /// agent-profile filter, and removed servers disappear before the next turn.
+    func currentToolSpecs() -> [ToolSpec] {
+        var current = tools.filter { !initiallyAdvertisedMCPToolNames.contains($0.name) }
+        for definition in mcpToolset.topLevelDefinitions() {
+            guard let registered = mcpToolset.tool(named: definition.name),
+                  registered.namespace == .mcp,
+                  sessionToolPolicy?.allows(liveToolName: definition.name) ?? true
+            else {
+                continue
+            }
+            current.append(ToolSpec(
+                name: definition.name,
+                description: definition.description,
+                parameters: definition.argumentsSchema
+                    ?? .object(["type": .string("object")])
+            ))
+        }
+        return current
+    }
+
+    private func registryToolIsCurrentlyDispatchable(_ name: String) -> Bool {
+        guard let registered = mcpToolset.tool(named: name) else { return false }
+        if registered.namespace == .mcp {
+            return registered.visibility == .topLevel
+                && (sessionToolPolicy?.allows(liveToolName: name) ?? true)
+        }
+        return registryToolNames.contains(name)
     }
 
     func runStop(
@@ -1113,7 +1183,7 @@ struct LiveToolExecutor: Sendable {
         // point per prompt possible without a hook in each tool.
         await sessionServices?.noteToolCall(name: call.name, arguments: args)
 
-        if registryToolNames.contains(call.name) {
+        if registryToolIsCurrentlyDispatchable(call.name) {
             if Task.isCancelled {
                 return .failure(.cancelled)
             }
@@ -1187,6 +1257,28 @@ struct LiveToolExecutor: Sendable {
                 return .failure(denial)
             }
             return await agentCollaboration.invoke(name: call.name, args: args)
+        }
+
+        if sessionCollaborationToolNames.contains(call.name),
+           let sessionCollaborationBackend {
+            let prepared: PreparedSessionCollaborationCall
+            do {
+                prepared = try LiveSessionCollaborationTools.prepare(
+                    name: call.name,
+                    arguments: args
+                )
+            } catch let error as SessionCollaborationError {
+                return .failure(.invalidCall(error.description))
+            } catch {
+                return .failure(.invalidCall(String(describing: error)))
+            }
+            if let denial = await gateSessionCollaborationTool(args: args, call: call) {
+                return .failure(denial)
+            }
+            return await LiveSessionCollaborationTools.invoke(
+                prepared,
+                backend: sessionCollaborationBackend
+            )
         }
 
         // The scheduler trio — session-state RPCs against the scheduler
@@ -1393,6 +1485,40 @@ struct LiveToolExecutor: Sendable {
             return .failed("hook \(hookName) denied: \(reason)")
         }
         return nil
+    }
+
+    /// Rust maps every session-collaboration input, including a peer message,
+    /// to `AccessKind::Read(None)` before its ordinary permission pipeline.
+    /// A delivered body never grants the recipient permission to run tools.
+    private func gateSessionCollaborationTool(
+        args: JSONValue,
+        call: ToolCall
+    ) async -> OpenGrokShellToolRuntimeError? {
+        guard let permissionPipeline else {
+            return .failed(
+                "'\(call.name)' has no permission gate configured for this session"
+            )
+        }
+        let prepared = await permissionPipeline.prepare(PrepareToolAccessRequest(
+            access: .read(nil),
+            toolName: call.name,
+            toolCallId: call.callId,
+            permissionModeLabel: await sessionPermissionMode?.permissionModeLabel()
+        ))
+        if prepared.mayDispatch { return nil }
+        switch prepared.decision {
+        case .policyDeny(let reason), .reject(let reason):
+            firePermissionDenied(call: call, args: args, reason: reason)
+            return .denied(reason)
+        case .cancelled:
+            return .cancelled
+        case .followupMessage(let message):
+            return .failed(message)
+        case .ask:
+            return .failed("'\(call.name)' requires approval, and no prompter is available.")
+        case .allow:
+            return nil
+        }
     }
 
     /// Run `kill_task` through the permission pipeline.
@@ -1606,6 +1732,9 @@ struct LiveToolExecutor: Sendable {
         // Monitor pipelines before the shell composition: a poll loop that
         // outlives the backend would spin against a dead process table.
         await monitorHost?.shutdown()
+        if let sessionBus = sessionCollaborationBackend as? LiveSessionBus {
+            await sessionBus.stop()
+        }
         await lspPullSession?.shutdown()
         await mcpConnections.shutdown()
         await composition.shutdown()

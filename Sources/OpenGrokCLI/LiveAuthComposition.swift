@@ -110,6 +110,9 @@ extension AuthAccountTarget {
         case .openCodeGo: return "OpenCode Go"
         case .wafer: return "Wafer AI"
         case .zai: return "Z AI"
+        case .runinfra: return "RunInfra"
+        case .gemini: return "Google Gemini"
+        case .openRouter: return "OpenRouter"
         }
     }
 
@@ -125,6 +128,9 @@ extension AuthAccountTarget {
         case .openCodeGo: return "opencode-go"
         case .wafer: return "wafer"
         case .zai: return "zai"
+        case .runinfra: return "runinfra"
+        case .gemini: return "gemini"
+        case .openRouter: return "openrouter"
         }
     }
 }
@@ -156,7 +162,7 @@ public struct LiveAuthProviderStatus: Sendable, Equatable, Encodable {
     public static let unauthenticated = LiveAuthProviderStatus(authenticated: false)
 }
 
-/// Combined status of all 9 supported providers.
+/// Combined status of all supported providers.
 public struct LiveAuthStatus: Sendable, Equatable, Encodable {
     public var xai: LiveAuthProviderStatus
     public var codex: LiveAuthProviderStatus
@@ -167,10 +173,14 @@ public struct LiveAuthStatus: Sendable, Equatable, Encodable {
     public var openCodeGo: LiveAuthProviderStatus
     public var wafer: LiveAuthProviderStatus
     public var zai: LiveAuthProviderStatus
+    public var runinfra: LiveAuthProviderStatus
+    public var gemini: LiveAuthProviderStatus
+    public var openRouter: LiveAuthProviderStatus
 
     public enum CodingKeys: String, CodingKey {
-        case xai, codex, kimi, fireworks, deepseek, meta, wafer, zai
+        case xai, codex, kimi, fireworks, deepseek, meta, wafer, zai, runinfra, gemini
         case openCodeGo = "opencode_go"
+        case openRouter = "openrouter"
     }
 
     public init(
@@ -182,7 +192,10 @@ public struct LiveAuthStatus: Sendable, Equatable, Encodable {
         meta: LiveAuthProviderStatus = .unauthenticated,
         openCodeGo: LiveAuthProviderStatus = .unauthenticated,
         wafer: LiveAuthProviderStatus = .unauthenticated,
-        zai: LiveAuthProviderStatus = .unauthenticated
+        zai: LiveAuthProviderStatus = .unauthenticated,
+        runinfra: LiveAuthProviderStatus = .unauthenticated,
+        gemini: LiveAuthProviderStatus = .unauthenticated,
+        openRouter: LiveAuthProviderStatus = .unauthenticated
     ) {
         self.xai = xai
         self.codex = codex
@@ -193,6 +206,9 @@ public struct LiveAuthStatus: Sendable, Equatable, Encodable {
         self.openCodeGo = openCodeGo
         self.wafer = wafer
         self.zai = zai
+        self.runinfra = runinfra
+        self.gemini = gemini
+        self.openRouter = openRouter
     }
 }
 
@@ -281,7 +297,8 @@ public enum LiveAuthComposition {
                 streams: streams,
                 services: services
             )
-        case .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai:
+        case .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai,
+             .runinfra, .gemini, .openRouter:
             try await loginScopedProvider(
                 target: accountTarget,
                 options: options,
@@ -458,6 +475,12 @@ public enum LiveAuthComposition {
                 try storeWaferAPIKey(grokHome: home, apiKey: apiKey)
             case .zai:
                 try storeZaiAPIKey(grokHome: home, apiKey: apiKey)
+            case .runinfra:
+                try storeRunInfraAPIKey(grokHome: home, apiKey: apiKey)
+            case .gemini:
+                try storeGeminiAPIKey(grokHome: home, apiKey: apiKey)
+            case .openRouter:
+                try storeOpenRouterAPIKey(grokHome: home, apiKey: apiKey)
             case .xai, .codex, .all:
                 break
             }
@@ -541,6 +564,12 @@ public enum LiveAuthComposition {
                 return v
             }
             return nil
+        case .runinfra:
+            return runInfraAPIKeyFromEnvironment(environment)
+        case .gemini:
+            return geminiAPIKeyFromEnvironment(environment)
+        case .openRouter:
+            return openRouterAPIKeyFromEnvironment(environment)
         case .codex, .all:
             return nil
         }
@@ -629,7 +658,8 @@ public enum LiveAuthComposition {
                             : "No Codex credentials were stored.\n"
                     )
                 }
-            case .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai:
+            case .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai,
+                 .runinfra, .gemini, .openRouter:
                 streams.out("Signed out of \(accountTarget.providerDisplayName); key removed from auth.json.\n")
             }
         }
@@ -639,7 +669,7 @@ public enum LiveAuthComposition {
 
     // MARK: - Status
 
-    /// Read-only status of all 9 provider stores and environments.
+    /// Read-only status of every provider store and environment.
     public static func status(environment: [String: String]) -> LiveAuthStatus {
         LiveAuthStatus(
             xai: xaiStatus(environment: environment),
@@ -650,7 +680,10 @@ public enum LiveAuthComposition {
             meta: metaStatus(environment: environment),
             openCodeGo: openCodeGoStatus(environment: environment),
             wafer: waferStatus(environment: environment),
-            zai: zaiStatus(environment: environment)
+            zai: zaiStatus(environment: environment),
+            runinfra: runInfraStatus(environment: environment),
+            gemini: geminiStatus(environment: environment),
+            openRouter: openRouterStatus(environment: environment)
         )
     }
 
@@ -666,6 +699,9 @@ public enum LiveAuthComposition {
             line(provider: "OpenCode Go", status: current.openCodeGo, hint: "open-grok login opencode-go"),
             line(provider: "Wafer AI", status: current.wafer, hint: "open-grok login wafer"),
             line(provider: "Z AI", status: current.zai, hint: "open-grok login zai"),
+            line(provider: "RunInfra", status: current.runinfra, hint: "open-grok login runinfra"),
+            line(provider: "Google Gemini", status: current.gemini, hint: "open-grok login gemini"),
+            line(provider: "OpenRouter", status: current.openRouter, hint: "open-grok login openrouter"),
         ]
     }
 
@@ -807,6 +843,36 @@ public enum LiveAuthComposition {
         return .unauthenticated
     }
 
+    private static func runInfraStatus(environment: [String: String]) -> LiveAuthProviderStatus {
+        if runInfraAPIKeyFromEnvironment(environment) != nil {
+            return LiveAuthProviderStatus(authenticated: true, source: "environment")
+        }
+        let home = OpenGrokHomeResolver.resolve(environment: environment)
+        return runInfraAPIKeyIsConfigured(grokHome: home)
+            ? LiveAuthProviderStatus(authenticated: true, source: "api_key")
+            : .unauthenticated
+    }
+
+    private static func geminiStatus(environment: [String: String]) -> LiveAuthProviderStatus {
+        if geminiAPIKeyFromEnvironment(environment) != nil {
+            return LiveAuthProviderStatus(authenticated: true, source: "environment")
+        }
+        let home = OpenGrokHomeResolver.resolve(environment: environment)
+        return geminiAPIKeyIsConfigured(grokHome: home)
+            ? LiveAuthProviderStatus(authenticated: true, source: "api_key")
+            : .unauthenticated
+    }
+
+    private static func openRouterStatus(environment: [String: String]) -> LiveAuthProviderStatus {
+        if openRouterAPIKeyFromEnvironment(environment) != nil {
+            return LiveAuthProviderStatus(authenticated: true, source: "environment")
+        }
+        let home = OpenGrokHomeResolver.resolve(environment: environment)
+        return openRouterAPIKeyIsConfigured(grokHome: home)
+            ? LiveAuthProviderStatus(authenticated: true, source: "api_key")
+            : .unauthenticated
+    }
+
     private static func emitStatus(
         options: CLIUtilityOptions,
         environment: [String: String],
@@ -847,6 +913,9 @@ public enum LiveAuthComposition {
     ///   * `"opencode-go"|"opencode_go"|"opencode"|"go"` -> `.openCodeGo`
     ///   * `"wafer"|"wafer-ai"|"wafer_ai"` -> `.wafer`
     ///   * `"zai"|"z-ai"|"z_ai"` -> `.zai`
+    ///   * `"runinfra"|"run-infra"|"run_infra"` -> `.runinfra`
+    ///   * `"gemini"|"google"|"ai-studio"|"google-gemini"` -> `.gemini`
+    ///   * `"openrouter"|"open-router"|"open_router"` -> `.openRouter`
     ///
     /// Default with no values is `.xai`.
     static func target(for options: CLIUtilityOptions) throws -> AuthAccountTarget {
@@ -872,6 +941,9 @@ public enum LiveAuthComposition {
         if options.options["--opencode-go"] != nil || options.options["--opencode_go"] != nil || options.options["--opencode"] != nil || options.options["--go"] != nil { return .openCodeGo }
         if options.options["--wafer"] != nil || options.options["--wafer-ai"] != nil || options.options["--wafer_ai"] != nil { return .wafer }
         if options.options["--zai"] != nil || options.options["--z-ai"] != nil || options.options["--z_ai"] != nil { return .zai }
+        if options.options["--runinfra"] != nil || options.options["--run-infra"] != nil || options.options["--run_infra"] != nil { return .runinfra }
+        if options.options["--gemini"] != nil || options.options["--google"] != nil || options.options["--google-gemini"] != nil || options.options["--ai-studio"] != nil { return .gemini }
+        if options.options["--openrouter"] != nil || options.options["--open-router"] != nil || options.options["--open_router"] != nil { return .openRouter }
 
         if let first = values.first(where: { !$0.isEmpty }) {
             switch first {
@@ -891,6 +963,13 @@ public enum LiveAuthComposition {
                 return .wafer
             case "zai", "z-ai", "z_ai":
                 return .zai
+            case "runinfra", "run-infra", "run_infra":
+                return .runinfra
+            case "gemini", "google", "google-gemini", "google_gemini", "ai-studio", "ai_studio",
+                 "aistudio", "gemini-api", "gemini_api":
+                return .gemini
+            case "openrouter", "open-router", "open_router":
+                return .openRouter
             default:
                 break
             }
@@ -921,6 +1000,14 @@ public enum LiveAuthComposition {
             return t == "wafer" || t == "wafer-ai" || t == "wafer_ai"
         case .zai:
             return t == "zai" || t == "z-ai" || t == "z_ai"
+        case .runinfra:
+            return t == "runinfra" || t == "run-infra" || t == "run_infra"
+        case .gemini:
+            return t == "gemini" || t == "google" || t == "google-gemini"
+                || t == "google_gemini" || t == "ai-studio" || t == "ai_studio"
+                || t == "aistudio" || t == "gemini-api" || t == "gemini_api"
+        case .openRouter:
+            return t == "openrouter" || t == "open-router" || t == "open_router"
         }
     }
 

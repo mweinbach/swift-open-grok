@@ -446,6 +446,19 @@ final class LivePagerSession: OpenGrokPagerMinimalSessionAdapter, @unchecked Sen
                             )))
                         case .reasoning(let text):
                             continuation.yield(.reasoning(text))
+                        case .responseStarted(
+                            let messageID, let model, let inputTokens,
+                            let cacheReadInputTokens, let cacheCreationInputTokens
+                        ):
+                            continuation.yield(.responseStarted(
+                                messageID: messageID,
+                                model: model,
+                                inputTokens: inputTokens,
+                                cacheReadInputTokens: cacheReadInputTokens,
+                                cacheCreationInputTokens: cacheCreationInputTokens
+                            ))
+                        case .reasoningCompleted(let signature):
+                            continuation.yield(.reasoningCompleted(signature: signature))
                         case .toolCallDelta(
                             let toolIndex, let id, let name, let argumentsDelta
                         ):
@@ -490,9 +503,25 @@ final class LivePagerSession: OpenGrokPagerMinimalSessionAdapter, @unchecked Sen
                             )))
                         }
                     case .turnCompleted(let result) where result.turnID == handle.turnID:
+                        continuation.yield(.responseCompleted(
+                            messageID: result.messageID,
+                            stopReason: result.rawStopReason ?? result.stopReason,
+                            stopSequence: result.stopSequence,
+                            inputTokens: result.inputTokens,
+                            outputTokens: result.outputTokens,
+                            cacheReadInputTokens: result.cacheReadInputTokens,
+                            cacheCreationInputTokens: result.cacheCreationInputTokens
+                        ))
                         continuation.yield(.completed(OpenGrokPagerMinimalCompletion(
                             sessionID: handle.sessionID.rawValue,
-                            summary: result.stopReason
+                            summary: result.stopReason,
+                            messageID: result.messageID,
+                            rawStopReason: result.rawStopReason,
+                            stopSequence: result.stopSequence,
+                            inputTokens: result.inputTokens,
+                            outputTokens: result.outputTokens,
+                            cacheReadInputTokens: result.cacheReadInputTokens,
+                            cacheCreationInputTokens: result.cacheCreationInputTokens
                         )))
                         continuation.finish()
                         return
@@ -1920,6 +1949,8 @@ actor LiveInteractivePagerRenderer: OpenGrokPagerRenderAdapter {
             status = "Failed (\(kind)): \(message)"
         case .permissionRequested(let request):
             status = "Permission required: \(request.prompt)"
+        case .responseStarted, .reasoningCompleted, .responseCompleted:
+            break
         case .completed:
             conversation.finishAssistant()
             status = "Completed"
@@ -2059,12 +2090,38 @@ struct SilentLivePagerOutput: OpenGrokPagerOutputAdapter, Sendable {
 actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
     private let streams: CLIStreams
     private let format: CLIOutputFormat
+    private var nativeMessages: NativeMessagesOutputReducer?
     private var collectedOutput = ""
     private var wrotePlainOutput = false
 
-    init(streams: CLIStreams, format: CLIOutputFormat) {
+    init(
+        streams: CLIStreams,
+        format: CLIOutputFormat,
+        includePartialMessages: Bool = false,
+        sessionID: String? = nil,
+        model: String? = nil,
+        workingDirectory: String? = nil,
+        tools: [String] = [],
+        slashCommands: [String] = [],
+        skills: [String] = [],
+        permissionMode: String? = nil,
+        apiKeySource: String = "user"
+    ) {
         self.streams = streams
         self.format = format
+        if format == .streamingMessagesJSON {
+            self.nativeMessages = NativeMessagesOutputReducer(
+                sessionID: sessionID ?? "",
+                model: model,
+                workingDirectory: workingDirectory ?? "",
+                includePartialMessages: includePartialMessages,
+                tools: tools,
+                slashCommands: slashCommands,
+                skills: skills,
+                permissionMode: permissionMode,
+                apiKeySource: apiKeySource
+            )
+        }
     }
 
     func forward(_ event: OpenGrokPagerMinimalEvent) async throws {
@@ -2074,9 +2131,14 @@ actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
         case .json:
             try forwardJSON(event)
         case .streamingJSON:
-            try forwardStreamingJSON(event, messagesOnly: false)
+            try forwardStreamingJSON(event)
         case .streamingMessagesJSON:
-            try forwardStreamingJSON(event, messagesOnly: true)
+            guard var reducer = nativeMessages else { return }
+            let lines = reducer.reduce(event)
+            nativeMessages = reducer
+            for line in lines {
+                streams.out(try Self.jsonLine(line))
+            }
         }
     }
 
@@ -2102,7 +2164,8 @@ actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
             streams.err("open-grok: retry \(attempt)/\(maxRetries): \(reason)\n")
         case .samplingFailed(let kind, let message, _, _):
             streams.err("open-grok: failed (\(kind)): \(message)\n")
-        case .lifecycle, .tool, .toolCallDelta:
+        case .lifecycle, .tool, .toolCallDelta, .responseStarted,
+             .reasoningCompleted, .responseCompleted:
             break
         }
     }
@@ -2130,23 +2193,22 @@ actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
                 "is_retryable": isRetryable,
                 "status_code": statusCode as Any
             ]))
-        case .lifecycle, .status, .tool, .toolCallDelta, .retrying, .permissionRequested:
+        case .lifecycle, .status, .tool, .toolCallDelta, .retrying,
+             .permissionRequested, .responseStarted, .reasoningCompleted,
+             .responseCompleted:
             break
         }
     }
 
-    private func forwardStreamingJSON(
-        _ event: OpenGrokPagerMinimalEvent,
-        messagesOnly: Bool
-    ) throws {
+    private func forwardStreamingJSON(_ event: OpenGrokPagerMinimalEvent) throws {
         switch event {
         case .output(let text):
             collectedOutput += text
             streams.out(try Self.jsonLine([
-                "type": messagesOnly ? "assistant" : "output",
+                "type": "output",
                 "content": text
             ]))
-        case .status(let status) where !messagesOnly:
+        case .status(let status):
             streams.out(try Self.jsonLine(["type": "status", "status": status]))
         case .tool(let tool):
             streams.out(try Self.jsonLine([
@@ -2157,9 +2219,9 @@ actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
                 "output": tool.output as Any,
                 "state": tool.state.rawValue
             ]))
-        case .reasoning(let text) where !messagesOnly:
+        case .reasoning(let text):
             streams.out(try Self.jsonLine(["type": "reasoning", "content": text]))
-        case .retrying(let attempt, let maxRetries, let kind, let reason) where !messagesOnly:
+        case .retrying(let attempt, let maxRetries, let kind, let reason):
             streams.out(try Self.jsonLine([
                 "type": "retrying",
                 "attempt": attempt,
@@ -2167,8 +2229,7 @@ actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
                 "kind": kind,
                 "reason": reason
             ]))
-        case .samplingFailed(let kind, let message, let isRetryable, let statusCode)
-            where !messagesOnly:
+        case .samplingFailed(let kind, let message, let isRetryable, let statusCode):
             streams.out(try Self.jsonLine([
                 "type": "failed",
                 "kind": kind,
@@ -2184,14 +2245,14 @@ actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
             ]))
         case .cancelled:
             streams.out(try Self.jsonLine(["type": "cancelled"]))
-        case .permissionRequested(let request) where !messagesOnly:
+        case .permissionRequested(let request):
             streams.out(try Self.jsonLine([
                 "type": "permission_requested",
                 "id": request.id,
                 "prompt": request.prompt
             ]))
-        case .lifecycle, .status, .permissionRequested, .toolCallDelta, .reasoning,
-             .retrying, .samplingFailed:
+        case .lifecycle, .toolCallDelta, .responseStarted, .reasoningCompleted,
+             .responseCompleted:
             break
         }
     }
@@ -2210,5 +2271,726 @@ actor LivePagerOutput: OpenGrokPagerMinimalOutputAdapter {
             options: [.sortedKeys, .withoutEscapingSlashes]
         )
         return String(decoding: data, as: UTF8.self) + "\n"
+    }
+}
+
+/// Native Messages API NDJSON frames; upstream keeps this reducer independent
+/// from `streaming-json` because flattening deltas destroys response identity,
+/// ordered content blocks, tool-result pairing, and prompt-cache accounting.
+private struct NativeMessagesOutputReducer {
+    private enum TextKind { case text, thinking }
+
+    private struct Usage {
+        var inputTokens: UInt64 = 0
+        var outputTokens: UInt64 = 0
+        var cacheReadInputTokens: UInt64 = 0
+        var cacheCreationInputTokens: UInt64 = 0
+
+        var fields: [String: Any] {
+            [
+                "input_tokens": inputTokens,
+                "output_tokens": outputTokens,
+                "cache_read_input_tokens": cacheReadInputTokens,
+                "cache_creation_input_tokens": cacheCreationInputTokens,
+            ]
+        }
+
+        var isEmpty: Bool {
+            inputTokens == 0 && outputTokens == 0
+                && cacheReadInputTokens == 0 && cacheCreationInputTokens == 0
+        }
+
+        mutating func add(_ other: Usage) {
+            inputTokens += other.inputTokens
+            outputTokens += other.outputTokens
+            cacheReadInputTokens += other.cacheReadInputTokens
+            cacheCreationInputTokens += other.cacheCreationInputTokens
+        }
+    }
+
+    private struct ToolResult {
+        var order: Int
+        var identifier: String
+        var content: String
+        var isError: Bool
+    }
+
+    private var sessionID: String
+    private var model: String
+    private let workingDirectory: String
+    private let includePartialMessages: Bool
+    private let tools: [String]
+    private let slashCommands: [String]
+    private let skills: [String]
+    private let permissionMode: String
+    private let apiKeySource: String
+    private let startedAt: UInt64
+
+    private var initialized = false
+    private var terminalEmitted = false
+    private var responseStarted = false
+    private var responseCompleted = false
+    private var responseID: String?
+    private var responseModel: String?
+    private var responseStopReason: String?
+    private var responseStopSequence: String?
+    private var responseUsage = Usage()
+    private var initialUsage = Usage()
+    private var aggregateUsage = Usage()
+    private var usageByModel: [String: Usage] = [:]
+    private var completedResponses = 0
+    private var assistantFrames = 0
+    private var nextMessageNumber = 0
+    private var lastText = ""
+    private var lastResponseStopReason: String?
+
+    private var blocks: [[String: Any]] = []
+    private var openKind: TextKind?
+    private var openText = ""
+    private var openSignature: String?
+    private var partialMessageOpen = false
+    private var partialBlockKind: TextKind?
+    private var partialBlockIndex: Int?
+
+    private var nextToolOrder = 0
+    private var pendingToolOrders: [String: Int] = [:]
+    private var completedToolIDs: Set<String> = []
+    private var pendingToolResults: [ToolResult] = []
+    private var pendingWebSearches: [String: OpenGrokPagerToolUpdate] = [:]
+    private var webSearchRequests: UInt64 = 0
+
+    init(
+        sessionID: String,
+        model: String?,
+        workingDirectory: String,
+        includePartialMessages: Bool,
+        tools: [String],
+        slashCommands: [String],
+        skills: [String],
+        permissionMode: String?,
+        apiKeySource: String
+    ) {
+        self.sessionID = sessionID
+        self.model = model.flatMap { $0.isEmpty ? nil : $0 } ?? "unknown"
+        self.workingDirectory = workingDirectory
+        self.includePartialMessages = includePartialMessages
+        self.tools = tools
+        self.slashCommands = slashCommands
+        self.skills = skills
+        switch permissionMode {
+        case "acceptEdits", "bypassPermissions", "plan", "dontAsk":
+            self.permissionMode = permissionMode ?? "default"
+        default:
+            self.permissionMode = "default"
+        }
+        self.apiKeySource = apiKeySource == "oauth" ? "oauth" : "user"
+        self.startedAt = DispatchTime.now().uptimeNanoseconds
+    }
+
+    mutating func reduce(_ event: OpenGrokPagerMinimalEvent) -> [[String: Any]] {
+        guard !terminalEmitted else { return [] }
+        var lines: [[String: Any]] = []
+
+        switch event {
+        case .responseStarted(
+            let messageID, let model, let inputTokens,
+            let cacheReadInputTokens, let cacheCreationInputTokens
+        ):
+            if hasPendingResponse {
+                ensureInitialized(into: &lines)
+                flushAssistant(defaultStopReason: "end_turn", into: &lines)
+                flushToolResults(into: &lines)
+            }
+            responseStarted = true
+            responseCompleted = false
+            responseID = messageID
+            responseModel = model.isEmpty ? nil : model
+            if !model.isEmpty { self.model = model }
+            initialUsage = Usage(
+                inputTokens: inputTokens,
+                cacheReadInputTokens: cacheReadInputTokens,
+                cacheCreationInputTokens: cacheCreationInputTokens
+            )
+            responseUsage = initialUsage
+        case .reasoningCompleted(let signature):
+            guard !signature.isEmpty else { return lines }
+            if openSignature != nil {
+                closePartialBlock(into: &lines)
+                finalizeOpenBlock()
+            }
+            openSignature = signature
+        case .responseCompleted(
+            let messageID, let stopReason, let stopSequence, let inputTokens,
+            let outputTokens, let cacheReadInputTokens, let cacheCreationInputTokens
+        ):
+            if let current = responseID, let messageID, current != messageID,
+               responseStarted {
+                return lines
+            }
+            if let messageID { responseID = messageID }
+            responseStopReason = stopReason
+            responseStopSequence = stopSequence
+            lastResponseStopReason = stopReason
+            let usage = Usage(
+                inputTokens: inputTokens,
+                outputTokens: outputTokens,
+                cacheReadInputTokens: cacheReadInputTokens,
+                cacheCreationInputTokens: cacheCreationInputTokens
+            )
+            responseUsage = usage.isEmpty ? initialUsage : usage
+            if !responseCompleted {
+                responseCompleted = true
+                completedResponses += 1
+                if !responseUsage.isEmpty {
+                    aggregateUsage.add(responseUsage)
+                    usageByModel[activeModel, default: Usage()].add(responseUsage)
+                }
+            }
+        case .output(let text):
+            guard !text.isEmpty else { return lines }
+            ensureInitialized(into: &lines)
+            flushToolResults(into: &lines)
+            appendText(text, kind: .text, into: &lines)
+        case .reasoning(let text):
+            guard !text.isEmpty else { return lines }
+            ensureInitialized(into: &lines)
+            flushToolResults(into: &lines)
+            appendText(text, kind: .thinking, into: &lines)
+        case .tool(let update):
+            ensureInitialized(into: &lines)
+            handleTool(update, into: &lines)
+        case .samplingFailed(_, let message, _, _):
+            finish(stopReason: nil, error: message, completion: nil, into: &lines)
+        case .cancelled:
+            finish(stopReason: "cancelled", error: "cancelled", completion: nil, into: &lines)
+        case .completed(let completion):
+            if sessionID.isEmpty, let identifier = completion.sessionID {
+                sessionID = identifier
+            }
+            if !responseCompleted, completion.messageID != nil
+                || completion.inputTokens != 0 || completion.outputTokens != 0
+                || completion.cacheReadInputTokens != 0
+                || completion.cacheCreationInputTokens != 0 {
+                let terminal = OpenGrokPagerMinimalEvent.responseCompleted(
+                    messageID: completion.messageID,
+                    stopReason: completion.rawStopReason ?? completion.summary,
+                    stopSequence: completion.stopSequence,
+                    inputTokens: completion.inputTokens,
+                    outputTokens: completion.outputTokens,
+                    cacheReadInputTokens: completion.cacheReadInputTokens,
+                    cacheCreationInputTokens: completion.cacheCreationInputTokens
+                )
+                lines.append(contentsOf: reduce(terminal))
+            }
+            let stopReason = completion.summary ?? lastResponseStopReason ?? "end_turn"
+            let error = stopReason == "refusal" ? "The model refused to continue" : nil
+            finish(stopReason: stopReason, error: error, completion: completion, into: &lines)
+        case .lifecycle:
+            ensureInitialized(into: &lines)
+        case .status, .toolCallDelta, .retrying, .permissionRequested:
+            break
+        }
+        return lines
+    }
+
+    private var activeModel: String {
+        responseModel.flatMap { $0.isEmpty ? nil : $0 } ?? model
+    }
+
+    private var hasPendingResponse: Bool {
+        responseStarted || responseCompleted || !blocks.isEmpty || !openText.isEmpty
+            || openSignature != nil || !pendingToolResults.isEmpty
+    }
+
+    private mutating func ensureInitialized(into lines: inout [[String: Any]]) {
+        guard !initialized else { return }
+        initialized = true
+        lines.append([
+            "type": "system",
+            "subtype": "init",
+            "session_id": sessionID,
+            "apiKeySource": apiKeySource,
+            "model": model,
+            "cwd": workingDirectory,
+            "permissionMode": permissionMode,
+            "tools": tools,
+            "slash_commands": slashCommands,
+            "mcp_servers": [[String: Any]](),
+            "skills": skills,
+            "uuid": UUID().uuidString.lowercased(),
+        ])
+    }
+
+    private mutating func appendText(
+        _ text: String,
+        kind: TextKind,
+        into lines: inout [[String: Any]]
+    ) {
+        if let current = openKind, current != kind {
+            closePartialBlock(into: &lines)
+            finalizeOpenBlock()
+        } else if openKind == nil, openSignature != nil, kind == .text {
+            appendSignatureOnlyBlock(into: &lines)
+        }
+        openKind = kind
+        openText += text
+        guard includePartialMessages else { return }
+        openPartialMessage(into: &lines)
+        if partialBlockIndex == nil {
+            let index = blocks.count
+            let contentBlock: [String: Any] = kind == .text
+                ? ["type": "text", "text": ""]
+                : ["type": "thinking", "thinking": "", "signature": ""]
+            appendPartial([
+                "type": "content_block_start",
+                "index": index,
+                "content_block": contentBlock,
+            ], into: &lines)
+            partialBlockKind = kind
+            partialBlockIndex = index
+        }
+        let delta: [String: Any] = kind == .text
+            ? ["type": "text_delta", "text": text]
+            : ["type": "thinking_delta", "thinking": text]
+        appendPartial([
+            "type": "content_block_delta",
+            "index": partialBlockIndex!,
+            "delta": delta,
+        ], into: &lines)
+    }
+
+    private mutating func finalizeOpenBlock() {
+        guard let kind = openKind else {
+            if let signature = openSignature {
+                blocks.append(["type": "thinking", "thinking": "", "signature": signature])
+                openSignature = nil
+            }
+            return
+        }
+        let text = openText
+        let signature = openSignature
+        openKind = nil
+        openText = ""
+        openSignature = nil
+        switch kind {
+        case .text where !text.isEmpty:
+            blocks.append(["type": "text", "text": text])
+        case .thinking where !text.isEmpty || signature != nil:
+            blocks.append([
+                "type": "thinking",
+                "thinking": text,
+                "signature": signature ?? "",
+            ])
+        default:
+            break
+        }
+    }
+
+    private mutating func openPartialMessage(into lines: inout [[String: Any]]) {
+        guard includePartialMessages, !partialMessageOpen else { return }
+        let identifier = messageIdentifier()
+        appendPartial([
+            "type": "message_start",
+            "message": [
+                "id": identifier,
+                "type": "message",
+                "role": "assistant",
+                "model": activeModel,
+                "content": [[String: Any]](),
+                "stop_reason": NSNull(),
+                "stop_sequence": NSNull(),
+                "usage": initialUsage.fields,
+            ] as [String: Any],
+        ], into: &lines)
+        partialMessageOpen = true
+    }
+
+    private mutating func closePartialBlock(into lines: inout [[String: Any]]) {
+        guard let index = partialBlockIndex else { return }
+        if partialBlockKind == .thinking, let signature = openSignature {
+            appendPartial([
+                "type": "content_block_delta",
+                "index": index,
+                "delta": ["type": "signature_delta", "signature": signature],
+            ], into: &lines)
+        }
+        appendPartial(["type": "content_block_stop", "index": index], into: &lines)
+        partialBlockKind = nil
+        partialBlockIndex = nil
+    }
+
+    private mutating func appendSignatureOnlyBlock(into lines: inout [[String: Any]]) {
+        guard let signature = openSignature, openKind == nil else { return }
+        if includePartialMessages {
+            openPartialMessage(into: &lines)
+            let index = blocks.count
+            appendPartial([
+                "type": "content_block_start",
+                "index": index,
+                "content_block": ["type": "thinking", "thinking": "", "signature": ""],
+            ], into: &lines)
+            appendPartial([
+                "type": "content_block_delta",
+                "index": index,
+                "delta": ["type": "signature_delta", "signature": signature],
+            ], into: &lines)
+            appendPartial(["type": "content_block_stop", "index": index], into: &lines)
+        }
+        blocks.append(["type": "thinking", "thinking": "", "signature": signature])
+        openSignature = nil
+    }
+
+    private mutating func appendPartial(
+        _ event: [String: Any],
+        into lines: inout [[String: Any]]
+    ) {
+        guard includePartialMessages else { return }
+        lines.append([
+            "type": "stream_event",
+            "event": event,
+            "parent_tool_use_id": NSNull(),
+            "session_id": sessionID,
+            "uuid": UUID().uuidString.lowercased(),
+        ])
+    }
+
+    private mutating func messageIdentifier() -> String {
+        if let responseID { return responseID }
+        let identifier = "msg_\(nextMessageNumber)"
+        nextMessageNumber += 1
+        responseID = identifier
+        return identifier
+    }
+
+    private mutating func handleTool(
+        _ update: OpenGrokPagerToolUpdate,
+        into lines: inout [[String: Any]]
+    ) {
+        guard !completedToolIDs.contains(update.callID) else { return }
+        switch update.state {
+        case .running:
+            guard pendingToolOrders[update.callID] == nil,
+                  pendingWebSearches[update.callID] == nil else { return }
+            if update.name == "web_search" {
+                pendingWebSearches[update.callID] = update
+                return
+            }
+            flushToolResults(into: &lines)
+            appendToolUse(update, into: &lines)
+        case .succeeded, .failed, .cancelled:
+            if let search = pendingWebSearches.removeValue(forKey: update.callID) {
+                completeWebSearch(started: search, update: update, into: &lines)
+                completedToolIDs.insert(update.callID)
+                return
+            }
+            if pendingToolOrders[update.callID] == nil {
+                appendToolUse(update, into: &lines)
+            }
+            let order = pendingToolOrders.removeValue(forKey: update.callID) ?? nextOrder()
+            flushAssistant(defaultStopReason: "tool_use", into: &lines)
+            pendingToolResults.append(ToolResult(
+                order: order,
+                identifier: update.callID,
+                content: update.output ?? update.structuredOutput ?? "",
+                isError: update.state != .succeeded
+            ))
+            completedToolIDs.insert(update.callID)
+        }
+    }
+
+    private mutating func appendToolUse(
+        _ update: OpenGrokPagerToolUpdate,
+        into lines: inout [[String: Any]]
+    ) {
+        closePartialBlock(into: &lines)
+        finalizeOpenBlock()
+        let input = Self.object(from: update.input)
+        let index = blocks.count
+        blocks.append([
+            "type": "tool_use",
+            "id": update.callID,
+            "name": update.name,
+            "input": input,
+        ])
+        pendingToolOrders[update.callID] = nextOrder()
+        guard includePartialMessages else { return }
+        openPartialMessage(into: &lines)
+        appendPartial([
+            "type": "content_block_start",
+            "index": index,
+            "content_block": [
+                "type": "tool_use", "id": update.callID,
+                "name": update.name, "input": [String: Any](),
+            ] as [String: Any],
+        ], into: &lines)
+        let encoded = Self.compactJSON(input)
+        appendPartial([
+            "type": "content_block_delta",
+            "index": index,
+            "delta": ["type": "input_json_delta", "partial_json": encoded],
+        ], into: &lines)
+        appendPartial(["type": "content_block_stop", "index": index], into: &lines)
+    }
+
+    private mutating func completeWebSearch(
+        started: OpenGrokPagerToolUpdate,
+        update: OpenGrokPagerToolUpdate,
+        into lines: inout [[String: Any]]
+    ) {
+        let parsed = Self.object(from: update.output ?? update.structuredOutput ?? "")
+        let action = parsed["action"] as? [String: Any] ?? parsed
+        let query = action["query"] as? String ?? ""
+        let sources = action["sources"] as? [[String: Any]] ?? []
+        let hits: [[String: Any]] = sources.compactMap { source in
+            guard let url = source["url"] as? String else { return nil }
+            let title = (source["title"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? url
+            return ["type": "web_search_result", "url": url, "title": title]
+        }
+        if update.state == .succeeded, query.isEmpty, hits.isEmpty {
+            appendToolUse(started, into: &lines)
+            let order = pendingToolOrders.removeValue(forKey: update.callID) ?? nextOrder()
+            flushAssistant(defaultStopReason: "tool_use", into: &lines)
+            pendingToolResults.append(ToolResult(
+                order: order, identifier: update.callID,
+                content: update.output ?? "", isError: false
+            ))
+            return
+        }
+        closePartialBlock(into: &lines)
+        finalizeOpenBlock()
+        let useIndex = blocks.count
+        let input: [String: Any] = ["query": query]
+        blocks.append([
+            "type": "server_tool_use", "id": update.callID,
+            "name": "web_search", "input": input,
+        ])
+        let content: Any
+        if update.state == .succeeded {
+            webSearchRequests += 1
+            content = hits
+        } else {
+            content = ["type": "web_search_tool_result_error", "error_code": "unavailable"]
+        }
+        let resultIndex = blocks.count
+        blocks.append([
+            "type": "web_search_tool_result",
+            "tool_use_id": update.callID,
+            "content": content,
+        ])
+        guard includePartialMessages else { return }
+        openPartialMessage(into: &lines)
+        appendPartial([
+            "type": "content_block_start", "index": useIndex,
+            "content_block": [
+                "type": "server_tool_use", "id": update.callID,
+                "name": "web_search", "input": [String: Any](),
+            ] as [String: Any],
+        ], into: &lines)
+        appendPartial([
+            "type": "content_block_delta", "index": useIndex,
+            "delta": ["type": "input_json_delta", "partial_json": Self.compactJSON(input)],
+        ], into: &lines)
+        appendPartial(["type": "content_block_stop", "index": useIndex], into: &lines)
+        appendPartial([
+            "type": "content_block_start", "index": resultIndex,
+            "content_block": [
+                "type": "web_search_tool_result",
+                "tool_use_id": update.callID,
+                "content": content,
+            ] as [String: Any],
+        ], into: &lines)
+        appendPartial(["type": "content_block_stop", "index": resultIndex], into: &lines)
+    }
+
+    private mutating func nextOrder() -> Int {
+        defer { nextToolOrder += 1 }
+        return nextToolOrder
+    }
+
+    private mutating func flushAssistant(
+        defaultStopReason: String?,
+        into lines: inout [[String: Any]]
+    ) {
+        closePartialBlock(into: &lines)
+        if openKind == nil, openSignature != nil {
+            appendSignatureOnlyBlock(into: &lines)
+        }
+        finalizeOpenBlock()
+        let resolvedStopReason: Any = defaultStopReason == nil
+            ? NSNull()
+            : responseStopReason ?? defaultStopReason!
+        if includePartialMessages, !partialMessageOpen, responseStarted {
+            openPartialMessage(into: &lines)
+        }
+        if partialMessageOpen {
+            appendPartial([
+                "type": "message_delta",
+                "delta": [
+                    "stop_reason": resolvedStopReason,
+                    "stop_sequence": Self.nullable(responseStopSequence),
+                ] as [String: Any],
+                "usage": responseUsage.fields,
+            ], into: &lines)
+            appendPartial(["type": "message_stop"], into: &lines)
+            partialMessageOpen = false
+        }
+        guard !blocks.isEmpty else {
+            clearResponse()
+            return
+        }
+        let content = blocks
+        blocks.removeAll(keepingCapacity: true)
+        lastText = content.compactMap { block in
+            block["type"] as? String == "text" ? block["text"] as? String : nil
+        }.joined()
+        lines.append([
+            "type": "assistant",
+            "message": [
+                "id": messageIdentifier(),
+                "type": "message",
+                "role": "assistant",
+                "model": activeModel,
+                "content": content,
+                "stop_reason": resolvedStopReason,
+                "stop_sequence": Self.nullable(responseStopSequence),
+                "usage": responseUsage.fields,
+            ] as [String: Any],
+            "parent_tool_use_id": NSNull(),
+            "session_id": sessionID,
+            "uuid": UUID().uuidString.lowercased(),
+        ])
+        assistantFrames += 1
+        clearResponse()
+    }
+
+    private mutating func clearResponse() {
+        responseStarted = false
+        responseCompleted = false
+        responseID = nil
+        responseModel = nil
+        responseStopReason = nil
+        responseStopSequence = nil
+        responseUsage = Usage()
+        initialUsage = Usage()
+        openSignature = nil
+    }
+
+    private mutating func flushToolResults(into lines: inout [[String: Any]]) {
+        guard !pendingToolResults.isEmpty else { return }
+        let content: [[String: Any]] = pendingToolResults
+            .sorted { $0.order < $1.order }
+            .map { result in
+                [
+                    "type": "tool_result",
+                    "tool_use_id": result.identifier,
+                    "content": result.content,
+                    "is_error": result.isError,
+                ]
+            }
+        pendingToolResults.removeAll(keepingCapacity: true)
+        lines.append([
+            "type": "user",
+            "message": ["role": "user", "content": content] as [String: Any],
+            "parent_tool_use_id": NSNull(),
+            "session_id": sessionID,
+            "uuid": UUID().uuidString.lowercased(),
+        ])
+    }
+
+    private mutating func finish(
+        stopReason: String?,
+        error: String?,
+        completion: OpenGrokPagerMinimalCompletion?,
+        into lines: inout [[String: Any]]
+    ) {
+        ensureInitialized(into: &lines)
+        let unresolvedSearches = Array(pendingWebSearches.values)
+        for search in unresolvedSearches {
+            completeWebSearch(
+                started: search,
+                update: OpenGrokPagerToolUpdate(
+                    callID: search.callID,
+                    name: search.name,
+                    input: search.input,
+                    state: .failed
+                ),
+                into: &lines
+            )
+        }
+        pendingWebSearches.removeAll(keepingCapacity: false)
+        let defaultStopReason = error == nil
+            ? (stopReason == "max_tokens" ? "max_tokens" : "end_turn")
+            : nil
+        flushAssistant(defaultStopReason: defaultStopReason, into: &lines)
+        let unresolvedTools = Array(pendingToolOrders)
+        for (identifier, order) in unresolvedTools {
+            pendingToolResults.append(ToolResult(
+                order: order,
+                identifier: identifier,
+                content: "tool call did not complete",
+                isError: true
+            ))
+        }
+        pendingToolOrders.removeAll(keepingCapacity: false)
+        flushToolResults(into: &lines)
+
+        var usage = aggregateUsage.fields
+        usage["server_tool_use"] = ["web_search_requests": webSearchRequests]
+        let modelUsage: [String: Any] = usageByModel.mapValues { usage in
+            [
+                "inputTokens": usage.inputTokens,
+                "outputTokens": usage.outputTokens,
+                "cacheReadInputTokens": usage.cacheReadInputTokens,
+                "cacheCreationInputTokens": usage.cacheCreationInputTokens,
+                "webSearchRequests": webSearchRequests,
+                "costUSD": 0.0,
+            ] as [String: Any]
+        }
+        let elapsed = DispatchTime.now().uptimeNanoseconds - startedAt
+        var result: [String: Any] = [
+            "type": "result",
+            "subtype": error == nil ? "success" : "error_during_execution",
+            "is_error": error != nil,
+            "duration_ms": elapsed / 1_000_000,
+            "duration_api_ms": 0,
+            "num_turns": completedResponses == 0 ? assistantFrames : completedResponses,
+            "stop_reason": Self.nullable(stopReason),
+            "total_cost_usd": 0.0,
+            "usage": usage,
+            "modelUsage": modelUsage,
+            "session_id": completion?.sessionID ?? sessionID,
+            "uuid": UUID().uuidString.lowercased(),
+        ]
+        if let error {
+            result["errors"] = [error]
+        } else {
+            result["result"] = lastText
+        }
+        lines.append(result)
+        terminalEmitted = true
+    }
+
+    private static func object(from value: String) -> [String: Any] {
+        guard let data = value.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dictionary = object as? [String: Any] else {
+            return [:]
+        }
+        return dictionary
+    }
+
+    private static func nullable(_ value: String?) -> Any {
+        guard let value else { return NSNull() }
+        return value
+    }
+
+    private static func compactJSON(_ value: [String: Any]) -> String {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: value,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        ) else {
+            return "{}"
+        }
+        return String(decoding: data, as: UTF8.self)
     }
 }

@@ -189,6 +189,20 @@ public enum SamplingEvent: Sendable, Equatable {
         name: String?
     )
 
+    /// The provider opened a response with its real message identity and the
+    /// three disjoint prompt-side token buckets, before any content arrived.
+    case responseStarted(
+        requestId: RequestId,
+        messageID: String,
+        model: String,
+        inputTokens: UInt64,
+        cacheReadInputTokens: UInt64,
+        cacheCreationInputTokens: UInt64
+    )
+
+    /// A thinking block finished and its encrypted signature is available.
+    case reasoningCompleted(requestId: RequestId, signature: String)
+
     /// Streaming completed successfully.
     case completed(
         requestId: RequestId,

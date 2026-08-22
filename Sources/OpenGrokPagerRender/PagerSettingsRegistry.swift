@@ -76,6 +76,8 @@ public enum PagerSettingDynamicSource: String, Sendable, Equatable, Hashable {
     case auxiliaryModelCatalog
     /// The multi-select of discovered OpenCode Go models.
     case openCodeGoModels
+    /// The explicitly enabled subset of discovered OpenRouter models.
+    case openRouterModels
     /// The multi-select of user custom models.
     case customModels
 }
@@ -474,6 +476,21 @@ public let CUSTOM_MODEL_PROVIDER_CHOICES: [PagerSettingChoice] = [
         canonical: "zai",
         display: "Z AI",
         summary: "api.z.ai GLM Coding Plan (ZAI_API_KEY)."
+    ),
+    PagerSettingChoice(
+        canonical: "runinfra",
+        display: "RunInfra",
+        summary: "api.runinfra.ai Chat Completions (RUNINFRA_GATEWAY_KEY)."
+    ),
+    PagerSettingChoice(
+        canonical: "gemini",
+        display: "Google Gemini",
+        summary: "Google AI Studio Chat Completions (GEMINI_API_KEY)."
+    ),
+    PagerSettingChoice(
+        canonical: "openrouter",
+        display: "OpenRouter",
+        summary: "OpenRouter catalog (OPENROUTER_API_KEY)."
     )
 ]
 
@@ -1004,7 +1021,7 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
         )
     ]
 
-    // MARK: Models (24)
+    // MARK: Models
 
     rows += [
         PagerSettingMeta(
@@ -1101,6 +1118,42 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             storage: .secretStore(account: "wafer")
         ),
         PagerSettingMeta(
+            key: "zai_api_key",
+            category: .models,
+            label: "Z AI API key",
+            description: "API key for Z AI (GLM Coding Plan). Saving refreshes its dynamic model catalog from api.z.ai.",
+            keywords: ["z", "ai", "zai", "glm", "api", "key", "credential", "models", "coding"],
+            kind: .secret,
+            storage: .secretStore(account: "zai")
+        ),
+        PagerSettingMeta(
+            key: "runinfra_api_key",
+            category: .models,
+            label: "RunInfra API key",
+            description: "API key for RunInfra. Saving refreshes its dynamic model catalog from api.runinfra.ai.",
+            keywords: ["runinfra", "run", "infra", "api", "key", "credential", "models", "deepseek", "qwen"],
+            kind: .secret,
+            storage: .secretStore(account: "runinfra")
+        ),
+        PagerSettingMeta(
+            key: "gemini_api_key",
+            category: .models,
+            label: "Google Gemini API key",
+            description: "API key for Google Gemini (AI Studio). Saving refreshes its model catalog from generativelanguage.googleapis.com.",
+            keywords: ["gemini", "google", "ai", "studio", "aistudio", "api", "key", "credential", "models"],
+            kind: .secret,
+            storage: .secretStore(account: "gemini")
+        ),
+        PagerSettingMeta(
+            key: "openrouter_api_key",
+            category: .models,
+            label: "OpenRouter API key",
+            description: "API key for OpenRouter. Saving queries its live model catalog; no models are enabled automatically.",
+            keywords: ["openrouter", "open", "router", "api", "key", "credential", "models"],
+            kind: .secret,
+            storage: .secretStore(account: "openrouter")
+        ),
+        PagerSettingMeta(
             key: "opencode_go_models",
             category: .models,
             label: "OpenCode Go models",
@@ -1108,6 +1161,15 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             keywords: ["opencode", "models"],
             kind: .dynamicMultiSelect(source: .openCodeGoModels),
             storage: .config(path: "models.opencode_go_enabled_models")
+        ),
+        PagerSettingMeta(
+            key: "openrouter_models",
+            category: .models,
+            label: "OpenRouter models",
+            description: "Choose which discovered OpenRouter models appear in model settings and are available to subagents.",
+            keywords: ["openrouter", "open", "router", "models", "enable", "disable", "subagents"],
+            kind: .dynamicMultiSelect(source: .openRouterModels),
+            storage: .config(path: "models.openrouter_enabled_models")
         ),
         PagerSettingMeta(
             key: "custom_models",

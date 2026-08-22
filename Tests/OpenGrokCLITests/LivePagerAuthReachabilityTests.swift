@@ -357,7 +357,7 @@ private actor FlowCounter {
 
 @Suite("Live /login provider picker", .serialized)
 struct LiveLoginPickerTests {
-    @Test("the overlay model carries all eight rows with live statuses")
+    @Test("the overlay model carries all twelve providers with isolated live statuses")
     func overlayModelCarriesStatuses() throws {
         let home = FileManager.default.temporaryDirectory
             .appendingPathComponent("opengrok-login-status-\(UUID().uuidString)", isDirectory: true)
@@ -370,9 +370,18 @@ struct LiveLoginPickerTests {
             scope: providerAPIKeyScope("fireworks"),
             apiKey: "fw-1"
         )
+        try storeScopedAPIKey(
+            grokHome: home,
+            scope: providerAPIKeyScope("openrouter"),
+            apiKey: "openrouter-1"
+        )
         let statuses = LiveLoginProviderPicker.statuses(
             openGrokHome: home,
-            environment: ["MOONSHOT_API_KEY": "env-kimi"]
+            environment: [
+                "MOONSHOT_API_KEY": "env-kimi",
+                "RUNINFRA_GATEWAY_KEY": "env-runinfra",
+                "GOOGLE_API_KEY": "env-gemini",
+            ]
         )
         #expect(statuses["fireworks"] == .stored)
         #expect(statuses["kimi"] == .environmentOverride)
@@ -381,6 +390,9 @@ struct LiveLoginPickerTests {
         #expect(statuses["opencode-go"] == .missing)
         #expect(statuses["wafer"] == .missing)
         #expect(statuses["zai"] == .missing)
+        #expect(statuses["runinfra"] == .environmentOverride)
+        #expect(statuses["gemini"] == .environmentOverride)
+        #expect(statuses["openrouter"] == .stored)
 
         let overlay = LiveLoginProviderPicker.overlay(statuses: statuses)
         guard case .list(let list) = overlay.content else {
@@ -394,16 +406,21 @@ struct LiveLoginPickerTests {
         #expect(list.rows.map(\.label) == [
             "xAI Grok", "ChatGPT Codex", "Kimi", "Fireworks AI",
             "DeepSeek", "Meta API", "OpenCode Go", "Wafer AI", "Z AI",
+            "RunInfra", "Google Gemini", "OpenRouter",
         ])
         #expect(list.rows.map(\.id) == [
             "xai", "codex", "kimi", "fireworks",
             "deepseek", "meta", "opencode-go", "wafer", "zai",
+            "runinfra", "gemini", "openrouter",
         ])
         #expect(list.rows[0].detail == "Sign in with xAI")
         #expect(list.rows[1].detail == "Connect an OpenAI Codex account")
         #expect(list.rows[2].detail == "API key · environment override")
         #expect(list.rows[3].detail == "API key · saved")
         #expect(list.rows[4].detail == "API key · not configured")
+        #expect(list.rows[9].detail == "API key · environment override")
+        #expect(list.rows[10].detail == "API key · environment override")
+        #expect(list.rows[11].detail == "API key · saved")
     }
 
     @Test("the picker paints and selecting the codex row round-trips the typed form")

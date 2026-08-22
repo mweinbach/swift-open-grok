@@ -104,6 +104,8 @@ public struct LiveACPLaunchComponents: Sendable {
     /// `PermissionHandle`. Carriers attach the live runtime as its reverse
     /// client; `nil` keeps today's fail-closed denial prompter.
     public let permissionPrompter: LiveACPPermissionPrompter?
+    public let onSessionOpened: ACPAgentRuntime.SessionOpenedHook?
+    public let onSessionClosed: ACPAgentRuntime.SessionClosedHook?
     /// Tool-gate pipeline that received `setPrompter` for `permissionPrompter`.
     /// Internal on purpose: only `liveACPServices` fills it, and composition
     /// tests reach it via `@testable import`. Not a carrier/public API.
@@ -117,13 +119,17 @@ public struct LiveACPLaunchComponents: Sendable {
         extensionHandler: (any ACPAgentExtensionHandler)? = nil,
         extensionNotifications: ACPExtensionNotificationRouter? = nil,
         notificationGateway: ACPNotificationGateway? = nil,
-        permissionPrompter: LiveACPPermissionPrompter? = nil
+        permissionPrompter: LiveACPPermissionPrompter? = nil,
+        onSessionOpened: ACPAgentRuntime.SessionOpenedHook? = nil,
+        onSessionClosed: ACPAgentRuntime.SessionClosedHook? = nil
     ) {
         self.promptDriver = promptDriver
         self.extensionHandler = extensionHandler
         self.extensionNotifications = extensionNotifications
         self.notificationGateway = notificationGateway
         self.permissionPrompter = permissionPrompter
+        self.onSessionOpened = onSessionOpened
+        self.onSessionClosed = onSessionClosed
         self.permissionPipeline = nil
     }
 
@@ -133,6 +139,8 @@ public struct LiveACPLaunchComponents: Sendable {
         extensionNotifications: ACPExtensionNotificationRouter? = nil,
         notificationGateway: ACPNotificationGateway? = nil,
         permissionPrompter: LiveACPPermissionPrompter? = nil,
+        onSessionOpened: ACPAgentRuntime.SessionOpenedHook? = nil,
+        onSessionClosed: ACPAgentRuntime.SessionClosedHook? = nil,
         permissionPipeline: PermissionPipeline?
     ) {
         self.promptDriver = promptDriver
@@ -140,6 +148,8 @@ public struct LiveACPLaunchComponents: Sendable {
         self.extensionNotifications = extensionNotifications
         self.notificationGateway = notificationGateway
         self.permissionPrompter = permissionPrompter
+        self.onSessionOpened = onSessionOpened
+        self.onSessionClosed = onSessionClosed
         self.permissionPipeline = permissionPipeline
     }
 }
@@ -362,7 +372,9 @@ public enum LiveACPComposition {
             workspace: workspace,
             promptDriver: launchComponents.promptDriver,
             extensionHandler: launchComponents.extensionHandler,
-            extensionNotifications: launchComponents.extensionNotifications
+            extensionNotifications: launchComponents.extensionNotifications,
+            onSessionOpened: launchComponents.onSessionOpened,
+            onSessionClosed: launchComponents.onSessionClosed
         )
         // The outbound half of the notification gateway: the components'
         // emitters (recap, swarm acks, the mailbox observer) now target THIS

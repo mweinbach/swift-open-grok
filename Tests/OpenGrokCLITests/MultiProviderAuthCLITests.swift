@@ -272,7 +272,7 @@ struct MultiProviderAuthCLITests {
         defer { fixture.dispose() }
 
         let lines = LiveAuthComposition.statusLines(environment: fixture.environment)
-        #expect(lines.count == 9)
+        #expect(lines.count == 12)
 
         #expect(lines.contains { $0.contains("xAI: not authenticated (run `open-grok login`)") })
         #expect(lines.contains { $0.contains("Codex: not authenticated (run `open-grok login --codex`)") })
@@ -283,6 +283,9 @@ struct MultiProviderAuthCLITests {
         #expect(lines.contains { $0.contains("OpenCode Go: not authenticated (run `open-grok login opencode-go`)") })
         #expect(lines.contains { $0.contains("Wafer AI: not authenticated (run `open-grok login wafer`)") })
         #expect(lines.contains { $0.contains("Z AI: not authenticated (run `open-grok login zai`)") })
+        #expect(lines.contains { $0.contains("RunInfra: not authenticated (run `open-grok login runinfra`)") })
+        #expect(lines.contains { $0.contains("Google Gemini: not authenticated (run `open-grok login gemini`)") })
+        #expect(lines.contains { $0.contains("OpenRouter: not authenticated (run `open-grok login openrouter`)") })
     }
 
     @Test("statusLines reports authenticated when keys are present in env or store")
@@ -300,7 +303,7 @@ struct MultiProviderAuthCLITests {
         try storeProviderAPIKey(grokHome: fixture.home, provider: "zai", apiKey: "store-zai-key")
 
         let lines = LiveAuthComposition.statusLines(environment: fixture.environment)
-        #expect(lines.count == 9)
+        #expect(lines.count == 12)
 
         #expect(lines.contains { $0.contains("Kimi: authenticated (environment)") })
         #expect(lines.contains { $0.contains("Fireworks AI: authenticated (environment)") })
@@ -309,5 +312,8 @@ struct MultiProviderAuthCLITests {
         #expect(lines.contains { $0.contains("OpenCode Go: authenticated (api_key)") })
         #expect(lines.contains { $0.contains("Wafer AI: authenticated (api_key)") })
         #expect(lines.contains { $0.contains("Z AI: authenticated (api_key)") })
+        #expect(lines.contains { $0.contains("RunInfra: not authenticated") })
+        #expect(lines.contains { $0.contains("Google Gemini: not authenticated") })
+        #expect(lines.contains { $0.contains("OpenRouter: not authenticated") })
     }
 }

@@ -209,8 +209,9 @@ public actor OpenGrokPagerForwardingFrontend: OpenGrokPagerFrontend {
                     terminalLifecycle = .cancelled
                 case .completed:
                     terminalLifecycle = .completed
-                case .lifecycle, .output, .status, .tool, .reasoning, .toolCallDelta,
-                     .retrying, .samplingFailed, .permissionRequested:
+                case .lifecycle, .output, .status, .tool, .responseStarted, .reasoning,
+                     .reasoningCompleted, .toolCallDelta, .retrying, .samplingFailed,
+                     .permissionRequested, .responseCompleted:
                     continue
                 }
                 if event.isTerminal { break }
@@ -467,8 +468,9 @@ private extension OpenGrokPagerEvent {
         switch self {
         case .completed, .cancelled:
             return true
-        case .lifecycle, .output, .status, .tool, .reasoning, .toolCallDelta,
-             .retrying, .samplingFailed, .permissionRequested:
+        case .lifecycle, .output, .status, .tool, .responseStarted, .reasoning,
+             .reasoningCompleted, .toolCallDelta, .retrying, .samplingFailed,
+             .permissionRequested, .responseCompleted:
             return false
         }
     }

@@ -2263,7 +2263,7 @@ extension LiveInteractiveControllerRenderer {
                 ))
             }
         case .settings(let deepLinkKey):
-            overlays.push(.settings(settingsOverlay(deepLinkKey: deepLinkKey)))
+            overlays.push(.settings(providerSettingsOverlay(deepLinkKey: deepLinkKey)))
         case .themePicker(let query):
             // A typed name that resolves applies straight away; only a miss or
             // a bare `/theme` opens the picker. Same rule as `/model`, and for
@@ -2711,10 +2711,37 @@ extension LiveInteractiveControllerRenderer {
                 return
             }
             var current = (try? store.loadMultiSelect(key: key)) ?? []
-            if enabled { current.insert(choice) } else { current.remove(choice) }
+            let selectedChoice: String
+            if key == "openrouter_models" {
+                let descriptors = catalogStore?.openRouterDescriptors() ?? []
+                guard let descriptor = descriptors.first(where: {
+                    $0.id == choice || $0.key == choice
+                }) else {
+                    appendMessage(PagerMessage(
+                        role: .error,
+                        text: "OpenRouter model \(choice) is not in the discovered catalog."
+                    ))
+                    return
+                }
+                for discovered in descriptors where current.contains(discovered.key) {
+                    current.remove(discovered.key)
+                    current.insert(discovered.id)
+                }
+                selectedChoice = descriptor.id
+            } else {
+                selectedChoice = choice
+            }
+            if enabled { current.insert(selectedChoice) } else { current.remove(selectedChoice) }
             do {
                 try store.writeMultiSelect(key: key, enabled: current)
+                if key == "openrouter_models" {
+                    catalogStore?.applyOpenRouterEnabledModels(current.sorted())
+                }
                 reloadCatalogInput()
+                refreshOpenProviderSettingsOverlay()
+                if key == "openrouter_models" {
+                    await reconcileModelStateAfterCatalogRefresh()
+                }
             } catch {
                 appendMessage(PagerMessage(
                     role: .error,
@@ -2842,15 +2869,89 @@ extension LiveInteractiveControllerRenderer {
         // the refreshed catalog still runs (model_state.rs:155-192).
         catalogStore?.refreshCredentialSnapshot()
         catalogStore?.spawnBackgroundRefresh()
-        Task { await self.reconcileModelStateAfterCatalogRefresh() }
+        refreshOpenProviderSettingsOverlay()
+        let refresh = catalogStore?.backgroundRefreshTask
+        Task {
+            await refresh?.value
+            self.refreshOpenProviderSettingsOverlay()
+            await self.reconcileModelStateAfterCatalogRefresh()
+        }
     }
 
     func reloadCatalogInput() {
         guard let catalogStore else { return }
         catalogStore.updateInput(liveCatalogResolutionInput(
             workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true),
-            environment: ProcessInfo.processInfo.environment
+            environment: environment
         ))
+    }
+
+    func providerSettingsOverlay(deepLinkKey: String? = nil) -> PagerSettingsOverlay {
+        var overlay = settingsOverlay(deepLinkKey: deepLinkKey)
+        populateProviderSettings(&overlay)
+        return overlay
+    }
+
+    private func populateProviderSettings(_ overlay: inout PagerSettingsOverlay) {
+        let statuses = LiveLoginProviderPicker.statuses(
+            openGrokHome: openGrokHome,
+            environment: environment
+        )
+        for (key, provider) in [
+            ("zai_api_key", "zai"),
+            ("runinfra_api_key", "runinfra"),
+            ("gemini_api_key", "gemini"),
+            ("openrouter_api_key", "openrouter"),
+        ] {
+            overlay.values[key] = .secret(statuses[provider] ?? .missing)
+        }
+
+        let descriptors = catalogStore?.openRouterDescriptors() ?? []
+        overlay.dynamicChoices[.openRouterModels] = descriptors.map { descriptor in
+            PagerSettingChoice(
+                canonical: descriptor.id,
+                display: descriptor.name,
+                summary: descriptor.id
+            )
+        }
+
+        let stored = PagerSettingsStore(
+            configPath: openGrokHome.appendingPathComponent("config.toml")
+        )
+        let configured: Set<String>
+        if let catalogStore {
+            configured = Set(catalogStore.openRouterEnabledModels())
+        } else {
+            configured = (try? stored.loadMultiSelect(key: "openrouter_models")) ?? []
+        }
+        overlay.multiSelectEnabled["openrouter_models"] = Set(
+            descriptors.compactMap { descriptor in
+                configured.contains(descriptor.id) || configured.contains(descriptor.key)
+                    ? descriptor.id
+                    : nil
+            }
+        )
+        let activeCatalog = catalogStore?.pickerEntries() ?? modelCatalog
+        overlay.dynamicChoices[.activeModelCatalog] = LiveModelPicker.sorted(activeCatalog).map {
+            entry in
+            PagerSettingChoice(
+                canonical: entry.id,
+                display: LiveModelPicker.providerLabel(forProviderID: entry.providerID)
+                    .map { "\($0) · \(entry.name)" } ?? entry.name,
+                summary: LiveModelPicker.description(for: entry)
+            )
+        }
+    }
+
+    private func refreshOpenProviderSettingsOverlay() {
+        guard let overlay = overlays.overlays.first(where: { $0.id == "settings" }),
+              case .settings(var settings) = overlay.content
+        else { return }
+        populateProviderSettings(&settings)
+        let updated = overlays.updateSettings { current in current = settings }
+        if updated {
+            try? renderState()
+        }
     }
 
     /// Repaint through the coalesced path: however many state changes arrive

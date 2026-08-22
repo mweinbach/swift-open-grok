@@ -21,9 +21,10 @@ struct PagerLoginLogoutCommandTests {
         let login = commands.first { $0.name == "login" }
         // `login.rs:108-114`.
         #expect(login?.summary
-            == "Connect xAI, OpenAI Codex, Kimi, Fireworks AI, DeepSeek, Meta API, Wafer AI, or OpenCode Go")
+            == "Connect xAI, OpenAI Codex, Kimi, Fireworks AI, DeepSeek, Meta API, "
+                + "Wafer AI, Z AI, RunInfra, Google Gemini, OpenCode Go, or OpenRouter")
         #expect(login?.usage
-            == "/login [xai|codex|kimi|fireworks|deepseek|meta|wafer|opencode-go]")
+            == "/login [xai|codex|kimi|fireworks|deepseek|meta|wafer|zai|runinfra|gemini|opencode-go|openrouter]")
         #expect(login?.aliases.isEmpty == true)
         // The argument is optional, so Enter on a bare `/login` dispatches.
         #expect(login?.requiresArguments == false)
@@ -73,6 +74,11 @@ struct PagerLoginLogoutCommandTests {
             "/login meta", "/login meta-ai", "/login meta_ai", "/login meta-api",
             "/login opencode", "/login opencode-go", "/login opencode_go", "/login go",
             "/login wafer", "/login wafer-ai", "/login wafer_ai",
+            "/login zai", "/login z-ai", "/login z_ai",
+            "/login runinfra", "/login run-infra", "/login run_infra",
+            "/login gemini", "/login google", "/login ai-studio", "/login aistudio",
+            "/login google-gemini",
+            "/login openrouter", "/login open-router", "/login open_router",
         ])
         #expect(await harness.overlayRequests == [
             .settings(deepLinkKey: "kimi_api_endpoint"),
@@ -92,6 +98,20 @@ struct PagerLoginLogoutCommandTests {
             .settings(deepLinkKey: "wafer_api_key"),
             .settings(deepLinkKey: "wafer_api_key"),
             .settings(deepLinkKey: "wafer_api_key"),
+            .settings(deepLinkKey: "zai_api_key"),
+            .settings(deepLinkKey: "zai_api_key"),
+            .settings(deepLinkKey: "zai_api_key"),
+            .settings(deepLinkKey: "runinfra_api_key"),
+            .settings(deepLinkKey: "runinfra_api_key"),
+            .settings(deepLinkKey: "runinfra_api_key"),
+            .settings(deepLinkKey: "gemini_api_key"),
+            .settings(deepLinkKey: "gemini_api_key"),
+            .settings(deepLinkKey: "gemini_api_key"),
+            .settings(deepLinkKey: "gemini_api_key"),
+            .settings(deepLinkKey: "gemini_api_key"),
+            .settings(deepLinkKey: "openrouter_api_key"),
+            .settings(deepLinkKey: "openrouter_api_key"),
+            .settings(deepLinkKey: "openrouter_api_key"),
         ])
     }
 
@@ -111,6 +131,12 @@ struct PagerLoginLogoutCommandTests {
             ("opencode", "opencode-go"), ("opencode-go", "opencode-go"),
             ("opencode_go", "opencode-go"), ("go", "opencode-go"),
             ("wafer", "wafer"), ("wafer-ai", "wafer"), ("wafer_ai", "wafer"),
+            ("zai", "zai"), ("z-ai", "zai"), ("z_ai", "zai"),
+            ("runinfra", "runinfra"), ("run-infra", "runinfra"), ("run_infra", "runinfra"),
+            ("gemini", "gemini"), ("google", "gemini"), ("ai-studio", "gemini"),
+            ("aistudio", "gemini"), ("google-gemini", "gemini"),
+            ("openrouter", "openrouter"), ("open-router", "openrouter"),
+            ("open_router", "openrouter"),
         ]
         for (spelling, expected) in arms {
             #expect(PagerLoginProviders.resolve(spelling)?.insertText == expected)
@@ -128,7 +154,8 @@ struct PagerLoginLogoutCommandTests {
         #expect(await harness.notices == [
             "Unknown provider: FooBar. Use /login xai, /login codex, /login kimi, "
                 + "/login fireworks, /login deepseek, /login meta, /login wafer, "
-                + "/login zai, or /login opencode-go"
+                + "/login zai, /login runinfra, /login gemini, /login opencode-go, "
+                + "or /login openrouter"
         ])
     }
 
@@ -159,19 +186,20 @@ struct PagerLoginLogoutCommandTests {
 
     // MARK: - Argument completion
 
-    @Test("/login offers the nine providers with neutral descriptions and ranks over match_text")
+    @Test("/login offers twelve providers with neutral descriptions and ranks over match_text")
     func loginArgumentSuggestions() async throws {
         let harness = try await AuthCommandHarness.run(events: [
             .paste("/login "),
             .paste("moonshot"),
         ])
         let states = await harness.promptStates
-        // Bare phase: all nine, upstream's picker order with the
+        // Bare phase: all twelve, upstream's picker order with the
         // provider-neutral descriptions (`suggest_args`, `login.rs:124-126`).
         let opened = states.first { $0.text == "/login " && !$0.completions.isEmpty }
         #expect(opened?.completions.map(\.name) == [
             "xAI Grok", "ChatGPT Codex", "Kimi", "Fireworks AI",
             "DeepSeek", "Meta API", "OpenCode Go", "Wafer AI", "Z AI",
+            "RunInfra", "Google Gemini", "OpenRouter",
         ])
         #expect(opened?.completions.first?.summary == "Sign in with xAI")
         #expect(opened?.completions.first?.insertText == "/login xai")

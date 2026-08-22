@@ -22,6 +22,7 @@ struct ProviderRegistryDriftTests {
     func registryCoverage() {
         let expected: [ModelProvider] = [
             .xai, .codex, .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai,
+            .runinfra, .gemini, .openRouter,
         ]
         #expect(PROVIDER_REGISTRY.count == expected.count)
         for provider in expected {

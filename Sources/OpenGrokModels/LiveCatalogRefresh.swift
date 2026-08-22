@@ -32,6 +32,9 @@ public struct LiveCatalogRefreshers: Sendable {
     public var openCodeGo: OpenCodeGoCatalogActor?
     public var wafer: APIKeyCatalogActor?
     public var zai: APIKeyCatalogActor?
+    public var runinfra: RunInfraCatalogActor?
+    public var gemini: GeminiCatalogActor?
+    public var openRouter: OpenRouterCatalogActor?
 
     public init(
         codex: CodexCatalogActor? = nil,
@@ -41,7 +44,10 @@ public struct LiveCatalogRefreshers: Sendable {
         meta: APIKeyCatalogActor? = nil,
         openCodeGo: OpenCodeGoCatalogActor? = nil,
         wafer: APIKeyCatalogActor? = nil,
-        zai: APIKeyCatalogActor? = nil
+        zai: APIKeyCatalogActor? = nil,
+        runinfra: RunInfraCatalogActor? = nil,
+        gemini: GeminiCatalogActor? = nil,
+        openRouter: OpenRouterCatalogActor? = nil
     ) {
         self.codex = codex
         self.kimi = kimi
@@ -51,6 +57,9 @@ public struct LiveCatalogRefreshers: Sendable {
         self.openCodeGo = openCodeGo
         self.wafer = wafer
         self.zai = zai
+        self.runinfra = runinfra
+        self.gemini = gemini
+        self.openRouter = openRouter
     }
 
     /// Build the full set from one transport and one credential broker.
@@ -117,6 +126,21 @@ public struct LiveCatalogRefreshers: Sendable {
                 transport: transport,
                 credentialSource: source(.zai),
                 baseURL: ZaiModels.apiBaseURL(environment: environment)
+            ),
+            runinfra: ProviderCatalogActors.runinfra(
+                transport: transport,
+                credentialSource: source(.runinfra),
+                baseURL: RunInfraModels.apiBaseURL(environment: environment)
+            ),
+            gemini: ProviderCatalogActors.gemini(
+                transport: transport,
+                credentialSource: source(.gemini),
+                baseURL: GeminiModels.apiBaseURL(environment: environment)
+            ),
+            openRouter: ProviderCatalogActors.openRouter(
+                transport: transport,
+                credentialSource: source(.openRouter),
+                baseURL: OpenRouterModels.apiBaseURL(environment: environment)
             )
         )
     }
@@ -259,6 +283,27 @@ public extension ModelsManager {
                         credentialFingerprint: result.fingerprint
                     )
                 )
+
+            case .runinfra:
+                guard let actor = refreshers.runinfra,
+                      let catalog = try await actor.fetch(cancellation: cancellation) else {
+                    return LiveCatalogRefreshOutcome(partition: partition, published: false)
+                }
+                published = applyRunInfraCatalog(catalog)
+
+            case .gemini:
+                guard let actor = refreshers.gemini,
+                      let catalog = try await actor.fetch(cancellation: cancellation) else {
+                    return LiveCatalogRefreshOutcome(partition: partition, published: false)
+                }
+                published = applyGeminiCatalog(catalog)
+
+            case .openRouter:
+                guard let actor = refreshers.openRouter,
+                      let catalog = try await actor.fetch(cancellation: cancellation) else {
+                    return LiveCatalogRefreshOutcome(partition: partition, published: false)
+                }
+                published = applyOpenRouterCatalog(catalog)
             }
             return LiveCatalogRefreshOutcome(partition: partition, published: published)
         } catch {

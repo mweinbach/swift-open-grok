@@ -81,7 +81,7 @@ private let stepperTestRegistry = PagerSettingsRegistry(entries: [
 
 @Suite("Settings registry")
 struct PagerSettingsRegistryTests {
-    @Test("the catalog carries 94 rows across 8 categories")
+    @Test("the catalog carries 99 live rows across 8 categories")
     func catalogSize() {
         let registry = PagerSettingsRegistry.default
         // Upstream registers 102; this port hides `show_tips` plus every `[ui]`
@@ -93,8 +93,9 @@ struct PagerSettingsRegistryTests {
         // the tick rail, and `page_flip_on_send` with the send/viewport pin.
         // The five Mouse rows (`scroll_*` / `invert_scroll` /
         // `keep_text_selection`) are live with the text-selection reader.
-        // 94 includes `custom_models` group + 10 child rows in `.models`.
-        #expect(registry.entries.count == 94)
+        // 99 includes four additional provider credentials, the opt-in
+        // OpenRouter model catalog, and the custom-model group and children.
+        #expect(registry.entries.count == 99)
         #expect(PagerSettingCategory.ordered.count == 8)
         #expect(!registry.entries.contains { $0.key == "show_tips" })
         #expect(registry.entries.contains { $0.key == "keep_text_selection" })
@@ -104,6 +105,11 @@ struct PagerSettingsRegistryTests {
         #expect(registry.entries.contains { $0.key == "page_flip_on_send" })
         #expect(registry.entries.contains { $0.key == "scroll_speed" })
         #expect(registry.entries.contains { $0.key == "custom_models" })
+        #expect(registry.entries.contains { $0.key == "zai_api_key" })
+        #expect(registry.entries.contains { $0.key == "runinfra_api_key" })
+        #expect(registry.entries.contains { $0.key == "gemini_api_key" })
+        #expect(registry.entries.contains { $0.key == "openrouter_api_key" })
+        #expect(registry.entries.contains { $0.key == "openrouter_models" })
         // Parsed from pager.toml; upstream has no settings row (`defs.rs`).
         #expect(registry.find("sticky_headers") == nil)
     }
@@ -117,8 +123,9 @@ struct PagerSettingsRegistryTests {
         #expect(registry.rows(in: .editor).count == 6)
         #expect(registry.rows(in: .agent).count == 9)
         #expect(registry.rows(in: .privacy).count == 1)
-        // 35 includes `meta_api_key` and 11 custom_models group/child rows (`settings/defs.rs:1400-1500`).
-        #expect(registry.rows(in: .models).count == 35)
+        // 40 includes all provider credentials, the two opt-in catalogs,
+        // and the 11 custom-model group/child rows.
+        #expect(registry.rows(in: .models).count == 40)
         // 20 top-level Advanced rows plus the 7 contextual-hint children, which
         // are registered but only reachable inside the group sheet. Upstream
         // has one more (`show_tips`), hidden here until the tips banner exists.

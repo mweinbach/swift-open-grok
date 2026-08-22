@@ -513,8 +513,12 @@ actor LiveModelSwitchCoordinator {
         case .none: requestedTier = previous.serviceTier
         case .some(let selection): requestedTier = selection
         }
-        let picksActiveModel = modelID == previous.model
-            || modelID == activeCatalogID(for: previous)
+        let requestedProvider = findModelByID(
+            resolver.catalogSource(),
+            modelID: modelID
+        )?.info.provider
+        let picksActiveModel = requestedProvider == previous.provider
+            && (modelID == previous.model || modelID == activeCatalogID(for: previous))
         if picksActiveModel,
            effort == nil || effort == previous.reasoningEffort,
            requestedTier == previous.serviceTier {
@@ -532,10 +536,7 @@ actor LiveModelSwitchCoordinator {
         } catch {
             return .failed(modelID: modelID, message: String(describing: error))
         }
-        guard resolution.sampling.model != previous.model
-            || resolution.sampling.reasoningEffort != previous.reasoningEffort
-            || resolution.sampling.serviceTier != previous.serviceTier
-        else {
+        guard !hasSameSamplingRoute(resolution.sampling, previous) else {
             return .unchanged(modelID: modelID)
         }
         let rebuilt: OpenGrokLiveSampler
@@ -606,10 +607,7 @@ actor LiveModelSwitchCoordinator {
         } catch {
             return .failed(modelID: modelID, message: String(describing: error))
         }
-        guard resolution.sampling.model != previous.model
-            || resolution.sampling.reasoningEffort != previous.reasoningEffort
-            || resolution.sampling.serviceTier != previous.serviceTier
-        else {
+        guard !hasSameSamplingRoute(resolution.sampling, previous) else {
             return .unchanged(modelID: modelID)
         }
         let rebuilt: OpenGrokLiveSampler
@@ -715,7 +713,10 @@ actor LiveModelSwitchCoordinator {
         _ configuration: OpenGrokLiveSamplingConfiguration
     ) -> Bool {
         resolver.catalogSource().pairs()
-            .first { $0.1.model == configuration.model }?
+            .first {
+                $0.1.model == configuration.model
+                    && $0.1.info.provider == configuration.provider
+            }?
             .1.info.supportsFastServiceTier ?? false
     }
 
@@ -724,8 +725,25 @@ actor LiveModelSwitchCoordinator {
     /// recognised as a no-op whichever name the picker used.
     private func activeCatalogID(for configuration: OpenGrokLiveSamplingConfiguration) -> String? {
         resolver.catalogSource().pairs()
-            .first { $0.1.model == configuration.model }
+            .first {
+                $0.1.model == configuration.model
+                    && $0.1.info.provider == configuration.provider
+            }
             .map { $0.0 }
+    }
+
+    private func hasSameSamplingRoute(
+        _ lhs: OpenGrokLiveSamplingConfiguration,
+        _ rhs: OpenGrokLiveSamplingConfiguration
+    ) -> Bool {
+        lhs.model == rhs.model
+            && lhs.provider == rhs.provider
+            && lhs.baseURL == rhs.baseURL
+            && lhs.apiKey == rhs.apiKey
+            && lhs.apiBackend == rhs.apiBackend
+            && lhs.extraHeaders == rhs.extraHeaders
+            && lhs.queryParams == rhs.queryParams
+            && lhs.tuning == rhs.tuning
     }
 
     /// The `/recap` side-call's sampling route, resolved WITHOUT switching the
@@ -776,7 +794,9 @@ actor LiveModelSwitchCoordinator {
         // config = active (sampler_turn.rs:1162): the session's own route,
         // reasoning effort re-derived under the auxiliary policy.
         let activeInfo = resolver.catalogSource().pairs()
-            .first { $0.1.model == active.model }?.1.info
+            .first {
+                $0.1.model == active.model && $0.1.info.provider == active.provider
+            }?.1.info
         var tuning = active.tuning
         tuning.reasoningEffort = activeInfo.flatMap(acceptedAuxiliaryEffort(info:))
         guard tuning != active.tuning else { return (active, sampler) }
@@ -950,6 +970,21 @@ final class LiveModelCatalogStore: @unchecked Sendable {
         manager.applyFireworksCatalog(catalog)
     }
 
+    @discardableResult
+    func applyRunInfraCatalog(_ catalog: RunInfraModelsCatalog?) -> Bool {
+        manager.applyRunInfraCatalog(catalog)
+    }
+
+    @discardableResult
+    func applyGeminiCatalog(_ catalog: GeminiModelsCatalog?) -> Bool {
+        manager.applyGeminiCatalog(catalog)
+    }
+
+    @discardableResult
+    func applyOpenRouterCatalog(_ catalog: OpenRouterModelsCatalog?) -> Bool {
+        manager.applyOpenRouterCatalog(catalog)
+    }
+
     // MARK: ACP credential-family seams
     //
     // Backings for the `open-grok/*/models/*` extension methods
@@ -1067,6 +1102,18 @@ final class LiveModelCatalogStore: @unchecked Sendable {
         manager.applyOpenCodeGoEnabledModels(enabledModels)
     }
 
+    func openRouterDescriptors() -> [OpenRouterModelDescriptor] {
+        manager.openRouterDescriptors()
+    }
+
+    func openRouterEnabledModels() -> [String] {
+        manager.openRouterEnabledModels()
+    }
+
+    func applyOpenRouterEnabledModels(_ enabledModels: [String]) {
+        manager.applyOpenRouterEnabledModels(enabledModels)
+    }
+
     /// Record a completed live model switch, mirroring the tail of upstream's
     /// `set_session_model` (handlers/model_switch.rs:299-303):
     /// `set_current_model_id` then `set_current_reasoning_effort`.
@@ -1094,10 +1141,19 @@ final class LiveModelCatalogStore: @unchecked Sendable {
     /// The composer border carries the wire name (`glm-5p2`'s full path, not
     /// `glm-5.2`), so `/effort` has to resolve the current model back to its
     /// catalog entry before it can read the effort menu.
-    func entryForWireModel(_ model: String) -> LiveModelPickerEntry? {
+    func entryForWireModel(
+        _ model: String,
+        provider: ModelProvider? = nil
+    ) -> LiveModelPickerEntry? {
         let entries = pickerEntries()
-        if let match = entries.first(where: { $0.id == model }) { return match }
-        guard let key = snapshot().pairs().first(where: { $0.1.model == model })?.0 else {
+        if let match = entries.first(where: {
+            $0.id == model && (provider == nil || $0.providerID == provider?.asString)
+        }) {
+            return match
+        }
+        guard let key = snapshot().pairs().first(where: {
+            $0.1.model == model && (provider == nil || $0.1.info.provider == provider)
+        })?.0 else {
             return nil
         }
         return entries.first { $0.id == key }
@@ -1196,7 +1252,9 @@ final class LiveModelCatalogStore: @unchecked Sendable {
         let codexCredentials = try? loadCodexCredentials(at: codexAuthFile)
 
         func fingerprint(_ partition: ModelCatalogPartition) -> String? {
-            broker.selectedAPIKey(for: partition).map(liveCatalogCredentialFingerprint)
+            broker.selectedAPIKey(for: partition).map {
+                liveCatalogCredentialFingerprint($0, partition: partition)
+            }
         }
 
         return EmptyCredentialSnapshot(
@@ -1209,7 +1267,10 @@ final class LiveModelCatalogStore: @unchecked Sendable {
             metaCredentialFingerprint: fingerprint(.meta),
             openCodeGoCredentialFingerprint: fingerprint(.openCodeGo),
             waferCredentialFingerprint: fingerprint(.wafer),
-            zaiCredentialFingerprint: fingerprint(.zai)
+            zaiCredentialFingerprint: fingerprint(.zai),
+            runinfraCredentialFingerprint: fingerprint(.runinfra),
+            geminiCredentialFingerprint: fingerprint(.gemini),
+            openRouterCredentialFingerprint: fingerprint(.openRouter)
         )
     }
 }
@@ -1266,7 +1327,10 @@ private struct LiveModelCatalogCredentialBroker: ModelCatalogCredentialBroker {
         }
         return ProviderCatalogCredential(
             apiKey: credential.bearer,
-            fingerprint: liveCatalogCredentialFingerprint(credential.bearer)
+            fingerprint: liveCatalogCredentialFingerprint(
+                credential.bearer,
+                partition: partition
+            )
         )
     }
 
@@ -1350,6 +1414,12 @@ private struct LiveModelCatalogCredentialBroker: ModelCatalogCredentialBroker {
         case .meta:
             // Upstream's Meta credential env key (meta_models.rs:16, :74-76).
             key = MetaModels.apiKeyEnv
+        case .runinfra:
+            return RunInfraModels.environmentAPIKey(environment: environment)
+        case .gemini:
+            return GeminiModels.environmentAPIKey(environment: environment)
+        case .openRouter:
+            key = OpenRouterModels.apiKeyEnv
         case .kimi, .xai, .codex:
             key = nil
         }
@@ -1377,6 +1447,12 @@ private struct LiveModelCatalogCredentialBroker: ModelCatalogCredentialBroker {
             return WaferModels.apiBaseURL(environment: environment)
         case .zai:
             return ZaiModels.apiBaseURL(environment: environment)
+        case .runinfra:
+            return RunInfraModels.apiBaseURL(environment: environment)
+        case .gemini:
+            return GeminiModels.apiBaseURL(environment: environment)
+        case .openRouter:
+            return OpenRouterModels.apiBaseURL(environment: environment)
         }
     }
 }
@@ -1409,6 +1485,22 @@ private func liveCatalogCredentialFingerprint(_ value: String) -> String {
     return String(hash, radix: 16)
 }
 
+private func liveCatalogCredentialFingerprint(
+    _ value: String,
+    partition: ModelCatalogPartition
+) -> String {
+    switch partition {
+    case .runinfra:
+        return RunInfraModels.credentialFingerprint(apiKey: value)
+    case .gemini:
+        return GeminiModels.credentialFingerprint(apiKey: value)
+    case .openRouter:
+        return OpenRouterModels.credentialFingerprint(value)
+    default:
+        return liveCatalogCredentialFingerprint(value)
+    }
+}
+
 func liveCatalogResolutionInput(
     workingDirectory: URL,
     environment: [String: String]
@@ -1417,7 +1509,9 @@ func liveCatalogResolutionInput(
         cwd: workingDirectory,
         environment: environment
     ).effective()) ?? .table(TOMLTable())
-    let enabled = document[path: ["models", "opencode_go_enabled_models"]]?.arrayValue?
+    let openCodeGoEnabled = document[path: ["models", "opencode_go_enabled_models"]]?.arrayValue?
+        .compactMap(\.stringValue) ?? []
+    let openRouterEnabled = document[path: ["models", "openrouter_enabled_models"]]?.arrayValue?
         .compactMap(\.stringValue) ?? []
     let configured = liveConfiguredModelCatalog(
         workingDirectory: workingDirectory,
@@ -1444,7 +1538,8 @@ func liveCatalogResolutionInput(
         endpoints: endpoints,
         models: ModelsSectionConfig(
             default: document[path: ["models", "default"]]?.stringValue,
-            opencodeGoEnabledModels: enabled
+            opencodeGoEnabledModels: openCodeGoEnabled,
+            openRouterEnabledModels: openRouterEnabled
         ),
         configModels: modelOverrides
     )

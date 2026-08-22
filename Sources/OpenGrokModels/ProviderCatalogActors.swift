@@ -28,6 +28,8 @@ public enum ModelCatalogTimeouts {
     /// `kimi_models.rs:24`, `fireworks_models.rs:20`, `deepseek_models.rs:22`,
     /// `meta_models.rs:17`, `opencode_go_models.rs:23`.
     public static let apiKeyProvider: TimeInterval = 10
+    /// `OPENROUTER_MODELS_REQUEST_TIMEOUT` (`openrouter_models.rs:22`).
+    public static let openRouter: TimeInterval = 15
 }
 
 /// Truncate and redact a provider error body before it is surfaced.
@@ -300,7 +302,10 @@ public actor APIKeyCatalogActor {
         cancellation: CancellationToken? = nil
     ) async throws -> (entries: OrderedModelMap, fingerprint: String)? {
         try cancellation?.throwIfCancelled()
-        guard let credential = await credentialSource() else { return nil }
+        guard let credential = await credentialSource(),
+              !credential.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
 
         let request = ModelCatalogRequests.bearerRequest(
             url: ModelCatalogRequests.modelsURL(baseURL: baseURL),
@@ -328,6 +333,214 @@ public actor APIKeyCatalogActor {
         guard current?.fingerprint == credential.fingerprint else { return nil }
 
         return (entries, credential.fingerprint)
+    }
+}
+
+// MARK: - RunInfra
+
+/// RunInfra alone keeps its reviewed fallback when authenticated discovery fails.
+public actor RunInfraCatalogActor {
+    private let transport: any ModelCatalogTransport
+    private let credentialSource: @Sendable () async -> ProviderCatalogCredential?
+    private let baseURL: String
+
+    public init(
+        transport: any ModelCatalogTransport,
+        credentialSource: @escaping @Sendable () async -> ProviderCatalogCredential?,
+        baseURL: String = RunInfraModels.apiBaseURLDefault
+    ) {
+        self.transport = transport
+        self.credentialSource = credentialSource
+        self.baseURL = baseURL
+    }
+
+    public func fetch(
+        cancellation: CancellationToken? = nil
+    ) async throws -> RunInfraModelsCatalog? {
+        try cancellation?.throwIfCancelled()
+        guard let credential = await credentialSource(),
+              !credential.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        let catalog: RunInfraModelsCatalog
+        do {
+            let request = ModelCatalogRequests.bearerRequest(
+                url: ModelCatalogRequests.modelsURL(baseURL: baseURL),
+                apiKey: credential.apiKey,
+                timeout: ModelCatalogTimeouts.apiKeyProvider
+            )
+            let response = try await transport.send(request, cancellation: cancellation)
+            try cancellation?.throwIfCancelled()
+
+            guard response.isSuccess else {
+                let body = String(decoding: response.body, as: UTF8.self)
+                throw ModelsError.remoteMalformed(
+                    "runinfra models request returned \(response.status): "
+                        + safeCatalogErrorExcerpt(body, apiKey: credential.apiKey)
+                )
+            }
+
+            var discovered = try RunInfraModels.parseCatalogSnapshot(
+                response.body,
+                baseURL: baseURL,
+                credentialFingerprint: credential.fingerprint
+            )
+            discovered.entries.retain { _, entry in entry.info.provider == .runinfra }
+            catalog = discovered
+        } catch {
+            if error is CancellationError || Task.isCancelled {
+                throw error
+            }
+            try cancellation?.throwIfCancelled()
+            catalog = RunInfraModelsCatalog(
+                entries: RunInfraModels.curatedCatalog(baseURL: baseURL),
+                credentialFingerprint: nil
+            )
+        }
+
+        let current = await credentialSource()
+        guard current?.fingerprint == credential.fingerprint,
+              current?.apiKey == credential.apiKey else {
+            return nil
+        }
+        try cancellation?.throwIfCancelled()
+        return catalog
+    }
+}
+
+// MARK: - Gemini
+
+/// Authenticated Gemini discovery enriches its fixed reviewed model set.
+public actor GeminiCatalogActor {
+    private let transport: any ModelCatalogTransport
+    private let credentialSource: @Sendable () async -> ProviderCatalogCredential?
+    private let baseURL: String
+
+    public init(
+        transport: any ModelCatalogTransport,
+        credentialSource: @escaping @Sendable () async -> ProviderCatalogCredential?,
+        baseURL: String = GeminiModels.apiBaseURLDefault
+    ) {
+        self.transport = transport
+        self.credentialSource = credentialSource
+        self.baseURL = baseURL
+    }
+
+    public func fetch(
+        cancellation: CancellationToken? = nil
+    ) async throws -> GeminiModelsCatalog? {
+        try cancellation?.throwIfCancelled()
+        guard let credential = await credentialSource(),
+              !credential.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              credential.fingerprint == GeminiModels.credentialFingerprint(apiKey: credential.apiKey) else {
+            return nil
+        }
+
+        let catalog: GeminiModelsCatalog
+        do {
+            let request = ModelCatalogRequests.bearerRequest(
+                url: ModelCatalogRequests.modelsURL(baseURL: baseURL),
+                apiKey: credential.apiKey,
+                timeout: ModelCatalogTimeouts.apiKeyProvider
+            )
+            let response = try await transport.send(request, cancellation: cancellation)
+            try cancellation?.throwIfCancelled()
+
+            guard response.isSuccess else {
+                let body = String(decoding: response.body, as: UTF8.self)
+                throw ModelsError.remoteMalformed(
+                    "gemini models request returned \(response.status): "
+                        + safeCatalogErrorExcerpt(body, apiKey: credential.apiKey)
+                )
+            }
+
+            var discovered = try GeminiModels.enrichedCatalog(
+                response.body,
+                baseURL: baseURL,
+                credentialFingerprint: credential.fingerprint
+            )
+            discovered.entries.retain { _, entry in entry.info.provider == .gemini }
+            catalog = discovered
+        } catch {
+            if error is CancellationError || Task.isCancelled {
+                throw error
+            }
+            try cancellation?.throwIfCancelled()
+            catalog = GeminiModelsCatalog(
+                entries: GeminiModels.curatedCatalog(baseURL: baseURL),
+                credentialFingerprint: credential.fingerprint
+            )
+        }
+
+        let current = await credentialSource()
+        guard current?.fingerprint == credential.fingerprint,
+              current?.apiKey == credential.apiKey else {
+            return nil
+        }
+        try cancellation?.throwIfCancelled()
+        return catalog
+    }
+}
+
+// MARK: - OpenRouter
+
+/// OpenRouter carries mandatory attribution headers and its own BLAKE3 identity.
+public actor OpenRouterCatalogActor {
+    private let transport: any ModelCatalogTransport
+    private let credentialSource: @Sendable () async -> ProviderCatalogCredential?
+    private let baseURL: String
+
+    public init(
+        transport: any ModelCatalogTransport,
+        credentialSource: @escaping @Sendable () async -> ProviderCatalogCredential?,
+        baseURL: String = OpenRouterModels.apiBaseURLDefault
+    ) {
+        self.transport = transport
+        self.credentialSource = credentialSource
+        self.baseURL = baseURL
+    }
+
+    public func fetch(
+        cancellation: CancellationToken? = nil
+    ) async throws -> OpenRouterModelsCatalog? {
+        try cancellation?.throwIfCancelled()
+        guard let credential = await credentialSource(),
+              !credential.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              credential.fingerprint == OpenRouterModels.credentialFingerprint(credential.apiKey) else {
+            return nil
+        }
+
+        let request = OpenRouterModels.modelsRequest(
+            apiKey: credential.apiKey,
+            baseURL: baseURL
+        )
+        let response = try await transport.send(request, cancellation: cancellation)
+        try cancellation?.throwIfCancelled()
+
+        guard response.isSuccess else {
+            let body = String(decoding: response.body, as: UTF8.self)
+            throw ModelsError.remoteMalformed(
+                "openrouter models request returned \(response.status): "
+                    + safeCatalogErrorExcerpt(body, apiKey: credential.apiKey)
+            )
+        }
+
+        var catalog = try OpenRouterModels.parseCatalogSnapshot(
+            response.body,
+            baseURL: baseURL,
+            apiKey: credential.apiKey
+        )
+        catalog.entries.retain { _, entry in entry.info.provider == .openRouter }
+        guard catalog.credentialFingerprint == credential.fingerprint else { return nil }
+
+        let current = await credentialSource()
+        guard current?.fingerprint == credential.fingerprint,
+              current?.apiKey == credential.apiKey else {
+            return nil
+        }
+        try cancellation?.throwIfCancelled()
+        return catalog
     }
 }
 
@@ -544,6 +757,42 @@ public enum ProviderCatalogActors {
             credentialSource: credentialSource,
             baseURL: baseURL,
             project: { data, base in try ZaiModels.parseCatalog(data, baseURL: base) }
+        )
+    }
+
+    public static func runinfra(
+        transport: any ModelCatalogTransport,
+        credentialSource: @escaping @Sendable () async -> ProviderCatalogCredential?,
+        baseURL: String = RunInfraModels.apiBaseURLDefault
+    ) -> RunInfraCatalogActor {
+        RunInfraCatalogActor(
+            transport: transport,
+            credentialSource: credentialSource,
+            baseURL: baseURL
+        )
+    }
+
+    public static func gemini(
+        transport: any ModelCatalogTransport,
+        credentialSource: @escaping @Sendable () async -> ProviderCatalogCredential?,
+        baseURL: String = GeminiModels.apiBaseURLDefault
+    ) -> GeminiCatalogActor {
+        GeminiCatalogActor(
+            transport: transport,
+            credentialSource: credentialSource,
+            baseURL: baseURL
+        )
+    }
+
+    public static func openRouter(
+        transport: any ModelCatalogTransport,
+        credentialSource: @escaping @Sendable () async -> ProviderCatalogCredential?,
+        baseURL: String = OpenRouterModels.apiBaseURLDefault
+    ) -> OpenRouterCatalogActor {
+        OpenRouterCatalogActor(
+            transport: transport,
+            credentialSource: credentialSource,
+            baseURL: baseURL
         )
     }
 }

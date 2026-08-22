@@ -415,12 +415,18 @@ struct AuthAccountTargetTests {
         #expect(AuthAccountTarget(rawValue: "openCodeGo") == .openCodeGo)
         #expect(AuthAccountTarget(rawValue: "wafer") == .wafer)
         #expect(AuthAccountTarget(rawValue: "zai") == .zai)
+        #expect(AuthAccountTarget(rawValue: "runinfra") == .runinfra)
+        #expect(AuthAccountTarget(rawValue: "run-infra") == .runinfra)
+        #expect(AuthAccountTarget(rawValue: "gemini") == .gemini)
+        #expect(AuthAccountTarget(rawValue: "google") == .gemini)
+        #expect(AuthAccountTarget(rawValue: "AI_STUDIO") == .gemini)
+        #expect(AuthAccountTarget(rawValue: "openrouter") == .openRouter)
+        #expect(AuthAccountTarget(rawValue: "OPEN_ROUTER") == .openRouter)
         #expect(AuthAccountTarget(rawValue: "all") == .all)
         #expect(AuthAccountTarget(rawValue: "ALL") == .all)
 
         #expect(AuthAccountTarget(rawValue: "nonexistent") == nil)
-        #expect(AuthAccountTarget(rawValue: "google") == nil)
 
-        #expect(AuthAccountTarget.allCases.count == 10)
+        #expect(AuthAccountTarget.allCases.count == 13)
     }
 }

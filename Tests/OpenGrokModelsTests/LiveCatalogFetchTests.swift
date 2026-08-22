@@ -939,13 +939,10 @@ struct LiveCatalogMergeOrderTests {
         #expect(sentinel.info.contextWindow != DEFAULT_CONTEXT_WINDOW)
     }
 
-    /// Upstream applies the Wafer wipe *after* the override loop
-    /// (`resolution.rs:364-369` runs on the value
-    /// `resolve_model_list_with_provider_catalogs` returned). Wafer is
-    /// therefore the one partition a live catalog can overwrite a user
-    /// override with. Pinned so the asymmetry is not "fixed" by accident.
-    @Test("Wafer is applied after [model.*], unlike every other partition")
-    func waferOutranksUserOverride() throws {
+    /// Current upstream re-applies `[model.*]` after every late provider
+    /// partition replacement (`agent/models/resolution.rs:450-453`).
+    @Test("a configured Wafer override survives its authoritative live catalog")
+    func waferUserOverrideSurvivesLiveCatalog() throws {
         var override = ConfigModelOverride()
         override.name = "User Renamed Wafer"
         let waferEntries = try WaferModels.parseCatalog(
@@ -957,8 +954,10 @@ struct LiveCatalogMergeOrderTests {
             input: CatalogResolutionInput(configModels: [("wafer:wafer-model", override)]),
             waferCatalog: WaferModelsCatalog(entries: waferEntries, credentialFingerprint: "fp")
         )
-        // The live catalog won: the override's name is gone.
-        #expect(catalog["wafer:wafer-model"]?.info.name == "wafer-model")
+        let liveEntry = try #require(catalog["wafer:wafer-model"])
+        #expect(liveEntry.info.name == "User Renamed Wafer")
+        #expect(liveEntry.info.provider == .wafer)
+        #expect(liveEntry.info.model == "wafer-model")
 
         // Without a live Wafer catalog the override stands.
         let noLive = resolveModelCatalog(

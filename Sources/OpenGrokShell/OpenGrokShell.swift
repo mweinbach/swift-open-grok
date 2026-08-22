@@ -116,6 +116,10 @@ public struct OpenGrokShellTurnRequest: Sendable, Equatable {
     public let turnID: String
     public let jsonSchema: JSONValue?
 
+    public var isAgentMessage: Bool {
+        promptID.hasPrefix("peer-message-") || promptID.hasPrefix("agent-message-")
+    }
+
     public init(
         promptID: String = UUID().uuidString,
         text: String,
@@ -182,9 +186,19 @@ public enum OpenGrokShellTurnUpdateKind: Sendable, Equatable {
     case assistantText(String)
     case status(String)
     case tool(OpenGrokShellToolUpdate)
+    /// Provider message identity and prompt usage arrive before any content.
+    case responseStarted(
+        messageID: String,
+        model: String,
+        inputTokens: UInt64,
+        cacheReadInputTokens: UInt64,
+        cacheCreationInputTokens: UInt64
+    )
     /// Streaming reasoning/thought channel delta. Not persisted as partial
     /// transcript until the turn commits a full reasoning item.
     case reasoning(String)
+    /// Preserve the provider's completed thinking-block signature.
+    case reasoningCompleted(signature: String)
     /// Provisional tool-call fragment from the sampler. Never execute from this;
     /// partial argument JSON must not be persisted (`updates.rs:196`).
     case toolCallDelta(
@@ -229,19 +243,40 @@ public struct OpenGrokShellSamplingResult: Sendable, Equatable {
     public let cancelled: Bool
     public let structuredOutput: JSONValue?
     public let structuredOutputError: String?
+    public let messageID: String?
+    public let rawStopReason: String?
+    public let stopSequence: String?
+    public let inputTokens: UInt64
+    public let outputTokens: UInt64
+    public let cacheReadInputTokens: UInt64
+    public let cacheCreationInputTokens: UInt64
 
     public init(
         output: String,
         stopReason: String? = nil,
         cancelled: Bool = false,
         structuredOutput: JSONValue? = nil,
-        structuredOutputError: String? = nil
+        structuredOutputError: String? = nil,
+        messageID: String? = nil,
+        rawStopReason: String? = nil,
+        stopSequence: String? = nil,
+        inputTokens: UInt64 = 0,
+        outputTokens: UInt64 = 0,
+        cacheReadInputTokens: UInt64 = 0,
+        cacheCreationInputTokens: UInt64 = 0
     ) {
         self.output = output
         self.stopReason = stopReason
         self.cancelled = cancelled
         self.structuredOutput = structuredOutput
         self.structuredOutputError = structuredOutputError
+        self.messageID = messageID
+        self.rawStopReason = rawStopReason
+        self.stopSequence = stopSequence
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cacheReadInputTokens = cacheReadInputTokens
+        self.cacheCreationInputTokens = cacheCreationInputTokens
     }
 }
 
@@ -253,6 +288,13 @@ public struct OpenGrokShellTurnResult: Sendable, Equatable {
     public let cancelled: Bool
     public let structuredOutput: JSONValue?
     public let structuredOutputError: String?
+    public let messageID: String?
+    public let rawStopReason: String?
+    public let stopSequence: String?
+    public let inputTokens: UInt64
+    public let outputTokens: UInt64
+    public let cacheReadInputTokens: UInt64
+    public let cacheCreationInputTokens: UInt64
 
     public init(
         sessionID: SessionID,
@@ -261,7 +303,14 @@ public struct OpenGrokShellTurnResult: Sendable, Equatable {
         stopReason: String? = nil,
         cancelled: Bool = false,
         structuredOutput: JSONValue? = nil,
-        structuredOutputError: String? = nil
+        structuredOutputError: String? = nil,
+        messageID: String? = nil,
+        rawStopReason: String? = nil,
+        stopSequence: String? = nil,
+        inputTokens: UInt64 = 0,
+        outputTokens: UInt64 = 0,
+        cacheReadInputTokens: UInt64 = 0,
+        cacheCreationInputTokens: UInt64 = 0
     ) {
         self.sessionID = sessionID
         self.turnID = turnID
@@ -270,6 +319,13 @@ public struct OpenGrokShellTurnResult: Sendable, Equatable {
         self.cancelled = cancelled
         self.structuredOutput = structuredOutput
         self.structuredOutputError = structuredOutputError
+        self.messageID = messageID
+        self.rawStopReason = rawStopReason
+        self.stopSequence = stopSequence
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cacheReadInputTokens = cacheReadInputTokens
+        self.cacheCreationInputTokens = cacheCreationInputTokens
     }
 }
 
@@ -487,7 +543,14 @@ public struct ProviderSessionTurnDriver: OpenGrokShellTurnDriver, Sendable {
                     stopReason: sample.stopReason,
                     cancelled: true,
                     structuredOutput: sample.structuredOutput,
-                    structuredOutputError: sample.structuredOutputError
+                    structuredOutputError: sample.structuredOutputError,
+                    messageID: sample.messageID,
+                    rawStopReason: sample.rawStopReason,
+                    stopSequence: sample.stopSequence,
+                    inputTokens: sample.inputTokens,
+                    outputTokens: sample.outputTokens,
+                    cacheReadInputTokens: sample.cacheReadInputTokens,
+                    cacheCreationInputTokens: sample.cacheCreationInputTokens
                 )
             }
             try await providerSession.finishTurn(turnID: request.turnID)
@@ -498,7 +561,14 @@ public struct ProviderSessionTurnDriver: OpenGrokShellTurnDriver, Sendable {
                 stopReason: sample.stopReason,
                 cancelled: false,
                 structuredOutput: sample.structuredOutput,
-                structuredOutputError: sample.structuredOutputError
+                structuredOutputError: sample.structuredOutputError,
+                messageID: sample.messageID,
+                rawStopReason: sample.rawStopReason,
+                stopSequence: sample.stopSequence,
+                inputTokens: sample.inputTokens,
+                outputTokens: sample.outputTokens,
+                cacheReadInputTokens: sample.cacheReadInputTokens,
+                cacheCreationInputTokens: sample.cacheCreationInputTokens
             )
         } catch {
             if error is CancellationError {
@@ -598,7 +668,9 @@ public struct DefaultOpenGrokShellACPRuntimeFactory: OpenGrokShellACPRuntimeFact
         workspace: any OpenGrokShellWorkspace,
         promptDriver: any ACPPromptDriver,
         extensionHandler: (any ACPAgentExtensionHandler)?,
-        extensionNotifications: ACPExtensionNotificationRouter?
+        extensionNotifications: ACPExtensionNotificationRouter?,
+        onSessionOpened: (@Sendable (AcpSessionId, AcpMeta?) async throws -> Void)? = nil,
+        onSessionClosed: (@Sendable (AcpSessionId) async -> Void)? = nil
     ) -> OpenGrokShellACPComponents {
         let store = InMemoryACPSessionStore()
         let runtime = ACPAgentRuntime(
@@ -606,7 +678,9 @@ public struct DefaultOpenGrokShellACPRuntimeFactory: OpenGrokShellACPRuntimeFact
             promptDriver: promptDriver,
             workspaceBoundary: workspace.acpBoundary,
             extensionHandler: extensionHandler,
-            extensionNotifications: extensionNotifications
+            extensionNotifications: extensionNotifications,
+            onSessionOpened: onSessionOpened,
+            onSessionClosed: onSessionClosed
         )
         return OpenGrokShellACPComponents(runtime: runtime, store: store)
     }
@@ -1034,7 +1108,7 @@ public actor OpenGrokShell: OpenGrokShellFacade {
         let previousSession = session
         let command = try await session.mailbox.enqueue(
             .prompt(promptID: request.promptID, text: request.text),
-            owner: .client,
+            owner: request.isAgentMessage ? .system : .client,
             issuedAtMS: milliseconds(configuration.now())
         )
         guard try await session.mailbox.claimNext(by: "shell")?.commandID == command.commandID else {
@@ -1044,7 +1118,7 @@ public actor OpenGrokShell: OpenGrokShellFacade {
         session.phase = .sampling
         session.summary.chatMessageCount &+= 1
         session.summary.updatedAt = configuration.now()
-        session.chatHistory.append(.object([
+        var historyItem: [String: JSONValue] = [
             "type": .string("user"),
             "content": .array([
                 .object([
@@ -1052,20 +1126,32 @@ public actor OpenGrokShell: OpenGrokShellFacade {
                     "text": .string(request.text)
                 ])
             ])
-        ]))
+        ]
+        if request.isAgentMessage {
+            // Same model-authored tag as ConversationItem.agentMessage; peer
+            // traffic must never deserialize as an instruction from the user.
+            historyItem["synthetic_reason"] = .string("agent_message")
+        }
+        session.chatHistory.append(.object(historyItem))
         do {
+            var update: [String: JSONValue] = [
+                "sessionUpdate": .string("user_message_chunk"),
+                "content": .object([
+                    "type": .string("text"),
+                    "text": .string(request.text)
+                ])
+            ]
+            if request.isAgentMessage {
+                update["_meta"] = .object(["hideFromScrollback": .bool(true)])
+            }
             try appendPersistedUpdate(
                 .acp(.object([
                     "sessionId": .string(sessionID.rawValue),
-                    "update": .object([
-                        "sessionUpdate": .string("user_message_chunk"),
-                        "content": .object([
-                            "type": .string("text"),
-                            "text": .string(request.text)
-                        ])
-                    ])
+                    "update": .object(update)
                 ])),
-                transcriptEvent: .userTextChunk(text: request.text, promptIndex: nil),
+                transcriptEvent: request.isAgentMessage
+                    ? nil
+                    : .userTextChunk(text: request.text, promptIndex: nil),
                 to: &session
             )
             sessions[sessionID] = session

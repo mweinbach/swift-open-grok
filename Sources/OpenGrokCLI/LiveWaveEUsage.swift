@@ -109,12 +109,7 @@ extension LiveInteractiveControllerRenderer {
                 let modelProvider = modelCatalog.first(where: {
                     $0.id == model.modelID || $0.name == model.modelID
                 }).flatMap { entry -> PagerUsageProvider? in
-                    switch entry.providerID.lowercased() {
-                    case "xai": return .xai
-                    case "codex": return .codex
-                    case "antigravity": return .antigravity
-                    default: return nil
-                    }
+                    waveEUsageProvider(entry.providerID)
                 } ?? provider
                 sections.append(PagerUsageSection(
                     provider: modelProvider,
@@ -143,14 +138,36 @@ extension LiveInteractiveControllerRenderer {
         if modelName.localizedCaseInsensitiveContains("antigravity") {
             return .antigravity
         }
-        guard let provider = await modelSwitch?.snapshot().provider else { return .xai }
-        return waveEUsageProvider(provider) ?? .xai
+        if let provider = await modelSwitch?.snapshot().provider {
+            return waveEUsageProvider(provider) ?? .xai
+        }
+        let current = modelCatalog.first {
+            $0.id == modelName || $0.name == modelName
+        }
+        return current.flatMap { waveEUsageProvider($0.providerID) } ?? .xai
+    }
+
+    private func waveEUsageProvider(_ providerID: String) -> PagerUsageProvider? {
+        switch providerID.lowercased() {
+        case "xai": return .xai
+        case "codex", "openai", "openai_codex": return .codex
+        case "runinfra", "run_infra", "run-infra": return .runinfra
+        case "gemini", "google", "google_gemini", "google-gemini",
+             "ai_studio", "aistudio", "gemini_api":
+            return .gemini
+        case "openrouter", "open_router", "open-router": return .openRouter
+        case "antigravity": return .antigravity
+        default: return nil
+        }
     }
 
     private func waveEUsageProvider(_ provider: ModelProvider) -> PagerUsageProvider? {
         switch provider {
         case .xai: return .xai
         case .codex: return .codex
+        case .runinfra: return .runinfra
+        case .gemini: return .gemini
+        case .openRouter: return .openRouter
         case .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai:
             return nil
         }

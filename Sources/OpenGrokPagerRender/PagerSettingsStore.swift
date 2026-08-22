@@ -482,7 +482,15 @@ public struct PagerSettingsStore: Sendable {
         var root = (try? readRoot()) ?? .table(TOMLTable())
         // Sorted so the file is stable across runs — an unordered set would
         // produce a spurious diff every time anything else in the file changed.
-        let array = TOMLValue.array(enabled.sorted().map(TOMLValue.string))
+        let normalized: [String]
+        if key == "openrouter_models" {
+            normalized = Array(Set(enabled.map {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            }.filter { !$0.isEmpty })).sorted()
+        } else {
+            normalized = enabled.sorted()
+        }
+        let array = TOMLValue.array(normalized.map(TOMLValue.string))
         try setValue(array, at: path.split(separator: ".").map(String.init), in: &root)
         try writeConfigFile(root, to: configPath)
         return path

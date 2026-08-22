@@ -13,6 +13,7 @@
 // integration slice owns.
 
 import Foundation
+import OpenGrokACPRuntime
 import OpenGrokConfig
 import OpenGrokConfigTypes
 import OpenGrokComputerHubMCPAdapter
@@ -267,11 +268,26 @@ public struct MCPServerConnection: Sendable {
 /// Live MCP servers held open for the duration of a session.
 public actor MCPSessionConnections {
     private var clients: [String: MCPClient] = [:]
+    private var clientIdentifiers: [String: UInt64] = [:]
+    private var resources: [String: [MCPResource]] = [:]
+    private var nextClientIdentifier: UInt64 = 1
+    private var lifecycle: LiveMCPLifecycle?
+    nonisolated let events = MCPEventStream()
 
     public init() {}
 
-    func retain(_ client: MCPClient, as name: String) {
+    func reserveClientIdentifier() -> UInt64 {
+        let identifier = nextClientIdentifier
+        nextClientIdentifier &+= 1
+        if nextClientIdentifier == 0 {
+            nextClientIdentifier = 1
+        }
+        return identifier
+    }
+
+    func retain(_ client: MCPClient, as name: String, clientID: UInt64? = nil) {
         clients[name] = client
+        clientIdentifiers[name] = clientID ?? reserveClientIdentifier()
     }
 
     /// The retained client for one server, for the `x.ai/mcp/call` /
@@ -280,23 +296,381 @@ public actor MCPSessionConnections {
     /// observe different servers.
     func client(named name: String) -> MCPClient? { clients[name] }
 
+    func clientIdentifier(named name: String) -> UInt64? { clientIdentifiers[name] }
+
+    func resourceSnapshot(named name: String) -> [MCPResource] {
+        resources[name] ?? []
+    }
+
+    func replaceResources(_ updated: [MCPResource], for name: String) {
+        resources[name] = updated
+    }
+
     /// Remove one server's client from the pool WITHOUT closing it — the
     /// caller owns the shutdown, because teardown must also unregister the
     /// server's tools and only the caller holds the toolset.
     func release(named name: String) -> MCPClient? {
-        clients.removeValue(forKey: name)
+        clientIdentifiers.removeValue(forKey: name)
+        resources.removeValue(forKey: name)
+        return clients.removeValue(forKey: name)
     }
 
     public func names() -> [String] { clients.keys.sorted() }
 
+    func startLifecycle(
+        sessionID: String,
+        toolset: FinalizedToolset,
+        declarations: @escaping @Sendable () -> MCPConfigLoadResult,
+        environment: [String: String],
+        disabledTools: @escaping @Sendable (String) -> Set<String> = { _ in [] }
+    ) async {
+        guard lifecycle == nil else { return }
+        let live = LiveMCPLifecycle(
+            sessionID: sessionID,
+            connections: self,
+            toolset: toolset,
+            declarations: declarations,
+            environment: environment,
+            disabledTools: disabledTools
+        )
+        lifecycle = live
+        await live.start(events: events.subscribe())
+    }
+
+    func attachLifecycle(
+        gateway: ACPNotificationGateway,
+        state: LiveMCPACPState,
+        declarations: @escaping @Sendable () -> MCPConfigLoadResult,
+        disabledTools: @escaping @Sendable (String) -> Set<String>
+    ) async {
+        await lifecycle?.attach(
+            gateway: gateway,
+            state: state,
+            declarations: declarations,
+            disabledTools: disabledTools
+        )
+    }
+
+    func markServerShuttingDown(_ name: String) async {
+        await lifecycle?.markShuttingDown(name)
+    }
+
+    func markServerAvailable(_ name: String) async {
+        await lifecycle?.markAvailable(name)
+    }
+
+    func flushLifecycle() async {
+        await lifecycle?.flush()
+    }
+
     /// Close every server. Safe to call more than once.
     public func shutdown() async {
+        let live = lifecycle
+        lifecycle = nil
+        await live?.close()
+        events.finish()
         let open = clients
         clients.removeAll()
+        clientIdentifiers.removeAll()
+        resources.removeAll()
         for client in open.values {
             try? await client.shutdown()
             await client.close()
         }
+    }
+}
+
+private actor LiveMCPLifecycle: McpRestartActions {
+    private let sessionID: String
+    private let connections: MCPSessionConnections
+    private let toolset: FinalizedToolset
+    private let environment: [String: String]
+    private var declarationSource: @Sendable () -> MCPConfigLoadResult
+    private var disabledToolSource: @Sendable (String) -> Set<String>
+    private var dispatcher: McpEventDispatcher?
+    private var gateway: ACPNotificationGateway?
+    private var state: LiveMCPACPState?
+    private var restarting: Set<String> = []
+    private var shuttingDown: Set<String> = []
+    private var isClosed = false
+
+    init(
+        sessionID: String,
+        connections: MCPSessionConnections,
+        toolset: FinalizedToolset,
+        declarations: @escaping @Sendable () -> MCPConfigLoadResult,
+        environment: [String: String],
+        disabledTools: @escaping @Sendable (String) -> Set<String>
+    ) {
+        self.sessionID = sessionID
+        self.connections = connections
+        self.toolset = toolset
+        self.declarationSource = declarations
+        self.environment = environment
+        self.disabledToolSource = disabledTools
+    }
+
+    func start(events: AsyncStream<McpClientEvent>) async {
+        let callbacks = McpEventDispatcherCallbacks(
+            isConfiguredAndEnabled: { [weak self] name in
+                await self?.isConfiguredAndEnabled(server: name) ?? false
+            },
+            currentClientID: { [weak self] name in
+                guard let self else { return nil }
+                return await self.connections.clientIdentifier(named: name)
+            },
+            removeClient: { [weak self] name in
+                await self?.removeClosedClient(server: name)
+            },
+            refreshTools: { [weak self] name in
+                await self?.refreshTools(server: name)
+            },
+            refreshResources: { [weak self] name in
+                await self?.refreshResources(server: name)
+            },
+            pushStatus: { [weak self] payload in
+                await self?.pushStatus(payload: payload)
+            }
+        )
+        let dispatcher = McpEventDispatcher(
+            sessionID: sessionID,
+            callbacks: callbacks,
+            restartActions: self
+        )
+        self.dispatcher = dispatcher
+        await dispatcher.start(events: events)
+    }
+
+    func attach(
+        gateway: ACPNotificationGateway,
+        state: LiveMCPACPState,
+        declarations: @escaping @Sendable () -> MCPConfigLoadResult,
+        disabledTools: @escaping @Sendable (String) -> Set<String>
+    ) {
+        self.gateway = gateway
+        self.state = state
+        self.declarationSource = declarations
+        let originalDisabledTools = disabledToolSource
+        self.disabledToolSource = { name in
+            originalDisabledTools(name).union(disabledTools(name))
+        }
+    }
+
+    func markShuttingDown(_ server: String) {
+        shuttingDown.insert(server)
+    }
+
+    func markAvailable(_ server: String) {
+        shuttingDown.remove(server)
+    }
+
+    func flush() async {
+        await dispatcher?.flush()
+    }
+
+    func close() async {
+        guard !isClosed else { return }
+        isClosed = true
+        let names = await connections.names()
+        shuttingDown.formUnion(names)
+        await dispatcher?.close()
+        dispatcher = nil
+        gateway = nil
+        state = nil
+    }
+
+    private func declaration(named server: String) -> MCPServerDeclaration? {
+        declarationSource().servers.first { $0.name == server }
+    }
+
+    private func isConfiguredAndEnabled(server: String) -> Bool {
+        !isClosed && !shuttingDown.contains(server)
+            && declaration(named: server)?.isEnabled == true
+    }
+
+    private func removeClosedClient(server: String) async {
+        guard let previous = await connections.release(named: server) else { return }
+        await previous.close()
+        MCPToolBridge.unregister(server: server, from: toolset)
+        LiveMCPToolSearchIndex.refreshIfPresent(in: toolset)
+        await state?.record(MCPServerConnection(
+            name: server,
+            failure: "MCP server transport closed"
+        ))
+    }
+
+    private func refreshTools(server: String) async {
+        guard isConfiguredAndEnabled(server: server),
+              let client = await connections.client(named: server)
+        else { return }
+
+        MCPToolBridge.unregister(server: server, from: toolset)
+        let registration = await MCPToolBridge.register(
+            provider: MCPClientToolProvider(serverName: server, client: client),
+            into: toolset,
+            disabledToolNames: disabledToolSource(server)
+        )
+        LiveMCPToolSearchIndex.refreshIfPresent(in: toolset)
+        let outcome = MCPServerConnection(
+            name: server,
+            toolNames: registration.registeredNames,
+            failure: registration.failure,
+            skipped: registration.skipped
+        )
+        await state?.record(outcome)
+        if let failure = registration.failure {
+            await pushStatus(payload: McpServerStatusPayload(
+                sessionId: sessionID,
+                name: server,
+                source: McpServerSource.classify(name: server),
+                status: .unavailable,
+                reason: .unavailable,
+                detail: failure
+            ))
+        }
+    }
+
+    private func refreshResources(server: String) async {
+        guard isConfiguredAndEnabled(server: server),
+              let client = await connections.client(named: server),
+              await client.serverCapabilities()?.resources != nil
+        else { return }
+
+        var collected: [MCPResource] = []
+        var cursor: String?
+        var visitedCursors: Set<String> = []
+        do {
+            repeat {
+                let page = try await client.listResources(MCPListResourcesParams(cursor: cursor))
+                collected.append(contentsOf: page.resources)
+                cursor = page.nextCursor
+                if let cursor, !visitedCursors.insert(cursor).inserted {
+                    throw MCPError.invalidRequest(
+                        "MCP resources/list repeated pagination cursor '\(cursor)'"
+                    )
+                }
+            } while cursor != nil
+            await connections.replaceResources(collected, for: server)
+        } catch {
+            await pushStatus(payload: McpServerStatusPayload(
+                sessionId: sessionID,
+                name: server,
+                source: McpServerSource.classify(name: server),
+                status: .unavailable,
+                reason: .unavailable,
+                detail: "resources/list failed: \(error)"
+            ))
+        }
+    }
+
+    func isStdioServerConfigured(server: String) async -> Bool {
+        guard isConfiguredAndEnabled(server: server),
+              case .stdio = declaration(named: server)?.config.transport
+        else { return false }
+        return true
+    }
+
+    func isHttpServerConfigured(server: String) async -> Bool {
+        guard isConfiguredAndEnabled(server: server),
+              case .streamableHttp = declaration(named: server)?.config.transport
+        else { return false }
+        return true
+    }
+
+    func isInShuttingDown(server: String) async -> Bool {
+        isClosed || shuttingDown.contains(server)
+    }
+
+    func beginRestart(server: String) async -> Bool {
+        restarting.insert(server).inserted
+    }
+
+    func endRestart(server: String) async {
+        restarting.remove(server)
+    }
+
+    func respawnStdio(server: String) async -> Result<Void, McpRestartError> {
+        guard let declaration = declaration(named: server),
+              case .stdio = declaration.config.transport,
+              isConfiguredAndEnabled(server: server)
+        else { return .failure(McpRestartError("server is disabled or no longer configured")) }
+
+        if let previous = await connections.release(named: server) {
+            await previous.close()
+        }
+        MCPToolBridge.unregister(server: server, from: toolset)
+        let outcome = await LiveMCPComposition.connect(
+            declaration: declaration,
+            toolset: toolset,
+            connections: connections,
+            environment: environment,
+            disabledToolNames: disabledToolSource(server)
+        )
+        LiveMCPToolSearchIndex.refreshIfPresent(in: toolset)
+        await state?.record(outcome)
+        if let failure = outcome.failure {
+            return .failure(McpRestartError(failure))
+        }
+        return .success(())
+    }
+
+    func resetHttpClient(server: String) async -> Result<Void, McpRestartError> {
+        guard let declaration = declaration(named: server),
+              case .streamableHttp = declaration.config.transport,
+              isConfiguredAndEnabled(server: server)
+        else { return .failure(McpRestartError("server is disabled or no longer configured")) }
+
+        if let previous = await connections.release(named: server) {
+            await previous.close()
+        }
+        MCPToolBridge.unregister(server: server, from: toolset)
+        let outcome = await LiveMCPComposition.connect(
+            declaration: declaration,
+            toolset: toolset,
+            connections: connections,
+            environment: environment,
+            disabledToolNames: disabledToolSource(server)
+        )
+        LiveMCPToolSearchIndex.refreshIfPresent(in: toolset)
+        await state?.record(outcome)
+        if let failure = outcome.failure {
+            return .failure(McpRestartError(failure))
+        }
+        return .success(())
+    }
+
+    func unregisterServerTools(server: String) async {
+        MCPToolBridge.unregister(server: server, from: toolset)
+        LiveMCPToolSearchIndex.refreshIfPresent(in: toolset)
+    }
+
+    func serverClientStateKind(server: String) async -> ClientStateKind? {
+        guard let client = await connections.client(named: server) else { return nil }
+        switch await client.state() {
+        case .initialized:
+            return .ready
+        case .initializing:
+            return .initializing
+        case .disconnected:
+            return .pending
+        case .shuttingDown, .closed:
+            return .empty
+        }
+    }
+
+    func pushStatus(payload: McpServerStatusPayload) async {
+        var fields: [String: JSONValue] = [
+            "sessionId": .string(payload.sessionId),
+            "name": .string(payload.name),
+            "source": .string(payload.source.rawValue),
+            "status": .string(payload.status.rawValue),
+            "reason": .string(payload.reason.rawValue),
+            "tools": payload.tools ?? .null,
+        ]
+        if let detail = payload.detail {
+            fields["detail"] = .string(detail)
+        }
+        await gateway?.send(method: "x.ai/mcp/server_status", params: .object(fields))
     }
 }
 
@@ -495,6 +869,12 @@ public enum LiveMCPComposition {
         }
 
         let client = MCPClient(transport: transport)
+        let clientID = await connections.reserveClientIdentifier()
+        await client.setEventSink(
+            connections.events,
+            serverName: declaration.name,
+            clientID: clientID
+        )
         do {
             _ = try await client.initialize()
         } catch {
@@ -502,7 +882,7 @@ public enum LiveMCPComposition {
             return nil
         }
 
-        await connections.retain(client, as: declaration.name)
+        await connections.retain(client, as: declaration.name, clientID: clientID)
         return HubMCPClientEntry(serverName: declaration.name, client: client)
     }
 
@@ -567,6 +947,12 @@ public enum LiveMCPComposition {
         }
 
         let client = MCPClient(transport: transport)
+        let clientID = await connections.reserveClientIdentifier()
+        await client.setEventSink(
+            connections.events,
+            serverName: declaration.name,
+            clientID: clientID
+        )
         do {
             _ = try await client.initialize()
         } catch {
@@ -587,7 +973,7 @@ public enum LiveMCPComposition {
             return MCPServerConnection(name: declaration.name, failure: failure)
         }
 
-        await connections.retain(client, as: declaration.name)
+        await connections.retain(client, as: declaration.name, clientID: clientID)
         return MCPServerConnection(
             name: declaration.name,
             toolNames: registration.registeredNames,

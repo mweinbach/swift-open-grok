@@ -75,11 +75,16 @@ enum LiveVideoToolComposition {
             return .unavailable
         }
 
-        let baseURL = OpenGrokLiveApplicationLauncher.configuredXaiAPIBaseURL(
-            workingDirectory: workingDirectory,
-            openGrokHome: openGrokHome,
+        let baseURL = LiveImageToolComposition.xaiMediaBaseURL(
+            samplingProvider: samplingProvider,
+            samplingBaseURL: samplingBaseURL,
+            configuredXaiBaseURL: OpenGrokLiveApplicationLauncher.configuredXaiAPIBaseURL(
+                workingDirectory: workingDirectory,
+                openGrokHome: openGrokHome,
+                environment: environment
+            ),
             environment: environment
-        ) ?? samplingBaseURL
+        )
 
         let headers: [(name: String, value: String)] = [
             ("user-agent", "xai-grok-build/\(OpenGrokVersion.compiledVersion)"),

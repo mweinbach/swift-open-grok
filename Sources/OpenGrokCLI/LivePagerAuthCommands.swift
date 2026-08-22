@@ -83,14 +83,24 @@ enum LiveLoginProviderPicker {
         storedKey: String?,
         environment: [String: String]
     ) -> PagerSecretStatus {
-        if let value = environment[envKey],
-           !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return .environmentOverride
+        secretStatus(envKeys: [envKey], storedKey: storedKey, environment: environment)
+    }
+
+    private static func secretStatus(
+        envKeys: [String],
+        storedKey: String?,
+        environment: [String: String]
+    ) -> PagerSecretStatus {
+        for envKey in envKeys {
+            if let value = environment[envKey],
+               !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return .environmentOverride
+            }
         }
         return storedKey == nil ? .missing : .stored
     }
 
-    /// Live statuses for the six API-key providers, keyed by the provider's
+    /// Live statuses for API-key providers, keyed by the provider's
     /// canonical token (`PagerLoginProvider.insertText`). Kimi reports the
     /// Platform service, as upstream's picker does (`ui.rs:29-31`); stored
     /// keys read the same scopes the settings modal's saves write.
@@ -98,18 +108,21 @@ enum LiveLoginProviderPicker {
         openGrokHome: URL,
         environment: [String: String]
     ) -> [String: PagerSecretStatus] {
-        let stored: [String: (envKey: String, provider: String)] = [
-            "kimi": (KimiModels.platformAPIKeyEnv, "kimi"),
-            "fireworks": (FireworksModels.apiKeyEnv, "fireworks"),
-            "deepseek": (DeepSeekModels.apiKeyEnv, "deepseek"),
-            "meta": (MetaModels.apiKeyEnv, "meta"),
-            "opencode-go": (OpenCodeGoModels.apiKeyEnv, "opencode_go"),
-            "wafer": (WaferModels.apiKeyEnv, "wafer"),
-            "zai": (ZaiModels.apiKeyEnv, "zai"),
+        let stored: [String: (envKeys: [String], provider: String)] = [
+            "kimi": ([KimiModels.platformAPIKeyEnv], "kimi"),
+            "fireworks": ([FireworksModels.apiKeyEnv], "fireworks"),
+            "deepseek": ([DeepSeekModels.apiKeyEnv], "deepseek"),
+            "meta": ([MetaModels.apiKeyEnv], "meta"),
+            "opencode-go": ([OpenCodeGoModels.apiKeyEnv], "opencode_go"),
+            "wafer": ([WaferModels.apiKeyEnv], "wafer"),
+            "zai": ([ZaiModels.apiKeyEnv], "zai"),
+            "runinfra": ([runInfraGatewayKeyEnv, runInfraAPIKeyEnv], "runinfra"),
+            "gemini": ([geminiAPIKeyEnv, googleAPIKeyEnv], "gemini"),
+            "openrouter": ([openRouterAPIKeyEnv], "openrouter"),
         ]
         return stored.mapValues { entry in
             secretStatus(
-                envKey: entry.envKey,
+                envKeys: entry.envKeys,
                 storedKey: readProviderAPIKey(
                     grokHome: openGrokHome,
                     provider: entry.provider
@@ -119,7 +132,7 @@ enum LiveLoginProviderPicker {
         }
     }
 
-    /// Eight rows in upstream's order. API-key rows show
+    /// Provider rows in upstream's order. API-key rows show
     /// "API key · <status>" (`login.rs:20-23`); the OAuth rows keep their
     /// fixed descriptions. Row ids are the provider tokens, so a selection
     /// round-trips as the exact typed form.

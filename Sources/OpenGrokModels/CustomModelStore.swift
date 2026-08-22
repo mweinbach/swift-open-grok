@@ -180,7 +180,8 @@ public struct CustomModelEntry: Codable, Sendable, Identifiable, Equatable {
         switch parsedProvider {
         case .codex, .meta:
             defaultBackend = .responses
-        case .xai, .kimi, .fireworks, .deepseek, .openCodeGo, .wafer, .zai:
+        case .xai, .kimi, .fireworks, .deepseek, .openCodeGo, .wafer, .zai,
+             .runinfra, .gemini, .openRouter:
             defaultBackend = .chatCompletions
         }
 
@@ -265,6 +266,10 @@ private func parseCustomModelProvider(_ raw: String) -> ModelProvider? {
     case "opencode_go", "opencode-go", "open_code_go": return .openCodeGo
     case "wafer", "wafer_ai": return .wafer
     case "zai", "z_ai", "z-ai", "zai_api", "glm": return .zai
+    case "runinfra", "run_infra", "run-infra": return .runinfra
+    case "gemini", "google", "google_gemini", "ai_studio", "aistudio", "gemini_api":
+        return .gemini
+    case "openrouter", "open_router", "open-router": return .openRouter
     default: return nil
     }
 }
@@ -275,6 +280,12 @@ private func customModelDefaultBaseURL(for provider: ModelProvider) -> String? {
         return WaferModels.apiBaseURL()
     case .zai:
         return ZaiModels.apiBaseURL()
+    case .runinfra:
+        return RunInfraModels.apiBaseURL()
+    case .gemini:
+        return GeminiModels.apiBaseURL()
+    case .openRouter:
+        return OpenRouterModels.apiBaseURL()
     case .xai, .codex, .kimi, .fireworks, .deepseek, .meta, .openCodeGo:
         return nil
     }
@@ -286,6 +297,12 @@ private func customModelDefaultEnvKey(for provider: ModelProvider) -> EnvKeys? {
         return .single(WaferModels.apiKeyEnv)
     case .zai:
         return .single(ZaiModels.apiKeyEnv)
+    case .runinfra:
+        return .new([RunInfraModels.gatewayKeyEnv, RunInfraModels.apiKeyEnv])
+    case .gemini:
+        return .new([GeminiModels.apiKeyEnv, GeminiModels.googleAPIKeyEnv])
+    case .openRouter:
+        return .single(OpenRouterModels.apiKeyEnv)
     case .xai, .codex, .kimi, .fireworks, .deepseek, .meta, .openCodeGo:
         return nil
     }

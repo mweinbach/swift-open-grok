@@ -6,7 +6,8 @@
 //   1. `GROK_DEPLOYMENT_KEY` (xAI routes only) — bare Bearer, outranks all.
 //   2. An explicit API key supplied by the caller (model `env_key`, provider
 //      environment variable, `--api-key`). Explicit keys outrank stored OAuth.
-//   3. Stored credentials for the provider:
+//   3. The selected provider's own environment keys, in upstream alias order.
+//   4. Stored credentials for the provider:
 //        * xAI    — `auth.json` session or API key via `AuthManager`.
 //        * Codex  — the ISOLATED `codex-auth.json` OAuth store, refreshed on
 //                   demand. Never reads `auth.json`.
@@ -201,6 +202,15 @@ public struct LiveCredentialResolver: Sendable {
             return try await resolveCodex(scope: scope, forceRefresh: forceRefresh)
         }
 
+        if let environmentKey = providerEnvironmentAPIKey(for: provider) {
+            return Self.apiKeyCredential(
+                provider: provider,
+                scope: scope,
+                source: .explicitAPIKey,
+                key: environmentKey
+            )
+        }
+
         let storedKeyEndpointTrusted = baseURL.map {
             trustedBuiltInSessionEndpoint(provider: provider, baseURL: $0)
         } ?? false
@@ -255,13 +265,15 @@ public struct LiveCredentialResolver: Sendable {
                 || store[apiKeyScope] != nil
         case .codex:
             return isCodexLoggedIn(at: codexAuthFile)
-        case .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai:
+        case .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai,
+             .runinfra, .gemini, .openRouter:
             // Meta joins the other API-key providers: the provider-scoped
             // stored key (`meta::api_key`, upstream `stored_api_key` at
             // meta_models.rs:74-76). This is only the "can authenticate at
             // all" hint; whether the key may travel to a given endpoint is
             // decided per-resolve by the trusted-host gate above.
-            return readProviderAPIKey(grokHome: openGrokHome, provider: provider.asString) != nil
+            return providerEnvironmentAPIKey(for: provider) != nil
+                || readProviderAPIKey(grokHome: openGrokHome, provider: provider.asString) != nil
         }
     }
 
@@ -448,6 +460,25 @@ public struct LiveCredentialResolver: Sendable {
             return "WAFER_API_KEY"
         case .zai:
             return "ZAI_API_KEY"
+        case .runinfra:
+            return "RUNINFRA_GATEWAY_KEY or RUNINFRA_API_KEY"
+        case .gemini:
+            return "GEMINI_API_KEY or GOOGLE_API_KEY"
+        case .openRouter:
+            return "OPENROUTER_API_KEY"
+        }
+    }
+
+    private func providerEnvironmentAPIKey(for provider: ModelProvider) -> String? {
+        switch provider {
+        case .runinfra:
+            return runInfraAPIKeyFromEnvironment(environment)
+        case .gemini:
+            return geminiAPIKeyFromEnvironment(environment)
+        case .openRouter:
+            return openRouterAPIKeyFromEnvironment(environment)
+        case .xai, .codex, .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai:
+            return nil
         }
     }
 

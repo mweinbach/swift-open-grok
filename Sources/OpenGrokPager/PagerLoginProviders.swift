@@ -50,7 +50,7 @@ public enum PagerLoginProviders {
     /// Upstream's neutral API-key row description (`login.rs:22`).
     static let apiKeyNeutralDescription = "Configure an API key and query models"
 
-    /// The eight providers in upstream's picker order (`login.rs:30-79`).
+    /// The providers in upstream's picker order (`login.rs:30-135`).
     ///
     /// Settings keys reference `PagerSettingsRegistry.default` rows. Kimi
     /// deep-links to the `kimi_api_endpoint` service chooser rather than one
@@ -129,6 +129,30 @@ public enum PagerLoginProviders {
             aliases: ["zai", "z-ai", "z_ai"],
             route: .apiKey(settingsKey: "zai_api_key")
         ),
+        PagerLoginProvider(
+            insertText: "runinfra",
+            display: "RunInfra",
+            matchText: "runinfra run infra api key chat completions hosted models deepseek qwen",
+            neutralDescription: apiKeyNeutralDescription,
+            aliases: ["runinfra", "run-infra", "run_infra"],
+            route: .apiKey(settingsKey: "runinfra_api_key")
+        ),
+        PagerLoginProvider(
+            insertText: "gemini",
+            display: "Google Gemini",
+            matchText: "gemini google google gemini ai studio aistudio api key chat completions models",
+            neutralDescription: apiKeyNeutralDescription,
+            aliases: ["gemini", "google", "ai-studio", "aistudio", "google-gemini"],
+            route: .apiKey(settingsKey: "gemini_api_key")
+        ),
+        PagerLoginProvider(
+            insertText: "openrouter",
+            display: "OpenRouter",
+            matchText: "openrouter open router api key dynamic models catalog",
+            neutralDescription: apiKeyNeutralDescription,
+            aliases: ["openrouter", "open-router", "open_router"],
+            route: .apiKey(settingsKey: "openrouter_api_key")
+        ),
     ]
 
     /// `provider_action`'s matching rule (`login.rs:85-87`): trim, ASCII
@@ -145,7 +169,8 @@ public enum PagerLoginProviders {
     public static func unknownProviderMessage(_ token: String) -> String {
         "Unknown provider: \(token.trimmingCharacters(in: .whitespacesAndNewlines)). "
             + "Use /login xai, /login codex, /login kimi, /login fireworks, "
-            + "/login deepseek, /login meta, /login wafer, /login zai, or /login opencode-go"
+            + "/login deepseek, /login meta, /login wafer, /login zai, "
+            + "/login runinfra, /login gemini, /login opencode-go, or /login openrouter"
     }
 
     /// Upstream's unknown-account error for `/logout` (`logout.rs:42-44`).

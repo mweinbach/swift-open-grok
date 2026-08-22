@@ -569,6 +569,12 @@ public struct ConversationResponse: Sendable, Equatable {
     public var doomLoopSignals: [DoomLoopSignal]
     /// Provider-supplied human-readable stop detail, when reported.
     public var stopMessage: String?
+    /// The provider's original message identifier, when available.
+    public var messageID: String?
+    /// The provider's verbatim stop reason before backend-neutral normalization.
+    public var rawStopReason: String?
+    /// The configured stop sequence that the provider matched, when reported.
+    public var stopSequence: String?
 
     public init(
         items: [ConversationItem],
@@ -577,7 +583,10 @@ public struct ConversationResponse: Sendable, Equatable {
         costUsdTicks: Int64? = nil,
         messageChunksEmitted: UInt64 = 0,
         doomLoopSignals: [DoomLoopSignal] = [],
-        stopMessage: String? = nil
+        stopMessage: String? = nil,
+        messageID: String? = nil,
+        rawStopReason: String? = nil,
+        stopSequence: String? = nil
     ) {
         self.items = items
         self.stopReason = stopReason
@@ -586,6 +595,9 @@ public struct ConversationResponse: Sendable, Equatable {
         self.messageChunksEmitted = messageChunksEmitted
         self.doomLoopSignals = doomLoopSignals
         self.stopMessage = stopMessage
+        self.messageID = messageID
+        self.rawStopReason = rawStopReason
+        self.stopSequence = stopSequence
     }
 
     /// The trailing `Assistant` item, if any.

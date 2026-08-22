@@ -475,6 +475,18 @@ public func defaultModelConfigs(
             m.baseURL = ZaiModels.apiBaseURL()
             m.envKey = .single(ZaiModels.apiKeyEnv)
         }
+        if m.provider == .runinfra {
+            m.baseURL = RunInfraModels.apiBaseURL()
+            m.envKey = .new([RunInfraModels.gatewayKeyEnv, RunInfraModels.apiKeyEnv])
+        }
+        if m.provider == .gemini {
+            m.baseURL = GeminiModels.apiBaseURL()
+            m.envKey = .new([GeminiModels.apiKeyEnv, GeminiModels.googleAPIKeyEnv])
+        }
+        if m.provider == .openRouter {
+            m.baseURL = OpenRouterModels.apiBaseURL()
+            m.envKey = .single(OpenRouterModels.apiKeyEnv)
+        }
 
         let key = m.id ?? m.model
         let contextWindow = m.contextWindow.map { max(1, $0) } ?? NEW_MODEL_DEFAULT_CONTEXT_WINDOW

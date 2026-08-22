@@ -829,7 +829,8 @@ public struct ConfigModelOverride: Sendable, Equatable {
             switch entry.info.provider {
             case .codex, .meta:
                 entry.info.apiBackend = .responses
-            case .xai, .kimi, .fireworks, .deepseek, .openCodeGo, .wafer, .zai:
+            case .xai, .kimi, .fireworks, .deepseek, .openCodeGo, .wafer, .zai,
+                 .runinfra, .gemini, .openRouter:
                 entry.info.apiBackend = .chatCompletions
             }
             if baseURL == nil { entry.info.baseURL = "" }
@@ -1010,6 +1011,12 @@ extension ModelInfo {
     public var isWafer: Bool { provider == .wafer }
     /// Whether this model is provided by Z AI.
     public var isZai: Bool { provider == .zai }
+    /// Whether this model is provided by RunInfra.
+    public var isRunInfra: Bool { provider == .runinfra }
+    /// Whether this model is provided directly by Google Gemini.
+    public var isGemini: Bool { provider == .gemini }
+    /// Whether this model is provided by OpenRouter.
+    public var isOpenRouter: Bool { provider == .openRouter }
 
     /// Whether this model supports reasoning / thinking mode.
     public var supportsThinking: Bool {
@@ -1051,6 +1058,12 @@ extension ModelEntry {
     public var isWafer: Bool { info.isWafer }
     /// Whether this model is provided by Z AI.
     public var isZai: Bool { info.isZai }
+    /// Whether this model is provided by RunInfra.
+    public var isRunInfra: Bool { info.isRunInfra }
+    /// Whether this model is provided directly by Google Gemini.
+    public var isGemini: Bool { info.isGemini }
+    /// Whether this model is provided by OpenRouter.
+    public var isOpenRouter: Bool { info.isOpenRouter }
 
     /// Whether this model supports reasoning / thinking mode.
     public var supportsThinking: Bool { info.supportsThinking }
@@ -1094,6 +1107,12 @@ extension ModelProvider {
             return ["WAFER_API_KEY"]
         case .zai:
             return ["ZAI_API_KEY", "GLM_API_KEY"]
+        case .runinfra:
+            return ["RUNINFRA_GATEWAY_KEY", "RUNINFRA_API_KEY"]
+        case .gemini:
+            return ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
+        case .openRouter:
+            return ["OPENROUTER_API_KEY"]
         }
     }
 
@@ -1141,6 +1160,9 @@ extension ModelCatalogPartition {
         case .openCodeGo: self = .openCodeGo
         case .wafer: self = .wafer
         case .zai: self = .zai
+        case .runinfra: self = .runinfra
+        case .gemini: self = .gemini
+        case .openRouter: self = .openRouter
         case .xai: return nil
         }
     }
@@ -1148,7 +1170,7 @@ extension ModelCatalogPartition {
 
 // MARK: - Model Partition Kind
 
-/// Comprehensive partition classification covering all 9 first-party providers and custom models.
+/// Comprehensive partition classification covering first-party providers and custom models.
 public enum ModelPartitionKind: String, Sendable, Equatable, Hashable, CaseIterable {
     case xai
     case codex
@@ -1159,6 +1181,9 @@ public enum ModelPartitionKind: String, Sendable, Equatable, Hashable, CaseItera
     case openCodeGo
     case wafer
     case zai
+    case runinfra
+    case gemini
+    case openRouter = "openrouter"
     case custom
 
     /// Corresponding `ModelProvider` if this is a first-party provider partition.
@@ -1173,6 +1198,9 @@ public enum ModelPartitionKind: String, Sendable, Equatable, Hashable, CaseItera
         case .openCodeGo: return .openCodeGo
         case .wafer: return .wafer
         case .zai: return .zai
+        case .runinfra: return .runinfra
+        case .gemini: return .gemini
+        case .openRouter: return .openRouter
         case .custom: return nil
         }
     }
@@ -1188,6 +1216,9 @@ public enum ModelPartitionKind: String, Sendable, Equatable, Hashable, CaseItera
         case .openCodeGo: return .openCodeGo
         case .wafer: return .wafer
         case .zai: return .zai
+        case .runinfra: return .runinfra
+        case .gemini: return .gemini
+        case .openRouter: return .openRouter
         case .xai, .custom: return nil
         }
     }

@@ -211,11 +211,16 @@ enum LiveImageToolComposition {
         ) else {
             return .unavailable
         }
-        let baseURL = OpenGrokLiveApplicationLauncher.configuredXaiAPIBaseURL(
-            workingDirectory: workingDirectory,
-            openGrokHome: openGrokHome,
+        let baseURL = xaiMediaBaseURL(
+            samplingProvider: samplingProvider,
+            samplingBaseURL: samplingBaseURL,
+            configuredXaiBaseURL: OpenGrokLiveApplicationLauncher.configuredXaiAPIBaseURL(
+                workingDirectory: workingDirectory,
+                openGrokHome: openGrokHome,
+                environment: environment
+            ),
             environment: environment
-        ) ?? samplingBaseURL
+        )
 
         let headers: [(name: String, value: String)] = [
             ("user-agent", "xai-grok-build/\(OpenGrokVersion.compiledVersion)"),
@@ -271,6 +276,27 @@ enum LiveImageToolComposition {
             }
         }
         return nil
+    }
+
+    /// An xAI bearer must never inherit another provider's inference host.
+    /// Explicit xAI endpoint overrides retain upstream's config > environment
+    /// precedence; otherwise only an xAI session may reuse its sampling URL.
+    static func xaiMediaBaseURL(
+        samplingProvider: ModelProvider,
+        samplingBaseURL: String,
+        configuredXaiBaseURL: String?,
+        environment: [String: String]
+    ) -> String {
+        if let configuredXaiBaseURL {
+            return configuredXaiBaseURL
+        }
+        if let override = environment["GROK_XAI_API_BASE_URL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !override.isEmpty {
+            return override
+        }
+        return samplingProvider.profile.sessionAuth.isXai
+            ? samplingBaseURL
+            : "https://api.x.ai/v1"
     }
 
     /// `CodexCredentials::supports_image_generation`

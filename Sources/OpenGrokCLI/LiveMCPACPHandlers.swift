@@ -59,15 +59,10 @@
 //     refusal for unknown `x.ai/mcp/*` names: bare `method_not_found`, NO
 //     data (mcp.rs:387 and the pin's regression test mcp.rs:1952-1965).
 //
-// The `sdk_call` reverse bridge itself (agent → client, in-process SDK MCP
-// servers, session/acp_mcp.rs) is NOT implemented: it needs a `session/new`
-// `_meta["x.ai/mcp/servers"]` seam from the runtime into the live toolset,
-// per-ACP-session tool scoping (this port's toolset is per-process), and an
-// MCP-handshake-over-reverse-channel transport. Because the bridge is
-// absent, the initialize `_meta` deliberately does NOT advertise
-// `x.ai/mcp/sdk` (upstream acp_agent.rs:700-702, wire.rs:25-27) — the SDK
-// reads that flag to enable `transport="acp"`, and advertising it without
-// the bridge would break every SDK client that trusts it.
+// The reverse SDK bridge is installed through the runtime's session-open and
+// session-close hooks. Its transports issue only agent-to-client
+// `x.ai/mcp/sdk_call` requests; accepting that same name as an inbound method
+// would invert the trust boundary, so the unknown-method refusal above stays.
 
 import Foundation
 import OpenGrokACP
@@ -87,9 +82,15 @@ import OpenGrokToolRegistry
 /// snapshot; `auth_trigger`/`upsert`/`delete` mutate it as they mutate the
 /// pool, so `list`/`auth_status` always describe the pool as it is NOW.
 actor LiveMCPACPState {
+    private struct SDKSession {
+        var registry: MCPACPBridgeRegistry
+        var clients: [String: MCPClient]
+    }
+
     let connections: MCPSessionConnections
     let toolset: FinalizedToolset
     private var outcomes: [String: MCPServerConnection]
+    private var sdkSessions: [String: SDKSession] = [:]
 
     init(
         connections: MCPSessionConnections,
@@ -114,6 +115,35 @@ actor LiveMCPACPState {
         outcomes.removeValue(forKey: name)
     }
 
+    func beginSDKSession(_ registry: MCPACPBridgeRegistry, sessionID: String) -> Bool {
+        guard sdkSessions[sessionID] == nil else { return false }
+        sdkSessions[sessionID] = SDKSession(registry: registry, clients: [:])
+        return true
+    }
+
+    func retainSDKClient(_ client: MCPClient, named name: String, sessionID: String) {
+        sdkSessions[sessionID]?.clients[name] = client
+    }
+
+    func sdkClient(named name: String, sessionID: String) -> MCPClient? {
+        sdkSessions[sessionID]?.clients[name]
+    }
+
+    func sdkServerOwner(named name: String) -> String? {
+        sdkSessions.first { $0.value.clients[name] != nil }?.key
+    }
+
+    func anySDKClient(named name: String) -> MCPClient? {
+        sdkSessions.values.lazy.compactMap { $0.clients[name] }.first
+    }
+
+    func releaseSDKSession(
+        sessionID: String
+    ) -> (registry: MCPACPBridgeRegistry, clients: [String: MCPClient])? {
+        guard let session = sdkSessions.removeValue(forKey: sessionID) else { return nil }
+        return (session.registry, session.clients)
+    }
+
     /// The port of the session's `auth_required` set (mcp_servers.rs state):
     /// servers whose connect outcome was the deferred-OAuth notice. Cleared
     /// by a successful `auth_trigger` reconnect recording a fresh outcome.
@@ -124,6 +154,32 @@ actor LiveMCPACPState {
             }
             .map(\.name)
             .sorted()
+    }
+}
+
+private struct SessionScopedMCPClientToolProvider: MCPToolProviding {
+    let serverName: String
+    let state: LiveMCPACPState
+    let client: MCPClient
+
+    func listBridgedTools() async throws -> [MCPBridgedTool] {
+        try await MCPClientToolProvider(serverName: serverName, client: client)
+            .listBridgedTools()
+    }
+
+    func callBridgedTool(
+        name: String,
+        arguments: JSONValue
+    ) async throws -> MCPBridgedCallResult {
+        guard let sessionID = LiveACPPermissionPrompter.activeSession?.rawValue,
+              let owningClient = await state.sdkClient(named: serverName, sessionID: sessionID)
+        else {
+            throw MCPError.invalidRequest(
+                "ACP MCP server '\(serverName)' is not authorized for this session"
+            )
+        }
+        return try await MCPClientToolProvider(serverName: serverName, client: owningClient)
+            .callBridgedTool(name: name, arguments: arguments)
     }
 }
 
@@ -182,6 +238,131 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         self.openBrowser = openBrowser ?? { LiveAuthComposition.openInSystemBrowser($0) }
         self.authTimeoutSeconds = authTimeoutSeconds
         self.authCredentialPollIntervalSeconds = authCredentialPollIntervalSeconds
+    }
+
+    func attachLifecycle(sessionID: String) async {
+        guard !sessionID.isEmpty else { return }
+        await state.connections.attachLifecycle(
+            gateway: gateway,
+            state: state,
+            declarations: declarations,
+            disabledTools: { [userConfigPath] name in
+                guard let root = LiveMCPComposition.loadForEdit(at: userConfigPath) else {
+                    return []
+                }
+                return allDisabledMCPTools(in: root)[name] ?? []
+            }
+        )
+    }
+
+    func openSDKServers(sessionID: AcpSessionId, meta: AcpMeta?) async throws {
+        let entries = MCPACPServerEntry.parse(from: meta)
+        guard !entries.isEmpty else { return }
+
+        let identifier = sessionID.rawValue
+        let requester = try await gateway.connectedReverseRequester()
+        let invoker = ClosureMCPACPReverseInvoker { [requester] serverID, message, _ in
+            try await requester(
+                MCPACPWire.sdkCall,
+                .object([
+                    "serverId": .string(serverID),
+                    "message": message,
+                ])
+            )
+        }
+        let registry = MCPACPBridgeRegistry(
+            sessionID: identifier,
+            servers: entries,
+            invoker: invoker
+        )
+        guard await state.beginSDKSession(registry, sessionID: identifier) else {
+            throw MCPError.invalidRequest("ACP MCP servers already opened for this session")
+        }
+
+        do {
+            let configuredNames = Set(declarations().servers.map(\.name))
+            for entry in entries {
+                let existingClient = await state.connections.client(named: entry.name)
+                if configuredNames.contains(entry.name) || existingClient != nil {
+                    continue
+                }
+
+                let transport = try await registry.open(
+                    serverID: entry.serverID,
+                    sessionID: identifier
+                )
+                let client = MCPClient(transport: transport)
+                _ = try await client.initialize()
+                let disabledTools: Set<String>
+                if let root = LiveMCPComposition.loadForEdit(at: userConfigPath) {
+                    disabledTools = allDisabledMCPTools(in: root)[entry.name] ?? []
+                } else {
+                    disabledTools = []
+                }
+                let registration = await MCPToolBridge.register(
+                    provider: SessionScopedMCPClientToolProvider(
+                        serverName: entry.name,
+                        state: state,
+                        client: client
+                    ),
+                    into: state.toolset,
+                    disabledToolNames: disabledTools
+                )
+                if let failure = registration.failure {
+                    await client.close()
+                    throw MCPError.invalidRequest(
+                        "ACP MCP server '\(entry.name)' registration failed: \(failure)"
+                    )
+                }
+                await state.retainSDKClient(client, named: entry.name, sessionID: identifier)
+                await state.record(MCPServerConnection(
+                    name: entry.name,
+                    toolNames: registration.registeredNames,
+                    skipped: registration.skipped
+                ))
+            }
+            LiveMCPToolSearchIndex.refreshIfPresent(in: state.toolset)
+        } catch {
+            await closeSDKServers(sessionID: sessionID)
+            throw error
+        }
+    }
+
+    func closeSDKServers(sessionID: AcpSessionId) async {
+        guard let session = await state.releaseSDKSession(sessionID: sessionID.rawValue) else {
+            return
+        }
+        for (name, client) in session.clients {
+            MCPToolBridge.unregister(server: name, from: state.toolset)
+            await client.close()
+            if let survivor = await state.anySDKClient(named: name) {
+                let disabledTools: Set<String>
+                if let root = LiveMCPComposition.loadForEdit(at: userConfigPath) {
+                    disabledTools = allDisabledMCPTools(in: root)[name] ?? []
+                } else {
+                    disabledTools = []
+                }
+                let registration = await MCPToolBridge.register(
+                    provider: SessionScopedMCPClientToolProvider(
+                        serverName: name,
+                        state: state,
+                        client: survivor
+                    ),
+                    into: state.toolset,
+                    disabledToolNames: disabledTools
+                )
+                await state.record(MCPServerConnection(
+                    name: name,
+                    toolNames: registration.registeredNames,
+                    failure: registration.failure,
+                    skipped: registration.skipped
+                ))
+            } else {
+                await state.removeOutcome(name: name)
+            }
+        }
+        await session.registry.closeAll()
+        LiveMCPToolSearchIndex.refreshIfPresent(in: state.toolset)
     }
 
     /// The production declaration source: re-resolve the config layers
@@ -285,6 +466,24 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         guard await gateway.sessionExists(AcpSessionId(sessionID)) else {
             throw invalidParams("session not found")
         }
+    }
+
+    private func authorizedClient(
+        named server: String,
+        sessionID: String?
+    ) async throws -> MCPClient {
+        if let sessionID,
+           let scoped = await state.sdkClient(named: server, sessionID: sessionID)
+        {
+            return scoped
+        }
+        if await state.sdkServerOwner(named: server) != nil {
+            throw invalidParams("MCP server is not authorized for this session")
+        }
+        guard let client = await state.connections.client(named: server) else {
+            throw internalError("server '\(server)' not found")
+        }
+        return client
     }
 
     // MARK: x.ai/mcp/list
@@ -421,7 +620,8 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
               let tool = params["tool"]?.stringValue else {
             throw invalidParams("invalid params: missing field `server` or `tool`")
         }
-        if let sessionID = params["sessionId"]?.stringValue {
+        let sessionID = params["sessionId"]?.stringValue
+        if let sessionID {
             try await requireSession(sessionID)
         }
         let serverURL = params["serverUrl"]?.stringValue
@@ -430,9 +630,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         // Resolution order (name + url) > url-only > name-only
         // (mcp.rs:836-857), against the current declarations.
         let target = resolveServerName(server: server, serverURL: serverURL)
-        guard let client = await state.connections.client(named: target) else {
-            throw internalError("server '\(target)' not found")
-        }
+        let client = try await authorizedClient(named: target, sessionID: sessionID)
 
         let timeoutSeconds = toolTimeoutSeconds(server: target, tool: tool)
         let result: MCPCallToolResult
@@ -515,12 +713,11 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
               let uri = params["uri"]?.stringValue else {
             throw invalidParams("invalid params: missing field `server` or `uri`")
         }
-        if let sessionID = params["sessionId"]?.stringValue {
+        let sessionID = params["sessionId"]?.stringValue
+        if let sessionID {
             try await requireSession(sessionID)
         }
-        guard let client = await state.connections.client(named: server) else {
-            throw internalError("server '\(server)' not found")
-        }
+        let client = try await authorizedClient(named: server, sessionID: sessionID)
 
         let result: MCPReadResourceResult
         do {
@@ -646,11 +843,13 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         // the just-stored token so the tools land in the RUNNING toolset.
         let connections = state.connections
         let toolset = state.toolset
+        await connections.markServerShuttingDown(serverName)
         MCPToolBridge.unregister(server: serverName, from: toolset)
         if let previous = await connections.release(named: serverName) {
             try? await previous.shutdown()
             await previous.close()
         }
+        await connections.markServerAvailable(serverName)
         let makeHTTPTransport = self.makeHTTPTransport
         let outcome = await LiveMCPComposition.connect(
             declaration: declaration,
@@ -728,11 +927,13 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         //    connect the new declaration and register its tools.
         let connections = state.connections
         let toolset = state.toolset
+        await connections.markServerShuttingDown(serverName)
         MCPToolBridge.unregister(server: serverName, from: toolset)
         if let previous = await connections.release(named: serverName) {
             try? await previous.shutdown()
             await previous.close()
         }
+        await connections.markServerAvailable(serverName)
         let declaration = MCPServerDeclaration(name: serverName, config: config, scope: "user")
         let makeHTTPTransport = self.makeHTTPTransport
         let outcome = await LiveMCPComposition.connect(
@@ -800,11 +1001,13 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
             }
             let connections = state.connections
             let toolset = state.toolset
+            await connections.markServerShuttingDown(serverName)
             MCPToolBridge.unregister(server: serverName, from: toolset)
             if let previous = await connections.release(named: serverName) {
                 try? await previous.shutdown()
                 await previous.close()
             }
+            await connections.markServerAvailable(serverName)
             let makeHTTPTransport = self.makeHTTPTransport
             let disabledTools = allDisabledMCPTools(in: root)
             let outcome = await LiveMCPComposition.connect(
@@ -824,6 +1027,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
             await emitToolsChanged(sessionID: sessionID, serverName: serverName)
         } else {
             let toolset = state.toolset
+            await state.connections.markServerShuttingDown(serverName)
             MCPToolBridge.unregister(server: serverName, from: toolset)
             if let previous = await state.connections.release(named: serverName) {
                 try? await previous.shutdown()
@@ -960,6 +1164,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         // Live teardown (mcp.rs:1926-1934): the tools leave the advertised
         // set and the client shuts down.
         let toolset = state.toolset
+        await state.connections.markServerShuttingDown(serverName)
         MCPToolBridge.unregister(server: serverName, from: toolset)
         if let previous = await state.connections.release(named: serverName) {
             try? await previous.shutdown()

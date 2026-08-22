@@ -30,10 +30,34 @@ public struct OpenGrokPagerMinimalRequest: Sendable, Equatable {
 public struct OpenGrokPagerMinimalCompletion: Sendable, Equatable {
     public var sessionID: String?
     public var summary: String?
+    public var messageID: String?
+    public var rawStopReason: String?
+    public var stopSequence: String?
+    public var inputTokens: UInt64
+    public var outputTokens: UInt64
+    public var cacheReadInputTokens: UInt64
+    public var cacheCreationInputTokens: UInt64
 
-    public init(sessionID: String? = nil, summary: String? = nil) {
+    public init(
+        sessionID: String? = nil,
+        summary: String? = nil,
+        messageID: String? = nil,
+        rawStopReason: String? = nil,
+        stopSequence: String? = nil,
+        inputTokens: UInt64 = 0,
+        outputTokens: UInt64 = 0,
+        cacheReadInputTokens: UInt64 = 0,
+        cacheCreationInputTokens: UInt64 = 0
+    ) {
         self.sessionID = sessionID
         self.summary = summary
+        self.messageID = messageID
+        self.rawStopReason = rawStopReason
+        self.stopSequence = stopSequence
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cacheReadInputTokens = cacheReadInputTokens
+        self.cacheCreationInputTokens = cacheCreationInputTokens
     }
 }
 
@@ -97,8 +121,16 @@ public enum OpenGrokPagerMinimalEvent: Sendable, Equatable {
     case output(String)
     case status(String)
     case tool(OpenGrokPagerToolUpdate)
+    case responseStarted(
+        messageID: String,
+        model: String,
+        inputTokens: UInt64,
+        cacheReadInputTokens: UInt64,
+        cacheCreationInputTokens: UInt64
+    )
     /// Streaming reasoning/thought channel delta → `PagerMessage(role: .reasoning)`.
     case reasoning(String)
+    case reasoningCompleted(signature: String)
     /// Provisional tool-call fragment. UI may hydrate a card header; never execute.
     case toolCallDelta(
         toolIndex: UInt32,
@@ -120,6 +152,15 @@ public enum OpenGrokPagerMinimalEvent: Sendable, Equatable {
         statusCode: UInt16?
     )
     case permissionRequested(OpenGrokPagerMinimalPermissionRequest)
+    case responseCompleted(
+        messageID: String?,
+        stopReason: String?,
+        stopSequence: String?,
+        inputTokens: UInt64,
+        outputTokens: UInt64,
+        cacheReadInputTokens: UInt64,
+        cacheCreationInputTokens: UInt64
+    )
     case completed(OpenGrokPagerMinimalCompletion)
     case cancelled
 }
@@ -333,8 +374,9 @@ public actor OpenGrokPagerMinimal {
                 terminalLifecycle = .cancelled
             case .completed:
                 terminalLifecycle = .completed
-            case .lifecycle, .output, .status, .tool, .reasoning, .toolCallDelta,
-                 .retrying, .samplingFailed, .permissionRequested:
+            case .lifecycle, .output, .status, .tool, .responseStarted, .reasoning,
+                 .reasoningCompleted, .toolCallDelta, .retrying, .samplingFailed,
+                 .permissionRequested, .responseCompleted:
                 continue
             }
 
@@ -362,8 +404,9 @@ private extension OpenGrokPagerMinimalEvent {
         switch self {
         case .completed, .cancelled:
             return true
-        case .lifecycle, .output, .status, .tool, .reasoning, .toolCallDelta,
-             .retrying, .samplingFailed, .permissionRequested:
+        case .lifecycle, .output, .status, .tool, .responseStarted, .reasoning,
+             .reasoningCompleted, .toolCallDelta, .retrying, .samplingFailed,
+             .permissionRequested, .responseCompleted:
             return false
         }
     }

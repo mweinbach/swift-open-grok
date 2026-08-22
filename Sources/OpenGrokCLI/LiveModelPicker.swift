@@ -216,6 +216,11 @@ enum LiveModelPicker {
         case "opencode_go", "opencode-go": return "OpenCode Go"
         case "wafer", "wafer_ai": return "Wafer AI"
         case "zai", "z_ai", "z-ai", "zai_api", "glm": return "Z AI"
+        case "runinfra", "run_infra", "run-infra": return "RunInfra"
+        case "gemini", "google", "google_gemini", "google-gemini",
+             "ai_studio", "ai-studio", "aistudio", "gemini_api":
+            return "Google Gemini"
+        case "openrouter", "open_router", "open-router": return "OpenRouter"
         default: return providerID
         }
     }

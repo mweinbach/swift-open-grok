@@ -302,6 +302,14 @@ public enum OpenGrokLiveSamplingEvent: Sendable, Equatable {
     case output(String)
     case status(String)
     case reasoning(String)
+    case responseStarted(
+        messageID: String,
+        model: String,
+        inputTokens: UInt64,
+        cacheReadInputTokens: UInt64,
+        cacheCreationInputTokens: UInt64
+    )
+    case reasoningCompleted(signature: String)
     case toolCallDelta(
         toolIndex: UInt32,
         id: String?,
@@ -336,6 +344,23 @@ enum LiveSamplingStreamMapper {
     /// firstToken, modelMetadata, empty channel tokens).
     static func map(_ event: SamplingEvent) -> Action? {
         switch event {
+        case .responseStarted(
+            _,
+            let messageID,
+            let model,
+            let inputTokens,
+            let cacheReadInputTokens,
+            let cacheCreationInputTokens
+        ):
+            return .emit(.responseStarted(
+                messageID: messageID,
+                model: model,
+                inputTokens: inputTokens,
+                cacheReadInputTokens: cacheReadInputTokens,
+                cacheCreationInputTokens: cacheCreationInputTokens
+            ))
+        case .reasoningCompleted(_, let signature):
+            return .emit(.reasoningCompleted(signature: signature))
         case .channelToken(_, .text, let text, _):
             guard !text.isEmpty else { return nil }
             return .emit(.output(text))
@@ -383,6 +408,9 @@ public struct OpenGrokLiveSamplingResponse: Sendable, Equatable {
     public let toolCalls: [ToolCall]
     public let usage: TokenUsage?
     public let costUsdTicks: Int64?
+    public let messageID: String?
+    public let rawStopReason: String?
+    public let stopSequence: String?
 
     public init(
         output: String,
@@ -390,12 +418,18 @@ public struct OpenGrokLiveSamplingResponse: Sendable, Equatable {
         items: [ConversationItem]? = nil,
         toolCalls: [ToolCall] = [],
         usage: TokenUsage? = nil,
-        costUsdTicks: Int64? = nil
+        costUsdTicks: Int64? = nil,
+        messageID: String? = nil,
+        rawStopReason: String? = nil,
+        stopSequence: String? = nil
     ) {
         self.output = output
         self.stopReason = stopReason
         self.usage = usage
         self.costUsdTicks = costUsdTicks
+        self.messageID = messageID
+        self.rawStopReason = rawStopReason
+        self.stopSequence = stopSequence
         let resolvedItems = items ?? [.assistant(AssistantItem(
             content: output,
             toolCalls: toolCalls
@@ -493,6 +527,14 @@ public struct OpenGrokLiveSampler: Sendable {
             transport = baseTransport
             bearerResolver = configuration.bearerResolver
         }
+        let configuredReasoningEffort = configuration.provider == .gemini
+            ? configuration.tuning.reasoningEffort.flatMap {
+                GeminiModels.normalizedReasoningEffort(
+                    modelID: configuration.model,
+                    effort: $0
+                )
+            }
+            : configuration.tuning.reasoningEffort
         // The tuning fields ride on the config, not per-request: the sampler
         // backfills them in `applyConversationDefaults`, which is upstream's
         // `apply_defaults` seam (xai-grok-sampler client.rs:1148, :1460,
@@ -513,7 +555,7 @@ public struct OpenGrokLiveSampler: Sendable {
                 .map { (name: $0.key, value: $0.value) },
             queryParams: configuration.queryParams,
             contextWindow: configuration.tuning.contextWindow ?? 0,
-            reasoningEffort: configuration.tuning.reasoningEffort,
+            reasoningEffort: configuredReasoningEffort,
             serviceTier: configuration.tuning.serviceTier,
             reasoningSummary: configuration.tuning.reasoningSummary,
             codexMultiAgentV2: configuration.tuning.codexMultiAgentV2,
@@ -544,6 +586,14 @@ public struct OpenGrokLiveSampler: Sendable {
             // tools, typed failures) are forwarded as they arrive; the
             // collected response carries the final assistant bytes, so nothing
             // is re-emitted once the turn completes.
+            let requestedReasoningEffort = configuration.provider == .gemini
+                ? request.reasoningEffort.flatMap {
+                    GeminiModels.normalizedReasoningEffort(
+                        modelID: request.model,
+                        effort: $0
+                    )
+                }
+                : request.reasoningEffort
             let response = try await turnClient.streamConversation(ConversationRequest(
                 items: request.items,
                 tools: request.tools,
@@ -553,7 +603,7 @@ public struct OpenGrokLiveSampler: Sendable {
                 xGrokSessionId: request.sessionID,
                 xGrokCacheAffinityId: request.cacheAffinityID,
                 xGrokTurnIdx: request.turnID,
-                reasoningEffort: request.reasoningEffort,
+                reasoningEffort: requestedReasoningEffort,
                 jsonSchema: request.jsonSchema
             ), codexPermissions: request.codexPermissions ?? configuration.codexPermissions) { event in
                 await emit(event)
@@ -565,7 +615,10 @@ public struct OpenGrokLiveSampler: Sendable {
                 items: response.items,
                 toolCalls: response.assistant()?.toolCalls ?? [],
                 usage: response.usage,
-                costUsdTicks: response.costUsdTicks
+                costUsdTicks: response.costUsdTicks,
+                messageID: response.messageID,
+                rawStopReason: response.rawStopReason,
+                stopSequence: response.stopSequence
             )
         }
     }
@@ -2325,6 +2378,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                                 )
                                 await controller.shutdown()
                                 await interactiveInput.close()
+                                stack.sessionBusObserver?.cancel()
+                                await foundation.sessionBus.stop()
                                 _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
                                 await codeMode?.shutdown()
                                 await toolExecutor.shutdown()
@@ -2351,6 +2406,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             )
                             await controller.shutdown()
                             await interactiveInput.close()
+                            stack.sessionBusObserver?.cancel()
+                            await foundation.sessionBus.stop()
                             _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
                             await codeMode?.shutdown()
                             await toolExecutor.shutdown()
@@ -2390,6 +2447,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     shutdown: {
                         task.cancel()
                         await pager.shutdown()
+                        stack.sessionBusObserver?.cancel()
+                        await foundation.sessionBus.stop()
                         _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
                         await codeMode?.shutdown()
                         await toolExecutor.shutdown()
@@ -2400,7 +2459,19 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 let pager = OpenGrokPagerMinimal(
                     runtime: runtime,
                     renderer: PlainLivePagerRenderer(),
-                    output: LivePagerOutput(streams: context.streams, format: options.outputFormat)
+                    output: LivePagerOutput(
+                        streams: context.streams,
+                        format: options.outputFormat,
+                        includePartialMessages: options.includePartialMessages,
+                        sessionID: sessionID,
+                        model: samplingConfiguration.model,
+                        workingDirectory: cwd.path,
+                        tools: toolExecutor.tools.map(\.name),
+                        slashCommands: OpenGrokPagerInteractiveController.builtinCommandNames.sorted(),
+                        skills: foundation.skillCatalog.map(\.commandName),
+                        permissionMode: options.common.permissions.mode?.rawValue,
+                        apiKeySource: samplingConfiguration.provider == .codex ? "oauth" : "user"
+                    )
                 )
                 let task = Task {
                     try await pager.run(OpenGrokPagerMinimalRequest(
@@ -2420,6 +2491,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     shutdown: {
                         task.cancel()
                         await pager.shutdown()
+                        stack.sessionBusObserver?.cancel()
+                        await foundation.sessionBus.stop()
                         _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
                         await codeMode?.shutdown()
                         await toolExecutor.shutdown()
@@ -2613,7 +2686,15 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let pager = OpenGrokPagerMinimal(
             runtime: runtime,
             renderer: PlainLivePagerRenderer(),
-            output: LivePagerOutput(streams: context.streams, format: options.outputFormat)
+            output: LivePagerOutput(
+                streams: context.streams,
+                format: options.outputFormat,
+                includePartialMessages: options.includePartialMessages,
+                sessionID: options.sessionID,
+                model: options.common.model,
+                workingDirectory: workingDirectory.path,
+                permissionMode: options.common.permissions.mode?.rawValue
+            )
         )
         let task = Task {
             try await pager.run(OpenGrokPagerMinimalRequest(
@@ -2949,6 +3030,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let planApprovalCoordinator: PagerPlanApprovalCoordinator?
         let telemetryBootstrapContext: LiveTelemetryBootstrapContext
         let toolExecutor: LiveToolExecutor
+        let sessionBus: LiveSessionBus
         /// The subagent stack for this root session: one coordinator plus the
         /// child runner. `nil` when gated off (`--no-subagents` or an empty
         /// roster); the tool executor holds the same reference.
@@ -2989,6 +3071,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         /// rounds. (`/btw` left this seam when it became a real side
         /// question — see `startSideQuestion`.)
         let interjections: LiveSessionInterjections
+        let sessionBusObserver: Task<Void, Never>?
         /// Retained only so reachability tests can await the post-readiness
         /// launch update check; production callers ignore it.
         let launchAutoUpdateTask: Task<Void, Never>?
@@ -2997,6 +3080,50 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         /// the live announcements feed (tests, headless launches without a
         /// transport); the renderer treats `nil` as "no banner slot."
         let announcements: LiveAnnouncementsComposition?
+    }
+
+    private actor LiveACPBusPresenceRegistry {
+        private let bus: LiveSessionBus
+        private let rootSessionID: String
+        private let workingDirectory: URL
+        private let model: String
+        private var openSessions: Set<String> = []
+
+        init(
+            bus: LiveSessionBus,
+            rootSessionID: String,
+            workingDirectory: URL,
+            model: String
+        ) {
+            self.bus = bus
+            self.rootSessionID = rootSessionID
+            self.workingDirectory = workingDirectory
+            self.model = model
+        }
+
+        func opened(_ wireSessionID: String) async {
+            guard await bus.busEnabled else { return }
+            let wasEmpty = openSessions.isEmpty
+            openSessions.insert(wireSessionID)
+            guard wasEmpty else { return }
+            do {
+                try await bus.registerRootSession(
+                    sessionID: rootSessionID,
+                    cwd: workingDirectory,
+                    model: model,
+                    title: nil
+                )
+            } catch {
+                openSessions.remove(wireSessionID)
+                await bus.disable()
+            }
+        }
+
+        func closed(_ wireSessionID: String) async {
+            openSessions.remove(wireSessionID)
+            guard openSessions.isEmpty else { return }
+            await bus.unregisterRootSession(rootSessionID)
+        }
     }
 
     static func makeSessionFoundation(
@@ -3298,6 +3425,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     .appendingPathComponent("terminal", isDirectory: true)
             ))
             : nil
+        let sessionBus = LiveSessionBus(
+            openGrokHome: openGrokHome,
+            cwd: cwd,
+            sessionID: sessionID,
+            model: samplingConfiguration.model,
+            provider: samplingConfiguration.provider.asString,
+            enabled: securityContext.document[path: ["session_bus", "enabled"]]?.boolValue ?? true
+        )
         let toolExecutor = try await LiveToolExecutor(
             processBackend: processBackend,
             sessionID: sessionID,
@@ -3318,6 +3453,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             sessionServices: sessionServices,
             permissionOptions: options.common.permissions,
             subagentHost: subagentHost,
+            sessionCollaborationBackend: sessionBus,
             userQuestions: questionCoordinator.map { LiveUserQuestionBroker(coordinator: $0) },
             planApprovals: planApprovalCoordinator.map { LivePlanApprovalBroker(coordinator: $0) },
             schedulerHost: schedulerHost,
@@ -3350,6 +3486,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             planApprovalCoordinator: planApprovalCoordinator,
             telemetryBootstrapContext: telemetryBootstrapContext,
             toolExecutor: toolExecutor,
+            sessionBus: sessionBus,
             subagentHost: subagentHost,
             discoveredSkills: discoveredSkills,
             skillCatalog: skillCatalog,
@@ -3663,6 +3800,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             providerFactory: ProviderSessionFactoryAdapter(),
             turnDriver: turnDriver
         ))
+        let sessionBusObserver = await startSessionBus(
+            bus: foundation.sessionBus,
+            shell: shell,
+            interjections: interjections,
+            rootSessionID: foundation.sessionID
+        )
         let stack = LiveAgentStack(
             toolSurface: toolSurface,
             codeMode: codeMode,
@@ -3673,6 +3816,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             turnDriver: turnDriver,
             shell: shell,
             interjections: interjections,
+            sessionBusObserver: sessionBusObserver,
             launchAutoUpdateTask: launchAutoUpdateTask,
             announcements: announcements
         )
@@ -3687,6 +3831,103 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             payload: ["source": .string("startup")]
         )
         return stack
+    }
+
+    private static func startSessionBus(
+        bus: LiveSessionBus,
+        shell: OpenGrokShell,
+        interjections: LiveSessionInterjections,
+        rootSessionID: String
+    ) async -> Task<Void, Never>? {
+        let events = await shell.events()
+        do {
+            try await bus.start { [weak bus] message in
+                guard let bus else { return .rejected }
+                let targetID = SessionID(message.targetSession)
+                guard let session = await shell.lookupSession(targetID) else {
+                    // ACP roots have no shell-owned turn queue. They remain
+                    // discoverable/readable but reject peer wakeups until a
+                    // serialized, agent-authored ACP prompt path exists.
+                    return message.targetSession == rootSessionID ? .rejected : .unknownSession
+                }
+
+                if session.phase != .idle {
+                    try await bus.recordInboundDelivery(
+                        message,
+                        status: .deliveredInterjection
+                    )
+                    return await interjections.interject(message.prompt)
+                        ? .accepted
+                        : .rejected
+                }
+
+                try await bus.recordInboundDelivery(message, status: .deliveredWake)
+                let promptID = "peer-message-\(message.messageID)"
+                do {
+                    let submittedTurn = try await shell.submitTurn(
+                        sessionID: targetID,
+                        request: OpenGrokShellTurnRequest(
+                            promptID: promptID,
+                            text: message.prompt,
+                            turnID: promptID
+                        )
+                    )
+                    guard submittedTurn.sessionID == targetID,
+                          submittedTurn.turnID == promptID else {
+                        return .rejected
+                    }
+                    return .accepted
+                } catch let error as OpenGrokShellError {
+                    if case .turnAlreadyActive = error,
+                       await interjections.interject(message.prompt) {
+                        return .accepted
+                    }
+                    return .rejected
+                } catch {
+                    return .rejected
+                }
+            }
+        } catch {
+            await bus.disable()
+            return nil
+        }
+        guard await bus.busEnabled else { return nil }
+
+        return Task {
+            do {
+                for try await event in events {
+                    switch event {
+                    case .sessionCreated(let session):
+                        guard session.sessionID.rawValue == rootSessionID else { continue }
+                        try await bus.registerRootSession(
+                            sessionID: session.sessionID.rawValue,
+                            cwd: session.cwd,
+                            model: session.modelID,
+                            title: nil
+                        )
+                    case .turnAccepted(let turn), .turnStarted(let turn):
+                        guard turn.sessionID.rawValue == rootSessionID else { continue }
+                        try await bus.updateStatus(.busy, sessionID: rootSessionID)
+                    case .turnCompleted(let turn):
+                        guard turn.sessionID.rawValue == rootSessionID else { continue }
+                        try await bus.updateStatus(.idle, sessionID: rootSessionID)
+                    case .turnCancelled(let turn), .turnFailed(let turn, _):
+                        guard turn.sessionID.rawValue == rootSessionID else { continue }
+                        try await bus.updateStatus(.idle, sessionID: rootSessionID)
+                    case .sessionClosed(let sessionID):
+                        guard sessionID.rawValue == rootSessionID else { continue }
+                        await bus.unregisterRootSession(sessionID.rawValue)
+                    case .shutdownBegan, .shutdownCompleted:
+                        await bus.stop()
+                        return
+                    default:
+                        continue
+                    }
+                }
+            } catch {
+                await bus.disable()
+            }
+        }
     }
 
     /// The prompt driver the `acp` route uses.
@@ -3754,6 +3995,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 skillCatalog: foundation.skillCatalog,
                 permissionPrompter: acpPermissionPrompter,
                 shutdown: {
+                    stack.sessionBusObserver?.cancel()
+                    await foundation.sessionBus.stop()
                     await stack.codeMode?.shutdown()
                     await foundation.toolExecutor.shutdown()
                 }
@@ -3815,6 +4058,13 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 userConfigPath: mcpUserHome.appendingPathComponent("config.toml"),
                 openGrokHome: mcpUserHome,
                 environment: launch.environment
+            )
+            await mcpHandler.attachLifecycle(sessionID: foundation.sessionID)
+            let acpBusPresence = LiveACPBusPresenceRegistry(
+                bus: foundation.sessionBus,
+                rootSessionID: foundation.sessionID,
+                workingDirectory: foundation.cwd,
+                model: foundation.samplingConfiguration.model
             )
             // The session-admin trio operates on the SAME on-disk store the
             // launch path resumes from; the resident session's rename goes
@@ -3912,6 +4162,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 extensionNotifications: extensionNotifications,
                 notificationGateway: gateway,
                 permissionPrompter: acpPermissionPrompter,
+                onSessionOpened: { sessionID, meta in
+                    try await mcpHandler.openSDKServers(sessionID: sessionID, meta: meta)
+                    await acpBusPresence.opened(sessionID.rawValue)
+                },
+                onSessionClosed: { sessionID in
+                    await mcpHandler.closeSDKServers(sessionID: sessionID)
+                    await acpBusPresence.closed(sessionID.rawValue)
+                },
                 permissionPipeline: permissionPipeline
             )
         })
@@ -4040,12 +4298,13 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             workingDirectory: workingDirectory,
             environment: environment
         )
-        let configuredCatalogMap = resolveModelCatalog(input: liveCatalogResolutionInput(
+        let catalogInput = liveCatalogResolutionInput(
             workingDirectory: workingDirectory,
             environment: environment
-        ))
+        )
+        let configuredCatalogMap = resolveModelCatalog(input: catalogInput)
         let routeProvider = requestedProvider ?? restoredProvider
-        let configuredEntry = requestedModel.flatMap { requested in
+        var configuredEntry = requestedModel.flatMap { requested in
             if let routeProvider {
                 return configuredCatalogMap.pairs().first { pair in
                     let entry = pair.1
@@ -4054,6 +4313,47 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 }?.1
             }
             return findModelByID(configuredCatalogMap, modelID: requested)
+        }
+        if requestedModel == nil,
+           let routeProvider,
+           routeProvider == .runinfra || routeProvider == .gemini || routeProvider == .openRouter {
+            configuredEntry = configuredCatalogMap.pairs().first {
+                $0.1.info.provider == routeProvider
+            }?.1
+        }
+        if routeProvider == .openRouter, let requestedModel {
+            let normalizedModel = requestedModel.hasPrefix("openrouter:")
+                ? String(requestedModel.dropFirst("openrouter:".count))
+                : requestedModel
+            let allowed = Set(catalogInput.models.openRouterEnabledModels)
+            guard !normalizedModel.isEmpty,
+                  allowed.contains(requestedModel)
+                    || allowed.contains(normalizedModel)
+                    || allowed.contains(OpenRouterModels.catalogKey(modelID: normalizedModel))
+            else {
+                throw CLIApplicationError.failed(
+                    "OpenRouter model '\(requestedModel)' is not enabled in [models].openrouter_enabled_models"
+                )
+            }
+            if configuredEntry == nil {
+                let catalogKey = OpenRouterModels.catalogKey(modelID: normalizedModel)
+                var info = ModelInfo.fallback(slug: catalogKey)
+                info.id = catalogKey
+                info.model = normalizedModel
+                info.provider = .openRouter
+                info.apiBackend = .chatCompletions
+                info.baseURL = OpenRouterModels.apiBaseURL(environment: environment)
+                info.authScheme = .bearer
+                info.toolMode = .direct
+                info.extraHeaders = [
+                    ("HTTP-Referer", OpenRouterModels.httpReferer),
+                    ("X-Title", OpenRouterModels.appTitle),
+                ]
+                configuredEntry = ModelEntry(
+                    info: info,
+                    envKey: .single(OpenRouterModels.apiKeyEnv)
+                )
+            }
         }
         let embeddedModel = requestedModel.flatMap { requested in
             let matches = embedded.models.filter { model in
@@ -4310,6 +4610,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 merged = merged.filter { $0.key.lowercased() != name.lowercased() }
             }
         }
+        if provider == .openRouter {
+            if !merged.keys.contains(where: { $0.caseInsensitiveCompare("HTTP-Referer") == .orderedSame }) {
+                merged["HTTP-Referer"] = "https://github.com/mweinbach/open-grok"
+            }
+            if !merged.keys.contains(where: { $0.caseInsensitiveCompare("X-Title") == .orderedSame }) {
+                merged["X-Title"] = "Open Grok"
+            }
+        }
         return merged
     }
 
@@ -4373,6 +4681,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             return .wafer
         case "zai", "z_ai", "z-ai", "zai_api", "zai-api", "glm":
             return .zai
+        case "runinfra", "run_infra", "run-infra":
+            return .runinfra
+        case "gemini", "google", "google_gemini", "google-gemini", "ai_studio", "aistudio", "gemini_api":
+            return .gemini
+        case "openrouter", "open_router", "open-router":
+            return .openRouter
         default:
             throw CLIApplicationError.unsupported(route: "provider \(value)")
         }
@@ -4383,6 +4697,28 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         embedded: EmbeddedDefaultModels,
         environment: [String: String]
     ) throws -> DefaultModelJSON {
+        switch provider {
+        case .runinfra:
+            guard let entry = RunInfraModels.curatedCatalog(
+                baseURL: RunInfraModels.apiBaseURL(environment: environment)
+            ).pairs().first?.1 else {
+                throw CLIApplicationError.failed("RunInfra has no reviewed default model")
+            }
+            return DefaultModelJSON.fromCatalogEntry(entry)
+        case .gemini:
+            guard let entry = GeminiModels.curatedCatalog(
+                baseURL: GeminiModels.apiBaseURL(environment: environment)
+            ).pairs().first?.1 else {
+                throw CLIApplicationError.failed("Google Gemini has no reviewed default model")
+            }
+            return DefaultModelJSON.fromCatalogEntry(entry)
+        case .openRouter:
+            throw CLIApplicationError.failed(
+                "OpenRouter has no enabled discovered model; enable a model in [models].openrouter_enabled_models"
+            )
+        default:
+            break
+        }
         // Reject an unroutable override before it can silently fall back to
         // the other Kimi service's catalog.
         if provider == .kimi,
@@ -4416,7 +4752,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // the provider-override mapping in agent/config.rs:4545-4553.
         case .codex, .meta:
             return .responses
-        case .kimi, .fireworks, .deepseek, .openCodeGo, .wafer, .zai:
+        case .kimi, .fireworks, .deepseek, .openCodeGo, .wafer, .zai,
+             .runinfra, .gemini, .openRouter:
             return .chatCompletions
         }
     }
@@ -4561,6 +4898,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         case .openCodeGo: overrideKey = OpenCodeGoModels.apiBaseURLEnv
         case .wafer: overrideKey = WaferModels.apiBaseURLEnv
         case .zai: overrideKey = ZaiModels.apiBaseURLEnv
+        case .runinfra: overrideKey = RunInfraModels.apiBaseURLEnv
+        case .gemini: overrideKey = GeminiModels.apiBaseURLEnv
+        case .openRouter: overrideKey = OpenRouterModels.apiBaseURLEnv
         case .meta:
             // Meta endpoint constants (meta_models.rs:14-16): the
             // OPENGROK_META_API_BASE_URL override, else the model's own URL,
@@ -4597,6 +4937,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             fallback = model?.apiBaseURL ?? model?.baseURL ?? WaferModels.apiBaseURLDefault
         case .zai:
             fallback = model?.apiBaseURL ?? model?.baseURL ?? ZaiModels.apiBaseURLDefault
+        case .runinfra:
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? RunInfraModels.apiBaseURLDefault
+        case .gemini:
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? GeminiModels.apiBaseURLDefault
+        case .openRouter:
+            fallback = model?.apiBaseURL ?? model?.baseURL ?? OpenRouterModels.apiBaseURLDefault
         case .meta:
             fallback = model?.apiBaseURL ?? model?.baseURL ?? MetaModels.apiBaseURLDefault
         }
@@ -4641,6 +4987,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             keys = [WaferModels.apiKeyEnv]
         case .zai:
             keys = [ZaiModels.apiKeyEnv]
+        case .runinfra:
+            keys = [RunInfraModels.gatewayKeyEnv, RunInfraModels.apiKeyEnv]
+        case .gemini:
+            keys = [GeminiModels.apiKeyEnv, GeminiModels.googleAPIKeyEnv]
+        case .openRouter:
+            keys = [OpenRouterModels.apiKeyEnv]
         case .meta:
             // META_API_KEY (meta_models.rs:16, :74-76).
             keys = [MetaModels.apiKeyEnv]
@@ -4680,6 +5032,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             return WaferModels.apiKeyEnv
         case .zai:
             return ZaiModels.apiKeyEnv
+        case .runinfra:
+            return "\(RunInfraModels.gatewayKeyEnv) or \(RunInfraModels.apiKeyEnv)"
+        case .gemini:
+            return "\(GeminiModels.apiKeyEnv) or \(GeminiModels.googleAPIKeyEnv)"
+        case .openRouter:
+            return OpenRouterModels.apiKeyEnv
         }
     }
 

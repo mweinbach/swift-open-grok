@@ -389,6 +389,9 @@ public struct PagerContextBlock: Sendable, Equatable, Hashable {
 public enum PagerUsageProvider: String, Sendable, Equatable, Hashable {
     case xai = "xAI"
     case codex = "Codex"
+    case runinfra = "RunInfra"
+    case gemini = "Google Gemini"
+    case openRouter = "OpenRouter"
     case antigravity = "Antigravity"
 }
 

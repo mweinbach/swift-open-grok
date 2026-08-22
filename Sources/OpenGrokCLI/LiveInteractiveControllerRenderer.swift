@@ -2113,6 +2113,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             turnPhase = .status(text)
         case .tool(let tool):
             apply(tool)
+        case .responseStarted, .reasoningCompleted, .responseCompleted:
+            break
         case .reasoning(let text):
             conversation.appendReasoning(text)
             turnPhase = .thinking

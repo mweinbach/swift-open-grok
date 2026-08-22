@@ -1,7 +1,8 @@
 // ProviderWireTests.swift
 //
-// Comprehensive wire policy and dialect tests for all 9 model providers in Open Grok:
-// xAI, OpenAI Codex, Kimi, Fireworks AI, DeepSeek, Meta, OpenCode Go, Wafer AI, and Z AI.
+// Comprehensive wire policy and dialect tests for all 12 model providers in Open Grok:
+// xAI, Codex, Kimi, Fireworks, DeepSeek, Meta, OpenCode Go, Wafer, Z AI,
+// RunInfra, Gemini, and OpenRouter.
 // Mirrors Rust `xai-grok-sampling-types/src/types.rs` and `xai-grok-sampler/src/provider.rs`.
 
 import Foundation
@@ -11,9 +12,9 @@ import OpenGrokSamplingTypes
 import OpenGrokShared
 import OpenGrokVersion
 
-// MARK: - 1. ProviderProfile Configurations for all 9 providers
+// MARK: - 1. ProviderProfile configurations for all 12 providers
 
-@Suite("ProviderProfile 9-Provider Matrix Tests")
+@Suite("ProviderProfile 12-Provider Matrix Tests")
 struct ProviderProfileMatrixTests {
     struct ExpectedProfile {
         let provider: ModelProvider
@@ -137,11 +138,47 @@ struct ProviderProfileMatrixTests {
             sessionAuth: .apiKeyOnly,
             xaiServices: .denied
         ),
+        ExpectedProfile(
+            provider: .runinfra,
+            id: "runinfra",
+            name: "RunInfra",
+            backends: ProviderBackends(chatCompletions: true, responses: nil, messages: false),
+            codeModeTransport: .unsupported,
+            hostedTools: nil,
+            nativeWebSearch: false,
+            requestMetadata: .standardHeadersOnly,
+            sessionAuth: .apiKeyOnly,
+            xaiServices: .denied
+        ),
+        ExpectedProfile(
+            provider: .gemini,
+            id: "gemini",
+            name: "Google Gemini",
+            backends: ProviderBackends(chatCompletions: true, responses: nil, messages: false),
+            codeModeTransport: .unsupported,
+            hostedTools: nil,
+            nativeWebSearch: false,
+            requestMetadata: .standardHeadersOnly,
+            sessionAuth: .apiKeyOnly,
+            xaiServices: .denied
+        ),
+        ExpectedProfile(
+            provider: .openRouter,
+            id: "openrouter",
+            name: "OpenRouter",
+            backends: ProviderBackends(chatCompletions: true, responses: nil, messages: false),
+            codeModeTransport: .unsupported,
+            hostedTools: nil,
+            nativeWebSearch: false,
+            requestMetadata: .standardHeadersOnly,
+            sessionAuth: .apiKeyOnly,
+            xaiServices: .denied
+        ),
     ]
 
-    @Test("all 9 provider profiles match exact requirements")
-    func verifyAllNineProfiles() {
-        #expect(allCases.count == 9)
+    @Test("all 12 provider profiles match exact requirements")
+    func verifyAllTwelveProfiles() {
+        #expect(allCases.count == 12)
 
         for item in allCases {
             let profile = item.provider.profile
@@ -169,6 +206,9 @@ struct ProviderProfileMatrixTests {
             #expect(profile.isOpenCodeGo == (item.provider == .openCodeGo))
             #expect(profile.isWafer == (item.provider == .wafer))
             #expect(profile.isZai == (item.provider == .zai))
+            #expect(profile.isRuninfra == (item.provider == .runinfra))
+            #expect(profile.isGemini == (item.provider == .gemini))
+            #expect(profile.isOpenRouter == (item.provider == .openRouter))
 
             // Verify backend support matrix matches
             #expect(profile.supportsBackend(.chatCompletions) == item.backends.chatCompletions)
@@ -177,7 +217,7 @@ struct ProviderProfileMatrixTests {
         }
     }
 
-    @Test("all 9 provider profiles round-trip through JSON encoding/decoding")
+    @Test("all 12 provider profiles round-trip through JSON encoding/decoding")
     func verifyProfileSerialization() throws {
         for item in allCases {
             let profile = item.provider.profile
@@ -187,9 +227,9 @@ struct ProviderProfileMatrixTests {
         }
     }
 
-    @Test("registry is exhaustive and contains all 9 providers")
+    @Test("registry is exhaustive and contains all 12 providers")
     func verifyProviderRegistry() {
-        #expect(PROVIDER_REGISTRY.count == 9)
+        #expect(PROVIDER_REGISTRY.count == 12)
         for item in allCases {
             let matching = PROVIDER_REGISTRY.filter { $0.provider == item.provider }
             #expect(matching.count == 1)
@@ -251,10 +291,11 @@ struct HeaderSanitizationTests {
         #expect(headers["x-grok-user-id"] == "user-456")
     }
 
-    @Test("all 8 non-xAI providers strip x-grok headers on sanitize")
+    @Test("all 11 non-xAI providers strip x-grok headers on sanitize")
     func nonXaiProvidersStripXGrokHeaders() {
         let nonXaiProviders: [ModelProvider] = [
             .codex, .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai,
+            .runinfra, .gemini, .openRouter,
         ]
 
         for provider in nonXaiProviders {
@@ -334,7 +375,10 @@ struct HeaderSanitizationTests {
         #expect(codexHeaders.keys.allSatisfy { !$0.hasPrefix("x-grok-") })
 
         // Other providers do not apply x-grok
-        for provider in [ModelProvider.kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai] {
+        for provider in [
+            ModelProvider.kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai,
+            .runinfra, .gemini, .openRouter,
+        ] {
             let adapter = providerAdapter(provider)
             var otherHeaders: [String: String] = [:]
             adapter.applyRequestHeaders(&otherHeaders, request: requestHeaders)
@@ -574,7 +618,7 @@ struct ResponsesDialectPatchingTests {
 
 @Suite("Backend Validation Matrix Tests")
 struct BackendValidationTests {
-    @Test("validateBackend enforces profile capability across all 9 providers")
+    @Test("validateBackend enforces profile capability across all 12 providers")
     func validateBackendAcrossAllProviders() {
         struct TestCase {
             let provider: ModelProvider
@@ -593,6 +637,9 @@ struct BackendValidationTests {
             TestCase(provider: .openCodeGo, chatCompletionsOk: true, responsesOk: false, messagesOk: true),
             TestCase(provider: .wafer, chatCompletionsOk: true, responsesOk: false, messagesOk: false),
             TestCase(provider: .zai, chatCompletionsOk: true, responsesOk: false, messagesOk: false),
+            TestCase(provider: .runinfra, chatCompletionsOk: true, responsesOk: false, messagesOk: false),
+            TestCase(provider: .gemini, chatCompletionsOk: true, responsesOk: false, messagesOk: false),
+            TestCase(provider: .openRouter, chatCompletionsOk: true, responsesOk: false, messagesOk: false),
         ]
 
         for tc in cases {
@@ -758,7 +805,10 @@ struct PromptCachingAndTurnStateTests {
         #expect(providerAdapter(.codex).promptCacheKey(sessionId: "") == nil)
         #expect(providerAdapter(.codex).promptCacheKey(sessionId: nil) == nil)
 
-        for provider in [ModelProvider.xai, .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai] {
+        for provider in [
+            ModelProvider.xai, .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai,
+            .runinfra, .gemini, .openRouter,
+        ] {
             #expect(providerAdapter(provider).promptCacheKey(sessionId: "session-123") == nil, "\(provider) promptCacheKey must be nil")
         }
     }
@@ -769,7 +819,10 @@ struct PromptCachingAndTurnStateTests {
         #expect(providerAdapter(.codex).supportsTurnState(backend: .chatCompletions) == false)
         #expect(providerAdapter(.codex).supportsTurnState(backend: .messages) == false)
 
-        for provider in [ModelProvider.xai, .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai] {
+        for provider in [
+            ModelProvider.xai, .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai,
+            .runinfra, .gemini, .openRouter,
+        ] {
             #expect(providerAdapter(provider).supportsTurnState(backend: .responses) == false, "\(provider) must not support turn state")
         }
     }
@@ -777,7 +830,10 @@ struct PromptCachingAndTurnStateTests {
     @Test("sendsDoomLoopOptIn is true only for xAI (.xGrokHeaders)")
     func sendsDoomLoopOptInBehavior() {
         #expect(providerAdapter(.xai).sendsDoomLoopOptIn == true)
-        for provider in [ModelProvider.codex, .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai] {
+        for provider in [
+            ModelProvider.codex, .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai,
+            .runinfra, .gemini, .openRouter,
+        ] {
             #expect(providerAdapter(provider).sendsDoomLoopOptIn == false, "\(provider) sendsDoomLoopOptIn must be false")
         }
     }
@@ -794,5 +850,8 @@ struct PromptCachingAndTurnStateTests {
         #expect(providerAdapter(.openCodeGo).normalizesResponseEvents == false)
         #expect(providerAdapter(.wafer).normalizesResponseEvents == false)
         #expect(providerAdapter(.zai).normalizesResponseEvents == false)
+        #expect(providerAdapter(.runinfra).normalizesResponseEvents == false)
+        #expect(providerAdapter(.gemini).normalizesResponseEvents == false)
+        #expect(providerAdapter(.openRouter).normalizesResponseEvents == false)
     }
 }

@@ -35,6 +35,12 @@ public protocol ModelCatalogCredentialSnapshot: Sendable {
     var waferCredentialFingerprint: String? { get }
     /// Non-secret digest for Z AI credential isolation.
     var zaiCredentialFingerprint: String? { get }
+    /// Non-secret digest for RunInfra credential isolation.
+    var runinfraCredentialFingerprint: String? { get }
+    /// Non-secret digest for direct Gemini credential isolation.
+    var geminiCredentialFingerprint: String? { get }
+    /// BLAKE3 digest for OpenRouter credential isolation.
+    var openRouterCredentialFingerprint: String? { get }
 }
 
 public extension ModelCatalogCredentialSnapshot {
@@ -45,6 +51,9 @@ public extension ModelCatalogCredentialSnapshot {
     var openCodeGoCredentialFingerprint: String? { nil }
     var waferCredentialFingerprint: String? { nil }
     var zaiCredentialFingerprint: String? { nil }
+    var runinfraCredentialFingerprint: String? { nil }
+    var geminiCredentialFingerprint: String? { nil }
+    var openRouterCredentialFingerprint: String? { nil }
 }
 
 /// Default empty credential snapshot (offline / hermetic tests).
@@ -59,6 +68,9 @@ public struct EmptyCredentialSnapshot: ModelCatalogCredentialSnapshot {
     public var openCodeGoCredentialFingerprint: String?
     public var waferCredentialFingerprint: String?
     public var zaiCredentialFingerprint: String?
+    public var runinfraCredentialFingerprint: String?
+    public var geminiCredentialFingerprint: String?
+    public var openRouterCredentialFingerprint: String?
 
     public init(
         hasXaiSession: Bool = false,
@@ -70,7 +82,10 @@ public struct EmptyCredentialSnapshot: ModelCatalogCredentialSnapshot {
         metaCredentialFingerprint: String? = nil,
         openCodeGoCredentialFingerprint: String? = nil,
         waferCredentialFingerprint: String? = nil,
-        zaiCredentialFingerprint: String? = nil
+        zaiCredentialFingerprint: String? = nil,
+        runinfraCredentialFingerprint: String? = nil,
+        geminiCredentialFingerprint: String? = nil,
+        openRouterCredentialFingerprint: String? = nil
     ) {
         self.hasXaiSession = hasXaiSession
         self.hasCodexSession = hasCodexSession
@@ -82,6 +97,9 @@ public struct EmptyCredentialSnapshot: ModelCatalogCredentialSnapshot {
         self.openCodeGoCredentialFingerprint = openCodeGoCredentialFingerprint
         self.waferCredentialFingerprint = waferCredentialFingerprint
         self.zaiCredentialFingerprint = zaiCredentialFingerprint
+        self.runinfraCredentialFingerprint = runinfraCredentialFingerprint
+        self.geminiCredentialFingerprint = geminiCredentialFingerprint
+        self.openRouterCredentialFingerprint = openRouterCredentialFingerprint
     }
 }
 
@@ -138,6 +156,9 @@ public final class ModelsManager: @unchecked Sendable {
     private var openCodeGoCatalog: OpenCodeGoModelsCatalog?
     private var waferCatalog: WaferModelsCatalog?
     private var zaiCatalog: ZaiModelsCatalog?
+    private var runInfraCatalog: RunInfraModelsCatalog?
+    private var geminiCatalog: GeminiModelsCatalog?
+    private var openRouterCatalog: OpenRouterModelsCatalog?
     private var models: OrderedModelMap
     private var currentModelID: String
     private var currentReasoningEffort: ReasoningEffort?
@@ -272,6 +293,15 @@ public final class ModelsManager: @unchecked Sendable {
 
     public func updateCredentials(_ credentials: any ModelCatalogCredentialSnapshot) {
         lock.lock()
+        if self.credentials.runinfraCredentialFingerprint != credentials.runinfraCredentialFingerprint {
+            runInfraCatalog = nil
+        }
+        if self.credentials.geminiCredentialFingerprint != credentials.geminiCredentialFingerprint {
+            geminiCatalog = nil
+        }
+        if self.credentials.openRouterCredentialFingerprint != credentials.openRouterCredentialFingerprint {
+            openRouterCatalog = nil
+        }
         self.credentials = credentials
         lock.unlock()
         reassemble()
@@ -428,6 +458,58 @@ public final class ModelsManager: @unchecked Sendable {
         return true
     }
 
+    @discardableResult
+    public func applyRunInfraCatalog(_ catalog: RunInfraModelsCatalog?) -> Bool {
+        lock.lock()
+        if let catalog {
+            guard let expected = credentials.runinfraCredentialFingerprint,
+                  catalog.credentialFingerprint == nil
+                    || catalog.credentialFingerprint == expected else {
+                lock.unlock()
+                return false
+            }
+        }
+        runInfraCatalog = catalog
+        lock.unlock()
+        reassemble()
+        reselectAfterFetch(wasFirstFetch: false)
+        return true
+    }
+
+    @discardableResult
+    public func applyGeminiCatalog(_ catalog: GeminiModelsCatalog?) -> Bool {
+        lock.lock()
+        if let catalog {
+            guard let expected = credentials.geminiCredentialFingerprint,
+                  catalog.credentialFingerprint == expected else {
+                lock.unlock()
+                return false
+            }
+        }
+        geminiCatalog = catalog
+        lock.unlock()
+        reassemble()
+        reselectAfterFetch(wasFirstFetch: false)
+        return true
+    }
+
+    @discardableResult
+    public func applyOpenRouterCatalog(_ catalog: OpenRouterModelsCatalog?) -> Bool {
+        lock.lock()
+        if let catalog {
+            guard let expected = credentials.openRouterCredentialFingerprint,
+                  catalog.credentialFingerprint == expected else {
+                lock.unlock()
+                return false
+            }
+        }
+        openRouterCatalog = catalog
+        lock.unlock()
+        reassemble()
+        reselectAfterFetch(wasFirstFetch: false)
+        return true
+    }
+
     /// Drop ONE provider's live catalog partition, report whether anything
     /// was actually dropped, and reselect if the current model vanished.
     ///
@@ -474,6 +556,15 @@ public final class ModelsManager: @unchecked Sendable {
         case .zai:
             hadCatalog = zaiCatalog != nil
             zaiCatalog = nil
+        case .runinfra:
+            hadCatalog = runInfraCatalog != nil
+            runInfraCatalog = nil
+        case .gemini:
+            hadCatalog = geminiCatalog != nil
+            geminiCatalog = nil
+        case .openRouter:
+            hadCatalog = openRouterCatalog != nil
+            openRouterCatalog = nil
         }
         lock.unlock()
         if partition == .codex {
@@ -534,6 +625,30 @@ public final class ModelsManager: @unchecked Sendable {
         lock.withLock { openCodeGoCatalog?.descriptors ?? [] }
     }
 
+    /// OpenRouter models are never selectable until explicitly enabled.
+    public func openRouterEnabledModels() -> [String] {
+        lock.withLock { input.models.openRouterEnabledModels }
+    }
+
+    public func applyOpenRouterEnabledModels(_ enabledModels: [String]) {
+        var enabled = enabledModels
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        enabled.sort()
+        var seen = Set<String>()
+        enabled.removeAll { !seen.insert($0).inserted }
+        lock.lock()
+        input.models.openRouterEnabledModels = enabled
+        lock.unlock()
+        reassemble()
+        reselectAfterFetch(wasFirstFetch: false)
+    }
+
+    /// Settings sees all discovered descriptors even while no models are enabled.
+    public func openRouterDescriptors() -> [OpenRouterModelDescriptor] {
+        lock.withLock { openRouterCatalog?.descriptors ?? [] }
+    }
+
     /// Clear provider-isolated remotes on identity change.
     public func clear(identityChange: Bool = true) {
         lock.lock()
@@ -545,6 +660,10 @@ public final class ModelsManager: @unchecked Sendable {
         metaCatalog = nil
         openCodeGoCatalog = nil
         waferCatalog = nil
+        zaiCatalog = nil
+        runInfraCatalog = nil
+        geminiCatalog = nil
+        openRouterCatalog = nil
         etag = nil
         hasFetchedRealCatalog = false
         lock.unlock()
@@ -646,7 +765,10 @@ public final class ModelsManager: @unchecked Sendable {
             metaCatalog: metaCatalog,
             openCodeGoCatalog: openCodeGoCatalog,
             waferCatalog: waferCatalog,
-            zaiCatalog: zaiCatalog
+            zaiCatalog: zaiCatalog,
+            runInfraCatalog: runInfraCatalog,
+            geminiCatalog: geminiCatalog,
+            openRouterCatalog: openRouterCatalog
         )
         models = assembled
         allowlistExcludesAll = allowlistMatchesNothing(input: input, catalog: assembled)

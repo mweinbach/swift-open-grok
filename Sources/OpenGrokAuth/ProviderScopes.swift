@@ -242,6 +242,107 @@ public func clearOpenCodeGoAPIKey(grokHome: URL) throws {
     try clearScopedAPIKey(grokHome: grokHome, scope: openCodeGoAPIKeyScope)
 }
 
+// MARK: - RunInfra
+
+/// `runinfra::api_key` — RunInfra's OpenAI-compatible model gateway.
+public let runInfraAPIKeyScope = "runinfra::api_key"
+public let runInfraGatewayKeyEnv = "RUNINFRA_GATEWAY_KEY"
+public let runInfraAPIKeyEnv = "RUNINFRA_API_KEY"
+
+/// The official gateway key takes precedence over the compatibility alias.
+public func runInfraAPIKeyFromEnvironment(_ environment: [String: String]) -> String? {
+    firstNonEmptyProviderEnvironmentKey(
+        [runInfraGatewayKeyEnv, runInfraAPIKeyEnv],
+        environment: environment
+    )
+}
+
+public func readRunInfraAPIKey(grokHome: URL) -> String? {
+    readScopedAPIKey(grokHome: grokHome, scope: runInfraAPIKeyScope)
+}
+
+public func runInfraAPIKeyIsConfigured(grokHome: URL) -> Bool {
+    readRunInfraAPIKey(grokHome: grokHome) != nil
+}
+
+public func storeRunInfraAPIKey(grokHome: URL, apiKey: String) throws {
+    try storeScopedAPIKeyTrimming(grokHome: grokHome, scope: runInfraAPIKeyScope, apiKey: apiKey)
+}
+
+public func clearRunInfraAPIKey(grokHome: URL) throws {
+    try clearScopedAPIKey(grokHome: grokHome, scope: runInfraAPIKeyScope)
+}
+
+// MARK: - Google Gemini
+
+/// `gemini::api_key` — Google Gemini API / AI Studio.
+public let geminiAPIKeyScope = "gemini::api_key"
+public let geminiAPIKeyEnv = "GEMINI_API_KEY"
+public let googleAPIKeyEnv = "GOOGLE_API_KEY"
+
+/// Google AI Studio's dedicated key takes precedence over the generic alias.
+public func geminiAPIKeyFromEnvironment(_ environment: [String: String]) -> String? {
+    firstNonEmptyProviderEnvironmentKey(
+        [geminiAPIKeyEnv, googleAPIKeyEnv],
+        environment: environment
+    )
+}
+
+public func readGeminiAPIKey(grokHome: URL) -> String? {
+    readScopedAPIKey(grokHome: grokHome, scope: geminiAPIKeyScope)
+}
+
+public func geminiAPIKeyIsConfigured(grokHome: URL) -> Bool {
+    readGeminiAPIKey(grokHome: grokHome) != nil
+}
+
+public func storeGeminiAPIKey(grokHome: URL, apiKey: String) throws {
+    try storeScopedAPIKeyTrimming(grokHome: grokHome, scope: geminiAPIKeyScope, apiKey: apiKey)
+}
+
+public func clearGeminiAPIKey(grokHome: URL) throws {
+    try clearScopedAPIKey(grokHome: grokHome, scope: geminiAPIKeyScope)
+}
+
+// MARK: - OpenRouter
+
+/// `openrouter::api_key` — OpenRouter's opt-in model gateway.
+public let openRouterAPIKeyScope = "openrouter::api_key"
+public let openRouterAPIKeyEnv = "OPENROUTER_API_KEY"
+
+public func openRouterAPIKeyFromEnvironment(_ environment: [String: String]) -> String? {
+    firstNonEmptyProviderEnvironmentKey([openRouterAPIKeyEnv], environment: environment)
+}
+
+public func readOpenRouterAPIKey(grokHome: URL) -> String? {
+    readScopedAPIKey(grokHome: grokHome, scope: openRouterAPIKeyScope)
+}
+
+public func openRouterAPIKeyIsConfigured(grokHome: URL) -> Bool {
+    readOpenRouterAPIKey(grokHome: grokHome) != nil
+}
+
+public func storeOpenRouterAPIKey(grokHome: URL, apiKey: String) throws {
+    try storeScopedAPIKeyTrimming(grokHome: grokHome, scope: openRouterAPIKeyScope, apiKey: apiKey)
+}
+
+public func clearOpenRouterAPIKey(grokHome: URL) throws {
+    try clearScopedAPIKey(grokHome: grokHome, scope: openRouterAPIKeyScope)
+}
+
+private func firstNonEmptyProviderEnvironmentKey(
+    _ names: [String],
+    environment: [String: String]
+) -> String? {
+    for name in names {
+        guard let value = environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty
+        else { continue }
+        return value
+    }
+    return nil
+}
+
 // MARK: - All Provider Scopes
 
 /// Exhaustive list of non-xAI provider API key scopes in `auth.json`.
@@ -254,6 +355,8 @@ public let allProviderAPIKeyScopes: [String] = [
     openCodeGoAPIKeyScope,
     waferAPIKeyScope,
     zaiAPIKeyScope,
+    runInfraAPIKeyScope,
+    geminiAPIKeyScope,
+    openRouterAPIKeyScope,
     perplexityAPIKeyScope,
 ]
-

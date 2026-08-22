@@ -1,7 +1,8 @@
 // MultiProviderCatalogTests.swift
 //
 // Tests for Multi-Provider Catalog Resolution and Model Metadata in OpenGrokModels.
-// Verifies all 9 providers (.xai, .codex, .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai),
+// Verifies all providers, including independently authenticated RunInfra,
+// Gemini, and explicitly enabled OpenRouter model partitions,
 // environment key resolution, model capabilities, partition filtering, and custom model merging.
 
 import Foundation
@@ -14,13 +15,13 @@ import OpenGrokSamplingTypes
 
 @Suite("Multi-Provider Classification & Resolution")
 struct MultiProviderClassificationTests {
-    @Test func allNineProvidersAreClassifiedAndIdentified() {
+    @Test func allTwelveProvidersAreClassifiedAndIdentified() {
         let providers: [ModelProvider] = [
-            .xai, .codex, .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai
+            .xai, .codex, .kimi, .fireworks, .deepseek, .meta,
+            .openCodeGo, .wafer, .zai, .runinfra, .gemini, .openRouter,
         ]
-        #expect(providers.count == 9)
+        #expect(providers.count == 12)
 
-        // Verify ModelInfo helper flags for all 9 providers
         for provider in providers {
             let info = ModelInfo(
                 model: "\(provider.asString)-test-model",
@@ -37,6 +38,9 @@ struct MultiProviderClassificationTests {
             #expect(info.isOpenCodeGo == (provider == .openCodeGo))
             #expect(info.isWafer == (provider == .wafer))
             #expect(info.isZai == (provider == .zai))
+            #expect(info.isRunInfra == (provider == .runinfra))
+            #expect(info.isGemini == (provider == .gemini))
+            #expect(info.isOpenRouter == (provider == .openRouter))
 
             #expect(entry.isXai == (provider == .xai))
             #expect(entry.isCodex == (provider == .codex))
@@ -47,12 +51,15 @@ struct MultiProviderClassificationTests {
             #expect(entry.isOpenCodeGo == (provider == .openCodeGo))
             #expect(entry.isWafer == (provider == .wafer))
             #expect(entry.isZai == (provider == .zai))
+            #expect(entry.isRunInfra == (provider == .runinfra))
+            #expect(entry.isGemini == (provider == .gemini))
+            #expect(entry.isOpenRouter == (provider == .openRouter))
         }
     }
 
     @Test func modelPartitionKindCoversAllPartitionsAndCustom() {
         let allKinds = ModelPartitionKind.allCases
-        #expect(allKinds.count == 10)
+        #expect(allKinds.count == 13)
         #expect(allKinds.contains(.xai))
         #expect(allKinds.contains(.codex))
         #expect(allKinds.contains(.kimi))
@@ -62,6 +69,9 @@ struct MultiProviderClassificationTests {
         #expect(allKinds.contains(.openCodeGo))
         #expect(allKinds.contains(.wafer))
         #expect(allKinds.contains(.zai))
+        #expect(allKinds.contains(.runinfra))
+        #expect(allKinds.contains(.gemini))
+        #expect(allKinds.contains(.openRouter))
         #expect(allKinds.contains(.custom))
 
         // First-party providers map to expected ModelProvider
@@ -74,12 +84,15 @@ struct MultiProviderClassificationTests {
         #expect(ModelPartitionKind.openCodeGo.provider == .openCodeGo)
         #expect(ModelPartitionKind.wafer.provider == .wafer)
         #expect(ModelPartitionKind.zai.provider == .zai)
+        #expect(ModelPartitionKind.runinfra.provider == .runinfra)
+        #expect(ModelPartitionKind.gemini.provider == .gemini)
+        #expect(ModelPartitionKind.openRouter.provider == .openRouter)
         #expect(ModelPartitionKind.custom.provider == nil)
     }
 
     @Test func modelCatalogPartitionMapsToExpectedProviders() {
         let partitions = ModelCatalogPartition.allCases
-        #expect(partitions.count == 8)
+        #expect(partitions.count == 11)
         #expect(ModelCatalogPartition.codex.provider == .codex)
         #expect(ModelCatalogPartition.kimi.provider == .kimi)
         #expect(ModelCatalogPartition.fireworks.provider == .fireworks)
@@ -88,6 +101,9 @@ struct MultiProviderClassificationTests {
         #expect(ModelCatalogPartition.openCodeGo.provider == .openCodeGo)
         #expect(ModelCatalogPartition.wafer.provider == .wafer)
         #expect(ModelCatalogPartition.zai.provider == .zai)
+        #expect(ModelCatalogPartition.runinfra.provider == .runinfra)
+        #expect(ModelCatalogPartition.gemini.provider == .gemini)
+        #expect(ModelCatalogPartition.openRouter.provider == .openRouter)
 
         // Reverse initializer
         #expect(ModelCatalogPartition(provider: .codex) == .codex)
@@ -98,6 +114,9 @@ struct MultiProviderClassificationTests {
         #expect(ModelCatalogPartition(provider: .openCodeGo) == .openCodeGo)
         #expect(ModelCatalogPartition(provider: .wafer) == .wafer)
         #expect(ModelCatalogPartition(provider: .zai) == .zai)
+        #expect(ModelCatalogPartition(provider: .runinfra) == .runinfra)
+        #expect(ModelCatalogPartition(provider: .gemini) == .gemini)
+        #expect(ModelCatalogPartition(provider: .openRouter) == .openRouter)
         #expect(ModelCatalogPartition(provider: .xai) == nil)
     }
 
@@ -152,7 +171,7 @@ struct MultiProviderClassificationTests {
 
 @Suite("Default Environment Key Resolution")
 struct EnvironmentKeyResolutionTests {
-    @Test func defaultEnvVarNamesForAllNineProviders() {
+    @Test func defaultEnvVarNamesForAllTwelveProviders() {
         #expect(ModelProvider.xai.defaultEnvVarNames == ["XAI_API_KEY"])
         #expect(ModelProvider.codex.defaultEnvVarNames == ["CODEX_API_KEY"])
         #expect(ModelProvider.kimi.defaultEnvVarNames.contains("KIMI_API_KEY"))
@@ -165,6 +184,13 @@ struct EnvironmentKeyResolutionTests {
         #expect(ModelProvider.wafer.defaultEnvVarNames == ["WAFER_API_KEY"])
         #expect(ModelProvider.zai.defaultEnvVarNames.contains("ZAI_API_KEY"))
         #expect(ModelProvider.zai.defaultEnvVarNames.contains("GLM_API_KEY"))
+        #expect(ModelProvider.runinfra.defaultEnvVarNames == [
+            "RUNINFRA_GATEWAY_KEY", "RUNINFRA_API_KEY",
+        ])
+        #expect(ModelProvider.gemini.defaultEnvVarNames == [
+            "GEMINI_API_KEY", "GOOGLE_API_KEY",
+        ])
+        #expect(ModelProvider.openRouter.defaultEnvVarNames == ["OPENROUTER_API_KEY"])
     }
 
     @Test func directKeyResolutionFromEnvironment() {
@@ -178,6 +204,9 @@ struct EnvironmentKeyResolutionTests {
             "OPENCODE_GO_API_KEY": "opencode-go-secret",
             "WAFER_API_KEY": "wafer-secret",
             "ZAI_API_KEY": "zai-secret",
+            "RUNINFRA_GATEWAY_KEY": "runinfra-secret",
+            "GEMINI_API_KEY": "gemini-secret",
+            "OPENROUTER_API_KEY": "openrouter-secret",
         ]
 
         #expect(ModelProvider.xai.resolveEnvironmentKey(environment: env) == "xai-secret")
@@ -189,6 +218,9 @@ struct EnvironmentKeyResolutionTests {
         #expect(ModelProvider.openCodeGo.resolveEnvironmentKey(environment: env) == "opencode-go-secret")
         #expect(ModelProvider.wafer.resolveEnvironmentKey(environment: env) == "wafer-secret")
         #expect(ModelProvider.zai.resolveEnvironmentKey(environment: env) == "zai-secret")
+        #expect(ModelProvider.runinfra.resolveEnvironmentKey(environment: env) == "runinfra-secret")
+        #expect(ModelProvider.gemini.resolveEnvironmentKey(environment: env) == "gemini-secret")
+        #expect(ModelProvider.openRouter.resolveEnvironmentKey(environment: env) == "openrouter-secret")
     }
 
     @Test func aliasKeyFallbackResolution() {
@@ -213,6 +245,21 @@ struct EnvironmentKeyResolutionTests {
 
         let bothOpenCodeEnv = ["OPENCODE_GO_API_KEY": "primary-opencode", "OPENCODE_API_KEY": "fallback-opencode"]
         #expect(ModelProvider.openCodeGo.resolveEnvironmentKey(environment: bothOpenCodeEnv) == "primary-opencode")
+
+        #expect(ModelProvider.runinfra.resolveEnvironmentKey(environment: [
+            "RUNINFRA_API_KEY": "runinfra-alias",
+        ]) == "runinfra-alias")
+        #expect(ModelProvider.runinfra.resolveEnvironmentKey(environment: [
+            "RUNINFRA_GATEWAY_KEY": "runinfra-primary",
+            "RUNINFRA_API_KEY": "runinfra-alias",
+        ]) == "runinfra-primary")
+        #expect(ModelProvider.gemini.resolveEnvironmentKey(environment: [
+            "GOOGLE_API_KEY": "google-alias",
+        ]) == "google-alias")
+        #expect(ModelProvider.gemini.resolveEnvironmentKey(environment: [
+            "GEMINI_API_KEY": "gemini-primary",
+            "GOOGLE_API_KEY": "google-alias",
+        ]) == "gemini-primary")
     }
 
     @Test func partitionEnvironmentKeyResolution() {
@@ -223,6 +270,9 @@ struct EnvironmentKeyResolutionTests {
             "META_API_KEY": "meta-part-key",
             "WAFER_API_KEY": "wafer-part-key",
             "ZAI_API_KEY": "zai-part-key",
+            "RUNINFRA_GATEWAY_KEY": "runinfra-part-key",
+            "GOOGLE_API_KEY": "gemini-part-key",
+            "OPENROUTER_API_KEY": "openrouter-part-key",
         ]
 
         #expect(ModelCatalogPartition.codex.resolveEnvironmentKey(environment: env) == "codex-part-key")
@@ -231,6 +281,9 @@ struct EnvironmentKeyResolutionTests {
         #expect(ModelCatalogPartition.meta.resolveEnvironmentKey(environment: env) == "meta-part-key")
         #expect(ModelCatalogPartition.wafer.resolveEnvironmentKey(environment: env) == "wafer-part-key")
         #expect(ModelCatalogPartition.zai.resolveEnvironmentKey(environment: env) == "zai-part-key")
+        #expect(ModelCatalogPartition.runinfra.resolveEnvironmentKey(environment: env) == "runinfra-part-key")
+        #expect(ModelCatalogPartition.gemini.resolveEnvironmentKey(environment: env) == "gemini-part-key")
+        #expect(ModelCatalogPartition.openRouter.resolveEnvironmentKey(environment: env) == "openrouter-part-key")
     }
 
     @Test func modelEntryOwnOrProviderCredentialResolution() {

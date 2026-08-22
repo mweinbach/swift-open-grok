@@ -723,10 +723,15 @@ actor LiveConversationStore {
                         "text": .string(text),
                     ]),
                 ]
+                var metadata: [String: JSONValue] = [:]
                 if let promptIndex = user.promptIndex {
-                    update["_meta"] = .object([
-                        "promptIndex": .number(.int64(Int64(promptIndex)))
-                    ])
+                    metadata["promptIndex"] = .number(.int64(Int64(promptIndex)))
+                }
+                if user.syntheticReason == .agentMessage {
+                    metadata["hideFromScrollback"] = .bool(true)
+                }
+                if !metadata.isEmpty {
+                    update["_meta"] = .object(metadata)
                 }
                 return try wrap(update)
             }
@@ -1151,14 +1156,21 @@ actor LiveConversationHistory {
     func itemsForTurn(
         sessionID: String,
         prompt: String,
-        schedulerFired: Bool = false
+        schedulerFired: Bool = false,
+        agentMessage: Bool = false
     ) -> [ConversationItem] {
         var items = sessionID == record.sessionID ? record.items : []
-        // A scheduler-fired prompt persists with the turn like any user item,
-        // tagged so compaction/replay/analytics see the cron turn — the port
-        // of `ConversationItem::scheduler_fired` at the same seam
-        // (acp_session_impl/turn.rs:858-860).
-        items.append(schedulerFired ? .schedulerFired(prompt) : .user(prompt))
+        // Peer and team mail must remain model-authored through persistence:
+        // treating either as an ordinary user item would fabricate user
+        // consent (acp_session_impl/turn.rs:871-885). Scheduler messages keep
+        // their separate synthetic origin at that same upstream boundary.
+        if agentMessage {
+            items.append(.agentMessage(prompt))
+        } else if schedulerFired {
+            items.append(.schedulerFired(prompt))
+        } else {
+            items.append(.user(prompt))
+        }
         return items
     }
 
@@ -1453,6 +1465,10 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         // the next turn, never to half of this one.
         let active = await modelSwitch.snapshot()
         let sampler = active.sampler
+        let activeToolSurface = LiveCodeModeToolSurface(
+            mode: toolSurface.mode,
+            baseTools: toolExecutor.currentToolSpecs()
+        )
         var items = await conversationHistory.itemsForTurn(
             sessionID: context.sessionID,
             prompt: request.text,
@@ -1461,7 +1477,8 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             // runtime adapter stamps `scheduler-fired-` on cron turns.
             schedulerFired: request.promptID.hasPrefix(
                 OpenGrokPagerInteractiveController.schedulerFiredPromptIDPrefix
-            )
+            ),
+            agentMessage: request.isAgentMessage
         )
         let combinedSystemPrompt = [systemPrompt, skillsListing]
             .compactMap { value in
@@ -1502,10 +1519,10 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         var structuredCoordinator = StructuredOutputTurnCoordinator(
             schema: request.jsonSchema,
             backend: active.configuration.apiBackend,
-            codeModeOnly: toolSurface.mode == .codeModeOnly
+            codeModeOnly: activeToolSurface.mode == .codeModeOnly
         )
         let (advertisedTools, structuredReminder, nativeSchema) = structuredCoordinator.prepareRequest(
-            tools: toolSurface.modelTools
+            tools: activeToolSurface.modelTools
         )
         if let structuredReminder {
             items.append(.user(wrapSystemReminder(structuredReminder)))
@@ -1586,8 +1603,24 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                                 await emit(.assistantText(text))
                             case .status(let status):
                                 await emit(.status(status))
+                            case .responseStarted(
+                                let messageID,
+                                let model,
+                                let inputTokens,
+                                let cacheReadInputTokens,
+                                let cacheCreationInputTokens
+                            ):
+                                await emit(.responseStarted(
+                                    messageID: messageID,
+                                    model: model,
+                                    inputTokens: inputTokens,
+                                    cacheReadInputTokens: cacheReadInputTokens,
+                                    cacheCreationInputTokens: cacheCreationInputTokens
+                                ))
                             case .reasoning(let text):
                                 await emit(.reasoning(text))
+                            case .reasoningCompleted(let signature):
+                                await emit(.reasoningCompleted(signature: signature))
                             case .toolCallDelta(
                                 let toolIndex, let id, let name, let argumentsDelta
                             ):
@@ -1726,9 +1759,8 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                             structuredErr = e
                         }
                     }
-                    return OpenGrokShellSamplingResult(
-                        output: response.output,
-                        stopReason: response.stopReason,
+                    return makeSamplingResult(
+                        from: response,
                         structuredOutput: structuredVal,
                         structuredOutputError: structuredErr
                     )
@@ -1760,9 +1792,8 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                         if case .failure(let e) = result { return e }
                         return nil
                     }()
-                    return OpenGrokShellSamplingResult(
-                        output: response.output,
-                        stopReason: response.stopReason,
+                    return makeSamplingResult(
+                        from: response,
                         structuredOutput: val,
                         structuredOutputError: err
                     )
@@ -1800,8 +1831,8 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                             sessionID: context.sessionID,
                             items: items
                         )
-                        return OpenGrokShellSamplingResult(
-                            output: response.output,
+                        return makeSamplingResult(
+                            from: response,
                             stopReason: "max_turns_reached"
                         )
                     }
@@ -1827,6 +1858,37 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             )
             throw error
         }
+    }
+
+    private func makeSamplingResult(
+        from response: OpenGrokLiveSamplingResponse,
+        stopReason: String? = nil,
+        structuredOutput: JSONValue? = nil,
+        structuredOutputError: String? = nil
+    ) -> OpenGrokShellSamplingResult {
+        let promptTokens = UInt64(response.usage?.promptTokens ?? 0)
+        let cacheReadInputTokens = UInt64(response.usage?.cachedPromptTokens ?? 0)
+        let cacheCreationInputTokens = UInt64(response.usage?.cacheCreationPromptTokens ?? 0)
+        let cachedInputTokens = cacheReadInputTokens + cacheCreationInputTokens
+        // The neutral usage ledger combines all prompt buckets; Messages
+        // requires its uncached input bucket separately from cache reads/writes.
+        let inputTokens = promptTokens >= cachedInputTokens
+            ? promptTokens - cachedInputTokens
+            : 0
+
+        return OpenGrokShellSamplingResult(
+            output: response.output,
+            stopReason: stopReason ?? response.stopReason,
+            structuredOutput: structuredOutput,
+            structuredOutputError: structuredOutputError,
+            messageID: response.messageID,
+            rawStopReason: response.rawStopReason,
+            stopSequence: response.stopSequence,
+            inputTokens: inputTokens,
+            outputTokens: UInt64(response.usage?.completionTokens ?? 0),
+            cacheReadInputTokens: cacheReadInputTokens,
+            cacheCreationInputTokens: cacheCreationInputTokens
+        )
     }
 
     /// Map a thrown turn error to upstream's `StopFailureKind` snake_case

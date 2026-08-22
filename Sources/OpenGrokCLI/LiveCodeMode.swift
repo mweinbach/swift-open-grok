@@ -57,7 +57,10 @@ let LIVE_CODE_MODE_DIRECT_ONLY_TOOLS: Set<String> = [
     "list_agents",
     "send_message",
     "followup_task",
-    "wait_agent"
+    "wait_agent",
+    "list_sessions",
+    "read_session",
+    "message_session",
 ]
 
 func isLiveCodeModeDirectOnlyTool(_ name: String) -> Bool {
@@ -484,6 +487,54 @@ private final class OneShotBox<Value: Sendable>: @unchecked Sendable {
     }
 }
 
+/// A persistent JavaScript VM must not capture the first turn's MCP roster.
+/// The request advertises a per-turn snapshot, while every callback checks
+/// the current live surface again so a removed server fails closed immediately.
+private struct LiveDynamicCodeModeDelegate: CodeModeSessionDelegate {
+    let executor: LiveCodeModeNestedExecutor
+    let toolExecutor: LiveToolExecutor
+    let mode: ToolModePreference
+
+    func invokeTool(
+        _ invocation: CodeModeNestedToolCall,
+        cancellationToken: CodeModeCancellationToken,
+        progress: NestedToolProgressSink
+    ) async -> Result<JSONValue, CodeModeError> {
+        let snapshot = LiveCodeModeToolSurface(
+            mode: mode,
+            baseTools: toolExecutor.currentToolSpecs()
+        ).snapshot
+        guard snapshot.definition(for: invocation.toolName) != nil else {
+            return .failure(
+                CodeModeError("unknown code mode tool `\(invocation.toolName)`")
+            )
+        }
+        return await executor.executeNestedTool(
+            invocation,
+            cancellationToken: cancellationToken,
+            progress: progress
+        )
+    }
+
+    func notify(
+        callId: String,
+        cellId: CellId,
+        text: String,
+        cancellationToken: CodeModeCancellationToken
+    ) async -> Result<Void, CodeModeError> {
+        await executor.deliverNotification(
+            callId: callId,
+            cellId: cellId,
+            text: text,
+            cancellationToken: cancellationToken
+        )
+    }
+
+    func cellClosed(_ cellId: CellId) {
+        executor.cellDidClose(cellId)
+    }
+}
+
 // MARK: - The coordinator
 
 /// Owns one code-mode session for the life of an agent timeline: it answers
@@ -496,12 +547,14 @@ actor LiveCodeModeCoordinator {
     private let sessionID: String
     private let workingDirectory: URL
     private let executor: LiveCodeModeNestedExecutor
+    private let toolExecutor: LiveToolExecutor
     private let emitter: LiveCodeModeEmitter
     private let notifications: LiveCodeModeNotifications
     /// `nil` keeps the engine's default per-entry ceiling.
     private let executionCeilingMs: UInt64?
 
     private var session: InProcessCodeModeSession?
+    private var activeSnapshot: CodeModeToolRegistrySnapshot
     private var liveCells: Set<CellId> = []
     private var isShutDown = false
 
@@ -515,8 +568,10 @@ actor LiveCodeModeCoordinator {
         let emitter = LiveCodeModeEmitter()
         let notifications = LiveCodeModeNotifications()
         self.surface = surface
+        self.activeSnapshot = surface.snapshot
         self.sessionID = sessionID
         self.workingDirectory = workingDirectory
+        self.toolExecutor = toolExecutor
         self.emitter = emitter
         self.notifications = notifications
         self.executionCeilingMs = executionCeilingMs
@@ -538,6 +593,10 @@ actor LiveCodeModeCoordinator {
     // MARK: Turn lifecycle
 
     func beginTurn(emit: @escaping LiveCodeModeEmitter.Sink) async {
+        activeSnapshot = LiveCodeModeToolSurface(
+            mode: surface.mode,
+            baseTools: toolExecutor.currentToolSpecs()
+        ).snapshot
         await emitter.attach(emit)
     }
 
@@ -617,7 +676,7 @@ actor LiveCodeModeCoordinator {
 
         let request = ExecuteRequest(
             toolCallId: call.callId,
-            enabledTools: surface.snapshot.executeRequestTools,
+            enabledTools: activeSnapshot.executeRequestTools,
             source: parsed.code,
             yieldTimeMs: parsed.yieldTimeMs ?? LIVE_CODE_MODE_EXEC_YIELD_TIME_MS,
             maxOutputTokens: parsed.maxOutputTokens
@@ -670,18 +729,19 @@ actor LiveCodeModeCoordinator {
 
     private func currentSession() -> InProcessCodeModeSession {
         if let session { return session }
+        let delegate = LiveDynamicCodeModeDelegate(
+            executor: executor,
+            toolExecutor: toolExecutor,
+            mode: surface.mode
+        )
         let created: InProcessCodeModeSession
         if let executionCeilingMs {
             created = InProcessCodeModeSession(
-                executor: executor,
-                snapshot: surface.snapshot,
+                delegate: delegate,
                 executionCeilingMs: executionCeilingMs
             )
         } else {
-            created = InProcessCodeModeSession(
-                executor: executor,
-                snapshot: surface.snapshot
-            )
+            created = InProcessCodeModeSession(delegate: delegate)
         }
         session = created
         return created

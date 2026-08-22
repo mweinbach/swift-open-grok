@@ -55,12 +55,16 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
     case openCodeGo
     case wafer
     case zai
+    case runinfra
+    case gemini
+    case openRouter = "openrouter"
 
     public static let defaultValue: ModelProvider = .xai
 
     public enum CodingKeys: String, CodingKey {
-        case xai, codex, kimi, fireworks, deepseek, meta, wafer, zai
+        case xai, codex, kimi, fireworks, deepseek, meta, wafer, zai, runinfra, gemini
         case openCodeGo = "opencode_go"
+        case openRouter = "openrouter"
     }
 
     public init(from decoder: Decoder) throws {
@@ -76,6 +80,10 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
         case "opencode_go", "opencode-go": self = .openCodeGo
         case "wafer", "wafer_ai": self = .wafer
         case "zai", "z_ai", "z-ai", "zai_api", "glm": self = .zai
+        case "runinfra", "run_infra", "run-infra": self = .runinfra
+        case "gemini", "google", "google_gemini", "ai_studio", "aistudio", "gemini_api":
+            self = .gemini
+        case "openrouter", "open_router", "open-router": self = .openRouter
         default:
             throw DecodingError.dataCorruptedError(
                 in: container,
@@ -101,6 +109,9 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
         case .openCodeGo: return "opencode_go"
         case .wafer: return "wafer"
         case .zai: return "zai"
+        case .runinfra: return "runinfra"
+        case .gemini: return "gemini"
+        case .openRouter: return "openrouter"
         }
     }
 
@@ -116,6 +127,9 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
         case .openCodeGo: return "OpenCode Go"
         case .wafer: return "Wafer AI"
         case .zai: return "Z AI"
+        case .runinfra: return "RunInfra"
+        case .gemini: return "Google Gemini"
+        case .openRouter: return "OpenRouter"
         }
     }
 
@@ -128,6 +142,9 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
     public var isOpenCodeGo: Bool { self == .openCodeGo }
     public var isWafer: Bool { self == .wafer }
     public var isZai: Bool { self == .zai }
+    public var isRuninfra: Bool { self == .runinfra }
+    public var isGemini: Bool { self == .gemini }
+    public var isOpenRouter: Bool { self == .openRouter }
 
     /// Return the built-in provider's complete behavior policy.
     public var profile: ProviderProfile {
@@ -141,6 +158,9 @@ public enum ModelProvider: String, Codable, Sendable, Equatable, Hashable, Defau
         case .openCodeGo: return .openCodeGo
         case .wafer: return .wafer
         case .zai: return .zai
+        case .runinfra: return .runinfra
+        case .gemini: return .gemini
+        case .openRouter: return .openRouter
         }
     }
 }
@@ -345,6 +365,9 @@ public struct ProviderProfile: Codable, Sendable, Equatable, Hashable {
     public var isOpenCodeGo: Bool { provider.isOpenCodeGo }
     public var isWafer: Bool { provider.isWafer }
     public var isZai: Bool { provider.isZai }
+    public var isRuninfra: Bool { provider.isRuninfra }
+    public var isGemini: Bool { provider.isGemini }
+    public var isOpenRouter: Bool { provider.isOpenRouter }
     public var allowsXaiServices: Bool { xaiServices.allows }
     public var hasNativeWebSearch: Bool { nativeWebSearch }
     public var responsesDialect: ResponsesDialect? { backends.responses }
@@ -461,6 +484,46 @@ public struct ProviderProfile: Codable, Sendable, Equatable, Hashable {
     /// hosted tools, web search, Responses, or provider-managed OAuth.
     public static let zai = ProviderProfile(
         provider: .zai,
+        backends: ProviderBackends(chatCompletions: true, responses: nil, messages: false),
+        codeModeTransport: .unsupported,
+        hostedToolDialect: nil,
+        nativeWebSearch: false,
+        requestMetadata: .standardHeadersOnly,
+        sessionAuth: .apiKeyOnly,
+        xaiServices: .denied
+    )
+
+    /// RunInfra's hosted models accept ordinary Chat Completions function
+    /// tools. Its `/v1/responses` compatibility adapter is not a first-class
+    /// Responses dialect and must not expose provider-hosted tools.
+    public static let runinfra = ProviderProfile(
+        provider: .runinfra,
+        backends: ProviderBackends(chatCompletions: true, responses: nil, messages: false),
+        codeModeTransport: .unsupported,
+        hostedToolDialect: nil,
+        nativeWebSearch: false,
+        requestMetadata: .standardHeadersOnly,
+        sessionAuth: .apiKeyOnly,
+        xaiServices: .denied
+    )
+
+    /// Google Gemini / AI Studio exposes only its OpenAI-compatible Chat
+    /// Completions surface here; native Gemini tools and auth are separate.
+    public static let gemini = ProviderProfile(
+        provider: .gemini,
+        backends: ProviderBackends(chatCompletions: true, responses: nil, messages: false),
+        codeModeTransport: .unsupported,
+        hostedToolDialect: nil,
+        nativeWebSearch: false,
+        requestMetadata: .standardHeadersOnly,
+        sessionAuth: .apiKeyOnly,
+        xaiServices: .denied
+    )
+
+    /// OpenRouter's explicitly enabled catalog uses provider-owned API keys
+    /// and Chat Completions, never hosted search, Responses, or xAI exports.
+    public static let openRouter = ProviderProfile(
+        provider: .openRouter,
         backends: ProviderBackends(chatCompletions: true, responses: nil, messages: false),
         codeModeTransport: .unsupported,
         hostedToolDialect: nil,

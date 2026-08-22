@@ -141,7 +141,9 @@ public enum LiveServeComposition {
                     promptDriver: promptDriver,
                     workspaceBoundary: boundary,
                     extensionHandler: launchComponents.extensionHandler,
-                    extensionNotifications: launchComponents.extensionNotifications
+                    extensionNotifications: launchComponents.extensionNotifications,
+                    onSessionOpened: launchComponents.onSessionOpened,
+                    onSessionClosed: launchComponents.onSessionClosed
                 )
                 // Re-attached per accepted connection: the serve host mints a
                 // runtime per client, and the gateway's emitters must follow

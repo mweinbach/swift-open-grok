@@ -597,8 +597,24 @@ private struct ParityLiveTurnDriver: OpenGrokShellSamplingDriver, Sendable {
                 await emit(.assistantText(output))
             case .status(let status):
                 await emit(.status(status))
+            case .responseStarted(
+                let messageID,
+                let model,
+                let inputTokens,
+                let cacheReadInputTokens,
+                let cacheCreationInputTokens
+            ):
+                await emit(.responseStarted(
+                    messageID: messageID,
+                    model: model,
+                    inputTokens: inputTokens,
+                    cacheReadInputTokens: cacheReadInputTokens,
+                    cacheCreationInputTokens: cacheCreationInputTokens
+                ))
             case .reasoning(let text):
                 await emit(.reasoning(text))
+            case .reasoningCompleted(let signature):
+                await emit(.reasoningCompleted(signature: signature))
             case .toolCallDelta(let toolIndex, let id, let name, let argumentsDelta):
                 await emit(.toolCallDelta(
                     toolIndex: toolIndex, id: id, name: name, argumentsDelta: argumentsDelta

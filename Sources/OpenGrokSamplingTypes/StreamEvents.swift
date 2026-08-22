@@ -365,21 +365,29 @@ public struct StopDetails: Codable, Sendable, Equatable, Hashable {
 public struct MessageDeltaBody: Codable, Sendable, Equatable, Hashable {
     public var stopReason: MessagesStopReason?
     public var stopDetails: StopDetails?
+    public var stopSequence: String?
 
-    public init(stopReason: MessagesStopReason? = nil, stopDetails: StopDetails? = nil) {
+    public init(
+        stopReason: MessagesStopReason? = nil,
+        stopDetails: StopDetails? = nil,
+        stopSequence: String? = nil
+    ) {
         self.stopReason = stopReason
         self.stopDetails = stopDetails
+        self.stopSequence = stopSequence
     }
 
     public enum CodingKeys: String, CodingKey {
         case stopReason = "stop_reason"
         case stopDetails = "stop_details"
+        case stopSequence = "stop_sequence"
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.stopReason = try c.decodeIfPresent(MessagesStopReason.self, forKey: .stopReason)
         self.stopDetails = try c.decodeIfPresent(StopDetails.self, forKey: .stopDetails)
+        self.stopSequence = try c.decodeIfPresent(String.self, forKey: .stopSequence)
     }
 }
 

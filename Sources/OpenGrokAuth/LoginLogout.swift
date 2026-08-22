@@ -27,6 +27,12 @@ public enum AuthAccountTarget: String, Sendable, Equatable, Hashable, CaseIterab
     case wafer
     /// `open-grok login --zai` / `logout --zai`.
     case zai
+    /// `open-grok login --runinfra` / `logout --runinfra`.
+    case runinfra
+    /// `open-grok login --gemini` / `logout --gemini`.
+    case gemini
+    /// `open-grok login --openrouter` / `logout --openrouter`.
+    case openRouter = "openrouter"
     /// `logout --all` — both stores and all provider scopes independently.
     case all
 
@@ -41,6 +47,10 @@ public enum AuthAccountTarget: String, Sendable, Equatable, Hashable, CaseIterab
         case "opencode_go", "opencode-go", "opencodego": self = .openCodeGo
         case "wafer": self = .wafer
         case "zai": self = .zai
+        case "runinfra", "run_infra", "run-infra": self = .runinfra
+        case "gemini", "google", "google_gemini", "google-gemini", "ai_studio", "ai-studio",
+             "aistudio", "gemini_api", "gemini-api": self = .gemini
+        case "openrouter", "open_router", "open-router": self = .openRouter
         case "all": self = .all
         default: return nil
         }
@@ -540,6 +550,18 @@ public func logout(
     case .zai:
         try clearZaiAPIKey(grokHome: resolvedGrokHome)
         result.removedScopes = [zaiAPIKeyScope]
+
+    case .runinfra:
+        try clearRunInfraAPIKey(grokHome: resolvedGrokHome)
+        result.removedScopes = [runInfraAPIKeyScope]
+
+    case .gemini:
+        try clearGeminiAPIKey(grokHome: resolvedGrokHome)
+        result.removedScopes = [geminiAPIKeyScope]
+
+    case .openRouter:
+        try clearOpenRouterAPIKey(grokHome: resolvedGrokHome)
+        result.removedScopes = [openRouterAPIKeyScope]
 
     case .all:
         if let manager {

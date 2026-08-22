@@ -1477,6 +1477,9 @@ public enum CLICommandParser {
         case "--cwd": common.cwd = try cursor.value(for: option)
         case "--model", "-m": common.model = try cursor.value(for: option)
         case "--provider": common.provider = try cursor.value(for: option)
+        case "--runinfra": common.provider = "runinfra"
+        case "--gemini", "--google": common.provider = "gemini"
+        case "--openrouter": common.provider = "openrouter"
         case "--profile", "--agent-profile": common.profile = try cursor.value(for: option)
         case "--plugin-dir": common.pluginDirectories.append(try cursor.value(for: option))
         case "--mcp-config": common.mcpConfig = try cursor.value(for: option)

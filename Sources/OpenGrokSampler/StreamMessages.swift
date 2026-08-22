@@ -30,6 +30,19 @@ private func saturatingMessageTokenSum(_ lhs: UInt32, _ rhs: UInt32) -> UInt32 {
     return overflow ? .max : sum
 }
 
+private func messagesStopReasonWire(_ reason: MessagesStopReason) -> String {
+    switch reason {
+    case .endTurn: "end_turn"
+    case .maxTokens: "max_tokens"
+    case .toolUse: "tool_use"
+    case .stopSequence: "stop_sequence"
+    case .refusal: "refusal"
+    case .pauseTurn: "pause_turn"
+    case .modelContextWindowExceeded: "model_context_window_exceeded"
+    case .unknown(let raw): raw
+    }
+}
+
 /// Transform a raw Anthropic Messages stream into ``SamplingEvent``s.
 public func streamMessages(
     rawStream: AsyncStream<Result<MessageStreamEvent, SamplingError>>,
@@ -58,6 +71,9 @@ public func streamMessages(
             var finalOutputTokens: UInt32 = 0
             var finalStopReason: StopReason?
             var finalStopMessage: String?
+            var finalMessageID: String?
+            var finalRawStopReason: String?
+            var finalStopSequence: String?
 
             var assistantText = ""
             var assistantToolCalls: [ToolCall] = []
@@ -112,10 +128,19 @@ public func streamMessages(
 
                 switch event {
                 case .messageStart(let message):
+                    finalMessageID = message.id
                     finalModel = message.model
                     finalInputTokens = message.usage.inputTokens
                     finalCacheRead = message.usage.cacheReadInputTokens
                     finalCacheCreation = message.usage.cacheCreationInputTokens
+                    continuation.yield(.responseStarted(
+                        requestId: requestId,
+                        messageID: message.id,
+                        model: message.model,
+                        inputTokens: UInt64(message.usage.inputTokens),
+                        cacheReadInputTokens: UInt64(message.usage.cacheReadInputTokens),
+                        cacheCreationInputTokens: UInt64(message.usage.cacheCreationInputTokens)
+                    ))
 
                 case .contentBlockStart(let index, let contentBlock):
                     switch contentBlock {
@@ -203,7 +228,7 @@ public func streamMessages(
                             ))
                         }
                     case .signatureDelta(let signature):
-                        state.signature += signature
+                        state.signature = signature
                     }
                     blocks[index] = state
 
@@ -218,6 +243,12 @@ public func streamMessages(
                             assistantText += state.textAcc
                         }
                     case .thinking:
+                        if !state.signature.isEmpty {
+                            continuation.yield(.reasoningCompleted(
+                                requestId: requestId,
+                                signature: state.signature
+                            ))
+                        }
                         if !state.thinkingAcc.isEmpty || !state.signature.isEmpty {
                             let summary: [SummaryPart] = state.thinkingAcc.isEmpty
                                 ? []
@@ -254,6 +285,13 @@ public func streamMessages(
                     if let input = usage.inputTokens { finalInputTokens = input }
                     if let cacheRead = usage.cacheReadInputTokens { finalCacheRead = cacheRead }
                     if let cacheCreate = usage.cacheCreationInputTokens { finalCacheCreation = cacheCreate }
+                    finalRawStopReason = delta.stopReason.map(messagesStopReasonWire)
+                    if let stopSequence = delta.stopSequence {
+                        finalStopSequence = stopSequence
+                    }
+                    if let stopDetails = delta.stopDetails {
+                        finalStopMessage = stopDetails.explanation
+                    }
 
                     if let stop = delta.stopReason {
                         switch stop {
@@ -265,7 +303,6 @@ public func streamMessages(
                             finalStopReason = .toolCalls
                         case .refusal:
                             finalStopReason = .contentFilter
-                            finalStopMessage = delta.stopDetails?.explanation
                         case .modelContextWindowExceeded:
                             continuation.yield(.failed(
                                 requestId: requestId,
@@ -333,14 +370,16 @@ public func streamMessages(
                 saturatingMessageTokenSum(finalInputTokens, finalCacheRead),
                 finalCacheCreation
             )
-            let usage = TokenUsage(
-                promptTokens: promptTokens,
-                completionTokens: finalOutputTokens,
-                totalTokens: saturatingMessageTokenSum(promptTokens, finalOutputTokens),
-                reasoningTokens: 0,
-                cachedPromptTokens: finalCacheRead,
-                cacheCreationPromptTokens: finalCacheCreation
-            )
+            let usage: TokenUsage? = promptTokens > 0 || finalOutputTokens > 0
+                ? TokenUsage(
+                    promptTokens: promptTokens,
+                    completionTokens: finalOutputTokens,
+                    totalTokens: saturatingMessageTokenSum(promptTokens, finalOutputTokens),
+                    reasoningTokens: 0,
+                    cachedPromptTokens: finalCacheRead,
+                    cacheCreationPromptTokens: finalCacheCreation
+                )
+                : nil
 
             let metrics = InferenceLatencyStats.fromTimestamps(
                 streamStart: streamStart,
@@ -353,7 +392,10 @@ public func streamMessages(
                 stopReason: finalStopReason ?? .stop,
                 usage: usage,
                 messageChunksEmitted: messageChunkCount,
-                stopMessage: finalStopMessage
+                stopMessage: finalStopMessage,
+                messageID: finalMessageID,
+                rawStopReason: finalRawStopReason,
+                stopSequence: finalStopSequence
             )
             continuation.yield(.completed(requestId: requestId, response: response, metrics: metrics))
             continuation.finish()

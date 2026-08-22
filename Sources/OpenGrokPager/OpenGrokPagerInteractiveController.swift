@@ -1987,8 +1987,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             terminalLifecycle = .completed
                         case .cancelled:
                             terminalLifecycle = .cancelled
-                        case .lifecycle, .output, .status, .tool, .reasoning, .toolCallDelta,
-                             .retrying, .samplingFailed, .permissionRequested:
+                        case .lifecycle, .output, .status, .tool, .responseStarted, .reasoning,
+                             .reasoningCompleted, .toolCallDelta, .retrying, .samplingFailed,
+                             .permissionRequested, .responseCompleted:
                             continue
                         }
                         let result = OpenGrokPagerRuntimeResult(
@@ -3439,8 +3440,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         // in the argument phase.
         PagerCommandDefinition(
             name: "login",
-            summary: "Connect xAI, OpenAI Codex, Kimi, Fireworks AI, DeepSeek, Meta API, Wafer AI, or OpenCode Go",
-            usage: "/login [xai|codex|kimi|fireworks|deepseek|meta|wafer|opencode-go]"
+            summary: "Connect xAI, OpenAI Codex, Kimi, Fireworks AI, DeepSeek, Meta API, Wafer AI, Z AI, RunInfra, Google Gemini, OpenCode Go, or OpenRouter",
+            usage: "/login [xai|codex|kimi|fireworks|deepseek|meta|wafer|zai|runinfra|gemini|opencode-go|openrouter]"
         ),
         PagerCommandDefinition(
             name: "logout",
@@ -5152,8 +5153,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         switch event {
         case .completed, .cancelled:
             return true
-        case .lifecycle, .output, .status, .tool, .reasoning, .toolCallDelta,
-             .retrying, .samplingFailed, .permissionRequested:
+        case .lifecycle, .output, .status, .tool, .responseStarted, .reasoning,
+             .reasoningCompleted, .toolCallDelta, .retrying, .samplingFailed,
+             .permissionRequested, .responseCompleted:
             return false
         }
     }
