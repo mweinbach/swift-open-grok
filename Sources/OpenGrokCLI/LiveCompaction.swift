@@ -113,6 +113,65 @@ private func withCompactionTimeout<T: Sendable>(
     }
 }
 
+/// Direct Codex compaction bypasses the sampler's captured-credential gate.
+/// Install this below auth-retry middleware so every original or refreshed
+/// wire attempt checks the exact generation that issued its bearer.
+struct LiveCodexCompactionCredentialTransport: HTTPTransport, Sendable {
+    let transport: any HTTPTransport
+    let snapshot: LiveModelSwitchCoordinator.Snapshot
+
+    func send(_ request: HTTPRequest) async throws -> HTTPResponse {
+        try snapshot.requireValidCredential()
+        return try await transport.send(request)
+    }
+
+    func stream(_ request: HTTPRequest) -> AsyncThrowingStream<HTTPStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    try Task.checkCancellation()
+                    try snapshot.requireValidCredential()
+                    for try await event in transport.stream(request) {
+                        try Task.checkCancellation()
+                        continuation.yield(event)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}
+
+func liveCredentialGuardedCompactionConfiguration(
+    snapshot: LiveModelSwitchCoordinator.Snapshot
+) -> OpenGrokLiveSamplingConfiguration {
+    let configuration = snapshot.configuration
+    guard snapshot.provider == .codex else { return configuration }
+
+    return OpenGrokLiveSamplingConfiguration(
+        model: configuration.model,
+        baseURL: configuration.baseURL,
+        apiKey: configuration.apiKey,
+        provider: configuration.provider,
+        apiBackend: configuration.apiBackend,
+        extraHeaders: configuration.extraHeaders,
+        queryParams: configuration.queryParams,
+        environment: configuration.environment,
+        tuning: configuration.tuning,
+        doomLoopRecovery: configuration.doomLoopRecovery,
+        codexPermissions: configuration.codexPermissions,
+        bearerResolver: configuration.bearerResolver,
+        credentialProvider: configuration.credentialProvider,
+        transport: LiveCodexCompactionCredentialTransport(
+            transport: configuration.transport ?? URLSessionHTTPTransport(),
+            snapshot: snapshot
+        )
+    )
+}
+
 /// Everything about the active model that compaction depends on, resolved from
 /// the embedded catalog plus, for Codex, the on-disk catalog cache.
 struct LiveCompactionContract: Sendable, Equatable {
@@ -758,7 +817,7 @@ actor LiveCompactionCoordinator {
                 sessionID: sessionID
             ),
             codexTransport: makeCodexTransport(
-                snapshot.configuration,
+                liveCredentialGuardedCompactionConfiguration(snapshot: snapshot),
                 requestPolicy,
                 cacheAffinityID,
                 codexTurnState
