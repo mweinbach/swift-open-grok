@@ -46,7 +46,22 @@
 // `find_protoc_include_dir`, and a default `ProtoBuilder` that performs real
 // `protoc` invocation and descriptor-set emission.
 
+import Dispatch
 import Foundation
+
+private func runProtoProcessToTermination(_ process: Process) throws {
+    let finished = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in finished.signal() }
+
+    do {
+        try process.run()
+    } catch {
+        process.terminationHandler = nil
+        throw error
+    }
+
+    finished.wait()
+}
 
 /// Discovery and compilation contract for Open Grok protocol generation.
 ///
@@ -263,11 +278,10 @@ public struct DefaultProtoCompiler: ProtoCompiler {
         process.standardOutput = pipe
         process.standardError = pipe
         do {
-            try process.run()
+            try runProtoProcessToTermination(process)
         } catch {
             return false
         }
-        process.waitUntilExit()
         return process.terminationStatus == 0
     }
 
@@ -778,13 +792,12 @@ extension ProtoBuilder {
             process.standardOutput = stdoutPipe
             process.standardError = stderrPipe
             do {
-                try process.run()
+                try runProtoProcessToTermination(process)
             } catch {
                 throw ProtoBuildError.invocationFailed(
                     "protoc command failed to launch: \(error.localizedDescription)"
                 )
             }
-            process.waitUntilExit()
             if process.terminationStatus != 0 {
                 let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
                 let stderr = String(data: stderrData, encoding: .utf8) ?? ""
@@ -836,13 +849,12 @@ extension ProtoBuilder {
         process.standardOutput = Pipe()
         process.standardError = stderrPipe
         do {
-            try process.run()
+            try runProtoProcessToTermination(process)
         } catch {
             throw ProtoBuildError.invocationFailed(
                 "protoc command failed to launch: \(error.localizedDescription)"
             )
         }
-        process.waitUntilExit()
         if process.terminationStatus != 0 {
             let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
             let stderr = String(data: stderrData, encoding: .utf8) ?? ""

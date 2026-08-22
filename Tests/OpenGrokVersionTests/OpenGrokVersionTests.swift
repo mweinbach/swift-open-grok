@@ -6,9 +6,24 @@
 // add coverage for the minimal semver parser, the `GROK_TEST_VERSION` runtime
 // override, and the Open Grok prerelease format `0.1.220-open-grok.58`.
 
+import Dispatch
 import Foundation
 import Testing
 @testable import OpenGrokVersion
+
+private func runVersionFixtureProcessToTermination(_ process: Process) throws {
+    let finished = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in finished.signal() }
+
+    do {
+        try process.run()
+    } catch {
+        process.terminationHandler = nil
+        throw error
+    }
+
+    finished.wait()
+}
 
 @Suite("OpenGrokVersion")
 struct OpenGrokVersionTests {
@@ -465,8 +480,7 @@ struct OpenGrokVersionTests {
             let pipe = Pipe()
             process.standardOutput = pipe
             process.standardError = pipe
-            try process.run()
-            process.waitUntilExit()
+            try runVersionFixtureProcessToTermination(process)
             let outputData = pipe.fileHandleForReading.readDataToEndOfFile()
             let output = String(data: outputData, encoding: .utf8) ?? ""
             #expect(process.terminationStatus == 0,
@@ -561,8 +575,7 @@ struct OpenGrokVersionTests {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
-        try process.run()
-        process.waitUntilExit()
+        try runVersionFixtureProcessToTermination(process)
         let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         #expect(process.terminationStatus == 0,
                 "regenerate-compiled-version.sh must exit 0 when GROK_VERSION is unset; output: \(output)")

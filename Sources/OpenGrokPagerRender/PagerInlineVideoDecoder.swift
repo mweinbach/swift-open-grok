@@ -233,11 +233,13 @@ public struct PagerInlineVideoDecoder: Sendable {
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = stdout
         process.standardError = stderr
+        let terminated = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in terminated.signal() }
         do {
             try process.run()
             let outputData = stdout.fileHandleForReading.readDataToEndOfFile()
             let errorData = stderr.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
+            terminated.wait()
             return PagerVideoCommandResult(
                 status: process.terminationStatus,
                 stdout: outputData,

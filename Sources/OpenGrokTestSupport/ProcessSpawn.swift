@@ -27,12 +27,20 @@ public final class PipedChild: @unchecked Sendable {
     /// A shared buffer capturing the child's stderr, drained by a background
     /// task. Safe to read via `stderrData()` from any thread.
     private let stderrStorage: StderrCapture
+    private let termination: DispatchSemaphore
 
-    init(process: Process, stdin: FileHandle, stdout: FileHandle, stderr: FileHandle) {
+    init(
+        process: Process,
+        stdin: FileHandle,
+        stdout: FileHandle,
+        stderr: FileHandle,
+        termination: DispatchSemaphore
+    ) {
         self.process = process
         self.stdin = stdin
         self.stdout = stdout
         self.stderrStorage = StderrCapture(handle: stderr)
+        self.termination = termination
     }
 
     /// Take ownership of the child's stdout handle (for line-buffered reading).
@@ -69,7 +77,10 @@ public final class PipedChild: @unchecked Sendable {
     /// Wait for the child to exit and return its status. Mirrors
     /// `child.wait()`.
     public func waitUntilExit() -> Int32 {
-        process.waitUntilExit()
+        termination.wait()
+        // Keep the completion latched so repeated or concurrent callers can
+        // observe the same already-exited child without losing its signal.
+        termination.signal()
         return process.terminationStatus
     }
 
@@ -166,6 +177,10 @@ public func spawnPipedWithStderrCapture(_ process: Process) throws -> PipedChild
     process.standardInput = stdinPipe
     process.standardOutput = stdoutPipe
     process.standardError = stderrPipe
+    let termination = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in
+        termination.signal()
+    }
 
     let program = process.executableURL?.lastPathComponent ?? "(unknown)"
     do {
@@ -178,6 +193,7 @@ public func spawnPipedWithStderrCapture(_ process: Process) throws -> PipedChild
         process: process,
         stdin: stdinPipe.fileHandleForWriting,
         stdout: stdoutPipe.fileHandleForReading,
-        stderr: stderrPipe.fileHandleForReading
+        stderr: stderrPipe.fileHandleForReading,
+        termination: termination
     )
 }

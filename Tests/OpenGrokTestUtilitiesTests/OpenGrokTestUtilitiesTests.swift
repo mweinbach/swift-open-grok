@@ -369,6 +369,23 @@ struct OpenGrokTestUtilitiesTests {
         #expect(version.contains("git version"))
     }
 
+    @Test("HermeticGit observes repeated immediately exiting children")
+    func rapidlyExitingGitProcesses() throws {
+        let env = try HermeticEnv(
+            inherit: ["PATH": ProcessInfo.processInfo.environment["PATH"] ?? ""]
+        )
+        defer { var mutable = env; mutable.dispose() }
+
+        for _ in 0..<8 {
+            let version = try HermeticGit.runGit(
+                in: env.root,
+                arguments: ["--version"],
+                environment: env.environment
+            )
+            #expect(version.contains("git version"))
+        }
+    }
+
     @Test("HermeticGit.writeFanoutTree creates the expected file count")
     func fanoutTree() throws {
         let env = try HermeticEnv()

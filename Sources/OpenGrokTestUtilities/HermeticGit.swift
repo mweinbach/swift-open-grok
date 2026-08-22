@@ -15,6 +15,34 @@
 
 import Foundation
 
+private final class HermeticGitPipeReader: @unchecked Sendable {
+    private let handle: FileHandle
+    private let finished = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var output = Data()
+
+    init(_ handle: FileHandle) {
+        self.handle = handle
+    }
+
+    func start() {
+        DispatchQueue.global(qos: .utility).async { [self] in
+            let bytes = handle.readDataToEndOfFile()
+            lock.lock()
+            output = bytes
+            lock.unlock()
+            finished.signal()
+        }
+    }
+
+    func result() -> Data {
+        finished.wait()
+        lock.lock()
+        defer { lock.unlock() }
+        return output
+    }
+}
+
 /// Hermetic git helpers.
 public enum HermeticGit {
     /// The env var naming a hermetic git binary directory (mirrors Rust's
@@ -132,11 +160,22 @@ public enum HermeticGit {
         let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            finished.signal()
+        }
         try process.run()
-        process.waitUntilExit()
 
-        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        // Either pipe can fill before git exits, so both drains must run while
+        // the child is alive rather than after the termination notification.
+        let stdoutReader = HermeticGitPipeReader(stdoutPipe.fileHandleForReading)
+        let stderrReader = HermeticGitPipeReader(stderrPipe.fileHandleForReading)
+        stdoutReader.start()
+        stderrReader.start()
+        finished.wait()
+
+        let stdoutData = stdoutReader.result()
+        let stderrData = stderrReader.result()
         let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
 
         guard process.terminationStatus == 0 else {

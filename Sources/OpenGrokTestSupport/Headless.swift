@@ -76,13 +76,20 @@ public enum Headless {
         }
         #endif
 
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            finished.signal()
+        }
         try process.run()
         let pid = process.processIdentifier
 
         // Drain stdout/stderr on background tasks.
         let stdoutBox = LockedBox<Data>(Data())
         let stderrBox = LockedBox<Data>(Data())
+        let stdoutDrained = DispatchSemaphore(value: 0)
+        let stderrDrained = DispatchSemaphore(value: 0)
         let stdoutTask = Task.detached(priority: .userInitiated) {
+            defer { stdoutDrained.signal() }
             let handle = stdoutPipe.fileHandleForReading
             while !Task.isCancelled {
                 let chunk = handle.availableData
@@ -92,6 +99,7 @@ public enum Headless {
             try? handle.close()
         }
         let stderrTask = Task.detached(priority: .userInitiated) {
+            defer { stderrDrained.signal() }
             let handle = stderrPipe.fileHandleForReading
             while !Task.isCancelled {
                 let chunk = handle.availableData
@@ -102,20 +110,13 @@ public enum Headless {
         }
 
         // Wait with timeout.
-        let deadline = Date().addingTimeInterval(timeout)
-        var timedOut = false
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.01)
-        }
-        if process.isRunning {
-            timedOut = true
+        let timedOut = finished.wait(timeout: .now() + max(timeout, 0)) == .timedOut
+        if timedOut {
             process.terminate()
-            // Wait briefly for the kill to take.
-            for _ in 0..<100 where process.isRunning {
-                Thread.sleep(forTimeInterval: 0.01)
-            }
+            finished.wait()
         }
-        process.waitUntilExit()
+        stdoutDrained.wait()
+        stderrDrained.wait()
         stdoutTask.cancel()
         stderrTask.cancel()
 

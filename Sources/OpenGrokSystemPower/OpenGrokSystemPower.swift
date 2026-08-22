@@ -503,9 +503,11 @@ public enum LinuxPower {
         ]
         probe.standardOutput = FileHandle.nullDevice
         probe.standardError = FileHandle.nullDevice
+        let terminated = DispatchSemaphore(value: 0)
+        probe.terminationHandler = { _ in terminated.signal() }
         do {
             try probe.run()
-            probe.waitUntilExit()
+            terminated.wait()
         } catch {
             return nil
         }
