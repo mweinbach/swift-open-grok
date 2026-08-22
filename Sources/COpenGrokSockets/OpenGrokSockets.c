@@ -1521,6 +1521,160 @@ int og_file_create_owner_only(const char *path, OGSocketHandle *handle) {
     return 0;
 }
 
+static int og_validate_owner_only_file_handle(HANDLE file) {
+    PSID owner = NULL;
+    PACL dacl = NULL;
+    PSECURITY_DESCRIPTOR security = NULL;
+    int metadata = og_private_path_metadata(file, 0, &owner, &dacl, &security);
+    if (metadata <= 0) return -1;
+
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    if (!dacl || !GetSecurityDescriptorControl(security, &control, &revision)) {
+        if (dacl) og_set_windows_error("could not inspect session event DACL protection");
+        else og_set_error(ERROR_ACCESS_DENIED, "session event file has no owner-only DACL");
+        LocalFree(security);
+        return -1;
+    }
+    if ((control & SE_DACL_PROTECTED) == 0) {
+        og_set_error(ERROR_ACCESS_DENIED, "session event DACL inherits external access");
+        LocalFree(security);
+        return -1;
+    }
+
+    ACL_SIZE_INFORMATION information;
+    if (!GetAclInformation(dacl, &information, sizeof(information), AclSizeInformation)) {
+        og_set_windows_error("could not inspect session event DACL entries");
+        LocalFree(security);
+        return -1;
+    }
+
+    int owner_allowed = 0;
+    for (DWORD index = 0; index < information.AceCount; index += 1) {
+        void *raw = NULL;
+        if (!GetAce(dacl, index, &raw)) {
+            og_set_windows_error("could not inspect session event DACL entry");
+            LocalFree(security);
+            return -1;
+        }
+        ACE_HEADER *header = (ACE_HEADER *)raw;
+        if (header->AceType == ACCESS_DENIED_ACE_TYPE) continue;
+        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) {
+            og_set_error(ERROR_ACCESS_DENIED, "session event DACL has an unsupported grant");
+            LocalFree(security);
+            return -1;
+        }
+        ACCESS_ALLOWED_ACE *entry = (ACCESS_ALLOWED_ACE *)raw;
+        if (!EqualSid(owner, (PSID)&entry->SidStart)) {
+            og_set_error(ERROR_ACCESS_DENIED, "session event DACL grants another principal");
+            LocalFree(security);
+            return -1;
+        }
+        DWORD required = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+        if ((entry->Mask & required) == required) owner_allowed = 1;
+    }
+
+    LocalFree(security);
+    if (owner_allowed) return 0;
+    og_set_error(ERROR_ACCESS_DENIED, "session event owner lacks required file access");
+    return -1;
+}
+
+int og_file_open_owner_only_append(const char *path, OGSocketHandle *handle) {
+    if (!path || !handle) {
+        og_set_error(ERROR_INVALID_PARAMETER, "invalid owner-only append arguments");
+        return -1;
+    }
+    wchar_t *wide = og_utf8_to_wide(path);
+    if (!wide) {
+        og_set_windows_error("owner-only append path is not valid UTF-8");
+        return -1;
+    }
+
+    PTOKEN_USER user = NULL;
+    PACL acl = NULL;
+    if (og_current_user_token(&user) != 0
+        || og_owner_only_acl_for_sid(user->User.Sid, &acl) != 0) {
+        free(user);
+        free(wide);
+        return -1;
+    }
+
+    SECURITY_DESCRIPTOR descriptor;
+    if (!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION)
+        || !SetSecurityDescriptorOwner(&descriptor, user->User.Sid, FALSE)
+        || !SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE)
+        || !SetSecurityDescriptorControl(
+            &descriptor,
+            SE_DACL_PROTECTED,
+            SE_DACL_PROTECTED
+        )) {
+        og_set_windows_error("could not initialize protected session event security");
+        LocalFree(acl);
+        free(user);
+        free(wide);
+        return -1;
+    }
+
+    SECURITY_ATTRIBUTES attributes;
+    ZeroMemory(&attributes, sizeof(attributes));
+    attributes.nLength = sizeof(attributes);
+    attributes.lpSecurityDescriptor = &descriptor;
+
+    HANDLE file = CreateFileW(
+        wide,
+        FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        &attributes,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+        NULL
+    );
+    free(wide);
+    if (file == INVALID_HANDLE_VALUE) {
+        og_set_windows_error("could not open owner-private session event log");
+        LocalFree(acl);
+        free(user);
+        return -1;
+    }
+
+    PSID owner = NULL;
+    PACL previous = NULL;
+    PSECURITY_DESCRIPTOR previous_security = NULL;
+    int metadata = og_private_path_metadata(file, 0, &owner, &previous, &previous_security);
+    if (metadata > 0) LocalFree(previous_security);
+    if (metadata <= 0) {
+        CloseHandle(file);
+        LocalFree(acl);
+        free(user);
+        return -1;
+    }
+
+    DWORD secured = SetSecurityInfo(
+        file,
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+        NULL,
+        NULL,
+        acl,
+        NULL
+    );
+    LocalFree(acl);
+    free(user);
+    if (secured != ERROR_SUCCESS) {
+        og_set_error((int)secured, "could not secure session event log DACL");
+        CloseHandle(file);
+        return -1;
+    }
+    if (og_validate_owner_only_file_handle(file) != 0) {
+        CloseHandle(file);
+        return -1;
+    }
+
+    *handle = (OGSocketHandle)(uintptr_t)file;
+    return 0;
+}
+
 int64_t og_file_handle_write_all(OGSocketHandle handle, const void *buffer, size_t length) {
     size_t written = 0;
     HANDLE file = (HANDLE)(uintptr_t)handle;
@@ -1832,6 +1986,11 @@ int64_t og_file_canonical_path(const char *path, char *buffer, size_t capacity) 
 int og_file_create_owner_only(const char *path, OGSocketHandle *handle) {
     (void)path; (void)handle;
     og_set_error(ENOTSUP, "owner-only files are only available on Windows through this shim");
+    return -1;
+}
+int og_file_open_owner_only_append(const char *path, OGSocketHandle *handle) {
+    (void)path; (void)handle;
+    og_set_error(ENOTSUP, "owner-only native append handles are only available on Windows");
     return -1;
 }
 int64_t og_file_handle_write_all(OGSocketHandle handle, const void *buffer, size_t length) {

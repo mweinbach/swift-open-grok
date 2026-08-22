@@ -1,10 +1,18 @@
 import Foundation
 import OpenGrokShared
 
-#if canImport(Darwin)
+#if os(Windows)
+import COpenGrokSockets
+#elseif canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#endif
+
+#if os(Windows)
+private typealias SessionEventFileHandle = OGSocketHandle
+#else
+private typealias SessionEventFileHandle = Int32
 #endif
 
 public enum SessionEventPhase: String, Codable, Sendable, Equatable {
@@ -299,7 +307,7 @@ public final class SessionEventLog: @unchecked Sendable {
 
     public let fileURL: URL
     private let lock = NSLock()
-    private let descriptor: Int32
+    private let descriptor: SessionEventFileHandle
     private let clock: @Sendable () -> Date
     private let formatter: ISO8601DateFormatter
     private let onFirstFailure: @Sendable (SessionEventLogError) -> Void
@@ -317,6 +325,16 @@ public final class SessionEventLog: @unchecked Sendable {
         else { throw SessionEventLogError.invalidDirectory(directory.path) }
 
         let path = directory.appendingPathComponent(Self.fileName)
+        #if os(Windows)
+        var opened: OGSocketHandle = -1
+        let result = path.path.withCString {
+            og_file_open_owner_only_append($0, &opened)
+        }
+        guard result == 0 else {
+            let detail = String(cString: og_socket_last_error_message())
+            throw SessionEventLogError.openFailed(detail)
+        }
+        #else
         let opened = path.path.withCString {
             open($0, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, mode_t(0o600))
         }
@@ -333,6 +351,7 @@ public final class SessionEventLog: @unchecked Sendable {
             close(opened)
             throw SessionEventLogError.unsafeFile(path.path)
         }
+        #endif
 
         self.fileURL = path
         self.descriptor = opened
@@ -344,7 +363,11 @@ public final class SessionEventLog: @unchecked Sendable {
     }
 
     deinit {
+        #if os(Windows)
+        _ = og_file_handle_close(descriptor)
+        #else
         close(descriptor)
+        #endif
     }
 
     public var firstFailure: SessionEventLogError? {
@@ -381,7 +404,16 @@ public final class SessionEventLog: @unchecked Sendable {
         }
     }
 
-    private static func writeAll(_ data: Data, descriptor: Int32) throws {
+    private static func writeAll(_ data: Data, descriptor: SessionEventFileHandle) throws {
+        #if os(Windows)
+        let count = data.withUnsafeBytes { buffer in
+            og_file_handle_write_all(descriptor, buffer.baseAddress, buffer.count)
+        }
+        guard count == Int64(data.count) else {
+            let detail = String(cString: og_socket_last_error_message())
+            throw SessionEventLogError.writeFailed(detail)
+        }
+        #else
         try data.withUnsafeBytes { buffer in
             guard let base = buffer.baseAddress else { return }
             var written = 0
@@ -396,5 +428,6 @@ public final class SessionEventLog: @unchecked Sendable {
                 }
             }
         }
+        #endif
     }
 }

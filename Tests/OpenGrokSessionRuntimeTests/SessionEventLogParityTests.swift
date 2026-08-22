@@ -3,6 +3,10 @@ import OpenGrokShared
 import Testing
 @testable import OpenGrokSessionRuntime
 
+#if os(Windows)
+import COpenGrokSockets
+#endif
+
 private struct SessionEventLogFixture {
     let directory: URL
 
@@ -94,8 +98,13 @@ struct SessionEventLogParityTests {
         defer { fixture.cleanup() }
         let log = try SessionEventLog(sessionDirectory: fixture.directory)
         #expect(log.emit(.firstToken))
+        #if os(Windows)
+        #expect(log.fileURL.path.withCString { og_file_is_owner_only($0) } == 1)
+        #expect(log.fileURL.path.withCString { og_path_is_private_to_current_user($0, 0) } == 1)
+        #else
         let attributes = try FileManager.default.attributesOfItem(atPath: log.fileURL.path)
         #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+        #endif
 
         let other = try SessionEventLogFixture()
         defer { other.cleanup() }
@@ -109,6 +118,31 @@ struct SessionEventLogParityTests {
             try SessionEventLog(sessionDirectory: other.directory)
         }
         #expect(try String(contentsOf: target, encoding: .utf8) == "untouched")
+    }
+
+    @Test("reopened owner-private event logs append without truncating existing records")
+    func reopeningExistingLogPreservesRecords() throws {
+        let fixture = try SessionEventLogFixture()
+        defer { fixture.cleanup() }
+
+        let first = try SessionEventLog(sessionDirectory: fixture.directory)
+        #expect(first.emit(.firstToken))
+
+        let reopened = try SessionEventLog(sessionDirectory: fixture.directory)
+        #expect(reopened.emit(.toolStarted(toolName: "read_file")))
+        #expect(first.emit(.phaseChanged(.streamingText)))
+
+        let values = try fixture.read()
+        #expect(values.compactMap { $0["type"]?.stringValue } == [
+            "first_token",
+            "tool_started",
+            "phase_changed",
+        ])
+
+        #if os(Windows)
+        #expect(reopened.fileURL.path.withCString { og_file_is_owner_only($0) } == 1)
+        #expect(reopened.fileURL.path.withCString { og_path_is_private_to_current_user($0, 0) } == 1)
+        #endif
     }
 
     @Test("concurrent callers append complete independent JSONL records")

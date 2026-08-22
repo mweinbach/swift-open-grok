@@ -312,7 +312,7 @@ private func targets() -> [Target] {
     t.append(.target(name: "OpenGrokWorkflow", dependencies: dep(w0s4, ["OpenGrokToolTypes"])))
 
     // ---- Wave 7 ----
-    t.append(contentsOf: libs(w7s1, dep(w0s2, w1s1, w1s2, w1s3, w2s1, w3s3, w4s3, w5s1, w5s2, w5s3, w6s1, w6s4, w6s6, w7s2, w7s4)))
+    t.append(contentsOf: libs(w7s1, dep(w0s2, w1s1, w1s2, w1s3, w2s1, w3s3, w4s3, w5s1, w5s2, w5s3, w6s1, w6s4, w6s6, w7s2, w7s4, ["COpenGrokSockets"])))
     t.append(contentsOf: libs(w7s2, dep(w0s2, w0s3, w0s4, w1s3, w2s2, w6s2, w6s3, w6s4)))
     t.append(contentsOf: libs(w7s3, dep(w0s2, w1s3, w1s5, w3s1, w3s2, w3s3, w5s2, w6s1, w6s2, w6s3, w6s4)))
     t.append(contentsOf: libs(w7s4, dep(w0s2, w1s2, w1s3, w4s2, w4s3, w5s3, w6s4, w6s5)))
@@ -462,7 +462,7 @@ private func targets() -> [Target] {
     ))
     t.append(.testTarget(
         name: "OpenGrokSessionRuntimeTests",
-        dependencies: dep(["OpenGrokSessionRuntime", "OpenGrokSessionPersistence", "OpenGrokWorkflow"])
+        dependencies: dep(["OpenGrokSessionRuntime", "OpenGrokSessionPersistence", "OpenGrokWorkflow", "COpenGrokSockets"])
     ))
     t.append(contentsOf: tests(w7s2))
     t.append(contentsOf: tests(w7s3))
