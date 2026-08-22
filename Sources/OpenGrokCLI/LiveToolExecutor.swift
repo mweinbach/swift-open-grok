@@ -159,7 +159,7 @@ struct LiveToolExecutor: Sendable {
             autoReviewEnabled: autoReviewEnabled
         )
     }
-    private let hookPermissionGate: HookPermissionGate?
+    private let launchPermissionOptions: CLIPermissionOptions
     /// The OS sandbox this session runs under. `profileName` is what a session
     /// writer persists so a resume is pinned to the same profile.
     let sandbox: LiveSandboxDecision
@@ -235,17 +235,15 @@ struct LiveToolExecutor: Sendable {
     /// that predates them keeps compiling and simply advertises none of their
     /// tools; see `LiveSessionServices.swift`.
     let sessionServices: LiveSessionServices?
-    /// The resolved session verdict, shared with hook discovery and its UI.
-    let projectTrusted: Bool
+    /// The current verdict, shared by slash revocation, discovery and the UI.
+    var projectTrusted: Bool { folderTrustRuntime.isTrusted }
+    private let folderTrustRuntime: LiveFolderTrustRuntimeState
     let hookPresentationStore: LiveHookPresentationStore
     /// The exact store backing the advertised `todo_write` handler. The
     /// renderer reads this actor through the executor so a successful tool
     /// call and the visible pane can never point at different lists.
     let todoStore: LiveTodoStore
     let telemetryStatus: LiveTelemetryStatus
-    /// Live LSP pull session when `features.lsp_tools` registered a tool.
-    private let lspPullSession: LSPPullSession?
-
     init(
         processBackend: any ShellProcessBackend,
         sessionID: String,
@@ -358,7 +356,6 @@ struct LiveToolExecutor: Sendable {
             isInteractive: fileAccessPolicy.isInteractive,
             cli: permissionOptions
         )
-        self.projectTrusted = security.projectTrusted
         let hookPresentationStore = LiveHookPresentationStore()
         self.hookPresentationStore = hookPresentationStore
         let hooks = LiveHooksComposition.load(
@@ -790,12 +787,16 @@ struct LiveToolExecutor: Sendable {
         } else {
             self.sessionPermissionMode = nil
         }
-        self.hookPermissionGate = hooks.gate
+        self.launchPermissionOptions = permissionOptions
         self.composition = composition
         self.fileToolBridge = fileToolBridge
         self.mcpConnections = mcpConnections
         self.mcpServerConnections = mcpServerConnections
-        self.lspPullSession = lspPullSession
+        self.folderTrustRuntime = LiveFolderTrustRuntimeState(
+            trusted: security.projectTrusted,
+            declarations: mcpDeclarations.enabledServers,
+            languageSession: lspPullSession
+        )
         self.registryToolNames = Set(allowedFileToolDefinitions.map(\.name))
         self.initiallyAdvertisedMCPToolNames = Set(
             allowedFileToolDefinitions.compactMap { definition in
@@ -883,10 +884,15 @@ struct LiveToolExecutor: Sendable {
     /// gates remain immutable; newly connected servers inherit the original
     /// agent-profile filter, and removed servers disappear before the next turn.
     func currentToolSpecs() -> [ToolSpec] {
-        var current = tools.filter { !initiallyAdvertisedMCPToolNames.contains($0.name) }
+        var current = tools.filter {
+            !initiallyAdvertisedMCPToolNames.contains($0.name)
+                && ($0.name != LiveLspComposition.toolName
+                    || mcpToolset.tool(named: $0.name) != nil)
+        }
         for definition in mcpToolset.topLevelDefinitions() {
             guard let registered = mcpToolset.tool(named: definition.name),
-                  registered.namespace == .mcp,
+                  registered.namespace == .mcp || registered.kind == .lsp,
+                  !current.contains(where: { $0.name == definition.name }),
                   sessionToolPolicy?.allows(liveToolName: definition.name) ?? true
             else {
                 continue
@@ -907,7 +913,106 @@ struct LiveToolExecutor: Sendable {
             return registered.visibility == .topLevel
                 && (sessionToolPolicy?.allows(liveToolName: name) ?? true)
         }
+        if registered.kind == .lsp {
+            return registered.visibility == .topLevel
+                && (sessionToolPolicy?.allows(liveToolName: name) ?? true)
+        }
         return registryToolNames.contains(name)
+    }
+
+    func failClosedAfterFolderTrustPersistenceFailure() {
+        folderTrustRuntime.failClosed()
+    }
+
+    func reloadFolderTrust(
+        trusted: Bool,
+        sessionID: String,
+        workspaceRoot: URL,
+        environment: [String: String]
+    ) async -> Int {
+        let previousDeclarations = folderTrustRuntime.begin(trusted: trusted)
+        var options = launchPermissionOptions
+        options.trustFolder = false
+        let security = LiveSecurityContext.resolve(
+            workspaceRoot: workspaceRoot,
+            environment: environment,
+            isInteractive: false,
+            cli: options
+        )
+        guard security.projectTrusted == trusted else {
+            folderTrustRuntime.failClosed()
+            return 0
+        }
+
+        let loadedHooks = LiveHooksComposition.load(
+            sessionId: sessionID,
+            workspaceRoot: workspaceRoot,
+            environment: environment,
+            projectTrusted: trusted
+        )
+        loadedHooks.gate?.setRunObserver { [hookPresentationStore] event, id, records in
+            Task {
+                await hookPresentationStore.record(event: event, id: id, records: records)
+            }
+        }
+        if let permissionPipeline {
+            let runner: any PreToolUseHookRunner = loadedHooks.gate
+                .map { $0 as any PreToolUseHookRunner }
+                ?? FailOpenPreToolUseHookRunner()
+            await permissionPipeline.replaceLiveFolderTrustHooks(runner)
+            await permissionPipeline.permissions.replaceConfig(security.permissions.config)
+        }
+
+        let disabledServers = disabledMCPServers(in: security.document)
+        let declarations = MCPConfigLoader.load(from: security.document).enabledServers
+            .filter { !disabledServers.contains($0.name) }
+        let declarationsByName = Dictionary(uniqueKeysWithValues: declarations.map { ($0.name, $0) })
+        for name in await mcpConnections.names() {
+            if let previous = previousDeclarations[name],
+               let current = declarationsByName[name],
+               previous == current {
+                continue
+            }
+            await mcpConnections.markServerShuttingDown(name)
+            MCPToolBridge.unregister(server: name, from: mcpToolset)
+            if let client = await mcpConnections.release(named: name) {
+                try? await client.shutdown()
+                await client.close()
+            }
+        }
+
+        if let previousLanguageSession = folderTrustRuntime.replaceLanguageSession(nil) {
+            await previousLanguageSession.shutdown()
+        }
+        mcpToolset.unregister(prefix: LiveLspComposition.toolName)
+        let languageSession = LiveLspComposition.registerTools(
+            toolset: mcpToolset,
+            workingDirectory: workspaceRoot,
+            document: security.document,
+            environment: environment,
+            projectTrusted: trusted
+        )
+        _ = folderTrustRuntime.replaceLanguageSession(languageSession)
+
+        let disabledTools = allDisabledMCPTools(in: security.document)
+        for declaration in declarations {
+            guard await mcpConnections.client(named: declaration.name) == nil else { continue }
+            await mcpConnections.markServerAvailable(declaration.name)
+            let outcome = await LiveMCPComposition.connect(
+                declaration: declaration,
+                toolset: mcpToolset,
+                connections: mcpConnections,
+                environment: environment,
+                disabledToolNames: disabledTools[declaration.name] ?? [],
+                managedMCPPolicy: security.managedMCPPolicy
+            )
+            if outcome.failure != nil {
+                MCPToolBridge.unregister(server: declaration.name, from: mcpToolset)
+            }
+        }
+        LiveMCPToolSearchIndex.refreshIfPresent(in: mcpToolset)
+        folderTrustRuntime.finish(trusted: trusted, declarations: declarations)
+        return loadedHooks.result.registry.count
     }
 
     func runStop(
@@ -915,7 +1020,9 @@ struct LiveToolExecutor: Sendable {
         promptID: String?,
         payload: [String: HookJSONValue]
     ) async -> StopDispatchResult {
-        guard let hookPermissionGate else { return StopDispatchResult() }
+        guard let permissionPipeline,
+              let hookPermissionGate = await permissionPipeline.liveFolderTrustHookGate()
+        else { return StopDispatchResult() }
         return await hookPermissionGate.runStop(
             event: event,
             promptId: promptID,
@@ -943,8 +1050,10 @@ struct LiveToolExecutor: Sendable {
         promptID: String? = nil,
         payload: [String: HookJSONValue] = [:]
     ) {
-        guard let hookPermissionGate else { return }
+        guard let permissionPipeline else { return }
         Task {
+            guard let hookPermissionGate = await permissionPipeline.liveFolderTrustHookGate()
+            else { return }
             _ = await hookPermissionGate.dispatchObserve(
                 event: event,
                 promptId: promptID,
@@ -1165,6 +1274,9 @@ struct LiveToolExecutor: Sendable {
         onProgress: (@Sendable (NestedToolProgress) async -> Void)? = nil,
         cancellationToken: CodeModeCancellationToken? = nil
     ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
+        guard !folderTrustRuntime.isChanging else {
+            return .failure(.failed("folder trust is changing; project access is blocked"))
+        }
         let args: JSONValue
         do {
             args = try JSONDecoder().decode(
@@ -1716,7 +1828,7 @@ struct LiveToolExecutor: Sendable {
         workingDirectory: URL,
         promptText: String
     ) async -> String {
-        guard let session = lspPullSession else { return promptText }
+        guard let session = folderTrustRuntime.currentLanguageSession else { return promptText }
 
         // Notify only SearchReplace EditsApplied — Rust does not notify write
         // or apply_patch from this reminder.
@@ -1775,7 +1887,7 @@ struct LiveToolExecutor: Sendable {
         if let sessionBus = sessionCollaborationBackend as? LiveSessionBus {
             await sessionBus.stop()
         }
-        await lspPullSession?.shutdown()
+        await folderTrustRuntime.currentLanguageSession?.shutdown()
         await mcpConnections.shutdown()
         await composition.shutdown()
     }

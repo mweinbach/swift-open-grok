@@ -2048,8 +2048,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             )
                         },
                         workflowsEnabled: workflowsEnabled,
+                        folderTrustCommandsEnabled: true,
                         mouseReportingToggleEnabled: uiConfiguration.mouseReportingToggleEnabled
                     )
+                    await controller.setFolderTrustHandler { trusted in
+                        await renderer.setFolderTrustFromSlash(trusted: trusted)
+                    }
                     // `[animation].fps` before first frame — must precede
                     // `run` so tick derivation never jumps mid-session
                     // (`setMotionFPS`, InteractiveController). Loaded once

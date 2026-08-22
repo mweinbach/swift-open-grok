@@ -998,6 +998,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// (prompt_queue.rs:222-233). `nil` resolves to false: without a live
     /// wait state, send-now keeps its cancel-and-run behavior.
     private var orchestrationWaitState: (@Sendable () async -> Bool)?
+    private var folderTrustHandler: (@Sendable (Bool) async -> String)?
 
     public init(
         input: AsyncThrowingStream<InputEvent, Error>,
@@ -1010,6 +1011,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         localCommandHandler: LocalCommandHandler? = nil,
         bashCommandHandler: BashCommandHandler? = nil,
         workflowsEnabled: Bool = true,
+        folderTrustCommandsEnabled: Bool = false,
         mouseReportingToggleEnabled: Bool = false
     ) {
         self.input = input
@@ -1027,6 +1029,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         }
         let builtinCommands = Self.sessionBuiltinCommands(
             workflowsEnabled: workflowsEnabled,
+            folderTrustCommandsEnabled: folderTrustCommandsEnabled,
             mouseReportingToggleEnabled: mouseReportingToggleEnabled
         )
         self.commands = PagerCommandRegistry(
@@ -1066,6 +1069,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         localCommandHandler: LocalCommandHandler? = nil,
         bashCommandHandler: BashCommandHandler? = nil,
         workflowsEnabled: Bool = true,
+        folderTrustCommandsEnabled: Bool = false,
         mouseReportingToggleEnabled: Bool = false
     ) {
         self.init(
@@ -1079,8 +1083,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             localCommandHandler: localCommandHandler,
             bashCommandHandler: bashCommandHandler,
             workflowsEnabled: workflowsEnabled,
+            folderTrustCommandsEnabled: folderTrustCommandsEnabled,
             mouseReportingToggleEnabled: mouseReportingToggleEnabled
         )
+    }
+
+    public func setFolderTrustHandler(
+        _ handler: (@Sendable (Bool) async -> String)?
+    ) {
+        folderTrustHandler = handler
     }
 
     /// Install the argument-completion source. Call before `run`.
@@ -3256,6 +3267,16 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             usage: "/hooks"
         ),
         PagerCommandDefinition(
+            name: "hooks-trust",
+            summary: "Trust this project for hook execution",
+            usage: "/hooks-trust"
+        ),
+        PagerCommandDefinition(
+            name: "hooks-untrust",
+            summary: "Remove trust for the current project",
+            usage: "/hooks-untrust"
+        ),
+        PagerCommandDefinition(
             name: "plugins",
             summary: "View plugins",
             usage: "/plugins"
@@ -3571,10 +3592,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// dropdown (`workflows` kill-switch + mouse-reporting toggle opt-in).
     public static func visibleBuiltinCommandCatalog(
         workflowsEnabled: Bool = true,
+        folderTrustCommandsEnabled: Bool = false,
         mouseReportingToggleEnabled: Bool = false
     ) -> [OpenGrokPagerCommandRegistration] {
         sessionBuiltinCommands(
             workflowsEnabled: workflowsEnabled,
+            folderTrustCommandsEnabled: folderTrustCommandsEnabled,
             mouseReportingToggleEnabled: mouseReportingToggleEnabled
         )
         .filter { !$0.isHidden && $0.availability.isAvailable }
@@ -3604,9 +3627,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// resolvable but hidden and unavailable so a direct invoke is honest.
     static func sessionBuiltinCommands(
         workflowsEnabled: Bool,
+        folderTrustCommandsEnabled: Bool = false,
         mouseReportingToggleEnabled: Bool
     ) -> [PagerCommandDefinition] {
         builtinCommands.compactMap { command in
+            if ["hooks-trust", "hooks-untrust"].contains(command.name),
+               !folderTrustCommandsEnabled {
+                return nil
+            }
             if command.name == "workflows", !workflowsEnabled {
                 return nil
             }
@@ -4134,6 +4162,16 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 return .handled
             case "mcps":
                 try await emit(.overlay(.mcpServers))
+                return .handled
+            case "hooks-trust", "hooks-untrust":
+                guard let folderTrustHandler else {
+                    try await emit(.notice("/\(command.name) is unavailable in this session"))
+                    return .handled
+                }
+                let outcome = await folderTrustHandler(command.name == "hooks-trust")
+                if !outcome.isEmpty {
+                    try await emit(.notice(outcome))
+                }
                 return .handled
             case "hooks", "plugins", "marketplace", "skills":
                 // Arguments are ignored — upstream's four commands declare
@@ -4820,6 +4858,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /compact-mode             Toggle compact UI (less padding, more content)
       /vim-mode                 Vim keys for the focused scrollback
       /hooks                    View hooks
+      /hooks-trust              Trust this project for hook execution
+      /hooks-untrust            Remove trust for the current project
       /plugins                  View plugins
       /marketplace              View marketplace
       /skills                   View skills

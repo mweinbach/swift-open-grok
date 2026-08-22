@@ -46,6 +46,19 @@ import OpenGrokWorkspace
 
 extension LiveInteractiveControllerRenderer {
 
+    func setFolderTrustFromSlash(trusted: Bool) async -> String {
+        guard let toolExecutor, !sessionID.isEmpty else {
+            return "No active session"
+        }
+        return await LiveFolderTrustControls.change(
+            trusted: trusted,
+            workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true),
+            sessionID: sessionID,
+            environment: environment,
+            executor: toolExecutor
+        )
+    }
+
     /// Fold the injectable XTVERSION collector into an otherwise-standalone
     /// diagnostic snapshot. Other TUI-only runtime probes stay Unavailable.
     func doctorDiagnosticSnapshot(
