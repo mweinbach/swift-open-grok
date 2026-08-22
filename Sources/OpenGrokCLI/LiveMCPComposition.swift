@@ -21,6 +21,7 @@ import OpenGrokHTTP
 import OpenGrokMCP
 import OpenGrokShared
 import OpenGrokToolRegistry
+import OpenGrokToolRuntime
 
 // MARK: - Hub bridge transport
 
@@ -188,6 +189,34 @@ public struct MCPClientToolProvider: MCPToolProviding {
     ) async throws -> MCPBridgedCallResult {
         let result = try await client.callTool(
             MCPCallToolParams(name: name, arguments: arguments)
+        )
+        return MCPBridgedCallResult(
+            text: Self.flatten(result.content),
+            structuredContent: result.structuredContent,
+            isError: result.isError
+        )
+    }
+
+    public func callBridgedTool(
+        name: String,
+        arguments: JSONValue,
+        onProgress: @escaping ToolProgressHandler
+    ) async throws -> MCPBridgedCallResult {
+        let result = try await client.callTool(
+            MCPCallToolParams(name: name, arguments: arguments),
+            onProgress: { update in
+                if let message = update.message, !message.isEmpty {
+                    await onProgress(.text(text: message))
+                } else {
+                    var fields: [String: JSONValue] = [
+                        "progress": .number(.double(update.progress))
+                    ]
+                    if let total = update.total {
+                        fields["total"] = .number(.double(total))
+                    }
+                    await onProgress(.custom(subkind: "mcp_progress", payload: .object(fields)))
+                }
+            }
         )
         return MCPBridgedCallResult(
             text: Self.flatten(result.content),

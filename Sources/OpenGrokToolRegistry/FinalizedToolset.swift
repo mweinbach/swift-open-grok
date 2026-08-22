@@ -123,7 +123,10 @@ public final class FinalizedToolset: @unchecked Sendable {
         clientName: String,
         args: JSONValue,
         callId: String = UUID().uuidString,
-        nested: Bool = false
+        nested: Bool = false,
+        viewerContext: WorkspaceViewerContext? = nil,
+        onProgress: ToolProgressHandler? = nil,
+        cancellation: Cancellation? = nil
     ) async -> Result<TypedToolOutput, ToolError> {
         guard let tool = tool(named: clientName) else {
             return .failure(toolNotFound(clientName, detail: "tool not found: \(clientName)"))
@@ -197,6 +200,26 @@ public final class FinalizedToolset: @unchecked Sendable {
             ctx.insert(BehaviorVersion(version))
         }
         ctx.insert(NestedCodeModeCall(nested))
+        if let viewerContext {
+            ctx.insert(viewerContext)
+        }
+        if let cancellation {
+            ctx.insert(cancellation)
+        }
+
+        let progressReporter: ToolProgressReporter?
+        if let viewerContext, viewerContext.streamToolProgress, let onProgress {
+            let reporter = ToolProgressReporter(
+                viewerContext: viewerContext,
+                cancellation: cancellation,
+                onProgress: onProgress
+            )
+            ctx.insert(reporter)
+            progressReporter = reporter
+        } else {
+            progressReporter = nil
+        }
+        defer { progressReporter?.close() }
 
         let result = await handler.invoke(
             clientName: clientName,
@@ -218,9 +241,20 @@ public final class FinalizedToolset: @unchecked Sendable {
     public func callNested(
         clientName: String,
         args: JSONValue,
-        callId: String = UUID().uuidString
+        callId: String = UUID().uuidString,
+        viewerContext: WorkspaceViewerContext? = nil,
+        onProgress: ToolProgressHandler? = nil,
+        cancellation: Cancellation? = nil
     ) async -> Result<TypedToolOutput, ToolError> {
-        await prepareAndCall(clientName: clientName, args: args, callId: callId, nested: true)
+        await prepareAndCall(
+            clientName: clientName,
+            args: args,
+            callId: callId,
+            nested: true,
+            viewerContext: viewerContext,
+            onProgress: onProgress,
+            cancellation: cancellation
+        )
     }
 
     /// Register a dynamic (MCP) tool at runtime.

@@ -194,6 +194,63 @@ public struct WorkspaceViewerContext: Codable, Sendable, Hashable {
     }
 }
 
+/// One acknowledged progress item produced by an authorized tool call.
+public typealias ToolProgressHandler = @Sendable (ToolProgress) async -> Void
+
+/// Call-local progress channel installed only after permission preparation.
+///
+/// Producers await each delivery, so the downstream bounded Code Mode queue
+/// provides backpressure without adding an unbounded task or buffer here.
+public final class ToolProgressReporter: @unchecked Sendable {
+    private let lock = NSLock()
+    private let viewerContext: WorkspaceViewerContext
+    private let cancellation: Cancellation?
+    private let handler: ToolProgressHandler
+    private var closed = false
+
+    public init(
+        viewerContext: WorkspaceViewerContext,
+        cancellation: Cancellation? = nil,
+        onProgress: @escaping ToolProgressHandler
+    ) {
+        self.viewerContext = viewerContext
+        self.cancellation = cancellation
+        self.handler = onProgress
+    }
+
+    public var isCancelled: Bool {
+        Task.isCancelled || cancellation?.isCancelled == true
+    }
+
+    public var isClosed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return closed
+    }
+
+    /// Returns false after cancellation, completion, or an explicit opt-out.
+    @discardableResult
+    public func emit(_ progress: ToolProgress) async -> Bool {
+        guard viewerContext.streamToolProgress, !isCancelled, beginDelivery() else {
+            return false
+        }
+        await handler(progress)
+        return !isCancelled
+    }
+
+    public func close() {
+        lock.lock()
+        closed = true
+        lock.unlock()
+    }
+
+    private func beginDelivery() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !closed
+    }
+}
+
 /// Per-tool configuration entry (shared wire shape used by
 /// `session.bind` metadata and tools-api finalize config).
 ///

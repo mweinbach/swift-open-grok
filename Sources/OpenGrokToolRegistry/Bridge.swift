@@ -62,9 +62,20 @@ public final class ToolBridge: @unchecked Sendable {
     public func call(
         name: String,
         args: JSONValue,
-        callId: String = UUID().uuidString
+        callId: String = UUID().uuidString,
+        viewerContext: WorkspaceViewerContext? = nil,
+        onProgress: ToolProgressHandler? = nil,
+        cancellation: Cancellation? = nil
     ) async -> Result<ToolBridgeResult, ToolError> {
-        switch await toolset.prepareAndCall(clientName: name, args: args, callId: callId, nested: false) {
+        switch await toolset.prepareAndCall(
+            clientName: name,
+            args: args,
+            callId: callId,
+            nested: false,
+            viewerContext: viewerContext,
+            onProgress: onProgress,
+            cancellation: cancellation
+        ) {
         case .success(let typed):
             return .success(ToolBridgeResult(output: typed, promptText: promptText(from: typed)))
         case .failure(let err):
@@ -76,9 +87,19 @@ public final class ToolBridge: @unchecked Sendable {
     public func callNested(
         name: String,
         args: JSONValue,
-        callId: String = UUID().uuidString
+        callId: String = UUID().uuidString,
+        viewerContext: WorkspaceViewerContext? = nil,
+        onProgress: ToolProgressHandler? = nil,
+        cancellation: Cancellation? = nil
     ) async -> Result<ToolBridgeResult, ToolError> {
-        switch await toolset.callNested(clientName: name, args: args, callId: callId) {
+        switch await toolset.callNested(
+            clientName: name,
+            args: args,
+            callId: callId,
+            viewerContext: viewerContext,
+            onProgress: onProgress,
+            cancellation: cancellation
+        ) {
         case .success(let typed):
             return .success(ToolBridgeResult(output: typed, promptText: promptText(from: typed)))
         case .failure(let err):

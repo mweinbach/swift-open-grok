@@ -199,6 +199,23 @@ public protocol MCPToolProviding: Sendable {
         name: String,
         arguments: JSONValue
     ) async throws -> MCPBridgedCallResult
+
+    /// Providers forward only server-originated progress correlated to this call.
+    func callBridgedTool(
+        name: String,
+        arguments: JSONValue,
+        onProgress: @escaping ToolProgressHandler
+    ) async throws -> MCPBridgedCallResult
+}
+
+extension MCPToolProviding {
+    public func callBridgedTool(
+        name: String,
+        arguments: JSONValue,
+        onProgress: @escaping ToolProgressHandler
+    ) async throws -> MCPBridgedCallResult {
+        return try await callBridgedTool(name: name, arguments: arguments)
+    }
 }
 
 // MARK: - Handler
@@ -220,13 +237,23 @@ struct MCPBridgedToolHandler: ToolHandler {
         ctx: ToolCallContext,
         resources: ToolResources
     ) async -> Result<TypedToolOutput, ToolError> {
-        _ = ctx
         _ = resources
         do {
-            let result = try await provider.callBridgedTool(
-                name: rawToolName,
-                arguments: normalizeArguments(args)
-            )
+            let result: MCPBridgedCallResult
+            if let reporter = ctx.get(ToolProgressReporter.self) {
+                result = try await provider.callBridgedTool(
+                    name: rawToolName,
+                    arguments: normalizeArguments(args),
+                    onProgress: { progress in
+                        guard await reporter.emit(progress) else { return }
+                    }
+                )
+            } else {
+                result = try await provider.callBridgedTool(
+                    name: rawToolName,
+                    arguments: normalizeArguments(args)
+                )
+            }
             if result.isError {
                 return .failure(ToolError(
                     kind: .execution,

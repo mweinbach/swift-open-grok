@@ -45,7 +45,8 @@ public enum ReadFileTool {
         args: JSONValue,
         resources: ToolResources,
         withHashlineAnchors: Bool = false,
-        concise: Bool = false
+        concise: Bool = false,
+        context: ToolCallContext? = nil
     ) async -> Result<TypedToolOutput, ToolError> {
         do {
             let input = try Input.parse(args)
@@ -122,6 +123,17 @@ public enum ReadFileTool {
             if concise && content.count > 4_000 {
                 content = truncateMiddle(content, maxChars: 4_000)
                 truncated = true
+            }
+
+            guard await streamFileToolContent(
+                content,
+                subkind: "read_file_chunk",
+                context: context
+            ) else {
+                return .failure(.cancelled(
+                    toolId: FileToolIDs.readFile,
+                    detail: "read_file was cancelled while streaming progress"
+                ))
             }
 
             let value: JSONValue = .object([

@@ -30,7 +30,8 @@ public enum GrepTool {
     public static func run(
         args: JSONValue,
         resources: ToolResources,
-        withHashline: Bool = false
+        withHashline: Bool = false,
+        context: ToolCallContext? = nil
     ) async -> Result<TypedToolOutput, ToolError> {
         do {
             guard case .object(let obj) = args else {
@@ -55,12 +56,19 @@ public enum GrepTool {
             let regex = try NSRegularExpression(pattern: pattern, options: options)
 
             let files = try collectFiles(root: root, glob: glob, allowedRoots: resources.allowedRoots)
+            let cancellation = context?.get(Cancellation.self)
             var matches: [(path: String, lineNumber: Int, text: String)] = []
             var matchingFiles: [(path: String, count: Int)] = []
             var matchCount = 0
             var truncated = false
 
             for file in files {
+                if Task.isCancelled || cancellation?.isCancelled == true {
+                    return .failure(.cancelled(
+                        toolId: FileToolIDs.grep,
+                        detail: "grep was cancelled while searching"
+                    ))
+                }
                 if outputMode == .content, matchCount >= headLimit {
                     truncated = true
                     break
@@ -74,6 +82,13 @@ public enum GrepTool {
                 let lines = SessionFS.logicalLines(text)
                 var fileMatchCount = 0
                 for (idx, line) in lines.enumerated() {
+                    if idx.isMultiple(of: 64),
+                       Task.isCancelled || cancellation?.isCancelled == true {
+                        return .failure(.cancelled(
+                            toolId: FileToolIDs.grep,
+                            detail: "grep was cancelled while searching"
+                        ))
+                    }
                     let range = NSRange(line.startIndex..<line.endIndex, in: line)
                     if regex.firstMatch(in: line, options: [], range: range) != nil {
                         let lineNo = idx + 1
@@ -97,10 +112,10 @@ public enum GrepTool {
             if outputMode != .content, matchingFiles.count > shownFiles.count {
                 truncated = true
             }
-            var content: String
+            let matchedBody: String
             switch outputMode {
             case .content:
-                content = matches.map { match in
+                matchedBody = matches.map { match in
                     if withHashline {
                         let anchor = Hashline.anchor(for: match.text, line: match.lineNumber)
                         return "\(match.path):\(match.lineNumber)|\(anchor):\(match.text)"
@@ -108,10 +123,11 @@ public enum GrepTool {
                     return "\(match.path):\(match.lineNumber):\(match.text)"
                 }.joined(separator: "\n")
             case .filesWithMatches:
-                content = shownFiles.map(\.path).joined(separator: "\n")
+                matchedBody = shownFiles.map(\.path).joined(separator: "\n")
             case .count:
-                content = shownFiles.map { "\($0.path):\($0.count)" }.joined(separator: "\n")
+                matchedBody = shownFiles.map { "\($0.path):\($0.count)" }.joined(separator: "\n")
             }
+            var content = matchedBody
             if content.isEmpty {
                 content = "No matches found"
             } else if truncated {
@@ -121,6 +137,26 @@ public enum GrepTool {
             if content.utf8.count > defaultToolOutputBytes {
                 let capped = capToolOutput(content)
                 content = capped.modelText
+            }
+
+            let visibleBody: String
+            if content.hasPrefix(matchedBody) {
+                visibleBody = matchedBody
+            } else {
+                visibleBody = String(zip(content, matchedBody)
+                    .prefix { $0.0 == $0.1 }
+                    .map { $0.0 })
+            }
+            guard await streamFileToolContent(
+                visibleBody,
+                subkind: "grep_match_chunk",
+                context: context,
+                flushPerLine: true
+            ) else {
+                return .failure(.cancelled(
+                    toolId: FileToolIDs.grep,
+                    detail: "grep was cancelled while streaming progress"
+                ))
             }
 
             let structuredMatches: [JSONValue]

@@ -25,7 +25,8 @@ public struct FileToolsHandler: ToolHandler {
                 args: args,
                 resources: resources,
                 withHashlineAnchors: clientName == "hashline_read",
-                concise: false
+                concise: false,
+                context: ctx
             )
         case "list_dir":
             return await ListDirTool.run(args: args, resources: resources)
@@ -33,7 +34,8 @@ public struct FileToolsHandler: ToolHandler {
             return await GrepTool.run(
                 args: args,
                 resources: resources,
-                withHashline: clientName == "hashline_grep"
+                withHashline: clientName == "hashline_grep",
+                context: ctx
             )
         case "glob":
             return await GlobTool.run(args: args, resources: resources)
@@ -52,7 +54,12 @@ public struct FileToolsHandler: ToolHandler {
         default:
             // Concise variants share client names after name_override; try kind-based fallback.
             if clientName.contains("read") {
-                return await ReadFileTool.run(args: args, resources: resources, concise: true)
+                return await ReadFileTool.run(
+                    args: args,
+                    resources: resources,
+                    concise: true,
+                    context: ctx
+                )
             }
             if clientName.contains("replace") || clientName.contains("edit") {
                 return await SearchReplaceTool.run(args: args, resources: resources)
@@ -60,6 +67,59 @@ public struct FileToolsHandler: ToolHandler {
             return .failure(.notImplemented("file tool handler does not implement \(clientName)"))
         }
     }
+}
+
+/// Replay only the already-formatted, permission-authorized model-visible body.
+func streamFileToolContent(
+    _ content: String,
+    subkind: String,
+    context: ToolCallContext?,
+    flushPerLine: Bool = false
+) async -> Bool {
+    guard let context,
+          context.get(WorkspaceViewerContext.self)?.streamToolProgress == true,
+          let reporter = context.get(ToolProgressReporter.self) else {
+        return true
+    }
+    guard !reporter.isCancelled else { return false }
+
+    let bytes = Array(content.utf8)
+    let spec = StreamingSpec(subkind: subkind)
+    var windowStart = 0
+    var lastTotal: UInt64 = 0
+
+    while windowStart < bytes.count {
+        let windowEnd: Int
+        if flushPerLine {
+            let searchStart = bytes[windowStart] == 0x0A ? windowStart + 1 : windowStart
+            windowEnd = bytes[searchStart...].firstIndex(of: 0x0A) ?? bytes.count
+        } else {
+            var alignedEnd = min(windowStart + 4_096, bytes.count)
+            while alignedEnd < bytes.count,
+                  alignedEnd > windowStart,
+                  bytes[alignedEnd] & 0xC0 == 0x80 {
+                alignedEnd -= 1
+            }
+            windowEnd = alignedEnd
+        }
+
+        let visibleBytes = Array(bytes[..<windowEnd])
+        while lastTotal < UInt64(windowEnd) {
+            guard !reporter.isCancelled else { return false }
+            guard let progress = streamChunk(
+                spec: spec,
+                tail: visibleBytes,
+                total: UInt64(windowEnd),
+                lastTotal: &lastTotal,
+                truncated: false
+            ) else {
+                return false
+            }
+            guard await reporter.emit(progress) else { return false }
+        }
+        windowStart = windowEnd
+    }
+    return true
 }
 
 public enum FileToolPack {

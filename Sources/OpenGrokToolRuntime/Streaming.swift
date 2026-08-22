@@ -51,15 +51,49 @@ public struct PartialResultPayload: Codable, Sendable, Hashable {
             )
         }
         self.delta = delta
-        guard let totalVal = raw["total_bytes"], let total = totalVal.doubleValue else {
+        guard let totalValue = raw["total_bytes"] else {
             throw DecodingError.keyNotFound(
                 CodingKeys.totalBytes,
                 DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "missing total_bytes")
             )
         }
-        self.totalBytes = UInt64(total)
-        self.truncated = raw["truncated"]?.boolValue ?? false
-        self.gap = raw["gap"]?.boolValue ?? false
+        guard let total = totalValue.uint64Value else {
+            throw DecodingError.dataCorrupted(
+                DecodingError.Context(
+                    codingPath: decoder.codingPath + [CodingKeys.totalBytes],
+                    debugDescription: "total_bytes must be an unsigned 64-bit integer"
+                )
+            )
+        }
+        self.totalBytes = total
+        if let truncated = raw["truncated"] {
+            guard case .bool(let value) = truncated else {
+                throw DecodingError.typeMismatch(
+                    Bool.self,
+                    DecodingError.Context(
+                        codingPath: decoder.codingPath + [CodingKeys.truncated],
+                        debugDescription: "truncated must be a boolean"
+                    )
+                )
+            }
+            self.truncated = value
+        } else {
+            self.truncated = false
+        }
+        if let gap = raw["gap"] {
+            guard case .bool(let value) = gap else {
+                throw DecodingError.typeMismatch(
+                    Bool.self,
+                    DecodingError.Context(
+                        codingPath: decoder.codingPath + [CodingKeys.gap],
+                        debugDescription: "gap must be a boolean"
+                    )
+                )
+            }
+            self.gap = value
+        } else {
+            self.gap = false
+        }
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -133,38 +167,40 @@ public func streamChunk(
     let gap = newCount > tailLen
     let available = gap ? tail : Array(tail.suffix(Int(newCount)))
 
-    // Hold back incomplete trailing UTF-8 sequences and oversize ticks.
-    var emitBytes = available
-    let incomplete = incompleteUTF8SuffixLen(emitBytes)
-    if incomplete > 0 {
-        emitBytes = Array(emitBytes.dropLast(incomplete))
+    var cut = min(available.count, maxDelta)
+    while cut > 0, incompleteUTF8SuffixLen(Array(available.prefix(cut))) > 0 {
+        cut -= 1
     }
-    if emitBytes.count > maxDelta {
-        // Cap at maxDelta, but not mid-codepoint.
-        var capped = Array(emitBytes.prefix(maxDelta))
-        let capIncomplete = incompleteUTF8SuffixLen(capped)
-        if capIncomplete > 0 {
-            capped = Array(capped.dropLast(capIncomplete))
+    if cut == 0, !available.isEmpty {
+        cut = min(available.count, 4)
+        while cut < available.count,
+              incompleteUTF8SuffixLen(Array(available.prefix(cut))) > 0 {
+            cut += 1
         }
-        emitBytes = capped
     }
-    if emitBytes.isEmpty {
+    guard cut > 0 else {
         return nil
     }
 
+    let emitBytes = Array(available.prefix(cut))
     let delta = String(bytes: emitBytes, encoding: .utf8)
         ?? String(decoding: emitBytes, as: UTF8.self)
-    lastTotal += UInt64(emitBytes.count)
+    let consumed = UInt64(emitBytes.count)
+    if gap {
+        lastTotal = total - (UInt64(available.count) - min(consumed, UInt64(available.count)))
+    } else {
+        lastTotal += consumed
+    }
 
     let payload = PartialResultPayload(
         delta: delta,
-        totalBytes: lastTotal,
+        totalBytes: total,
         truncated: truncated,
         gap: gap
     )
     let value = (try? JSONValue.encode(payload)) ?? .object([
         "delta": .string(delta),
-        "total_bytes": .number(.double(Double(lastTotal))),
+        "total_bytes": .number(.uint64(total)),
     ])
     return .custom(subkind: spec.subkind, payload: value)
 }
