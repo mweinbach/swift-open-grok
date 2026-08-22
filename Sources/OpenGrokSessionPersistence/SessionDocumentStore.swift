@@ -222,21 +222,37 @@ public struct SessionDocumentStore: Sendable {
         }
     }
 
+    /// Resolve the private event log only after the canonical session is published.
+    /// Merely asking for this path never creates an event file.
+    public func eventLogURL(sessionID: String, cwd: String) throws -> URL {
+        let directory = try publishedSessionDirectory(sessionID: sessionID, cwd: cwd)
+        let url = directory.appendingPathComponent(Self.eventsFileName)
+        guard FileManager.default.fileExists(atPath: url.path) else { return url }
+
+        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true else {
+            throw SessionDocumentStoreError.io(
+                path: url.path,
+                reason: "session event log must be a regular owner-private file"
+            )
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        return url
+    }
+
     /// Events are opt-in upstream; this file exists only after an explicit append.
     public func appendEvent(
         _ event: JSONValue,
         sessionID: String,
         cwd: String
     ) throws {
-        let directory = try publishedSessionDirectory(sessionID: sessionID, cwd: cwd)
-        try appendJSONLine(event, to: directory.appendingPathComponent(Self.eventsFileName))
+        try appendJSONLine(event, to: eventLogURL(sessionID: sessionID, cwd: cwd))
     }
 
     public func readEvents(sessionID: String, cwd: String) throws -> [JSONValue] {
-        let directory = try publishedSessionDirectory(sessionID: sessionID, cwd: cwd)
         return try readJSONLines(
             JSONValue.self,
-            from: directory.appendingPathComponent(Self.eventsFileName)
+            from: eventLogURL(sessionID: sessionID, cwd: cwd)
         ).values
     }
 

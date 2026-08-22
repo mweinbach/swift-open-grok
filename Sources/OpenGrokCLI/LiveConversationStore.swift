@@ -342,6 +342,14 @@ actor LiveConversationStore {
         }
     }
 
+    func eventLogURL(sessionID: String, workingDirectory: String) throws -> URL {
+        try documentStore.eventLogURL(sessionID: sessionID, cwd: workingDirectory)
+    }
+
+    func sessionEvents(sessionID: String, workingDirectory: String) throws -> [JSONValue] {
+        try documentStore.readEvents(sessionID: sessionID, cwd: workingDirectory)
+    }
+
     /// `x.ai/session/rename` for a session that is NOT the live spine: load,
     /// set the stored title, persist — one actor turn, so the read-modify-
     /// write cannot interleave with another store call. Returns `false` when
@@ -1073,6 +1081,8 @@ actor LiveConversationHistory {
     private var usageCancellationToken: ChatStateCancellationToken
     private var usageSamplingConfig: SamplingConfig
     private var activeUsagePromptID: String?
+    private var eventTracker: SessionEventTracker?
+    private(set) var eventLoggingFailure: String?
 
     init(
         record: LiveConversationRecord,
@@ -1142,6 +1152,8 @@ actor LiveConversationHistory {
             cancellationToken: cancellationToken
         )
         activeUsagePromptID = nil
+        eventTracker = nil
+        eventLoggingFailure = nil
         self.record = record
         if record.everUsedNonXAI != false {
             self.exportBoundary.sync(everUsedNonXAI: true)
@@ -1244,6 +1256,130 @@ actor LiveConversationHistory {
     func endUsagePrompt(_ promptID: String) async {
         if activeUsagePromptID == promptID {
             activeUsagePromptID = nil
+        }
+    }
+
+    func beginEventTurn(modelID: String, yoloMode: Bool) async {
+        if eventTracker == nil {
+            do {
+                let existing = try await store.sessionEvents(
+                    sessionID: record.sessionID,
+                    workingDirectory: record.workingDirectory
+                )
+                let recordedTurn = existing.compactMap { event -> UInt64? in
+                    guard event["type"]?.stringValue == "turn_started" else { return nil }
+                    return event["turn_number"]?.uint64Value
+                }.max()
+                let inheritedTurn = UInt64(record.items.filter { item in
+                    guard case .user(let user) = item else { return false }
+                    guard let reason = user.syntheticReason else { return true }
+                    return reason.startsPromptTurn
+                }.count)
+                let nextTurn: UInt64
+                if let recordedTurn {
+                    nextTurn = recordedTurn == .max ? .max : recordedTurn + 1
+                } else {
+                    nextTurn = inheritedTurn
+                }
+                let file = try await store.eventLogURL(
+                    sessionID: record.sessionID,
+                    workingDirectory: record.workingDirectory
+                )
+                let log = try SessionEventLog(
+                    sessionDirectory: file.deletingLastPathComponent(),
+                    onFirstFailure: { failure in
+                        let message = "open-grok: session event logging failed: \(failure)\n"
+                        FileHandle.standardError.write(Data(message.utf8))
+                    }
+                )
+                eventTracker = SessionEventTracker(log: log, initialTurnNumber: nextTurn)
+            } catch {
+                reportEventFailure(error)
+                return
+            }
+        }
+
+        guard let eventTracker else { return }
+        let relationship: SessionEventRelationship = record.sessionKind?.hasPrefix("subagent") == true
+            ? .subagent
+            : .primary
+        let succeeded = await eventTracker.beginTurn(
+            sessionID: record.sessionID,
+            modelID: modelID,
+            yoloMode: yoloMode,
+            conversationMessageCount: record.items.count,
+            relationship: relationship
+        )
+        if !succeeded { reportEventFailure(eventTracker.log.firstFailure) }
+    }
+
+    func beginEventSamplerRound() async {
+        guard let eventTracker else { return }
+        if await !eventTracker.beginSamplerRound() {
+            reportEventFailure(eventTracker.log.firstFailure)
+        }
+    }
+
+    func noteEventToken(phase: SessionEventPhase) async {
+        guard let eventTracker else { return }
+        if await !eventTracker.noteToken(phase: phase) {
+            reportEventFailure(eventTracker.log.firstFailure)
+        }
+    }
+
+    func recordEventInterjections(_ items: [ConversationItem]) async {
+        guard let eventTracker else { return }
+        for item in items {
+            guard case .user(let user) = item, user.syntheticReason == .interjection else {
+                continue
+            }
+            let imageCount = user.content.reduce(UInt32.zero) { count, part in
+                if case .image = part { return count == .max ? .max : count + 1 }
+                return count
+            }
+            if await !eventTracker.interjected(source: .queue, imageCount: imageCount) {
+                reportEventFailure(eventTracker.log.firstFailure)
+            }
+        }
+    }
+
+    func beginEventTool(name: String, callID: String) async {
+        guard let eventTracker else { return }
+        if await !eventTracker.toolStarted(name: name, callID: callID) {
+            reportEventFailure(eventTracker.log.firstFailure)
+        }
+    }
+
+    func completeEventTool(callID: String, outcome: SessionEventToolOutcome) async {
+        guard let eventTracker else { return }
+        if await !eventTracker.toolCompleted(callID: callID, outcome: outcome) {
+            reportEventFailure(eventTracker.log.firstFailure)
+        }
+    }
+
+    func endEventTurn(
+        outcome: SessionEventTurnOutcome,
+        cancellationCategory: SessionEventCancellationCategory? = nil,
+        cancellationContext: JSONValue? = nil
+    ) async {
+        guard let eventTracker else { return }
+        let succeeded = await eventTracker.endTurn(
+            outcome: outcome,
+            cancellationCategory: cancellationCategory,
+            cancellationContext: cancellationContext
+        )
+        if !succeeded { reportEventFailure(eventTracker.log.firstFailure) }
+    }
+
+    private func reportEventFailure(_ error: (any Error)?) {
+        guard eventLoggingFailure == nil, let error else { return }
+        eventLoggingFailure = String(describing: error)
+        if !(error is SessionEventLogError), eventTracker == nil {
+            let message = "open-grok: session event logging unavailable: \(error)\n"
+            FileHandle.standardError.write(Data(message.utf8))
+        } else if eventTracker == nil {
+            let message = "open-grok: session event log could not be opened: \(error)\n"
+            FileHandle.standardError.write(Data(message.utf8))
         }
     }
 
@@ -1463,9 +1599,26 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         // `current_prompt_id` becoming Some for the Interject arm's
         // running-turn check (run_loop.rs:1968-1974).
         await conversationHistory.beginUsagePrompt(request.promptID)
+        let yoloMode: Bool
+        if let permissions = await toolExecutor.permissionHandle() {
+            yoloMode = await permissions.yoloMode
+        } else {
+            yoloMode = false
+        }
+        await conversationHistory.beginEventTurn(modelID: context.modelID, yoloMode: yoloMode)
         await interjections.beginTurn()
         do {
             let result = try await sampleTurn(context: context, request: request, emit: emit)
+            if result.stopReason == "max_turns_reached" {
+                var fields: [String: JSONValue] = ["reason": .string("max_turns_reached")]
+                if let maxTurns { fields["limit"] = .number(.uint64(UInt64(maxTurns))) }
+                await conversationHistory.endEventTurn(
+                    outcome: .cancelled,
+                    cancellationContext: .object(fields)
+                )
+            } else {
+                await conversationHistory.endEventTurn(outcome: .completed)
+            }
             // Buffer left intact: entries that raced past the final drain are
             // flushed into prompt turns by the controller (run_loop.rs:432-447).
             await interjections.endTurn()
@@ -1477,10 +1630,15 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             return result
         } catch {
             if error is CancellationError {
+                await conversationHistory.endEventTurn(
+                    outcome: .cancelled,
+                    cancellationCategory: .midTurnAbort
+                )
                 // Upstream's Cancel arm clears pending interjections — a
                 // cancelled turn has nothing to inject into (run_loop.rs:989-991).
                 await interjections.cancelTurn()
             } else {
+                await conversationHistory.endEventTurn(outcome: .error)
                 // A failed turn still flushes stranded interjections into
                 // prompt turns, exactly like a completed one — upstream's
                 // completion arm handles Err results too (run_loop.rs:416-447).
@@ -1620,6 +1778,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         do {
             while true {
                 try Task.checkCancellation()
+                await conversationHistory.beginEventSamplerRound()
                 // Mid-turn interjections land at the top of every sampler
                 // round. Upstream drains right before each request is built
                 // (turn.rs:2413) AND immediately after tool results land
@@ -1627,7 +1786,9 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                 // because control re-enters here after `executeToolCalls`.
                 // Before compaction on purpose: the injected user item must
                 // count toward the budget like everything else.
-                items.append(contentsOf: await drainPendingInterjections())
+                let pendingInterjections = await drainPendingInterjections()
+                await conversationHistory.recordEventInterjections(pendingInterjections)
+                items.append(contentsOf: pendingInterjections)
                 // Before every sample, not only the first: a tool round can add
                 // more to the prompt than the whole preceding turn did, and the
                 // request that dies at the context wall is usually the one after a
@@ -1665,6 +1826,9 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                         )) { event in
                             switch event {
                             case .output(let text):
+                                if !text.isEmpty {
+                                    await conversationHistory.noteEventToken(phase: .streamingText)
+                                }
                                 await streamedText.record()
                                 await emit(.assistantText(text))
                             case .status(let status):
@@ -1684,6 +1848,9 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                                     cacheCreationInputTokens: cacheCreationInputTokens
                                 ))
                             case .reasoning(let text):
+                                if !text.isEmpty {
+                                    await conversationHistory.noteEventToken(phase: .streamingReasoning)
+                                }
                                 await emit(.reasoning(text))
                             case .reasoningCompleted(let signature):
                                 await emit(.reasoningCompleted(signature: signature))
@@ -1779,6 +1946,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                 )
                 let emittedText = await streamedText.hasEmitted
                 if !emittedText, !response.output.isEmpty {
+                    await conversationHistory.noteEventToken(phase: .streamingText)
                     await emit(.assistantText(response.output))
                 }
 
@@ -1806,6 +1974,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                     // round gets one more round instead of missing the turn.
                     let preCompletion = await drainPendingInterjections()
                     if !preCompletion.isEmpty {
+                        await conversationHistory.recordEventInterjections(preCompletion)
                         items.append(contentsOf: preCompletion)
                         continue
                     }
@@ -1820,6 +1989,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                     // commit re-saves the record with the extra items.
                     let late = await drainPendingInterjections()
                     if !late.isEmpty {
+                        await conversationHistory.recordEventInterjections(late)
                         items.append(contentsOf: late)
                         continue
                     }
@@ -2105,6 +2275,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
 
         for (_, call) in dispatched {
             try Task.checkCancellation()
+            await conversationHistory.beginEventTool(name: call.name, callID: call.callId)
             await emit(.tool(OpenGrokShellToolUpdate(
                 callID: call.callId,
                 name: call.name,
@@ -2159,6 +2330,10 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                             callID: call.callId,
                             state: displayState
                         )
+                        await conversationHistory.completeEventTool(
+                            callID: call.callId,
+                            outcome: displayState == .failed ? .error : .success
+                        )
                         await emit(.status(
                             displayState == .failed
                                 ? "tool \(call.name) failed"
@@ -2176,6 +2351,10 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                         await conversationHistory.recordToolOutcome(
                             callID: call.callId,
                             state: .cancelled
+                        )
+                        await conversationHistory.completeEventTool(
+                            callID: call.callId,
+                            outcome: .cancelled
                         )
                         throw CancellationError()
                     case .failure(.denied):
@@ -2196,6 +2375,10 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                             outcome: .denied,
                             detail: content
                         )
+                        await conversationHistory.completeEventTool(
+                            callID: call.callId,
+                            outcome: .permissionRejected
+                        )
                         await emit(.status("tool \(call.name) denied"))
                     case .failure(let error):
                         content = "Tool \(call.name) failed: \(error.description)"
@@ -2209,6 +2392,17 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                         await conversationHistory.recordToolOutcome(
                             callID: call.callId,
                             state: .failed
+                        )
+                        let eventOutcome: SessionEventToolOutcome
+                        switch error {
+                        case .invalidCall, .unsupported:
+                            eventOutcome = .invalidTool
+                        default:
+                            eventOutcome = .error
+                        }
+                        await conversationHistory.completeEventTool(
+                            callID: call.callId,
+                            outcome: eventOutcome
                         )
                         await emit(.status("tool \(call.name) failed"))
                         toolExecutor.firePostToolUseFailure(call: call, error: error)
