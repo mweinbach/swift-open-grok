@@ -8,17 +8,29 @@ import OpenGrokShared
 /// The durable-history lane, deliberately distinct from the resident-agent roster.
 /// Rust: `xai-grok-shell/src/agent/handlers/session.rs:37-42,177-221,262-283`.
 struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
+    private static let maximumJournalBytes = 16 * 1_024 * 1_024
+    private static let maximumJournalRecords = 100_000
+    private static let maximumUpdatePage = 10_000
+    private static let maximumUpdateChunk = 1_000
+    private static let maximumSearchDocuments = 10_000
+    private static let maximumSearchPage = 1_000
+    private static let maximumSearchOffset = 100_000
+
     static let methods = [
         "x.ai/session/list",
+        "x.ai/session/updates",
+        "x.ai/session/search",
         "x.ai/session_summaries/session_list",
         "x.ai/session_summaries/workspace_list",
         "x.ai/session_summaries/workspace_list_recent",
     ]
 
     let openGrokHome: URL
+    let gateway: ACPNotificationGateway?
 
-    init(openGrokHome: URL) {
+    init(openGrokHome: URL, gateway: ACPNotificationGateway? = nil) {
         self.openGrokHome = openGrokHome.standardizedFileURL
+        self.gateway = gateway
     }
 
     func handle(method: String, params: JSONValue) async throws -> JSONValue {
@@ -28,6 +40,10 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
         switch method {
         case "x.ai/session/list":
             return try unifiedList(params)
+        case "x.ai/session/updates":
+            return try await sessionUpdates(params)
+        case "x.ai/session/search":
+            return try sessionSearch(params)
         case "x.ai/session_summaries/session_list":
             return try workspaceSessions(params)
         case "x.ai/session_summaries/workspace_list":
@@ -131,6 +147,409 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
             throw invalidParams("invalid params: missing or invalid field `limit`")
         }
         return .array(try loadEntries().prefix(limit).map(\.summary))
+    }
+
+    /// Rust: `extensions/session_updates.rs:46-67,345-445`; this method is RAW,
+    /// while streamed chunks carry `routing.rs:28-45` connection metadata.
+    private func sessionUpdates(_ params: JSONValue) async throws -> JSONValue {
+        let request: UpdatesRequest
+        do {
+            request = try params.decode(UpdatesRequest.self)
+            try LiveConversationStore.validateSessionID(request.sessionId)
+        } catch {
+            throw invalidParams("invalid params: \(error)")
+        }
+        let workspace = try validatedWorkspace(request.cwd, field: "cwd")
+        let routedClientID: JSONValue?
+        if let metadata = request.metadata {
+            guard let object = metadata.objectValue else {
+                throw invalidParams("invalid params: _meta must be an object")
+            }
+            if let clientID = object["clientId"], !clientID.isNull {
+                guard let client = clientID.objectValue,
+                      client["instanceId"]?.stringValue != nil,
+                      client["connId"]?.stringValue != nil
+                else {
+                    throw invalidParams("invalid params: _meta.clientId is not a valid client identity")
+                }
+                routedClientID = clientID
+            } else {
+                routedClientID = nil
+            }
+        } else {
+            routedClientID = nil
+        }
+        if request.stream == true && gateway == nil {
+            throw AcpError.invalidRequest().withData(
+                .string("session update streaming requires an attached ACP notification gateway")
+            )
+        }
+
+        let entries = try loadEntries()
+        guard let entry = entries.first(where: {
+            $0.listing.sessionID == request.sessionId
+                && matchesWorkspace($0.listing.workingDirectory, workspace)
+        }) else {
+            return emptyUpdatesResponse(streaming: request.stream == true)
+        }
+
+        let store = SessionDocumentStore(grokHome: openGrokHome)
+        let directory: URL
+        do {
+            directory = try store.sessionDirectory(
+                sessionID: entry.listing.sessionID,
+                cwd: entry.listing.workingDirectory
+            )
+        } catch {
+            throw internalError("failed to resolve session updates: \(error)")
+        }
+        let journal = directory.appendingPathComponent(SessionDocumentStore.updatesFileName)
+        guard FileManager.default.fileExists(atPath: journal.path) else {
+            return emptyUpdatesResponse(streaming: request.stream == true)
+        }
+        let root = openGrokHome.appendingPathComponent("sessions", isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL
+        guard isSafeRegularFile(journal, root: root) else {
+            throw internalError("session update journal is not a private regular file")
+        }
+
+        let size: Int
+        do {
+            size = try journal.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        } catch {
+            throw internalError("failed to inspect session update journal: \(error)")
+        }
+        guard size <= Self.maximumJournalBytes else {
+            throw internalError("session update journal exceeds the bounded replay size")
+        }
+        let raw: String
+        do {
+            guard let decoded = String(data: try Data(contentsOf: journal), encoding: .utf8)
+            else {
+                throw internalError("session update journal is not valid UTF-8")
+            }
+            raw = decoded
+        } catch let error as AcpError {
+            throw error
+        } catch {
+            throw internalError("failed to read session update journal: \(error)")
+        }
+
+        var updates: [JSONValue] = []
+        let decoder = JSONDecoder()
+        for line in raw.split(whereSeparator: \.isNewline) {
+            guard !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            guard updates.count < Self.maximumJournalRecords else {
+                throw internalError("session update journal exceeds the bounded replay record count")
+            }
+            do {
+                let update = try decoder.decode(JSONValue.self, from: Data(line.utf8))
+                guard update.objectValue != nil else {
+                    throw internalError("session update journal contains an invalid envelope")
+                }
+                updates.append(update)
+            } catch let error as AcpError {
+                throw error
+            } catch {
+                throw internalError("session update journal contains an invalid envelope: \(error)")
+            }
+        }
+
+        let survivors = filterRewoundUpdates(updates)
+        let promptStarts = promptStartIndexes(in: survivors)
+        let total = survivors.count
+        let pageLimit = min(
+            request.limit.flatMap(Int.init(exactly:)) ?? Self.maximumUpdatePage,
+            Self.maximumUpdatePage
+        )
+        let start: Int
+        let tailByTurn = request.offset == nil && (request.turnIndex ?? 0) > 0
+        if tailByTurn {
+            let count = Int(exactly: min(request.turnIndex ?? 0, UInt64(promptStarts.count)))
+                ?? promptStarts.count
+            start = count >= promptStarts.count ? 0 : promptStarts[promptStarts.count - count]
+        } else if let offset = request.offset, offset < 0 {
+            let backwards = min(offset.magnitude, UInt64(total))
+            start = total - Int(backwards)
+        } else if let offset = request.offset {
+            start = min(Int(exactly: offset) ?? total, total)
+        } else {
+            start = 0
+        }
+        let end = min(start + min(pageLimit, total - start), total)
+        let page = Array(survivors[start..<end])
+        let lastEventId = page.reversed().compactMap {
+            $0["params"]?["_meta"]?["eventId"]?.stringValue
+        }.first
+        let promptValues = JSONValue.array(promptStarts.map {
+            .number(.uint64(UInt64($0)))
+        })
+
+        if request.stream == true {
+            guard let gateway else {
+                throw AcpError.invalidRequest().withData(
+                    .string("session update streaming requires an attached ACP notification gateway")
+                )
+            }
+            let chunkSize = max(1, min(
+                request.chunkSize.flatMap(Int.init(exactly:)) ?? 64,
+                Self.maximumUpdateChunk
+            ))
+            let chunkCount = page.isEmpty ? 0 : (page.count - 1) / chunkSize + 1
+            for index in 0..<chunkCount {
+                let lower = index * chunkSize
+                let upper = min(lower + chunkSize, page.count)
+                var notification: [String: JSONValue] = [
+                    "sessionId": .string(request.sessionId),
+                    "index": .number(.uint64(UInt64(index))),
+                    "updates": .array(Array(page[lower..<upper])),
+                    "done": .bool(index + 1 == chunkCount),
+                ]
+                if let routedClientID {
+                    notification["_meta"] = .object(["targetClientId": routedClientID])
+                }
+                await gateway.send(
+                    method: "x.ai/session/updates/chunk",
+                    params: .object(notification)
+                )
+            }
+            var result: [String: JSONValue] = [
+                "totalCount": .number(.uint64(UInt64(total))),
+                "chunkCount": .number(.uint64(UInt64(chunkCount))),
+                "promptStarts": promptValues,
+            ]
+            if let lastEventId { result["lastEventId"] = .string(lastEventId) }
+            return .object(result)
+        }
+
+        var result: [String: JSONValue] = [
+            "updates": .array(page),
+            "totalCount": .number(.uint64(UInt64(total))),
+            "hasMore": .bool(tailByTurn ? start > 0 : end < total),
+            "promptStarts": promptValues,
+        ]
+        if let lastEventId { result["lastEventId"] = .string(lastEventId) }
+        return .object(result)
+    }
+
+    private func emptyUpdatesResponse(streaming: Bool) -> JSONValue {
+        if streaming {
+            return .object([
+                "totalCount": .number(.uint64(0)),
+                "chunkCount": .number(.uint64(0)),
+                "promptStarts": .array([]),
+            ])
+        }
+        return .object([
+            "updates": .array([]),
+            "totalCount": .number(.uint64(0)),
+            "hasMore": .bool(false),
+            "promptStarts": .array([]),
+        ])
+    }
+
+    /// Rust: `session/storage/mod.rs:1378-1469`; host turns never own a rewind.
+    private func filterRewoundUpdates(_ updates: [JSONValue]) -> [JSONValue] {
+        var survivors: [JSONValue] = []
+        var promptStarts: [Int] = []
+        var tracker = UserTurnTracker()
+
+        for envelope in updates {
+            let method = envelope["method"]?.stringValue
+            let update = envelope["params"]?["update"]
+            let tag = update?["sessionUpdate"]?.stringValue
+            if method == "_x.ai/session/update", tag == "rewind_marker",
+               let rawTarget = update?["target_prompt_index"]?.uint64Value
+            {
+                let target = Int(exactly: rawTarget) ?? promptStarts.count
+                let truncation = target < promptStarts.count
+                    ? promptStarts[target] : survivors.count
+                survivors.removeSubrange(truncation..<survivors.count)
+                if target < promptStarts.count {
+                    promptStarts.removeSubrange(target..<promptStarts.count)
+                }
+                tracker.finishRun()
+                continue
+            }
+
+            let metadata = update?["_meta"]
+            if method == "session/update", tag == "user_message_chunk",
+               metadata?["hostTurn"]?.boolValue != true
+            {
+                let promptIndex = metadata?["promptIndex"]?.uint64Value
+                    .flatMap(Int.init(exactly:))
+                if tracker.startsCountedTurn(promptIndex: promptIndex) {
+                    promptStarts.append(survivors.count)
+                }
+            } else {
+                tracker.finishRun()
+            }
+            survivors.append(envelope)
+        }
+        return survivors
+    }
+
+    private func promptStartIndexes(in updates: [JSONValue]) -> [Int] {
+        var starts: [Int] = []
+        var inUserRun = false
+        for (index, envelope) in updates.enumerated() {
+            let isUser = envelope["params"]?["update"]?["sessionUpdate"]?.stringValue
+                == "user_message_chunk"
+            if isUser && !inUserRun { starts.append(index) }
+            inUserRun = isUser
+        }
+        return starts
+    }
+
+    /// Rust: `extensions/session_search.rs:22-115`; unlike updates, search is
+    /// returned inside `ExtMethodResult`'s `result` envelope.
+    private func sessionSearch(_ params: JSONValue) throws -> JSONValue {
+        let request: SearchRequest
+        do {
+            request = try params.decode(SearchRequest.self)
+        } catch {
+            throw invalidParams("invalid params: \(error)")
+        }
+        let workspace = try request.cwd.map { try validatedWorkspace($0, field: "cwd") }
+        guard request.offset <= UInt64(Self.maximumSearchOffset) else {
+            throw invalidParams("invalid params: offset exceeds the bounded search range")
+        }
+        let offset = Int(request.offset)
+        let limit = Int(min(request.limit, UInt64(Self.maximumSearchPage)))
+        let entries = try loadEntries().filter { entry in
+            guard let workspace else { return true }
+            return matchesWorkspace(entry.listing.workingDirectory, workspace)
+        }
+        let root = openGrokHome.appendingPathComponent("sessions", isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL
+        let documents = entries.prefix(Self.maximumSearchDocuments).compactMap {
+            secureSearchDocument(for: $0, root: root)
+        }
+        let needle = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let idShaped = isSessionIDQuery(needle)
+        let matchingIDs: [LiveSessionSearchHit]
+        if idShaped {
+            matchingIDs = documents.filter {
+                $0.sessionID.localizedCaseInsensitiveContains(needle)
+            }.sorted {
+                if $0.updatedAt == $1.updatedAt { return $0.sessionID < $1.sessionID }
+                return $0.updatedAt > $1.updatedAt
+            }.map {
+                LiveSessionSearchHit(
+                    sessionID: $0.sessionID,
+                    title: $0.title,
+                    workingDirectory: $0.workingDirectory,
+                    updatedAt: $0.updatedAt,
+                    score: 1,
+                    snippet: ""
+                )
+            }
+        } else {
+            matchingIDs = []
+        }
+        let useIDResults = !matchingIDs.isEmpty || (idShaped && UUID(uuidString: needle) != nil)
+        let ranked = useIDResults
+            ? matchingIDs
+            : LiveSessionSearch.rank(documents: documents, query: needle, limit: documents.count)
+        let page = offset < ranked.count ? Array(ranked.dropFirst(offset).prefix(limit)) : []
+        let documentsByID = Dictionary(uniqueKeysWithValues: documents.map { ($0.sessionID, $0) })
+        let rows = page.map { hit -> JSONValue in
+            var row: [String: JSONValue] = [
+                "sessionId": .string(hit.sessionID),
+                "cwd": .string(hit.workingDirectory),
+                "summary": .string(hit.title ?? ""),
+                "updatedAt": .string(formatTimestamp(hit.updatedAt)),
+                "score": .number(.double(hit.score)),
+                "matchedFields": .array(
+                    useIDResults
+                        ? [.string("session_id")]
+                        : searchMatchedFields(
+                            document: documentsByID[hit.sessionID],
+                            query: needle
+                        ).map(JSONValue.string)
+                ),
+            ]
+            if request.includeContent && !useIDResults {
+                row["snippet"] = .string(hit.snippet)
+            }
+            return .object(row)
+        }
+        let nextOffset = offset + page.count < ranked.count ? offset + page.count : nil
+        return .object(["result": .object([
+            "results": .array(rows),
+            "nextOffset": nextOffset.map { .number(.uint64(UInt64($0))) } ?? .null,
+            "totalEstimate": .number(.uint64(UInt64(ranked.count))),
+            "bootstrapping": .bool(false),
+        ])])
+    }
+
+    private func secureSearchDocument(for entry: Entry, root: URL) -> LiveSessionDocument? {
+        let store = SessionDocumentStore(grokHome: openGrokHome)
+        do {
+            let directory = try store.sessionDirectory(
+                sessionID: entry.listing.sessionID,
+                cwd: entry.listing.workingDirectory
+            )
+            let summary = directory.appendingPathComponent(SessionDocumentStore.summaryFileName)
+            if isSafeRegularFile(summary, root: root) {
+                for name in [
+                    SessionDocumentStore.chatHistoryFileName,
+                    SessionDocumentStore.updatesFileName,
+                ] {
+                    let document = directory.appendingPathComponent(name)
+                    if FileManager.default.fileExists(atPath: document.path) {
+                        guard isSafeRegularFile(document, root: root) else { return nil }
+                        let size = try document.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+                        guard size <= Self.maximumJournalBytes else { return nil }
+                    }
+                }
+                guard let state = try store.load(
+                    sessionID: entry.listing.sessionID,
+                    cwd: entry.listing.workingDirectory
+                ) else { return nil }
+                return LiveSessionDocument.build(from: try LiveConversationStore.record(
+                    from: state,
+                    requestedSessionID: entry.listing.sessionID
+                ))
+            }
+
+            let legacy = root.appendingPathComponent("\(entry.listing.sessionID).json")
+            guard isSafeRegularFile(legacy, root: root) else { return nil }
+            let legacySize = try legacy.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+            guard legacySize <= Self.maximumJournalBytes else { return nil }
+            let record = try JSONDecoder().decode(
+                LiveConversationRecord.self,
+                from: Data(contentsOf: legacy)
+            )
+            guard record.sessionID == entry.listing.sessionID,
+                  matchesWorkspace(
+                    record.workingDirectory,
+                    URL(fileURLWithPath: entry.listing.workingDirectory)
+                  )
+            else { return nil }
+            return LiveSessionDocument.build(from: record)
+        } catch {
+            return nil
+        }
+    }
+
+    private func searchMatchedFields(document: LiveSessionDocument?, query: String) -> [String] {
+        guard let document else { return ["content"] }
+        let stems = LiveSessionSearchQuery.tokens(query).map(LiveSessionSearchQuery.stem)
+        let title = (document.title ?? "").lowercased()
+        let content = document.content.lowercased()
+        var fields: [String] = []
+        if stems.contains(where: title.contains) { fields.append("title") }
+        if stems.contains(where: content.contains) { fields.append("content") }
+        return fields.isEmpty ? ["content"] : fields
+    }
+
+    private func isSessionIDQuery(_ query: String) -> Bool {
+        if UUID(uuidString: query) != nil { return true }
+        let stripped = query.filter { $0 != "-" }
+        return stripped.count >= 8 && stripped.allSatisfy {
+            $0.isASCII && "0123456789abcdefABCDEF".contains($0)
+        }
     }
 
     private func loadEntries() throws -> [Entry] {
@@ -452,6 +871,67 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
     private struct Entry: Sendable {
         let listing: LiveSessionListing
         let summary: JSONValue
+    }
+
+    private struct UpdatesRequest: Decodable {
+        let sessionId: String
+        let cwd: String
+        let offset: Int64?
+        let limit: UInt64?
+        let stream: Bool?
+        let chunkSize: UInt64?
+        let turnIndex: UInt64?
+        let metadata: JSONValue?
+
+        private enum CodingKeys: String, CodingKey {
+            case sessionId, cwd, offset, limit, stream, chunkSize, turnIndex
+            case metadata = "_meta"
+        }
+    }
+
+    private struct SearchRequest: Decodable {
+        let query: String
+        let cwd: String?
+        let limit: UInt64
+        let offset: UInt64
+        let includeContent: Bool
+
+        private enum CodingKeys: String, CodingKey {
+            case query, cwd, limit, offset, includeContent
+        }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            query = try values.decode(String.self, forKey: .query)
+            cwd = try values.decodeIfPresent(String.self, forKey: .cwd)
+            limit = try values.decodeIfPresent(UInt64.self, forKey: .limit) ?? 20
+            offset = try values.decodeIfPresent(UInt64.self, forKey: .offset) ?? 0
+            includeContent = try values.decodeIfPresent(Bool.self, forKey: .includeContent)
+                ?? false
+        }
+    }
+
+    private struct UserTurnTracker {
+        private var seenPromptIndex = false
+        private var inUserRun = false
+        private var currentPromptIndex: Int?
+
+        mutating func startsCountedTurn(promptIndex: Int?) -> Bool {
+            if promptIndex != nil { seenPromptIndex = true }
+            let counted = !seenPromptIndex || promptIndex != nil
+            let newRun = !inUserRun
+                || ((seenPromptIndex || promptIndex != nil) && promptIndex != currentPromptIndex)
+            if newRun {
+                currentPromptIndex = promptIndex
+            }
+            inUserRun = true
+            return newRun && counted
+        }
+
+        mutating func finishRun() {
+            inUserRun = false
+            currentPromptIndex = nil
+        }
     }
 
     private struct ListRequest: Decodable {

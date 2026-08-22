@@ -46,10 +46,9 @@
 //     no per-session web-search reload command channel), `x.ai/getApiKey`/
 //     `x.ai/setApiKey` and `x.ai/auth/*` (:4112, :4387 — the xAI auth
 //     family, Wave 17), the rest of `x.ai/session*`
-//     search/usage/repair (:4115-4155 — the item 6 remainder:
-//     updates/import/load_history/search/repair/usage need updates journals
-//     or the FTS index; info/state/close are routed (Wave 20 S4);
-//     singular `x.ai/session/list` still needs the persisted-history lane;
+//     usage/repair (:4115-4155 — the item 6 remainder:
+//     import/load_history/repair/usage lack their upstream backing;
+//     info/state/close and durable list/updates/content search are routed;
 //     plural `x.ai/sessions/list` is the live typed leader roster snapshot),
 //     `x.ai/memory/*` (:4156),
 //     `x.ai/skills/refresh-baseline` (:4159), `x.ai/interject` (:4165),
@@ -160,8 +159,12 @@ enum LiveACPExtensionRouter {
             }
         }
         if let persistentSessions {
+            let sessions = LivePersistentSessionACPHandler(
+                openGrokHome: persistentSessions.openGrokHome,
+                gateway: persistentSessions.gateway ?? sessionAdmin?.gateway
+            )
             for method in LivePersistentSessionACPHandler.methods {
-                router = router.register(exact: method, handler: persistentSessions)
+                router = router.register(exact: method, handler: sessions)
             }
         }
         return router

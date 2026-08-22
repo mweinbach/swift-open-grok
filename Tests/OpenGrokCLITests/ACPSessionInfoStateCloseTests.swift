@@ -9,8 +9,9 @@
 //     session errors with invalid_params.
 //   * `close` reports the close outcome (`closed`/`notResident`) and is
 //     idempotent: a second close of the same session reports `notResident`.
-//   * Out-of-scope methods (`updates`, `import`, `load_history`, `search`,
-//     `repair`, `usage`) are refused with upstream's terminal error.
+//   * Methods without backing in this admin-only router are refused. Durable
+//     `updates` and `search` become available only when their separately
+//     authorized persistent-history handler is actually installed.
 
 import Foundation
 import OpenGrokACP
@@ -445,9 +446,9 @@ struct ACPSessionInfoStateCloseTests {
         #expect(error?.data?.stringValue?.contains("sessionId") == true)
     }
 
-    // MARK: - Out-of-scope refusals
+    // MARK: - Methods without a backing handler
 
-    @Test("out-of-scope session methods are refused with upstream's terminal error")
+    @Test("session methods without their backing handler are refused with upstream's terminal error")
     func outOfScopeMethodsRefused() async throws {
         let harness = try await InfoStateCloseHarness.start(
             liveSessionID: "live-refuse",
