@@ -24,6 +24,7 @@ import OpenGrokShared
 import OpenGrokShell
 import OpenGrokTestSupport
 import OpenGrokToolTypes
+import OpenGrokWorkspace
 @testable import OpenGrokCLI
 
 // MARK: - Fixture
@@ -58,6 +59,7 @@ private struct PersonaFixture {
             "HOME": home.path,
             "OPENGROK_HOME": home.path,
             "XDG_STATE_HOME": home.appendingPathComponent("state").path,
+            "GROK_FOLDER_TRUST": "1",
             "XAI_API_KEY": "test-xai-key",
         ]
     }
@@ -106,9 +108,15 @@ private struct PersonaFixture {
 
     /// The REAL production sampler factory — the child must reach the wire
     /// through the code path the executable runs, not a stub.
-    func makeFoundation() async throws -> OpenGrokLiveApplicationLauncher.LiveSessionFoundation {
+    func makeFoundation(
+        trustProject: Bool = false
+    ) async throws -> OpenGrokLiveApplicationLauncher.LiveSessionFoundation {
+        var arguments = ["headless", "--prompt", "hello", "--cwd", workspace.path, "--model", "grok-4.5"]
+        if trustProject {
+            arguments.append("--trust")
+        }
         let command = try CLICommandParser.parseOrThrow(
-            ["headless", "--prompt", "hello", "--cwd", workspace.path, "--model", "grok-4.5"]
+            arguments
         )
         guard case .launch(let options) = command else {
             throw CLIApplicationError.failed("fixture did not parse to a launch")
@@ -201,8 +209,10 @@ struct LiveSubagentPersonaTests {
         try fixture.writeUserPersona("probe", instructions: userMarker)
         try fixture.enqueueChildTurn("child done")
 
-        let foundation = try await fixture.makeFoundation()
+        let foundation = try await fixture.makeFoundation(trustProject: true)
         defer { Task { await foundation.toolExecutor.shutdown() } }
+        #expect(foundation.securityContext.projectTrusted)
+        #expect(PersistentFolderTrustStore(environment: fixture.environment).isTrusted(fixture.workspace))
         let host = try #require(foundation.subagentHost)
 
         let result = await host.spawn(
@@ -219,6 +229,65 @@ struct LiveSubagentPersonaTests {
         #expect(!childBody.contains(userMarker))
     }
 
+    /// The same colliding files as the precedence control above, but without
+    /// an authoritative folder grant. A project persona is executable agent
+    /// configuration and must remain absent from the actual provider request
+    /// (`effective_definition_maps`, config/mod.rs:632-655).
+    @Test("an untrusted project persona cannot shadow a user persona on the wire")
+    func untrustedProjectCannotShadowUserOnTheWire() async throws {
+        let fixture = try PersonaFixture()
+        defer { fixture.dispose() }
+        let projectMarker = "UNTRUSTED-PROJECT-SOUL-\(UUID().uuidString)"
+        let userMarker = "TRUSTED-USER-SOUL-\(UUID().uuidString)"
+        try fixture.writeProjectPersona("probe", instructions: projectMarker)
+        try fixture.writeUserPersona("probe", instructions: userMarker)
+        try fixture.enqueueChildTurn("child done")
+
+        let foundation = try await fixture.makeFoundation()
+        defer { Task { await foundation.toolExecutor.shutdown() } }
+        #expect(!foundation.securityContext.projectTrusted)
+        #expect(!PersistentFolderTrustStore(environment: fixture.environment).isTrusted(fixture.workspace))
+        let host = try #require(foundation.subagentHost)
+
+        let result = await host.spawn(
+            args: PersonaFixture.spawnArgs(prompt: "run the probe"),
+            toolCallID: "call-untrusted-persona",
+            persona: "probe"
+        )
+        guard case .success = result else {
+            Issue.record("trusted user persona failed beside an untrusted project file: \(result)")
+            return
+        }
+
+        let childBody = try #require(fixture.responsesBodies().first)
+        #expect(childBody.contains(userMarker))
+        #expect(!childBody.contains(projectMarker))
+    }
+
+    @Test("a project-only persona remains unreachable until its folder is trusted")
+    func untrustedProjectOnlyPersonaNeverReachesTheWire() async throws {
+        let fixture = try PersonaFixture()
+        defer { fixture.dispose() }
+        try fixture.writeProjectPersona("hostile", instructions: "UNTRUSTED-PROJECT-INSTRUCTIONS")
+
+        let foundation = try await fixture.makeFoundation()
+        defer { Task { await foundation.toolExecutor.shutdown() } }
+        #expect(!foundation.securityContext.projectTrusted)
+        let host = try #require(foundation.subagentHost)
+
+        let result = await host.spawn(
+            args: PersonaFixture.spawnArgs(prompt: "run the probe"),
+            toolCallID: "call-project-only-persona",
+            persona: "hostile"
+        )
+        guard case let .failure(error) = result else {
+            Issue.record("an untrusted project-only persona unexpectedly spawned: \(result)")
+            return
+        }
+        #expect(error.description.contains("persona \"hostile\" not found in config"))
+        #expect(fixture.responsesBodies().isEmpty)
+    }
+
     /// Inline `[subagents.personas]` beats a project file of the same name —
     /// the `source_path.is_none()` arm of the merge (config/mod.rs:554-559).
     @Test("an inline config persona shadows the project file on the wire")
@@ -233,8 +302,9 @@ struct LiveSubagentPersonaTests {
         try fixture.writeProjectPersona("probe", instructions: projectMarker)
         try fixture.enqueueChildTurn("child done")
 
-        let foundation = try await fixture.makeFoundation()
+        let foundation = try await fixture.makeFoundation(trustProject: true)
         defer { Task { await foundation.toolExecutor.shutdown() } }
+        #expect(foundation.securityContext.projectTrusted)
         let host = try #require(foundation.subagentHost)
 
         let result = await host.spawn(
