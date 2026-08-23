@@ -3300,15 +3300,33 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 .union(["feedback", "announcements", "hooks-trust", "hooks-untrust"])
         )
         let conversationStore = LiveConversationStore(openGrokHome: openGrokHome)
-        var conversationRecord = try await resolveConversationRecord(
-            options: options,
-            lookupWorkingDirectory: sourceCwd,
-            workingDirectory: cwd,
-            openGrokHome: openGrokHome,
-            store: conversationStore
-        )
+        var conversationRecord: LiveConversationRecord
+        do {
+            conversationRecord = try await resolveConversationRecord(
+                options: options,
+                lookupWorkingDirectory: sourceCwd,
+                workingDirectory: cwd,
+                openGrokHome: openGrokHome,
+                store: conversationStore
+            )
+            try LiveWorktreeLaunch.attachSession(
+                worktreePreparation,
+                sessionID: conversationRecord.sessionID
+            )
+        } catch {
+            if let worktreePreparation {
+                do {
+                    try LiveWorktreeLaunch.discard(worktreePreparation)
+                } catch let cleanupError {
+                    throw CLIApplicationError.failed(
+                        "could not create the worktree session: \(error); "
+                            + "worktree cleanup also failed: \(cleanupError)"
+                    )
+                }
+            }
+            throw error
+        }
         let sessionID = conversationRecord.sessionID
-        try LiveWorktreeLaunch.attachSession(worktreePreparation, sessionID: sessionID)
         let permissionCoordinator = PagerPermissionCoordinator()
         let fileAccessPolicy = resolveFileAccessPolicy(
             environment: context.environment,
@@ -4408,7 +4426,6 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         openGrokHome: URL
     ) async throws -> URL {
         guard !options.forkSession,
-              options.worktree == nil,
               !options.continueSession,
               let requestedSessionID = options.sessionToResume?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -4428,6 +4445,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             return invocationWorkingDirectory
         }
         let persistedWorkingDirectory = try resolveWorkingDirectory(record.workingDirectory)
+
+        if options.worktree != nil {
+            try LiveWorktreeLaunch.validateResumeSource(
+                invocationDirectory: invocationWorkingDirectory,
+                sourceDirectory: persistedWorkingDirectory
+            )
+            return persistedWorkingDirectory
+        }
 
         if options.common.cwd != nil {
             guard LiveToolExecutor.workspaceRootsMatch(
@@ -4507,7 +4532,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             )
         }
 
-        if var sourceRecord {
+        if let sourceRecord {
             if let requestedSessionID = options.sessionID,
                requestedSessionID != sourceRecord.sessionID {
                 throw CLIApplicationError.failed(
@@ -4515,7 +4540,15 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 )
             }
             if options.worktree != nil {
-                sourceRecord.workingDirectory = workingDirectory.standardizedFileURL.path
+                let childSessionID = UUID().uuidString
+                var childRecord = try await store.fork(
+                    sourceSessionID: sourceRecord.sessionID,
+                    destinationSessionID: childSessionID,
+                    workingDirectory: workingDirectory
+                )
+                childRecord.sessionKind = "worktree"
+                try await store.save(childRecord)
+                return childRecord
             } else {
                 let persistedWorkingDirectory = URL(
                     fileURLWithPath: sourceRecord.workingDirectory,
