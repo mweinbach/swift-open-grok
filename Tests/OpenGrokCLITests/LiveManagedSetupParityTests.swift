@@ -7,6 +7,10 @@ import OpenGrokHTTP
 import Testing
 @testable import OpenGrokCLI
 
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+
 #if canImport(CryptoKit)
 import CryptoKit
 #endif
@@ -193,6 +197,35 @@ private struct ManagedSetupFixture {
 
 @Suite("live managed setup security and Rust CLI parity", .serialized)
 struct LiveManagedSetupParityTests {
+    @Test("production setup redirects are rejected before credentials can leave the trusted host")
+    func productionRedirectDelegateFailsClosedAcrossFoundationImplementations() async throws {
+        let trustedURL = try #require(URL(string: "https://cli-chat-proxy.grok.com/v1/deployment/config"))
+        let redirectedURL = try #require(URL(string: "https://attacker.example/collect"))
+        let response = try #require(HTTPURLResponse(
+            url: trustedURL,
+            statusCode: 302,
+            httpVersion: nil,
+            headerFields: ["Location": redirectedURL.absoluteString]
+        ))
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let task = session.dataTask(with: trustedURL)
+        let delegate = ManagedSetupNoRedirectDelegate()
+
+        let rejected = await withCheckedContinuation { continuation in
+            delegate.urlSession(
+                session,
+                task: task,
+                willPerformHTTPRedirection: response,
+                newRequest: URLRequest(url: redirectedURL)
+            ) { request in
+                continuation.resume(returning: request == nil)
+            }
+        }
+
+        #expect(rejected)
+    }
+
     @Test("hostile deployment backoff overrides are capped without arithmetic overflow")
     func hostileRetryBackoffCannotOverflowOrHang() {
         let delay = LiveManagedSetupComposition.boundedRetryBackoffNanoseconds(
