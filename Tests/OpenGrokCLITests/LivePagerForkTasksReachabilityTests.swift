@@ -270,6 +270,7 @@ private struct ForkTasksSession {
             modelName: "test-model",
             sessionID: sessionID,
             conversationStore: store,
+            openGrokHome: workspace.grokHome,
             // NOT `minimumPaintCadence` (1 ms): a running background task
             // keeps the motion ticker animating, and at ~1000 fps this
             // suite's 30-second `sleep` test accumulated frame diffs into
@@ -354,6 +355,26 @@ private func subagentID(from result: Result<OpenGrokShellToolCallResult, OpenGro
 
 @Suite("/fork live seam", .serialized)
 struct LivePagerForkReachabilityTests {
+    @Test("renderer resolves its state home from the injected audited environment")
+    func rendererHomeUsesInjectedEnvironment() async throws {
+        let workspace = ForkTasksWorkspace()
+        defer { workspace.cleanup() }
+        let renderer = LiveInteractiveControllerRenderer(
+            mode: .fullScreen,
+            terminal: OpenGrokLiveTerminal(
+                isTTY: { false },
+                size: { OpenGrokLiveTerminalSize(width: 120, height: 40) },
+                write: { _ in }
+            ),
+            sink: ForkCapturingSink(),
+            workingDirectory: workspace.root.path,
+            environment: workspace.environment
+        )
+
+        let resolvedHome = await renderer.openGrokHome
+        #expect(resolvedHome == workspace.grokHome)
+    }
+
     @Test("/fork writes a REAL forked session record: parent id, copied items, rewind bytes")
     func forkWritesTheForkedRecord() async throws {
         let workspace = ForkTasksWorkspace()
@@ -373,7 +394,8 @@ struct LivePagerForkReachabilityTests {
         try await session.renderer.render(.overlay(.fork(worktreeOverride: nil, directive: nil)))
 
         await session.waitForPaint(of: "Forked this session as")
-        #expect(session.paintedContains("Forked this session as"))
+        let forkNoticeVisible = session.paintedContains("Forked this session as")
+        #expect(forkNoticeVisible)
 
         // The record is asserted ON DISK, not through the store that wrote
         // it: a decode of the actual file is what a resume will see.
@@ -400,8 +422,10 @@ struct LivePagerForkReachabilityTests {
         #expect(try Data(contentsOf: forkedRewindURL) == rewindBytes)
 
         // The note names both real open routes for the new id.
-        #expect(session.paintedContains("/resume \(forkedID)"))
-        #expect(session.paintedContains("open-grok --resume \(forkedID)"))
+        let inPagerResumeVisible = session.paintedContains("/resume \(forkedID)")
+        let externalResumeVisible = session.paintedContains("open-grok --resume \(forkedID)")
+        #expect(inPagerResumeVisible)
+        #expect(externalResumeVisible)
         try await session.renderer.restoreTerminal()
     }
 
@@ -427,12 +451,18 @@ struct LivePagerForkReachabilityTests {
             backend: ForkInertShellBackend(),
             store: store
         )
+        let rendererHome = await session.renderer.openGrokHome
+        #expect(rendererHome == workspace.grokHome)
 
         try await session.renderer.render(.overlay(.fork(worktreeOverride: true, directive: nil)))
 
         await session.waitForPaint(of: "Forked this session into a worktree as")
         let childIDs = workspace.storedSessionIDs().filter { $0 != source.sessionID }
-        try #require(childIDs.count == 1, "exactly one worktree child, found \(childIDs)")
+        let observedNotice = String(session.sink.strippedText.suffix(1_200))
+        try #require(
+            childIDs.count == 1,
+            "exactly one worktree child, found \(childIDs); rendered notice: \(observedNotice)"
+        )
         let childID = childIDs[0]
         let child = try await store.load(sessionID: childID)
         let childDirectory = URL(fileURLWithPath: child.workingDirectory, isDirectory: true)
@@ -476,8 +506,12 @@ struct LivePagerForkReachabilityTests {
         #expect(parentAfter == parentBefore)
         #expect(currentSessionID == source.sessionID)
         #expect(currentWorkingDirectory == workspace.root.path)
-        #expect(session.paintedContains("open-grok --resume \(childID)"))
-        #expect(!session.paintedContains("Open it here with /resume \(childID)"))
+        let externalResumeVisible = session.paintedContains("open-grok --resume \(childID)")
+        let forbiddenInPagerResumeVisible = session.paintedContains(
+            "Open it here with /resume \(childID)"
+        )
+        #expect(externalResumeVisible)
+        #expect(!forbiddenInPagerResumeVisible)
         try await session.renderer.restoreTerminal()
         await session.executor.shutdown()
     }
@@ -507,7 +541,8 @@ struct LivePagerForkReachabilityTests {
         let registryRecords = try WorktreeRegistry(openGrokHome: workspace.grokHome).records()
         let worktrees = try workspace.pooledWorktrees()
         let parentAfter = try await store.load(sessionID: source.sessionID)
-        #expect(session.paintedContains(LivePagerForkCommand.worktreeRequiresGit))
+        let gitRefusalVisible = session.paintedContains(LivePagerForkCommand.worktreeRequiresGit)
+        #expect(gitRefusalVisible)
         #expect(workspace.storedSessionIDs() == [source.sessionID])
         #expect(registryRecords.isEmpty)
         #expect(worktrees.isEmpty)
@@ -544,8 +579,12 @@ struct LivePagerForkReachabilityTests {
         let registryRecords = try WorktreeRegistry(openGrokHome: workspace.grokHome).records()
         let worktrees = try workspace.pooledWorktrees()
         let parentAfter = try await store.load(sessionID: source.sessionID)
-        #expect(session.paintedContains("cannot fork legacy session"))
-        #expect(session.paintedContains("ever_used_codex export-boundary marker"))
+        let legacyRefusalVisible = session.paintedContains("cannot fork legacy session")
+        let exportBoundaryRefusalVisible = session.paintedContains(
+            "ever_used_codex export-boundary marker"
+        )
+        #expect(legacyRefusalVisible)
+        #expect(exportBoundaryRefusalVisible)
         #expect(workspace.storedSessionIDs() == [source.sessionID])
         #expect(registryRecords.isEmpty)
         #expect(worktrees.isEmpty)
@@ -583,7 +622,10 @@ struct LivePagerForkReachabilityTests {
         let registryRecords = try WorktreeRegistry(openGrokHome: workspace.grokHome).records()
         let worktrees = try workspace.pooledWorktrees()
         let parentAfter = try await store.load(sessionID: source.sessionID)
-        #expect(session.paintedContains("differs from this authorized workspace"))
+        let workspaceRefusalVisible = session.paintedContains(
+            "differs from this authorized workspace"
+        )
+        #expect(workspaceRefusalVisible)
         #expect(workspace.storedSessionIDs() == [source.sessionID])
         #expect(registryRecords.isEmpty)
         #expect(worktrees.isEmpty)
@@ -613,7 +655,8 @@ struct LivePagerForkReachabilityTests {
         )))
 
         await session.waitForPaint(of: "/fork with a directive is not available")
-        #expect(session.paintedContains(LivePagerForkCommand.directiveRefusal))
+        let directiveRefusalVisible = session.paintedContains(LivePagerForkCommand.directiveRefusal)
+        #expect(directiveRefusalVisible)
         #expect(workspace.storedSessionIDs() == [source.sessionID])
         try await session.renderer.restoreTerminal()
     }
@@ -647,7 +690,8 @@ struct LivePagerForkReachabilityTests {
         let registryRecords = try WorktreeRegistry(openGrokHome: workspace.grokHome).records()
         let worktrees = try workspace.pooledWorktrees()
         let parentAfter = try await store.load(sessionID: source.sessionID)
-        #expect(session.paintedContains(LivePagerForkCommand.directiveRefusal))
+        let directiveRefusalVisible = session.paintedContains(LivePagerForkCommand.directiveRefusal)
+        #expect(directiveRefusalVisible)
         #expect(workspace.storedSessionIDs() == [source.sessionID])
         #expect(registryRecords.isEmpty)
         #expect(worktrees.isEmpty)
@@ -672,7 +716,8 @@ struct LivePagerForkReachabilityTests {
         try await session.renderer.render(.overlay(.fork(worktreeOverride: nil, directive: nil)))
 
         await session.waitForPaint(of: "session not found: fork-live-missing")
-        #expect(session.paintedContains("session not found: fork-live-missing"))
+        let missingSessionVisible = session.paintedContains("session not found: fork-live-missing")
+        #expect(missingSessionVisible)
         #expect(workspace.storedSessionIDs().isEmpty)
         try await session.renderer.restoreTerminal()
     }
@@ -714,7 +759,9 @@ struct LivePagerTasksReachabilityTests {
               !sink.strippedText.filter({ !$0.isWhitespace }).contains(needle) {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
-        #expect(sink.strippedText.filter { !$0.isWhitespace }.contains(needle))
+        let sessionRefusalVisible = sink.strippedText.filter { !$0.isWhitespace }
+            .contains(needle)
+        #expect(sessionRefusalVisible)
         try await renderer.restoreTerminal()
     }
 
@@ -734,7 +781,10 @@ struct LivePagerTasksReachabilityTests {
 
         // `status_blocks.rs:169`, byte for byte.
         await session.waitForPaint(of: "No background tasks, workflows, or subagents.")
-        #expect(session.paintedContains("No background tasks, workflows, or subagents."))
+        let emptyTasksVisible = session.paintedContains(
+            "No background tasks, workflows, or subagents."
+        )
+        #expect(emptyTasksVisible)
         try await session.renderer.restoreTerminal()
     }
 
@@ -776,9 +826,12 @@ struct LivePagerTasksReachabilityTests {
 
         await session.waitForPaint(of: "Task · long sleeper")
         // Header (`Task (1):`), status, kind and the description one-liner.
-        #expect(session.paintedContains("Task (1):"))
-        #expect(session.paintedContains("running"))
-        #expect(session.paintedContains("Task · long sleeper"))
+        let taskHeaderVisible = session.paintedContains("Task (1):")
+        let taskRunningVisible = session.paintedContains("running")
+        let taskDescriptionVisible = session.paintedContains("Task · long sleeper")
+        #expect(taskHeaderVisible)
+        #expect(taskRunningVisible)
+        #expect(taskDescriptionVisible)
 
         // Tear the process down through the REAL kill tool, asserting on
         // the outcome at the call site — never `_ =`.
@@ -887,9 +940,12 @@ struct LivePagerTasksReachabilityTests {
         // `format_subagent_label`: "explore" is a meaningful type, so the
         // label is "Explore · <description>".
         await session.waitForPaint(of: "Explore · probe the fixture")
-        #expect(session.paintedContains("Task (1):"))
-        #expect(session.paintedContains("completed"))
-        #expect(session.paintedContains("Explore · probe the fixture"))
+        let taskHeaderVisible = session.paintedContains("Task (1):")
+        let childCompletedVisible = session.paintedContains("completed")
+        let childDescriptionVisible = session.paintedContains("Explore · probe the fixture")
+        #expect(taskHeaderVisible)
+        #expect(childCompletedVisible)
+        #expect(childDescriptionVisible)
         try await session.renderer.restoreTerminal()
         await session.executor.shutdown()
     }

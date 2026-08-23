@@ -847,8 +847,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         self.sessionCatalog = sessionCatalog
         self.conversationStore = conversationStore
         self.mcpServers = mcpServers
+        let resolvedEnvironment = environment ?? ProcessInfo.processInfo.environment
         let resolvedOpenGrokHome = openGrokHome ?? OpenGrokHomeResolver
-            .resolve(environment: ProcessInfo.processInfo.environment)
+            .resolve(environment: resolvedEnvironment)
         self.openGrokHome = resolvedOpenGrokHome
         self.announcements = announcements
         self.changelog = changelog
@@ -880,7 +881,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // reference's terminal-native lock. Everything else resolves the stored
         // preference against what this terminal can render, so a truecolor-only
         // theme degrades to GrokNight instead of to mush.
-        let environment = environment ?? ProcessInfo.processInfo.environment
+        let environment = resolvedEnvironment
         self.environment = environment
         let resolvedUIConfiguration = uiConfiguration ?? Self.resolveUIConfig(
             workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true),
