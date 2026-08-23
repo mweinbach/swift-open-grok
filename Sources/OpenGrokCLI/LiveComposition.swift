@@ -1039,6 +1039,7 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
     public let makeSampler: @Sendable (OpenGrokLiveSamplingConfiguration) throws -> OpenGrokLiveSampler
     public let makeCodeModeCapability: @Sendable () -> CodeModeRuntimeCapability
     public let makeProcessBackend: @Sendable () -> any ShellProcessBackend
+    public let makeSandboxRuntime: @Sendable () -> any LiveSandboxRuntime
     public let terminal: OpenGrokLiveTerminal
     public let makeInteractiveInput: @Sendable () async throws -> OpenGrokLiveInteractiveInput?
     public let makeTerminalSink: @Sendable () -> (any PagerTerminalSink)?
@@ -1063,6 +1064,9 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
         makeProcessBackend: @escaping @Sendable () -> any ShellProcessBackend = {
             LocalShellProcessBackend()
         },
+        makeSandboxRuntime: @escaping @Sendable () -> any LiveSandboxRuntime = {
+            LiveSandboxRuntimeAdapter()
+        },
         terminal: OpenGrokLiveTerminal = .production,
         makeInteractiveInput: @escaping @Sendable () async throws -> OpenGrokLiveInteractiveInput? = { nil },
         makeTerminalSink: @escaping @Sendable () -> (any PagerTerminalSink)? = { nil },
@@ -1081,6 +1085,7 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
         self.makeSampler = makeSampler
         self.makeCodeModeCapability = makeCodeModeCapability
         self.makeProcessBackend = makeProcessBackend
+        self.makeSandboxRuntime = makeSandboxRuntime
         self.terminal = terminal
         self.makeInteractiveInput = makeInteractiveInput
         self.makeTerminalSink = makeTerminalSink
@@ -1095,6 +1100,7 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
         makeSampler: OpenGrokLiveSampler.production(configuration:),
         makeCodeModeCapability: { InProcessCodeModeSession.runtimeCapability },
         makeProcessBackend: { LocalShellProcessBackend() },
+        makeSandboxRuntime: { LiveSandboxRuntimeAdapter() },
         terminal: .production,
             makeInteractiveInput: OpenGrokLiveInteractiveInput.production,
             makeTerminalSink: { FileHandlePagerTerminalSink() },
@@ -1603,6 +1609,13 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 invocationWorkingDirectory: invocationCWD,
                 openGrokHome: Self.resolveOpenGrokHome(environment: context.environment)
             )
+            if options.common.leader {
+                try LiveLeaderSandboxPolicy.enforce(
+                    options: options,
+                    workingDirectory: workflowSourceCWD,
+                    environment: context.environment
+                )
+            }
             let acquiredInteractiveInput = options.mode == .interactive
                 && dependencies.terminal.isTTY()
                 ? try await dependencies.makeInteractiveInput()
@@ -1794,7 +1807,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             coordinator: permissionCoordinator
                         ),
                         makeProcessBackend: dependencies.makeProcessBackend,
-                        environment: context.environment
+                        environment: context.environment,
+                        subagentHost: foundation.subagentHost
                     )
                 )
                 if options.mode != .interactive {
@@ -3259,6 +3273,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let conversationStore: LiveConversationStore
         let conversationHistory: LiveConversationHistory
         let securityContext: LiveSecurityContext
+        let sessionSearchEnabled: Bool
         let sandboxDecision: LiveSandboxDecision
         let samplingConfiguration: OpenGrokLiveSamplingConfiguration
         let sampler: OpenGrokLiveSampler
@@ -3471,6 +3486,14 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             isInteractive: fileAccessPolicy.isInteractive,
             cli: options.common.permissions
         )
+        let sessionSearchEnabled = LiveSessionSearchPolicy(
+            environment: context.environment,
+            document: securityContext.document,
+            requirements: securityContext.requirements,
+            remote: dependencies.remoteSettingsSnapshot.flatMap {
+                AllowlistedRemoteSettings(projecting: $0).sessionSearch
+            }
+        ).apply()
         let authorizedWorkflowScript = try options.common.workflow.map {
             try LiveWorkflowComposition.readScript(
                 at: $0,
@@ -3493,7 +3516,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             workspaceRoot: cwd.standardizedFileURL,
             cliProfile: options.common.permissions.sandboxProfile,
             persistedProfile: conversationRecord.sandboxProfile,
-            environment: context.environment
+            environment: context.environment,
+            runtime: dependencies.makeSandboxRuntime()
         )
         conversationRecord.sandboxProfile = sandboxDecision.profileName
         let (resolvedSamplingConfiguration, credential) = try await resolveSamplingConfiguration(
@@ -3773,6 +3797,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             conversationStore: conversationStore,
             conversationHistory: launchHistory,
             securityContext: securityContext,
+            sessionSearchEnabled: sessionSearchEnabled,
             sandboxDecision: sandboxDecision,
             samplingConfiguration: samplingConfiguration,
             sampler: sampler,
@@ -4341,6 +4366,21 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 workingDirectory: foundation.cwd,
                 model: foundation.samplingConfiguration.model
             )
+            let acpSchedulerHost = foundation.toolExecutor.schedulerHost ?? LiveSchedulerHost(
+                backgroundLoopsEnabled: false,
+                persistence: LiveSchedulerPersistence.forSessionDirectory(
+                    foundation.openGrokHome
+                        .appendingPathComponent("sessions", isDirectory: true)
+                        .appendingPathComponent(foundation.sessionID, isDirectory: true)
+                )
+            )
+            let taskControl = LiveACPTaskControlHandler(
+                gateway: gateway,
+                ownerRootSessionID: foundation.sessionID,
+                workingDirectory: foundation.cwd,
+                toolExecutor: foundation.toolExecutor,
+                schedulerHost: acpSchedulerHost
+            )
             await acpPeerBridge.install()
             let mouseReportingToggleEnabled = LiveInteractiveControllerRenderer
                 .resolveUIConfig(
@@ -4374,6 +4414,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         streams: context.streams
                     )
                     await stack.codeMode?.shutdown()
+                    await acpSchedulerHost.shutdown()
                     await foundation.toolExecutor.shutdown()
                 }
             )
@@ -4520,8 +4561,16 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     }
                 ),
                 persistentSessions: LivePersistentSessionACPHandler(
-                    openGrokHome: foundation.openGrokHome
-                )
+                    openGrokHome: foundation.openGrokHome,
+                    gateway: gateway,
+                    environment: launch.environment,
+                    enabledAtLaunch: foundation.sessionSearchEnabled
+                ),
+                interjection: LiveACPInterjectionHandler(
+                    gateway: gateway,
+                    interjections: stack.interjections
+                ),
+                taskControl: taskControl
             )
             // Inbound ext notifications land on the LIVE state, never a
             // mirror: yolo on the session permission-mode handle, swarm on
@@ -4543,8 +4592,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 onSessionOpened: { sessionID, meta in
                     try await mcpHandler.openSDKServers(sessionID: sessionID, meta: meta)
                     try await acpPeerBridge.opened(sessionID)
+                    await taskControl.opened(sessionID)
                 },
                 onSessionClosed: { sessionID in
+                    await taskControl.closed(sessionID)
                     await mcpHandler.closeSDKServers(sessionID: sessionID)
                     await acpPeerBridge.closed(sessionID)
                 },

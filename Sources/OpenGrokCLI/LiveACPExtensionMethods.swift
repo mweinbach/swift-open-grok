@@ -51,7 +51,7 @@
 //     info/state/close and durable list/updates/content search are routed;
 //     plural `x.ai/sessions/list` is the live typed leader roster snapshot),
 //     `x.ai/memory/*` (:4156),
-//     `x.ai/skills/refresh-baseline` (:4159), `x.ai/interject` (:4165),
+//     `x.ai/skills/refresh-baseline` (:4159),
 //     `x.ai/feedback/dismiss` (:4166 — its `x.ai/btw` sibling left this
 //     list with item 7), `x.ai/cloud/*` (:4170-4370), `x.ai/billing` +
 //     `x.ai/auto-topup-rule` (:4371-4374; `x.ai/share_session` at :4375
@@ -94,7 +94,9 @@ enum LiveACPExtensionRouter {
         sessionAdmin: LiveSessionAdminACPHandler? = nil,
         share: LiveShareACPHandler? = nil,
         memory: LiveMemoryACPHandler? = nil,
-        persistentSessions: LivePersistentSessionACPHandler? = nil
+        persistentSessions: LivePersistentSessionACPHandler? = nil,
+        interjection: LiveACPInterjectionHandler? = nil,
+        taskControl: LiveACPTaskControlHandler? = nil
     ) -> ACPExtensionMethodRouter {
         var router = ACPExtensionMethodRouter()
         if let feedback {
@@ -161,10 +163,24 @@ enum LiveACPExtensionRouter {
         if let persistentSessions {
             let sessions = LivePersistentSessionACPHandler(
                 openGrokHome: persistentSessions.openGrokHome,
-                gateway: persistentSessions.gateway ?? sessionAdmin?.gateway
+                gateway: persistentSessions.gateway ?? sessionAdmin?.gateway,
+                environment: persistentSessions.environment,
+                searchGate: persistentSessions.searchGate,
+                enabledAtLaunch: persistentSessions.enabledAtLaunch
             )
             for method in LivePersistentSessionACPHandler.methods {
                 router = router.register(exact: method, handler: sessions)
+            }
+        }
+        if let interjection {
+            router = router.register(
+                exact: LiveACPInterjectionHandler.method,
+                handler: interjection
+            )
+        }
+        if let taskControl {
+            for method in LiveACPTaskControlHandler.methods {
+                router = router.register(exact: method, handler: taskControl)
             }
         }
         return router
