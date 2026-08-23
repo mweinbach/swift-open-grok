@@ -194,7 +194,7 @@ private func targets() -> [Target] {
     t.append(contentsOf: libs(w1s4, dep(w0s4)))
     // W1-S5: Config builds on ConfigTypes.
     t.append(.target(name: "OpenGrokConfigTypes", dependencies: dep(w0s3, w0s4)))
-    t.append(.target(name: "OpenGrokConfig", dependencies: dep(w0s3, w0s4, ["OpenGrokConfigTypes"])))
+    t.append(.target(name: "OpenGrokConfig", dependencies: dep(w0s3, w0s4, ["OpenGrokConfigTypes", "COpenGrokSockets"])))
 
     // ---- Wave 2 ----
     // W2-S1: Tracing/HTTP base; CircuitBreaker -> HTTP; Telemetry -> both.
@@ -313,7 +313,7 @@ private func targets() -> [Target] {
 
     // ---- Wave 7 ----
     t.append(contentsOf: libs(w7s1, dep(w0s2, w1s1, w1s2, w1s3, w2s1, w3s3, w4s3, w5s1, w5s2, w5s3, w6s1, w6s4, w6s6, w7s2, w7s4, ["COpenGrokSockets"])))
-    t.append(contentsOf: libs(w7s2, dep(w0s2, w0s3, w0s4, w1s3, w2s2, w6s2, w6s3, w6s4)))
+    t.append(contentsOf: libs(w7s2, dep(w0s2, w0s3, w0s4, w1s3, w2s2, w6s2, w6s3, w6s4, ["COpenGrokSockets"])))
     t.append(contentsOf: libs(w7s3, dep(w0s2, w1s3, w1s5, w3s1, w3s2, w3s3, w5s2, w6s1, w6s2, w6s3, w6s4)))
     t.append(contentsOf: libs(w7s4, dep(w0s2, w1s2, w1s3, w4s2, w4s3, w5s3, w6s4, w6s5)))
     t.append(contentsOf: libs(w7s5, dep(w0s2, w0s3, w0s4, w1s2, w1s4, w2s1, w4s3, w6s4)))
@@ -419,7 +419,11 @@ private func targets() -> [Target] {
     t.append(contentsOf: tests(w1s2))
     t.append(contentsOf: tests(["OpenGrokSamplingTypes", "OpenGrokChatState", "OpenGrokTokenEstimation"]))
     t.append(contentsOf: tests(w1s4))
-    t.append(contentsOf: tests(["OpenGrokConfigTypes", "OpenGrokConfig"]))
+    t.append(contentsOf: tests(["OpenGrokConfigTypes"]))
+    t.append(.testTarget(
+        name: "OpenGrokConfigTests",
+        dependencies: dep(["OpenGrokConfig", "OpenGrokTestUtilities", "COpenGrokSockets"])
+    ))
     t.append(contentsOf: tests(["OpenGrokExtraCA", "OpenGrokCircuitBreaker", "OpenGrokTracing", "OpenGrokHTTP", "OpenGrokTelemetry"]))
     t.append(contentsOf: tests(["OpenGrokFileUtils", "OpenGrokSQLiteJournal", "OpenGrokSecrets"]))
     t.append(contentsOf: tests(w2s3))
@@ -464,7 +468,10 @@ private func targets() -> [Target] {
         name: "OpenGrokSessionRuntimeTests",
         dependencies: dep(["OpenGrokSessionRuntime", "OpenGrokSessionPersistence", "OpenGrokWorkflow", "COpenGrokSockets"])
     ))
-    t.append(contentsOf: tests(w7s2))
+    t.append(.testTarget(
+        name: "OpenGrokSessionPersistenceTests",
+        dependencies: dep(["OpenGrokSessionPersistence", "OpenGrokTestUtilities", "COpenGrokSockets"])
+    ))
     t.append(contentsOf: tests(w7s3))
     t.append(contentsOf: tests(w7s4))
     t.append(.testTarget(
