@@ -93,8 +93,6 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
     func makeSession(
         for request: OpenGrokPagerMinimalRequest
     ) async throws -> any OpenGrokPagerMinimalSessionAdapter {
-        _ = try await shell.start()
-        let shellEvents = await shell.events()
         let sessionID = SessionID(request.sessionID ?? providerConfiguration.sessionID)
         let record = await conversationHistory.snapshot()
         guard record.sessionID == sessionID.rawValue else {
@@ -106,6 +104,12 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
             fileURLWithPath: record.workingDirectory,
             isDirectory: true
         ).standardizedFileURL
+        try await validateWorkspaceAuthority(
+            sessionID: sessionID.rawValue,
+            workingDirectory: sessionDirectory
+        )
+        _ = try await shell.start()
+        let shellEvents = await shell.events()
         if !createdSessionIDs.contains(sessionID) {
             _ = try await shell.createSession(OpenGrokShellSessionRequest(
                 sessionID: sessionID,
@@ -219,7 +223,6 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
         workingDirectory: String?
     ) async throws -> String {
         _ = request
-        await retainActiveRecord()
         let newSessionID = UUID().uuidString
         try LiveConversationStore.validateSessionID(newSessionID)
         let newWorkingDirectory: URL
@@ -231,6 +234,11 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
         } else {
             newWorkingDirectory = activeWorkingDirectory
         }
+        try await validateWorkspaceAuthority(
+            sessionID: newSessionID,
+            workingDirectory: newWorkingDirectory
+        )
+        await retainActiveRecord()
         let record = LiveConversationRecord.new(
             sessionID: newSessionID,
             workingDirectory: newWorkingDirectory,
@@ -286,15 +294,21 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
     /// `/model` applies, because a resume across providers is the same seam.
     func resumeSession(sessionID: String) async throws -> String {
         try LiveConversationStore.validateSessionID(sessionID)
-        await retainActiveRecord()
+        let activeRecord = await conversationHistory.snapshot()
         let storedRecord = try await conversationStore.loadIfPresent(sessionID: sessionID)
-        guard let record = retainedRecords[sessionID] ?? storedRecord else {
+        let currentRecord = activeRecord.sessionID == sessionID ? activeRecord : nil
+        guard let record = retainedRecords[sessionID] ?? currentRecord ?? storedRecord else {
             throw CLIApplicationError.failed("session not found: \(sessionID)")
         }
         let sessionDirectory = URL(
             fileURLWithPath: record.workingDirectory,
             isDirectory: true
         ).standardizedFileURL
+        try await validateWorkspaceAuthority(
+            sessionID: sessionID,
+            workingDirectory: sessionDirectory
+        )
+        await retainActiveRecord()
         let configuration = ProviderSessionConfiguration(
             sessionID: sessionID,
             modelCatalog: providerConfiguration.modelCatalog,
@@ -395,6 +409,27 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
             fileURLWithPath: record.workingDirectory,
             isDirectory: true
         ).standardizedFileURL
+    }
+
+    private func validateWorkspaceAuthority(
+        sessionID: String,
+        workingDirectory requestedDirectory: URL
+    ) async throws {
+        if let toolExecutor {
+            try await toolExecutor.validateWorkspaceAuthority(
+                sessionID: sessionID,
+                workingDirectory: requestedDirectory
+            )
+            return
+        }
+        guard LiveToolExecutor.workspaceRootsMatch(cwd, requestedDirectory)
+        else {
+            throw CLIApplicationError.failed(
+                "session \(sessionID) belongs to workspace \(requestedDirectory.path), "
+                    + "but this process is authorized only for \(cwd.path); "
+                    + "resume it in a separate process from its own workspace"
+            )
+        }
     }
 }
 

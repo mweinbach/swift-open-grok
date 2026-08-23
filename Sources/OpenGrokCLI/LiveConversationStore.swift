@@ -1592,6 +1592,14 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         request: OpenGrokShellTurnRequest,
         emit: @escaping @Sendable (OpenGrokShellTurnUpdateKind) async -> Void
     ) async throws -> OpenGrokShellSamplingResult {
+        let registeredDirectory = await toolExecutor.workingDirectory(
+            sessionID: context.sessionID
+        )
+        try await toolExecutor.validateWorkspaceAuthority(
+            sessionID: context.sessionID,
+            workingDirectory: registeredDirectory,
+            requiresRegisteredSession: true
+        )
         // Open the rewind point around the whole turn, and close it on every
         // exit path — including a thrown error or a cancelled turn, because a
         // turn that died half-way through an edit is precisely the one worth

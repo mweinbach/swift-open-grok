@@ -84,6 +84,78 @@ struct LiveToolExecutor: Sendable {
         permissionPipeline
     }
 
+    /// File handlers keep one immutable, session-rooted registry. Registering
+    /// another shell session changes its process cwd, not that registry, so a
+    /// different workspace cannot safely borrow this executor.
+    func validateWorkspaceAuthority(
+        sessionID: String,
+        workingDirectory requestedDirectory: URL,
+        requiresRegisteredSession: Bool = false
+    ) async throws {
+        let authorizedRoot = Self.canonicalWorkspaceRoot(workingDirectory)
+        let requestedRoot = Self.canonicalWorkspaceRoot(requestedDirectory)
+        let resourceRoot = Self.canonicalWorkspaceRoot(URL(
+            fileURLWithPath: fileToolBridge.toolset.resources.cwd,
+            isDirectory: true
+        ))
+        let sessionFolder = Self.canonicalWorkspaceRoot(URL(
+            fileURLWithPath: fileToolBridge.toolset.resources.sessionFolder,
+            isDirectory: true
+        ))
+        let registeredDirectory = await sessionDirectories.directory(
+            sessionID: sessionID,
+            fallback: requestedDirectory
+        )
+        let registeredRoot = Self.canonicalWorkspaceRoot(registeredDirectory)
+        let hasAuthorizedBoundary = fileToolBridge.toolset.resources.allowedRoots.contains {
+            Self.workspaceRootsMatch(
+                URL(fileURLWithPath: $0, isDirectory: true),
+                authorizedRoot
+            )
+        }
+
+        guard Self.workspaceRootsMatch(requestedRoot, authorizedRoot),
+              Self.workspaceRootsMatch(registeredRoot, authorizedRoot),
+              Self.workspaceRootsMatch(resourceRoot, authorizedRoot),
+              Self.workspaceRootsMatch(sessionFolder, authorizedRoot),
+              hasAuthorizedBoundary
+        else {
+            throw CLIApplicationError.failed(
+                "session \(sessionID) belongs to workspace \(requestedDirectory.path), "
+                    + "but this process is authorized only for \(workingDirectory.path); "
+                    + "resume it in a separate process from its own workspace"
+            )
+        }
+
+        if requiresRegisteredSession {
+            do {
+                _ = try await composition.execution(
+                    for: sessionID,
+                    workingDirectory: registeredDirectory
+                )
+            } catch {
+                throw CLIApplicationError.failed(
+                    "session \(sessionID) has no registered workspace authority: \(error)"
+                )
+            }
+        }
+    }
+
+    static func canonicalWorkspaceRoot(_ directory: URL) -> URL {
+        directory.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL
+    }
+
+    static func workspaceRootsMatch(_ first: URL, _ second: URL) -> Bool {
+        let firstRoot = canonicalWorkspaceRoot(first)
+        let secondRoot = canonicalWorkspaceRoot(second)
+        #if os(Windows)
+        return firstRoot.path.replacingOccurrences(of: "\\", with: "/").lowercased()
+            == secondRoot.path.replacingOccurrences(of: "\\", with: "/").lowercased()
+        #else
+        return firstRoot == secondRoot
+        #endif
+    }
+
     /// Provider policy is sampled from the live gate, not the launch flags:
     /// `/auto` and `/yolo` can change between two requests in the same session.
     func currentCodexPermissions(provider: ModelProvider) async -> CodexPermissions? {
@@ -1274,6 +1346,14 @@ struct LiveToolExecutor: Sendable {
         onProgress: (@Sendable (NestedToolProgress) async -> Void)? = nil,
         cancellationToken: CodeModeCancellationToken? = nil
     ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
+        do {
+            try await validateWorkspaceAuthority(
+                sessionID: sessionID,
+                workingDirectory: workingDirectory
+            )
+        } catch {
+            return .failure(.failed(String(describing: error)))
+        }
         guard !folderTrustRuntime.isChanging else {
             return .failure(.failed("folder trust is changing; project access is blocked"))
         }
@@ -1893,6 +1973,10 @@ struct LiveToolExecutor: Sendable {
     }
 
     func registerSession(sessionID: String, workingDirectory: URL) async throws {
+        try await validateWorkspaceAuthority(
+            sessionID: sessionID,
+            workingDirectory: workingDirectory
+        )
         try await composition.registerSession(
             sessionID: sessionID,
             workingDirectory: workingDirectory
