@@ -180,7 +180,7 @@ private struct WorkflowChildAuthorityFixture {
     }
 }
 
-private enum WorkflowUnsupportedAuthority: String, CaseIterable, Sendable {
+enum WorkflowUnsupportedAuthority: String, CaseIterable, Sendable {
     case worktree
     case fork
     case resume
