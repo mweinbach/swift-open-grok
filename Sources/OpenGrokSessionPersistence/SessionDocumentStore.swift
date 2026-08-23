@@ -59,7 +59,7 @@ public struct SessionDocumentStore: Sendable {
         )
         defer { summaryLock.release() }
 
-        if FileManager.default.fileExists(atPath: summaryURL.path) {
+        if try documentExists(at: summaryURL) {
             let existing = try readSummary(at: summaryURL)
             guard existing.sessionID == state.summary.sessionID else {
                 throw SessionDocumentStoreError.corruptDocument(
@@ -140,10 +140,10 @@ public struct SessionDocumentStore: Sendable {
             .appendingPathComponent("sessions", isDirectory: true)
             .appendingPathComponent(sessionID, isDirectory: true)
             .appendingPathComponent(Self.auxiliaryStateFileName)
-        guard FileManager.default.fileExists(atPath: legacy.path) else { return nil }
+        guard try documentExists(at: legacy) else { return nil }
         let state: PersistedSessionState
         do {
-            state = try makeDecoder().decode(PersistedSessionState.self, from: Data(contentsOf: legacy))
+            state = try makeDecoder().decode(PersistedSessionState.self, from: readDocument(at: legacy))
         } catch {
             throw SessionDocumentStoreError.corruptDocument(
                 path: legacy.path,
@@ -229,8 +229,9 @@ public struct SessionDocumentStore: Sendable {
     public func eventLogURL(sessionID: String, cwd: String) throws -> URL {
         let directory = try publishedSessionDirectory(sessionID: sessionID, cwd: cwd)
         let url = directory.appendingPathComponent(Self.eventsFileName)
-        guard FileManager.default.fileExists(atPath: url.path) else { return url }
+        guard try documentExists(at: url) else { return url }
 
+        #if !os(Windows)
         let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
         guard values.isRegularFile == true, values.isSymbolicLink != true else {
             throw SessionDocumentStoreError.io(
@@ -239,6 +240,7 @@ public struct SessionDocumentStore: Sendable {
             )
         }
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        #endif
         return url
     }
 
@@ -298,9 +300,7 @@ public struct SessionDocumentStore: Sendable {
             sessionID: destinationSessionID,
             cwd: destinationCWD
         )
-        guard !FileManager.default.fileExists(
-            atPath: destination.appendingPathComponent(Self.summaryFileName).path
-        ) else {
+        guard try !documentExists(at: destination.appendingPathComponent(Self.summaryFileName)) else {
             throw SessionDocumentStoreError.sessionAlreadyExists(destinationSessionID)
         }
 
@@ -343,7 +343,7 @@ public struct SessionDocumentStore: Sendable {
     private func publishedSessionDirectory(sessionID: String, cwd: String) throws -> URL {
         let directory = try sessionDirectory(sessionID: sessionID, cwd: cwd)
         let summary = directory.appendingPathComponent(Self.summaryFileName)
-        guard FileManager.default.fileExists(atPath: summary.path) else {
+        guard try documentExists(at: summary) else {
             throw SessionDocumentStoreError.sessionNotFound(sessionID)
         }
         return directory
@@ -355,9 +355,7 @@ public struct SessionDocumentStore: Sendable {
     ) throws -> URL? {
         if let preferredCWD {
             let exact = try sessionDirectory(sessionID: sessionID, cwd: preferredCWD)
-            if FileManager.default.fileExists(
-                atPath: exact.appendingPathComponent(Self.summaryFileName).path
-            ) {
+            if try documentExists(at: exact.appendingPathComponent(Self.summaryFileName)) {
                 return exact
             }
         }
@@ -368,7 +366,14 @@ public struct SessionDocumentStore: Sendable {
 
     private func canonicalSessionDirectories(cwd: String?) throws -> [URL] {
         let root = RelocationFS.sessionsDir(grokHome: grokHome)
+        #if os(Windows)
+        guard try WindowsSessionDirectoryTraversal.directoryExists(
+            at: root,
+            stateRoot: grokHome
+        ) else { return [] }
+        #else
         guard FileManager.default.fileExists(atPath: root.path) else { return [] }
+        #endif
 
         let workspaceDirectories: [URL]
         if let cwd {
@@ -378,25 +383,39 @@ public struct SessionDocumentStore: Sendable {
                 isDirectory: true
             )]
         } else {
+            #if os(Windows)
+            workspaceDirectories = try WindowsSessionDirectoryTraversal.contentsOfDirectory(
+                at: root,
+                stateRoot: grokHome
+            ).sorted { $0.lastPathComponent < $1.lastPathComponent }
+            #else
             workspaceDirectories = try FileManager.default.contentsOfDirectory(
                 at: root,
                 includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
                 options: [.skipsHiddenFiles]
             ).sorted { $0.lastPathComponent < $1.lastPathComponent }
+            #endif
         }
 
         var sessions: [URL] = []
         for workspace in workspaceDirectories {
             guard try isRealDirectory(workspace) else { continue }
+            #if os(Windows)
+            let children = try WindowsSessionDirectoryTraversal.contentsOfDirectory(
+                at: workspace,
+                stateRoot: grokHome
+            )
+            #else
             let children = try FileManager.default.contentsOfDirectory(
                 at: workspace,
                 includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
                 options: [.skipsHiddenFiles]
             )
+            #endif
             for child in children {
                 guard try isRealDirectory(child) else { continue }
                 let summary = child.appendingPathComponent(Self.summaryFileName)
-                if FileManager.default.fileExists(atPath: summary.path) {
+                if try documentExists(at: summary) {
                     sessions.append(child)
                 }
             }
@@ -405,9 +424,29 @@ public struct SessionDocumentStore: Sendable {
     }
 
     private func isRealDirectory(_ url: URL) throws -> Bool {
+        #if os(Windows)
+        return try WindowsSessionDirectoryTraversal.directoryExists(at: url, stateRoot: grokHome)
+        #else
         guard FileManager.default.fileExists(atPath: url.path) else { return false }
         let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         return values.isDirectory == true && values.isSymbolicLink != true
+        #endif
+    }
+
+    private func documentExists(at url: URL) throws -> Bool {
+        #if os(Windows)
+        return try WindowsSessionDirectoryTraversal.documentExists(at: url, stateRoot: grokHome)
+        #else
+        return FileManager.default.fileExists(atPath: url.path)
+        #endif
+    }
+
+    private func readDocument(at url: URL) throws -> Data {
+        #if os(Windows)
+        return try WindowsSessionDirectoryTraversal.readDocument(at: url, stateRoot: grokHome)
+        #else
+        return try Data(contentsOf: url)
+        #endif
     }
 
     // MARK: - Rust summary compatibility
@@ -431,7 +470,7 @@ public struct SessionDocumentStore: Sendable {
 
     private func readSummary(at url: URL) throws -> SessionSummary {
         do {
-            let data = try Data(contentsOf: url)
+            let data = try readDocument(at: url)
             guard !data.isEmpty else {
                 throw SessionDocumentStoreError.corruptDocument(
                     path: url.path,
@@ -522,10 +561,10 @@ public struct SessionDocumentStore: Sendable {
         let auxiliary = directory.appendingPathComponent(Self.auxiliaryStateFileName)
 
         var state: PersistedSessionState
-        if FileManager.default.fileExists(atPath: auxiliary.path),
+        if try documentExists(at: auxiliary),
            let decoded = try? makeDecoder().decode(
                PersistedSessionState.self,
-               from: Data(contentsOf: auxiliary)
+               from: readDocument(at: auxiliary)
            ) {
             state = decoded
             state.summary = summary
@@ -574,6 +613,31 @@ public struct SessionDocumentStore: Sendable {
     private func appendJSONLine<T: Encodable>(_ value: T, to path: URL) throws {
         try RelocationFS.createDirectoryDurable(path.deletingLastPathComponent(), stateRoot: grokHome)
         try withJSONLLock(at: path) {
+            #if os(Windows)
+            if try !documentExists(at: path) {
+                try RelocationFS.writeAtomicDurable(path: path, data: Data(), stateRoot: grokHome)
+            }
+
+            let original = try readDocument(at: path)
+            var line = try makeEncoder(prettyPrinted: false).encode(value)
+            if let last = original.last, last != 0x0A {
+                let boundary = original.lastIndex(of: 0x0A)
+                let tailStart = boundary.map { original.index(after: $0) } ?? original.startIndex
+                let tail = original[tailStart...]
+                if (try? makeDecoder().decode(JSONValue.self, from: Data(tail))) == nil {
+                    try RelocationFS.writeAtomicDurable(
+                        path: path,
+                        data: Data(original[..<tailStart]),
+                        stateRoot: grokHome
+                    )
+                } else {
+                    line.insert(0x0A, at: line.startIndex)
+                }
+            }
+            line.append(0x0A)
+            try WindowsSessionDirectoryTraversal.append(line, to: path, stateRoot: grokHome)
+            try RelocationFS.syncDirectory(path.deletingLastPathComponent())
+            #else
             if !FileManager.default.fileExists(atPath: path.path) {
                 guard FileManager.default.createFile(
                     atPath: path.path,
@@ -607,6 +671,7 @@ public struct SessionDocumentStore: Sendable {
             try handle.write(contentsOf: line)
             try handle.synchronize()
             try RelocationFS.syncDirectory(path.deletingLastPathComponent())
+            #endif
         }
     }
 
@@ -614,10 +679,10 @@ public struct SessionDocumentStore: Sendable {
         _ type: T.Type,
         from path: URL
     ) throws -> JSONLReadResult<T> {
-        guard FileManager.default.fileExists(atPath: path.path) else {
+        guard try documentExists(at: path) else {
             return JSONLReadResult(values: [], skippedLines: 0, originalBytes: Data())
         }
-        let data = try Data(contentsOf: path)
+        let data = try readDocument(at: path)
         var values: [T] = []
         var skipped = 0
         for raw in data.split(separator: 0x0A, omittingEmptySubsequences: false) {
@@ -633,10 +698,10 @@ public struct SessionDocumentStore: Sendable {
     }
 
     private func readUpdates(at path: URL) throws -> JSONLReadResult<SessionUpdateEnvelope> {
-        guard FileManager.default.fileExists(atPath: path.path) else {
+        guard try documentExists(at: path) else {
             return JSONLReadResult(values: [], skippedLines: 0, originalBytes: Data())
         }
-        let data = try Data(contentsOf: path)
+        let data = try readDocument(at: path)
         var values: [SessionUpdateEnvelope] = []
         var skipped = 0
         for raw in data.split(separator: 0x0A, omittingEmptySubsequences: false) {
@@ -679,7 +744,7 @@ public struct SessionDocumentStore: Sendable {
             let backup = path.deletingLastPathComponent().appendingPathComponent(
                 "\(path.lastPathComponent).corrupt"
             )
-            if !FileManager.default.fileExists(atPath: backup.path) {
+            if try !documentExists(at: backup) {
                 try RelocationFS.writeAtomicDurable(
                     path: backup,
                     data: history.originalBytes,
@@ -738,17 +803,28 @@ public struct SessionDocumentStore: Sendable {
             isDirectory: true
         )
         try RelocationFS.createDirectoryDurable(destinationDirectory, stateRoot: grokHome)
+        #if os(Windows)
+        let entries = try WindowsSessionDirectoryTraversal.contentsOfDirectory(
+            at: sourceDirectory,
+            stateRoot: grokHome
+        )
+        #else
         let entries = try FileManager.default.contentsOfDirectory(
             at: sourceDirectory,
             includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
             options: [.skipsHiddenFiles]
         )
+        #endif
         for entry in entries where entry.pathExtension == "json" {
+            #if os(Windows)
+            guard try documentExists(at: entry) else { continue }
+            #else
             let values = try entry.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
             guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+            #endif
             try RelocationFS.writeAtomicDurable(
                 path: destinationDirectory.appendingPathComponent(entry.lastPathComponent),
-                data: Data(contentsOf: entry),
+                data: readDocument(at: entry),
                 stateRoot: grokHome
             )
         }

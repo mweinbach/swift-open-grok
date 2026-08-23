@@ -1,5 +1,6 @@
 import Foundation
 import OpenGrokConfig
+import OpenGrokFileUtils
 import OpenGrokSamplingTypes
 import OpenGrokShared
 import OpenGrokShellSessionSupport
@@ -33,14 +34,26 @@ struct WindowsLongPathPersistenceParityTests {
         try RelocationFS.writeAtomicDurable(path: destination, data: Data("first\n".utf8))
         try RelocationFS.writeAtomicDurable(path: destination, data: Data("second\n".utf8))
 
-        #expect(try String(contentsOf: destination, encoding: .utf8) == "second\n")
         #if os(Windows)
+        let written = try PathSecurity.readNoFollow(
+            destination,
+            maximumBytes: 128,
+            requireOwnerOnly: true
+        )
+        #expect(String(data: written, encoding: .utf8) == "second\n")
         try expectOwnerPrivateWindowsFile(destination)
-        #endif
+        let siblings = try WindowsSecurePath.contentsOfDirectory(
+            at: directory,
+            maximumEntries: 16,
+            skipsHiddenFiles: false
+        )
+        #else
+        #expect(try String(contentsOf: destination, encoding: .utf8) == "second\n")
         let siblings = try FileManager.default.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: nil
         )
+        #endif
         #expect(siblings.map(\.lastPathComponent) == ["chat_history.jsonl"])
     }
 
@@ -49,7 +62,7 @@ struct WindowsLongPathPersistenceParityTests {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let home = root.appendingPathComponent("home", isDirectory: true)
+        let home = root.appendingPathComponent(String(repeating: "s", count: 120), isDirectory: true)
         let workspace = root.appendingPathComponent("workspace", isDirectory: true)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
@@ -57,6 +70,7 @@ struct WindowsLongPathPersistenceParityTests {
         let sessionID = UUID().uuidString
         let store = SessionDocumentStore(grokHome: home)
         let directory = try store.sessionDirectory(sessionID: sessionID, cwd: workspace.path)
+        #expect(directory.path.utf16.count > 260)
         let temporaryHistory = directory.appendingPathComponent(
             ".chat_history.jsonl.\(UUID().uuidString).tmp"
         )
@@ -80,21 +94,99 @@ struct WindowsLongPathPersistenceParityTests {
         let recovered = try #require(try store.load(sessionID: sessionID, cwd: workspace.path))
         #expect(recovered.chatHistory == [first, second])
         #expect(recovered.summary.chatMessageCount == 2)
+        #expect(try store.load(sessionID: sessionID)?.chatHistory == [first, second])
+        #expect(try store.list().map(\.sessionID.rawValue) == [sessionID])
+        #expect(try store.list(cwd: workspace.path).map(\.sessionID.rawValue) == [sessionID])
+
+        let third = try JSONValue.encode(ConversationItem.user("appended native history"))
+        try store.appendChatItem(third, sessionID: sessionID, cwd: workspace.path)
+        let update = try SessionUpdateEnvelope(
+            timestamp: 123,
+            method: "session/update",
+            params: .object([
+                "sessionId": .string(sessionID),
+                "update": .object([
+                    "sessionUpdate": .string("user_message_chunk"),
+                    "content": .object([
+                        "type": .string("text"),
+                        "text": .string("native replay beyond MAX_PATH"),
+                    ]),
+                ]),
+            ])
+        )
+        try store.appendUpdate(update, sessionID: sessionID, cwd: workspace.path)
+        let event: JSONValue = .object(["type": .string("native-long-path-event")])
+        try store.appendEvent(event, sessionID: sessionID, cwd: workspace.path)
+
+        let replay = try #require(try store.load(sessionID: sessionID))
+        #expect(replay.chatHistory == [first, second, third])
+        #expect(replay.updates == [update])
+        #expect(replay.summary.chatMessageCount == 3)
+        #expect(replay.summary.messageCount == 1)
+        #expect(try store.readEvents(sessionID: sessionID, cwd: workspace.path) == [event])
 
         #if os(Windows)
-        for filename in ["chat_history.jsonl", "updates.jsonl", "state.json", "summary.json"] {
-            try expectOwnerPrivateWindowsFile(directory.appendingPathComponent(filename))
+        for filename in ["chat_history.jsonl", "updates.jsonl", "state.json", "summary.json", "events.jsonl"] {
+            let document = directory.appendingPathComponent(filename)
+            #expect(document.path.utf16.count > 260)
+            try expectOwnerPrivateWindowsFile(document)
         }
-        #endif
-
-        let temporarySiblings = try FileManager.default.contentsOfDirectory(
+        let entries = try WindowsSecurePath.contentsOfDirectory(
+            at: directory,
+            maximumEntries: 32,
+            skipsHiddenFiles: false
+        )
+        #else
+        let entries = try FileManager.default.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: nil
-        ).filter { $0.lastPathComponent.hasSuffix(".tmp") }
+        )
+        #endif
+        let temporarySiblings = entries.filter { $0.lastPathComponent.hasSuffix(".tmp") }
         #expect(temporarySiblings.isEmpty)
     }
 
     #if os(Windows)
+    @Test("canonical session discovery refuses permissive state ownership and reparse-point workspaces")
+    func longPathDiscoveryRejectsUntrustedAncestors() throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let broadHome = root.appendingPathComponent("broad-state", isDirectory: true)
+        let broadSessions = broadHome.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: broadSessions, withIntermediateDirectories: true)
+        let broadNative = try WindowsSecurePath.extendedLengthPath(broadSessions.path)
+        guard broadNative.withCString({ og_path_is_private_to_current_user($0, 1) }) == 0 else {
+            Issue.record("negative session-discovery fixture did not create a permissive state directory")
+            return
+        }
+        #expect(throws: SessionDocumentStoreError.self) {
+            try SessionDocumentStore(grokHome: broadHome).list()
+        }
+
+        let secureHome = root.appendingPathComponent("secure-state", isDirectory: true)
+        let sessions = secureHome.appendingPathComponent("sessions", isDirectory: true)
+        try RelocationFS.createDirectoryDurable(sessions, stateRoot: secureHome)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let workspace = root.appendingPathComponent("workspace", isDirectory: true)
+        let redirect = sessions.appendingPathComponent(
+            RelocationFS.encodeCwdDirname(workspace.path),
+            isDirectory: true
+        )
+        try FileManager.default.createSymbolicLink(at: redirect, withDestinationURL: outside)
+
+        #expect(throws: SessionDocumentStoreError.self) {
+            try SessionDocumentStore(grokHome: secureHome).load(
+                sessionID: "redirected",
+                cwd: workspace.path
+            )
+        }
+        #expect(FileManager.default.fileExists(
+            atPath: outside.appendingPathComponent("redirected").path
+        ) == false)
+    }
+
     @Test("durable session creation hardens the state, sessions, workspace, and session chain")
     func durableDirectoryCreationProtectsEveryAncestor() throws {
         let root = try temporaryRoot()
