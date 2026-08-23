@@ -171,7 +171,10 @@ struct LiveResumedWorkspaceAuthorityParityTests {
         }
 
         #expect(await fixture.stack.conversationHistory.snapshot() == parentBefore)
-        #expect(try await fixture.foundation.conversationStore.load(sessionID: child.sessionID) == child)
+        let persistedChild = try await fixture.foundation.conversationStore.load(
+            sessionID: child.sessionID
+        )
+        #expect(persistedChild == child)
         #expect(await fixture.stack.shell.lookupSession(SessionID(child.sessionID)) == nil)
         #expect(await fixture.probe.requestCount == 0)
         #expect(!FileManager.default.fileExists(
@@ -225,7 +228,10 @@ struct LiveResumedWorkspaceAuthorityParityTests {
             workingDirectory: equivalentRoot
         )
 
-        #expect(try await fixture.adapter.resumeSession(sessionID: child.sessionID) == child.sessionID)
+        let resumedSessionID = try await fixture.adapter.resumeSession(
+            sessionID: child.sessionID
+        )
+        #expect(resumedSessionID == child.sessionID)
         let handle = try await fixture.stack.shell.submitTurn(
             sessionID: SessionID(child.sessionID),
             request: OpenGrokShellTurnRequest(
@@ -238,10 +244,11 @@ struct LiveResumedWorkspaceAuthorityParityTests {
             timeout: ShellDuration(timeInterval: 15)
         )
         #expect(result.output == "authorized workspace complete")
-        #expect(try String(
+        let authorizedContents = try String(
             contentsOf: fixture.parent.appendingPathComponent("workspace-authority.txt"),
             encoding: .utf8
-        ) == "authorized")
+        )
+        #expect(authorizedContents == "authorized")
         #expect(!FileManager.default.fileExists(
             atPath: fixture.child.appendingPathComponent("workspace-authority.txt").path
         ))
@@ -343,10 +350,11 @@ struct LiveResumedWorkspaceAuthorityParityTests {
             Issue.record("separate-process resumed tool did not dispatch in its own workspace")
             return
         }
-        #expect(try String(
+        let authorizedContents = try String(
             contentsOf: fixture.child.appendingPathComponent("workspace-authority.txt"),
             encoding: .utf8
-        ) == "authorized")
+        )
+        #expect(authorizedContents == "authorized")
         #expect(!FileManager.default.fileExists(
             atPath: fixture.parent.appendingPathComponent("workspace-authority.txt").path
         ))
@@ -389,6 +397,9 @@ struct LiveResumedWorkspaceAuthorityParityTests {
             #expect(String(describing: error).contains("workspace"))
         }
         #expect(constructions.count == 0)
-        #expect(try await fixture.foundation.conversationStore.load(sessionID: child.sessionID) == child)
+        let persistedChild = try await fixture.foundation.conversationStore.load(
+            sessionID: child.sessionID
+        )
+        #expect(persistedChild == child)
     }
 }

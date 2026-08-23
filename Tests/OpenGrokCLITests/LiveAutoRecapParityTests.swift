@@ -237,7 +237,8 @@ struct LiveAutoRecapParityTests {
         try await withAutoRecapFixture { fixture in
             fixture.server.setResponse("Recap: The cached away summary is already ready.")
 
-            #expect(try await fixture.renderer.handleInput(.focusLost) == .consumed)
+            let lost = try await fixture.renderer.handleInput(.focusLost)
+            #expect(lost == .consumed)
             #expect(await fixture.awaitInferenceRequests(1))
             #expect(await fixture.renderer.terminalNotifications.focused == false)
             #expect(await fixture.awaitRecap(
@@ -247,11 +248,13 @@ struct LiveAutoRecapParityTests {
             #expect(await fixture.renderer.terminalNotifications.focused == false)
             #expect(fixture.inferenceRequests.count == 1)
             #expect(fixture.inferenceRequests[0].body?["tools"].isNull == true)
-            #expect(try String(contentsOf: fixture.watermarkURL, encoding: .utf8) == "3")
+            let watermark = try String(contentsOf: fixture.watermarkURL, encoding: .utf8)
+            #expect(watermark == "3")
             #expect(await fixture.history.items == fixture.initialItems)
             #expect(await fixture.renderer.awayRecapPollTask == nil)
 
-            #expect(try await fixture.renderer.handleInput(.focusGained) == .consumed)
+            let gained = try await fixture.renderer.handleInput(.focusGained)
+            #expect(gained == .consumed)
             #expect(await fixture.awaitRecap(
                 summary: "The cached away summary is already ready.",
                 auto: true
@@ -267,10 +270,12 @@ struct LiveAutoRecapParityTests {
             fixture.server.setChunkDelay(0.05)
             fixture.server.setResponse("Recap: One background request survives refocus.")
 
-            #expect(try await fixture.renderer.handleInput(.focusLost) == .consumed)
+            let lost = try await fixture.renderer.handleInput(.focusLost)
+            #expect(lost == .consumed)
             #expect(await fixture.awaitInferenceRequests(1))
             #expect(await fixture.renderer.terminalNotifications.focused == false)
-            #expect(try await fixture.renderer.handleInput(.focusGained) == .consumed)
+            let gained = try await fixture.renderer.handleInput(.focusGained)
+            #expect(gained == .consumed)
 
             #expect(await fixture.awaitRecap(
                 summary: "One background request survives refocus.",
@@ -285,22 +290,26 @@ struct LiveAutoRecapParityTests {
     @Test("focus regain before the configured threshold cancels unfocused generation")
     func earlyFocusRegainCancelsThresholdTimer() async throws {
         try await withAutoRecapFixture(awayThresholdSeconds: 60) { fixture in
-            #expect(try await fixture.renderer.handleInput(.focusLost) == .consumed)
+            let lost = try await fixture.renderer.handleInput(.focusLost)
+            #expect(lost == .consumed)
             #expect(await fixture.renderer.awayRecapPollTask != nil)
             #expect(fixture.inferenceRequests.isEmpty)
 
-            #expect(try await fixture.renderer.handleInput(.focusGained) == .consumed)
+            let gained = try await fixture.renderer.handleInput(.focusGained)
+            #expect(gained == .consumed)
             #expect(await fixture.renderer.awayRecapPollTask == nil)
             #expect(await fixture.renderer.recapTask == nil)
             #expect(fixture.inferenceRequests.isEmpty)
-            #expect(!FileManager.default.fileExists(atPath: try fixture.watermarkURL.path))
+            let watermarkPath = try fixture.watermarkURL.path
+            #expect(!FileManager.default.fileExists(atPath: watermarkPath))
         }
     }
 
     @Test("terminal shutdown cancels the pending away recap before it can sample")
     func shutdownCancelsAwayPregeneration() async throws {
         try await withAutoRecapFixture(awayThresholdSeconds: 60) { fixture in
-            #expect(try await fixture.renderer.handleInput(.focusLost) == .consumed)
+            let lost = try await fixture.renderer.handleInput(.focusLost)
+            #expect(lost == .consumed)
             #expect(await fixture.renderer.awayRecapPollTask != nil)
 
             try await fixture.renderer.restoreTerminal()
@@ -318,7 +327,8 @@ struct LiveAutoRecapParityTests {
             fixture.server.setChunkDelay(0.1)
             fixture.server.setResponse("Recap: This stale summary must never be painted.")
 
-            #expect(try await fixture.renderer.handleInput(.focusLost) == .consumed)
+            let lost = try await fixture.renderer.handleInput(.focusLost)
+            #expect(lost == .consumed)
             #expect(await fixture.awaitInferenceRequests(1))
             try await fixture.renderer.render(.turnStarted(OpenGrokPagerRequest(
                 prompt: "a newer real turn invalidates this summary",
@@ -334,7 +344,8 @@ struct LiveAutoRecapParityTests {
                 return true
             })
             #expect(fixture.inferenceRequests.count == 1)
-            #expect(!FileManager.default.fileExists(atPath: try fixture.watermarkURL.path))
+            let watermarkPath = try fixture.watermarkURL.path
+            #expect(!FileManager.default.fileExists(atPath: watermarkPath))
         }
     }
 

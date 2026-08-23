@@ -217,7 +217,8 @@ struct LiveExportCompositionParityTests {
 
         try await fixture.launch(["export", "file-export", destination.path], streams: streams)
 
-        #expect(try String(contentsOf: destination, encoding: .utf8) == "## User\n\nArchive me")
+        let exported = try String(contentsOf: destination, encoding: .utf8)
+        #expect(exported == "## User\n\nArchive me")
         #expect(output.contents.isEmpty)
         #expect(errors.contents == "Conversation exported to \(destination.path)\n")
     }
@@ -232,7 +233,8 @@ struct LiveExportCompositionParityTests {
 
         try await fixture.launch(["export", "tilde", "~/exports/session.md"], streams: streams)
 
-        #expect(try String(contentsOf: destination, encoding: .utf8) == "## User\n\nAt home")
+        let exported = try String(contentsOf: destination, encoding: .utf8)
+        #expect(exported == "## User\n\nAt home")
         #expect(output.contents.isEmpty)
         #expect(errors.contents == "Conversation exported to \(destination.path)\n")
     }
@@ -254,7 +256,8 @@ struct LiveExportCompositionParityTests {
         )
 
         #expect(await clipboard.snapshot().isEmpty)
-        #expect(try String(contentsOf: destination, encoding: .utf8) == "## User\n\nKeep the file")
+        let exported = try String(contentsOf: destination, encoding: .utf8)
+        #expect(exported == "## User\n\nKeep the file")
         #expect(output.contents.isEmpty)
         #expect(errors.contents == "Conversation exported to \(destination.path)\n")
     }
@@ -541,7 +544,8 @@ struct LiveExportCompositionParityTests {
         await #expect(throws: CLIApplicationError.self) {
             try await fixture.launch(["export", "destination", link.path], streams: streams)
         }
-        #expect(try String(contentsOf: untouched, encoding: .utf8) == "do not overwrite")
+        let preserved = try String(contentsOf: untouched, encoding: .utf8)
+        #expect(preserved == "do not overwrite")
         #expect(output.contents.isEmpty)
         #expect(errors.contents.isEmpty)
     }
