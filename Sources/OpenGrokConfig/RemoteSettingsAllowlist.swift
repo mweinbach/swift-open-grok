@@ -77,6 +77,12 @@ public struct AllowlistedRemoteSettings: Sendable, Equatable {
     /// `LiveRecap.enabled` (`resolve_session_recap`, config.rs:2657-2667).
     public var sessionRecap: Bool?
 
+    // -- Persistent session-search gate (SessionSearchGate) --
+
+    /// `session_search` — consumed by the fail-closed persistent index gate
+    /// (`resolve_session_search`, agent/config.rs:2759-2769).
+    public var sessionSearch: Bool?
+
     // -- Sampling recovery (OpenGrokLiveApplicationLauncher) --
 
     /// `doom_loop_recovery` — consumed by the session-frozen trusted-policy
@@ -116,6 +122,7 @@ extension AllowlistedRemoteSettings {
         self.zdrAccessEnabled = remote.zdrAccessEnabled
         self.gateMessage = remote.gateMessage
         self.sessionRecap = remote.sessionRecap
+        self.sessionSearch = remote.sessionSearch
         self.doomLoopRecovery = remote.doomLoopRecovery
         self.traceUploadEnabled = remote.traceUploadEnabled
         self.twoPassCompactionEnabled = remote.twoPassCompactionEnabled
@@ -145,6 +152,7 @@ public let remoteSettingsAllowlistedWireNames: Set<String> = [
     "zdr_access_enabled",
     "gate_message",
     "session_recap",
+    "session_search",
     "doom_loop_recovery",
     "trace_upload_enabled",
     "two_pass_compaction_enabled",

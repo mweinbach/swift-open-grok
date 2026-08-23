@@ -589,6 +589,9 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
     public var restoreCode: Bool?
     public var cancelRewindEnabled: Bool?
     public var sessionRecap: Bool?
+    /// Optional server kill-switch for the persistent session-search index.
+    /// Absence preserves the enabled-by-default local resolver.
+    public var sessionSearch: Bool?
     public var askUserQuestionEnabled: Bool?
     public var webFetchEnabled: Bool?
     public var webFetchProxy: String?
@@ -767,6 +770,7 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         case restoreCode = "restore_code"
         case cancelRewindEnabled = "cancel_rewind_enabled"
         case sessionRecap = "session_recap"
+        case sessionSearch = "session_search"
         case askUserQuestionEnabled = "ask_user_question_enabled"
         case webFetchEnabled = "web_fetch_enabled"
         case webFetchProxy = "web_fetch_proxy"
@@ -924,6 +928,7 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         restoreCode = try c.decodeIfPresent(Bool.self, forKey: .restoreCode)
         cancelRewindEnabled = try c.decodeIfPresent(Bool.self, forKey: .cancelRewindEnabled)
         sessionRecap = try c.decodeIfPresent(Bool.self, forKey: .sessionRecap)
+        sessionSearch = try c.decodeIfPresent(Bool.self, forKey: .sessionSearch)
         askUserQuestionEnabled = try c.decodeIfPresent(Bool.self, forKey: .askUserQuestionEnabled)
         webFetchEnabled = try c.decodeIfPresent(Bool.self, forKey: .webFetchEnabled)
         webFetchProxy = try c.decodeIfPresent(String.self, forKey: .webFetchProxy)
@@ -1081,6 +1086,7 @@ public struct RemoteSettings: Hashable, Sendable, Codable, Equatable {
         try c.encodeIfPresent(restoreCode, forKey: .restoreCode)
         try c.encodeIfPresent(cancelRewindEnabled, forKey: .cancelRewindEnabled)
         try c.encodeIfPresent(sessionRecap, forKey: .sessionRecap)
+        try c.encodeIfPresent(sessionSearch, forKey: .sessionSearch)
         try c.encodeIfPresent(askUserQuestionEnabled, forKey: .askUserQuestionEnabled)
         try c.encodeIfPresent(webFetchEnabled, forKey: .webFetchEnabled)
         try c.encodeIfPresent(webFetchProxy, forKey: .webFetchProxy)
