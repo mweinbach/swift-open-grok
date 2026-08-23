@@ -651,8 +651,13 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
         do {
             let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
             guard values.isRegularFile == true, values.isSymbolicLink != true else { return false }
-            let resolved = url.resolvingSymlinksInPath().standardizedFileURL.path
-            return resolved.hasPrefix(root.path + "/")
+            let resolved = url.resolvingSymlinksInPath().standardizedFileURL
+            let rootComponents = root.standardizedFileURL.pathComponents
+            let resolvedComponents = resolved.pathComponents
+            guard resolvedComponents.count > rootComponents.count else { return false }
+            return zip(rootComponents, resolvedComponents).allSatisfy { root, candidate in
+                pathsMatch(root, candidate)
+            }
         } catch {
             return false
         }
@@ -788,8 +793,21 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
 
     private func matchesWorkspace(_ raw: String, _ expected: URL) -> Bool {
         let actual = URL(fileURLWithPath: raw).standardizedFileURL
-        return actual.path == expected.path
-            || actual.resolvingSymlinksInPath().path == expected.resolvingSymlinksInPath().path
+        return pathsMatch(actual.path, expected.standardizedFileURL.path)
+            || pathsMatch(
+                actual.resolvingSymlinksInPath().standardizedFileURL.path,
+                expected.resolvingSymlinksInPath().standardizedFileURL.path
+            )
+    }
+
+    private func pathsMatch(_ left: String, _ right: String) -> Bool {
+        #if os(Windows)
+        return left.replacingOccurrences(of: "\\", with: "/")
+            .caseInsensitiveCompare(right.replacingOccurrences(of: "\\", with: "/"))
+            == .orderedSame
+        #else
+        return left == right
+        #endif
     }
 
     private func decodedCursor(_ raw: String?) -> Boundary? {

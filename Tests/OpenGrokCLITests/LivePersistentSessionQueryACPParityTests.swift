@@ -351,6 +351,7 @@ struct LivePersistentSessionQueryACPParityTests {
         #expect(wrongError == nil)
         #expect(wrongWorkspace?["updates"] == .array([]))
 
+        #if !os(Windows)
         let store = SessionDocumentStore(grokHome: fixture.home)
         let journal = try store.sessionDirectory(sessionID: "private", cwd: fixture.firstWorkspace.path)
             .appendingPathComponent(SessionDocumentStore.updatesFileName)
@@ -365,6 +366,53 @@ struct LivePersistentSessionQueryACPParityTests {
         )
         #expect(escaped == nil)
         #expect(escapeError?.code == .internalError)
+        #endif
+    }
+
+    @Test("workspace casing follows the native filesystem without crossing session roots")
+    func workspaceMatchingFollowsPlatformCaseSensitivity() async throws {
+        let fixture = try await PersistentQueryFixture.make()
+        defer { fixture.clean() }
+        try await fixture.seed(
+            "case-sensitive-workspace",
+            workspace: fixture.firstWorkspace,
+            title: "Case-preserving session",
+            content: "platform-owned conversation"
+        )
+        try fixture.append(
+            to: "case-sensitive-workspace",
+            tag: "agent_message_chunk",
+            text: "platform-owned conversation"
+        )
+
+        let alternateCasing = fixture.firstWorkspace.path.uppercased()
+        #expect(alternateCasing != fixture.firstWorkspace.path)
+
+        let (updates, updateError) = try await fixture.call(
+            "x.ai/session/updates",
+            params: .object([
+                "sessionId": .string("case-sensitive-workspace"),
+                "cwd": .string(alternateCasing),
+            ])
+        )
+        let (search, searchError) = try await fixture.call(
+            "x.ai/session/search",
+            params: .object([
+                "query": .string("platform-owned"),
+                "cwd": .string(alternateCasing),
+            ])
+        )
+        #expect(updateError == nil)
+        #expect(searchError == nil)
+
+        #if os(Windows)
+        #expect(updates?["totalCount"]?.uint64Value == 1)
+        #expect(search?["result"]?["results"]?[0]?["sessionId"]?.stringValue
+            == "case-sensitive-workspace")
+        #else
+        #expect(updates?["updates"] == .array([]))
+        #expect(search?["result"]?["results"] == .array([]))
+        #endif
     }
 
     @Test("search ranks real transcript content and reports upstream camelCase fields")
