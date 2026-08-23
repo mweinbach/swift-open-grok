@@ -175,6 +175,36 @@ private struct PersistentQueryFixture {
     }
 }
 
+private func nativeFilesystemAliasesDirectory(_ original: URL, as alternative: URL) throws -> Bool {
+    let manager = FileManager.default
+    var isDirectory: ObjCBool = false
+    guard manager.fileExists(atPath: alternative.path, isDirectory: &isDirectory),
+          isDirectory.boolValue
+    else { return false }
+
+    let originalAttributes = try manager.attributesOfItem(atPath: original.path)
+    let alternativeAttributes = try manager.attributesOfItem(atPath: alternative.path)
+    if let originalDevice = originalAttributes[.systemNumber] as? NSNumber,
+       let originalInode = originalAttributes[.systemFileNumber] as? NSNumber,
+       let alternativeDevice = alternativeAttributes[.systemNumber] as? NSNumber,
+       let alternativeInode = alternativeAttributes[.systemFileNumber] as? NSNumber
+    {
+        return originalDevice == alternativeDevice && originalInode == alternativeInode
+    }
+
+    // Some Windows filesystems do not expose POSIX device/inode attributes.
+    // A fresh private marker proves both spellings resolve inside the same
+    // directory without inferring case sensitivity from the operating system.
+    let markerName = ".opengrok-case-probe-\(UUID().uuidString)"
+    let marker = original.appendingPathComponent(markerName)
+    let expected = Data(UUID().uuidString.utf8)
+    try expected.write(to: marker, options: [.withoutOverwriting])
+    defer { try? manager.removeItem(at: marker) }
+    let alternativeMarker = alternative.appendingPathComponent(markerName)
+    guard let observed = try? Data(contentsOf: alternativeMarker) else { return false }
+    return observed == expected
+}
+
 @Suite("ACP durable updates and full-content session search", .serialized)
 struct LivePersistentSessionQueryACPParityTests {
     @Test("updates return raw persisted envelopes, prompt boundaries, and the last event ID")
@@ -387,6 +417,10 @@ struct LivePersistentSessionQueryACPParityTests {
 
         let alternateCasing = fixture.firstWorkspace.path.uppercased()
         #expect(alternateCasing != fixture.firstWorkspace.path)
+        let resolvesToSameWorkspace = try nativeFilesystemAliasesDirectory(
+            fixture.firstWorkspace,
+            as: URL(fileURLWithPath: alternateCasing, isDirectory: true)
+        )
 
         let (updates, updateError) = try await fixture.call(
             "x.ai/session/updates",
@@ -405,14 +439,14 @@ struct LivePersistentSessionQueryACPParityTests {
         #expect(updateError == nil)
         #expect(searchError == nil)
 
-        #if os(Windows)
-        #expect(updates?["totalCount"]?.uint64Value == 1)
-        #expect(search?["result"]?["results"]?[0]?["sessionId"]?.stringValue
-            == "case-sensitive-workspace")
-        #else
-        #expect(updates?["updates"] == .array([]))
-        #expect(search?["result"]?["results"] == .array([]))
-        #endif
+        if resolvesToSameWorkspace {
+            #expect(updates?["totalCount"]?.uint64Value == 1)
+            #expect(search?["result"]?["results"]?[0]?["sessionId"]?.stringValue
+                == "case-sensitive-workspace")
+        } else {
+            #expect(updates?["updates"] == .array([]))
+            #expect(search?["result"]?["results"] == .array([]))
+        }
     }
 
     @Test("search ranks real transcript content and reports upstream camelCase fields")
