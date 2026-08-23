@@ -313,10 +313,17 @@ public enum LiveWorkspaceComposition {
         guard case .utility(let options) = command, options.name == routeName else {
             throw CLIApplicationError.unsupported(route: command.routeName)
         }
-        let sandboxProfile = OpenGrokSandbox.configuredProfile()
+        let sandboxProfile: String?
         if let rawAction = options.values.first {
             let action = rawAction == "list" ? "status" : rawAction
+            sandboxProfile = try resolvedSandboxProfile(
+                action: action,
+                options: options,
+                environment: context.environment
+            )
             try enforceSandboxProfile(action: action, profile: sandboxProfile)
+        } else {
+            sandboxProfile = OpenGrokSandbox.configuredProfile()
         }
         let remoteSettings: RemoteSettings?
         if workspaceCommandEnvironmentOverride(context.environment) == nil {
@@ -374,8 +381,51 @@ public enum LiveWorkspaceComposition {
         }
     }
 
+    private static func resolvedSandboxProfile(
+        action: String,
+        options: CLIUtilityOptions,
+        environment: [String: String]
+    ) throws -> String? {
+        guard activatingActions.contains(action) else {
+            return OpenGrokSandbox.configuredProfile()
+        }
+
+        let workingDirectory = URL(fileURLWithPath: try resolveCwd(
+            options.options["--cwd"] ?? options.common.cwd,
+            environment: environment
+        ))
+        var permissionOptions = options.common.permissions
+        // A route refused before exposure must not make `--trust` durable as a
+        // side effect of reading the policy that refused it.
+        permissionOptions.trustFolder = false
+        let security = LiveSecurityContext.resolve(
+            workspaceRoot: workingDirectory,
+            environment: environment,
+            isInteractive: false,
+            cli: permissionOptions
+        )
+        let requested = LiveSandboxComposition.resolveProfileName(
+            document: security.document,
+            requirements: security.requirements,
+            cliProfile: options.common.permissions.sandboxProfile,
+            environment: environment
+        )
+
+        // A process that was already confined cannot widen itself merely
+        // because a later control request names `off`.
+        if let configured = OpenGrokSandbox.configuredProfile(),
+           ProfileName(parsing: configured) != .off
+        {
+            return ProfileName(parsing: configured).description
+        }
+        return ProfileName(parsing: requested).description
+    }
+
     private static func enforceSandboxProfile(action: String, profile: String?) throws {
-        if activatingActions.contains(action), let profile {
+        if activatingActions.contains(action),
+           let profile,
+           ProfileName(parsing: profile) != .off
+        {
             throw WorkspaceRouteError(
                 "`open-grok workspace` start/restart/resume is unavailable under "
                     + "sandbox profile '\(profile)': those commands (re)activate "

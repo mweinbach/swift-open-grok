@@ -212,11 +212,14 @@ struct LiveWorkspaceLauncherReachabilityTests {
 
     @Test("every workspace subcommand reaches the route, not just status")
     func allSubcommandsReachTheRoute() async throws {
-        // `start`/`restart`/`resume` would hit the sandbox refusal first if a
-        // profile were active; none is in the test environment, so all six
-        // land on the same feature gate.
+        // Activating routes default to workspace confinement. Their explicit
+        // supported `--sandbox off` keeps this reachability test focused on
+        // the feature-gate wording; default-profile refusal has its own suite.
         for action in ["start", "restart", "pause", "resume", "stop", "status", "list"] {
-            let command = try CLICommandParser.parseOrThrow(["workspace", action])
+            let arguments = LiveWorkspaceComposition.activatingActions.contains(action)
+                ? ["--sandbox", "off", "workspace", action]
+                : ["workspace", action]
+            let command = try CLICommandParser.parseOrThrow(arguments)
             let (context, _, _) = launcherContext(environment: Self.gateOff)
             let launcher = OpenGrokLiveApplicationLauncher().launcher
 
