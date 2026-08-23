@@ -152,7 +152,9 @@ struct LiveToolExecutor: Sendable {
         return firstRoot.path.replacingOccurrences(of: "\\", with: "/").lowercased()
             == secondRoot.path.replacingOccurrences(of: "\\", with: "/").lowercased()
         #else
-        return firstRoot == secondRoot
+        // URL equality also compares directory/trailing-slash metadata, which
+        // is not filesystem authority and differs across the live registries.
+        return firstRoot.path == secondRoot.path
         #endif
     }
 
