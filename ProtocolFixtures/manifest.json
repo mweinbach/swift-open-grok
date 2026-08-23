@@ -1,42 +1,42 @@
 {
   "version": 1,
   "generatedAt": "2026-08-23",
-  "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+  "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
   "files": [
     {
       "path": "ProtocolFixtures/PROVENANCE.json",
-      "sizeBytes": 11802,
-      "sha256": "f52187df893a442635564e6535325d1060bd5437574a89bf17654911d91c79cf"
+      "sizeBytes": 12093,
+      "sha256": "9b7a60b207b8fccfb4bb2aeed213baf484316983bb1c4b9d6ef0e9be68d32f94"
     },
     {
       "path": "ProtocolFixtures/acp-mcp-icons.json",
       "sizeBytes": 3969,
-      "sha256": "d8fb7760568da5ea10f4c2ceebb0b34864e7ed38e9c6de8bc013a7d9c1383ee7"
+      "sha256": "22187765df7c7a0102bede5b207de316b73f08ecb4c8e00594940dfdc3950e7b"
     },
     {
       "path": "ProtocolFixtures/acp-methods.json",
       "sizeBytes": 1390,
-      "sha256": "0be2709610efecdd4e537efb651b5f99105ae1013fb6185b88176fb717d02ef8"
+      "sha256": "ce629582b7d5a6a140e342cc4663264394d7efed0d6d2150b5283c69d936007f"
     },
     {
       "path": "ProtocolFixtures/cli-version-and-home.json",
-      "sizeBytes": 2388,
-      "sha256": "8acc38d0542079d9cc78e18a53c64683bd5a52374b74481b94b766ce19eac5a4"
+      "sizeBytes": 2484,
+      "sha256": "a7628e503a892e755913d7509fe6324f2073091bf89f1671fb7262956ba158c7"
     },
     {
       "path": "ProtocolFixtures/config-workspace-codemode-keys.json",
       "sizeBytes": 6324,
-      "sha256": "5ba5ebb1373af1556762f143aef63b46eef88aa30b16f1eaa892034dcfc30c6a"
+      "sha256": "01979827043325a3d125c7d41fd370546e4e037b939df8604cced8b6c168aabb"
     },
     {
       "path": "ProtocolFixtures/crash-gcrx-format.json",
       "sizeBytes": 2602,
-      "sha256": "3114a84dc4bef37158487d296108210bda9dbc3beccc87e9fee3c82b950ddcc0"
+      "sha256": "16806265c68ae0d65421e32051d314a97147328dde8b6f805a8fb16eb7e220d9"
     },
     {
       "path": "ProtocolFixtures/crash-gcrx-sample.bin",
       "sizeBytes": 64,
-      "sha256": "bace86fd66393da068cf3d0d4285b123adacb7adadc62954f69f9ca320bd571c"
+      "sha256": "471b2a7f5d6ae50a379606bea9fd481ffa4eb11471a6424a2aa2d708cb69d2d2"
     },
     {
       "path": "ProtocolFixtures/git-loose-blob-hello.zlib",
@@ -46,17 +46,17 @@
     {
       "path": "ProtocolFixtures/git-object-and-index.json",
       "sizeBytes": 1635,
-      "sha256": "4faa11a22d93e8aec627943ceb5786b646ba1adf76865249fe4bf4ca2b9bef1e"
+      "sha256": "4ac033f7715b901fdb44c91de46f402f779395c224a90d3c7b5ede75579b8baf"
     },
     {
       "path": "ProtocolFixtures/hook-runtime-identity.json",
       "sizeBytes": 4425,
-      "sha256": "c4b19c685b50b1b478ad9606929c8a7109e7094e60115c922e87f26076729daa"
+      "sha256": "5ee0f1aa882ba68c8e0d3e93d3f04a19daa50900048fbad1074502b4d23b25e1"
     },
     {
       "path": "ProtocolFixtures/hunk-tracker-snapshot.json",
       "sizeBytes": 1816,
-      "sha256": "7466ad5e7d84c8ccd2ad001e68d1450b0acb92819c81e1ddf661a24c84dfd653"
+      "sha256": "25f7faa57dc349fb3229ef3a156afe110ecc1733c5d251604eaa387e86841cd1"
     },
     {
       "path": "ProtocolFixtures/otlp-export-trace-grpc.bin",
@@ -71,27 +71,27 @@
     {
       "path": "ProtocolFixtures/otlp-span-export-shape.json",
       "sizeBytes": 2632,
-      "sha256": "6975551ae43c8513f2a2af6117962c020308a03f51e905e28da40fecee4c982d"
+      "sha256": "c0f8bc9da2104947e290e0772abb076b8c374de68485936ce2b156c3fa01c064"
     },
     {
       "path": "ProtocolFixtures/provider-streaming-policy.json",
       "sizeBytes": 4472,
-      "sha256": "d46a630971eef4625c641775b7af5a531c900c2bf8d4d3669cf2c2c542702e53"
+      "sha256": "af24733d4f028b22fde321c4bdcac74c1df2d251166108cbb5e6289af8cd84f6"
     },
     {
       "path": "ProtocolFixtures/pty-process-signals.json",
       "sizeBytes": 1215,
-      "sha256": "b41f696127a900184d357bfbaf9693ca8c47f899ace856fb5ee096b587ae8522"
+      "sha256": "4e378913f92dee0d8c48411e16d4e7f2d8f3860ae34062968507995c998d5411"
     },
     {
       "path": "ProtocolFixtures/sqlite-journal-modes.json",
       "sizeBytes": 2592,
-      "sha256": "08fa2d9ee128992bafa5dc6006cd5fd5793ca70920b298b607bfda0cadc6377f"
+      "sha256": "9ed507cf951664287c00ccfc72f77d4023aaa5febeadd8abdf1ba1b78f315255"
     },
     {
       "path": "ProtocolFixtures/tracing-w3c-traceparent.json",
       "sizeBytes": 1851,
-      "sha256": "263cd190d3fbe019737a92d55943c7f7e1eedaadb7c8e930f1d8e419993f31bb"
+      "sha256": "a1d3d1768c25f379ab7aab8e91c757daa714a121ede1ff58c8c66347a6659aa3"
     }
   ]
 }

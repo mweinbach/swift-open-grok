@@ -2,7 +2,7 @@
 
 **Planning baseline:** 2026-07-20 (inventory and reference pin refreshed 2026-08-22)
 **Destination:** `/Users/mweinbach/Projects/swift-open-grok`
-**Read-only reference:** `xai-org/grok-build` at `448a2afebcff7878465e8f67cd9c995c3ba00b9b` (`1.0.0-open-grok.81`), local clone `/Users/mweinbach/Projects/grok-build`. Current protocol-fixture and executable provenance is recorded in `PORT_STATUS.md`.
+**Read-only reference:** `xai-org/grok-build` at `b962dfa6dd9a49df96d28412eae3a8f5478b0dfa` (`1.0.0-open-grok.82`), local clone `/Users/mweinbach/Projects/grok-build`. Current protocol-fixture and executable provenance is recorded in `PORT_STATUS.md`.
 **SwiftPM baseline:** `swift-tools-version: 6.1`
 **Reference inventory:** 93 root Cargo workspace members + 1 standalone Markdown fuzz crate = **94 mapped crates**; five previously omitted workspace members are identified in `CRATE_MAP.md`.
 **Swift source/test inventory (directory recount, 2026-08-22):** **106** `Sources/` target directories and **106** `Tests/` target directories. Workers must not invoke SwiftPM; only `zsh workflows/swift-safe-verify.zsh` via the sole integration agent.

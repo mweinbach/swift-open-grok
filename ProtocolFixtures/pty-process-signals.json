@@ -16,10 +16,10 @@
     "darwinLinux": "OpenGrokPTYC setsid+TIOCSCTTY spawn shim",
     "windows": "ConPTY/Job Objects later; typed unsupported"
   },
-  "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+  "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
   "provenance": {
     "source": "OpenGrokPTY.ProcessSignal portableValue vs ptyctl",
-    "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+    "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
     "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
     "pinVerdict": "unchanged (verified)",
     "evidence": [

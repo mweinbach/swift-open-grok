@@ -125,12 +125,12 @@
       "allow"
     ]
   },
-  "notes": "Checked-in key-order fixtures for implemented foundation contracts, re-evaluated against Rust revision 448a2afe with per-key source provenance and the secure new-session sandbox default.",
-  "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+  "notes": "Checked-in key-order fixtures for implemented foundation contracts, re-evaluated against Rust revision b962dfa6 with per-key source provenance and the secure new-session sandbox default.",
+  "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
   "portDrift": {},
   "provenance": {
     "source": "xai-grok-config-types (ConfigSource, RuleAction), xai-grok-shell (sandbox profile defaults), and xai-grok-code-mode-protocol (runtime defaults), cross-checked against live Swift composition and foundation targets",
-    "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+    "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
     "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
     "pinVerdict": "recaptured",
     "recapturedFields": [

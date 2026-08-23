@@ -32,12 +32,12 @@
     "pid": 4242,
     "timestamp": 1700000000,
     "nFrames": 0,
-    "appVersion": "1.0.0-open-grok.81"
+    "appVersion": "1.0.0-open-grok.82"
   },
-  "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+  "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
   "provenance": {
     "source": "OpenGrokCrashHandler.CrashBlobFormat / CrashBlob.serialize vs xai-crash-handler",
-    "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+    "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
     "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
     "pinVerdict": "recaptured",
     "recapturedFields": [
@@ -46,14 +46,14 @@
     ],
     "keyProvenance": {
       "magic/version/maxFrames/versionStringLength/headerSize/maxFileSize": "crates/codegen/xai-crash-handler/src/format.rs:7,10,13,16,30,33 — byte-identical between the two pins",
-      "sample.appVersion": "release marker OPEN_GROK_VERSION at 538a16df (1.0.0-open-grok.81); asserted equal to OpenGrokDistributionSupport.referencePinnedRelease",
+      "sample.appVersion": "release marker OPEN_GROK_VERSION at b962dfa6 (1.0.0-open-grok.82); asserted equal to OpenGrokDistributionSupport.referencePinnedRelease",
       "layout": "crates/codegen/xai-crash-handler/src/format.rs:136-151 (writer) and :53-71 (parser); mirrored by Sources/OpenGrokCrashHandler/OpenGrokCrashHandler.swift:100-197",
       "capturedSignals.unix": "crates/codegen/xai-crash-handler/src/handler.rs:306-308 (SIGBUS, SIGSEGV, SIGABRT)",
       "capturedSignals.windows": "crates/codegen/xai-crash-handler/src/handler.rs:1-8 module doc — abort() does not route through SetUnhandledExceptionFilter, so SIGABRT capture is Unix-only"
     },
     "evidence": [
       "git diff 650c1db7..538a16df -- crates/codegen/xai-crash-handler => empty. The GCRX header layout, magic, version byte, frame cap, version-string field, and captured signal set remain unchanged from the prior pin.",
-      "crash-gcrx-sample.bin re-encoded with the 18-byte app_version 1.0.0-open-grok.81; the complete 32-byte field at offset 32 is NUL-padded, the first 32 bytes are preserved, and the header remains exactly 64 bytes."
+      "crash-gcrx-sample.bin re-encoded with the 18-byte app_version 1.0.0-open-grok.82; the complete 32-byte field at offset 32 is NUL-padded, the first 32 bytes are preserved, and the header remains exactly 64 bytes."
     ]
   }
 }

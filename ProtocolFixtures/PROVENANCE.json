@@ -1,10 +1,10 @@
 {
   "$schema": "open-grok/protocol-fixtures/provenance",
   "generatedAt": "2026-08-23",
-  "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+  "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
   "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
   "note": "Fixtures are provenance-labelled compatibility artifacts for implemented foundation formats. Binary goldens are re-encoded or structurally decoded in tests (OTLP, GCRX, git zlib metadata, hunk/PTY/tracing/storage keys) rather than digest-only validation.",
-  "recaptureNote": "Every entry was re-evaluated against the 2026-08-23 UTC advance from release baseline 538a16df to 448a2afe, a seven-commit upstream delta; OPEN_GROK_VERSION remains 1.0.0-open-grok.81 and the original historical reference remains 650c1db7. The earlier 178-commit 650c1db7..538a16df advance recaptured the CLI release, GNU Linux x86_64/aarch64 distribution, fixed-width crash release stamp, shared SQLite busy-retry budget, provider-local streaming, Codex permissions, and nested progress. The new delta adds workspace-by-default sandbox confinement with explicit opt-out and resume pinning, sanitized ACP MCP server/tool icon wire fields, authentic command/HTTP hook runner identity, browser-style prompt selection, object-free Git HEAD resolution, and a documentation-only upstream snapshot note. The config fixture now captures sandbox precedence; icon and hook contracts have dedicated recaptured fixtures, while prior unchanged fixture source surfaces and release-stamped binary goldens remain unchanged.",
+  "recaptureNote": "Every entry was re-evaluated against the 2026-08-23 UTC advance from release baseline 538a16df (1.0.0-open-grok.81) to b962dfa6 (1.0.0-open-grok.82), an eight-commit upstream delta; the original historical reference remains 650c1db7. The earlier 178-commit 650c1db7..538a16df advance recaptured the .81 CLI release, GNU Linux x86_64/aarch64 distribution, fixed-width crash release stamp, shared SQLite busy-retry budget, provider-local streaming, Codex permissions, and nested progress. Seven subsequent commits through 448a2afe retained release .81 while adding workspace-by-default sandbox confinement with explicit opt-out and resume pinning, sanitized ACP MCP server/tool icon wire fields, authentic command/HTTP hook runner identity, browser-style prompt selection, object-free Git HEAD resolution, and a documentation-only upstream snapshot note. Final release commit b962dfa6 changes OPEN_GROK_VERSION to .82 and adds release notes without changing those runtime contracts; the CLI/build-plugin/generated-source/distribution defaults and fixed-width GCRX golden have been re-stamped to .82, while other binary wire artifacts remain unchanged.",
   "method": "Hand-derivation from immutable Rust source with file:line provenance, cross-checked against production Swift targets. Both revisions and every family-level diff were read through git plumbing from the read-only reference clone at /Users/mweinbach/Projects/grok-build; release-stamped binary goldens were structurally re-encoded and the manifest was regenerated from actual file bytes.",
   "entries": [
     {
@@ -31,7 +31,7 @@
       "referenceSources": [
         "crates/codegen/xai-acp-lib"
       ],
-      "evidence": "git diff 650c1db7..538a16df and git diff 538a16df..448a2afe -- crates/codegen/xai-acp-lib => empty (source and Cargo.toml both untouched); new MCP extension payload fields are captured separately in acp-mcp-icons.json."
+      "evidence": "git diff 650c1db7..538a16df and git diff 538a16df..b962dfa6 -- crates/codegen/xai-acp-lib => empty (source and Cargo.toml both untouched); new MCP extension payload fields are captured separately in acp-mcp-icons.json."
     },
     {
       "file": "cli-version-and-home.json",
@@ -45,7 +45,7 @@
         "crates/codegen/xai-grok-config/src/paths.rs",
         "crates/codegen/xai-grok-paths"
       ],
-      "evidence": "OPEN_GROK_VERSION moved from 0.1.220-open-grok.58 to 1.0.0-open-grok.81. install.sh:35-53 and scripts/build-linux-release.sh:9-26 now publish GNU Linux x86_64/aarch64 releases and their exact uname aliases. Version-library behavior and the branded home-policy contract are unchanged; config paths additionally harden session directories to mode 0700 without changing home selection."
+      "evidence": "OPEN_GROK_VERSION historically moved from 0.1.220-open-grok.58 to 1.0.0-open-grok.81, then release commit b962dfa6 advances it to 1.0.0-open-grok.82. install.sh:35-53 and scripts/build-linux-release.sh:9-26 continue to publish GNU Linux x86_64/aarch64 releases and their exact uname aliases. Version-library behavior and the branded home-policy contract are unchanged; config paths additionally harden session directories to mode 0700 without changing home selection."
     },
     {
       "file": "config-workspace-codemode-keys.json",
@@ -69,7 +69,7 @@
         "crates/codegen/xai-crash-handler/src/format.rs",
         "crates/codegen/xai-crash-handler/src/handler.rs"
       ],
-      "evidence": "git diff 650c1db7..538a16df -- crates/codegen/xai-crash-handler => empty, so the GCRX layout and signal capture remain unchanged; only the sample app_version was re-encoded to the 1.0.0-open-grok.81 release marker."
+      "evidence": "git diff 650c1db7..538a16df and git diff 538a16df..b962dfa6 -- crates/codegen/xai-crash-handler => empty, so the GCRX layout and signal capture remain unchanged; the sample app_version was re-encoded from the historical .81 stamp to the current 1.0.0-open-grok.82 release marker."
     },
     {
       "file": "crash-gcrx-sample.bin",
@@ -78,7 +78,7 @@
       "referenceSources": [
         "crates/codegen/xai-crash-handler/src/format.rs"
       ],
-      "evidence": "Re-encoded the complete 32-byte NUL-padded version field at offset 32 with the 18-byte 1.0.0-open-grok.81 release; bytes 0...31 remain identical and the golden stays exactly 64 bytes."
+      "evidence": "Re-encoded the complete 32-byte NUL-padded version field at offset 32 with the 18-byte 1.0.0-open-grok.82 release; bytes 0...31 remain identical and the golden stays exactly 64 bytes."
     },
     {
       "file": "git-loose-blob-hello.zlib",

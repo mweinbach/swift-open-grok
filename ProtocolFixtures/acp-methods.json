@@ -1,6 +1,6 @@
 {
   "$schema": "https://agentsdk.com/schemas/acp-methods.json",
-  "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+  "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
   "methods": [
     "initialize",
     "authenticate",
@@ -24,14 +24,14 @@
   },
   "provenance": {
     "source": "OpenGrokACP method name surface vs xai-acp-lib",
-    "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+    "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
     "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
     "pinVerdict": "unchanged (verified)",
     "evidence": [
       "git diff 650c1db7..538a16df -- crates/codegen/xai-acp-lib => empty (no source change)",
       "git diff 650c1db7..538a16df -- crates/codegen/xai-acp-lib/Cargo.toml => empty (agent-client-protocol dependency pin unchanged)",
-      "git diff 538a16df..448a2afe -- crates/codegen/xai-acp-lib => empty; ACP MCP icon payload additions are independently captured in acp-mcp-icons.json",
-      "crates/codegen/xai-acp-lib/src/normalize.rs:99,113,154,168 spell the same session/* JSON-RPC method names at 448a2afe"
+      "git diff 538a16df..b962dfa6 -- crates/codegen/xai-acp-lib => empty; ACP MCP icon payload additions are independently captured in acp-mcp-icons.json",
+      "crates/codegen/xai-acp-lib/src/normalize.rs:99,113,154,168 spell the same session/* JSON-RPC method names at b962dfa6"
     ]
   }
 }

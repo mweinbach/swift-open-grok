@@ -1,6 +1,6 @@
 {
   "$schema": "open-grok/protocol-fixtures/provider-streaming-policy",
-  "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+  "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
   "providers": [
     "xai",
     "codex",
@@ -120,7 +120,7 @@
   },
   "provenance": {
     "source": "xai-grok-sampling-types provider-local streaming gate, xai-grok-sampler Codex execution policy, and xai-grok-code-mode-protocol nested progress wire",
-    "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+    "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
     "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
     "pinVerdict": "recaptured",
     "recapturedFields": [

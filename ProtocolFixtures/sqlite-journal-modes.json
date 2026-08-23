@@ -19,11 +19,11 @@
   "busyRetryBudgetMilliseconds": 10000,
   "busyRetryPauseMilliseconds": 20,
   "maxBusyAttemptMilliseconds": 1000,
-  "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+  "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
   "referenceEnvOverride": "GROK_SQLITE_JOURNAL_MODE",
   "provenance": {
     "source": "OpenGrokSQLiteJournal.JournalMode vs xai-sqlite-journal",
-    "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+    "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
     "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
     "pinVerdict": "recaptured",
     "recapturedFields": [

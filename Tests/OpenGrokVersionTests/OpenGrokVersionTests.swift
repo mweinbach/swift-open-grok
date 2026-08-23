@@ -30,7 +30,7 @@ struct OpenGrokVersionTests {
 
     private var expectedCompiledVersion: String {
         ProcessInfo.processInfo.environment["GROK_TEST_EXPECTED_COMPILED_VERSION"]
-            ?? "1.0.0-open-grok.81"
+            ?? "1.0.0-open-grok.82"
     }
 
     // MARK: - Compiled version constant
@@ -54,7 +54,7 @@ struct OpenGrokVersionTests {
             .split(whereSeparator: \.isNewline)
             .first
             .map(String.init) ?? ""
-        #expect(marker == "1.0.0-open-grok.81")
+        #expect(marker == "1.0.0-open-grok.82")
         #expect(OpenGrokVersion.compiledVersion == marker)
     }
 
@@ -598,7 +598,7 @@ struct OpenGrokVersionTests {
 
         // If the package root has an OPEN_GROK_VERSION file (copied into the
         // temp package root), the script must use its first line. Otherwise it
-        // uses the current reference-release default `1.0.0-open-grok.81`.
+        // uses the current reference-release default `1.0.0-open-grok.82`.
         let tempVersionFile = tempDir.appendingPathComponent("OPEN_GROK_VERSION")
         if FileManager.default.fileExists(atPath: tempVersionFile.path),
            let fileContents = try? String(contentsOf: tempVersionFile, encoding: .utf8) {
@@ -614,7 +614,7 @@ struct OpenGrokVersionTests {
         } else {
             // No OPEN_GROK_VERSION file in the package root: the script falls
             // back to the default version.
-            #expect(version == "1.0.0-open-grok.81",
+            #expect(version == "1.0.0-open-grok.82",
                     "Generated version must be the default when no OPEN_GROK_VERSION file exists")
         }
     }

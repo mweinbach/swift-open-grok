@@ -1,7 +1,7 @@
 // OpenGrokDistributionSupportTests.swift
 //
 // Every expectation here is anchored to a concrete line in the Rust reference
-// at 448a2afebcff7878465e8f67cd9c995c3ba00b9b (see the target's source
+// at b962dfa6dd9a49df96d28412eae3a8f5478b0dfa (see the target's source
 // comments for the file:line citations).
 
 import Foundation
