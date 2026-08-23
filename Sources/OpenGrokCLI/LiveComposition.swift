@@ -1766,6 +1766,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     session: LiveWorkflowLaunch.Session(
                         sampler: sampler,
                         model: samplingConfiguration.model,
+                        supportsReasoningEffort:
+                            foundation.samplingConfiguration.tuning.reasoningEffort != nil,
                         workspaceRoot: cwd,
                         sessionID: sessionID,
                         openGrokHome: openGrokHome,
