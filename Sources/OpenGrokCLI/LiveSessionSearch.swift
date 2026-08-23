@@ -8,17 +8,9 @@
 // mirrored into a contentless `session_docs_fts` by triggers, ranked with
 // `bm25(session_docs_fts, 10.0, 1.0)` — title weighted 10×, content 1×.
 //
-// This port does a **bounded scan** instead of an FTS index. The live catalog
-// discovers canonical cwd-bucket JSONL sessions first, then deduplicates any
-// legacy flat compatibility mirrors. Scanning those authoritative records is
-// bounded by the same caps Rust applies when building its index, without
-// introducing a second persistence authority or bootstrap race.
-//
-// What is faithfully ported is everything the user can observe: the same
-// tokenization, the same prefix matching, the same AND-then-OR retry, the same
-// 10:1 title:content weighting, the same three-line output shape, and the same
-// resume-by-title rules including the UUID short-circuit and the
-// refuse-to-guess behaviour on an ambiguous title.
+// The durable indexed CLI/ACP path lives in `LiveSessionSearchIndex.swift`.
+// This file retains shared document extraction and the in-memory ranker used
+// by transient picker surfaces that intentionally have no persistent corpus.
 
 import Foundation
 import OpenGrokSamplingTypes
