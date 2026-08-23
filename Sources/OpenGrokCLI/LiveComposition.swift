@@ -1464,7 +1464,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     }
 
     public var launcher: CLIApplicationLauncher {
-        CLIApplicationLauncher { command, context in
+        let activeLauncher = CLIApplicationLauncher { command, context in
             if LiveAuthComposition.handles(command) {
                 return try await LiveAuthComposition.session(for: command, context: context)
             }
@@ -1581,42 +1581,91 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 environment: context.environment,
                 required: options.mode != .interactive
             )
-            let workflowSourceCWD = try Self.resolveWorkingDirectory(options.common.cwd)
-            let workflowsEnabled = try loadResolvedWorkflows(
-                cwd: workflowSourceCWD,
-                environment: context.environment
-            ).value
-            if options.common.workflow != nil && !workflowsEnabled {
-                throw CLIApplicationError.failed(
-                    "workflows are disabled by GROK_WORKFLOWS or [workflows].enabled"
-                )
-            }
-            if options.common.leader {
-                let cwd = try Self.resolveWorkingDirectory(options.common.cwd)
-                let openGrokHome = Self.resolveOpenGrokHome(environment: context.environment)
-                let relay = GrokComConfig.default(environment: context.environment)
-                let lease = try await dependencies.makeLeaderClient(
-                    LiveLeaderClientLaunchConfiguration(
-                        workingDirectory: cwd,
-                        openGrokHome: openGrokHome,
-                        relayURL: relay.grokWSURL,
-                        relayOrigin: relay.grokWSOrigin,
-                        socketOverride: options.common.leaderSocket,
+            let invocationCWD = try Self.resolveWorkingDirectory(options.common.cwd)
+            let workflowSourceCWD = try await Self.resolveResumeWorkingDirectory(
+                options: options,
+                invocationWorkingDirectory: invocationCWD,
+                openGrokHome: Self.resolveOpenGrokHome(environment: context.environment)
+            )
+            let acquiredInteractiveInput = options.mode == .interactive
+                && dependencies.terminal.isTTY()
+                ? try await dependencies.makeInteractiveInput()
+                : nil
+            let interactiveSink = acquiredInteractiveInput != nil
+                ? dependencies.makeTerminalSink()
+                : nil
+            let interactiveInput: OpenGrokLiveInteractiveInput?
+            do {
+                let trust = try await LiveFolderTrustPrompt.preflight(
+                    workingDirectory: workflowSourceCWD,
+                    environment: context.environment,
+                    explicitTrust: options.common.permissions.trustFolder,
+                    interactiveInput: acquiredInteractiveInput,
+                    hasInteractiveSurface: acquiredInteractiveInput != nil
+                        && interactiveSink != nil,
+                    terminal: dependencies.terminal,
+                    authenticationReady: await LiveStartupAuthenticationReadiness.isReady(
+                        options: options,
                         environment: context.environment,
-                        clientType: options.mode == .headless ? "grok-p" : "grok-tui",
-                        mode: options.mode == .headless ? .headless : .stdio,
-                        capabilities: ACPLeaderClientCapabilities(
-                            clientVersion: OpenGrokCLIVersion.installed(environment: context.environment),
-                            terminal: options.mode == .interactive,
-                            fsRead: true,
-                            fsWrite: true
-                        )
+                        remoteSettings: dependencies.remoteSettingsSnapshot
                     )
                 )
-                let interactiveInput = options.mode == .interactive
-                    && dependencies.terminal.isTTY()
-                    ? try await dependencies.makeInteractiveInput()
-                    : nil
+                switch trust {
+                case .proceed(let approvedInput):
+                    interactiveInput = approvedInput
+                case .cancelled:
+                    await acquiredInteractiveInput?.close()
+                    return CLIApplicationSession(waitForExit: {}, shutdown: {})
+                }
+            } catch {
+                await acquiredInteractiveInput?.close()
+                throw error
+            }
+            LiveManagedPolicyLifecycle.start(environment: context.environment)
+
+            let workflowsEnabled: Bool
+            do {
+                workflowsEnabled = try loadResolvedWorkflows(
+                    cwd: workflowSourceCWD,
+                    environment: context.environment
+                ).value
+                if options.common.workflow != nil && !workflowsEnabled {
+                    throw CLIApplicationError.failed(
+                        "workflows are disabled by GROK_WORKFLOWS or [workflows].enabled"
+                    )
+                }
+            } catch {
+                await interactiveInput?.close()
+                throw error
+            }
+            if options.common.leader {
+                let cwd = workflowSourceCWD
+                let openGrokHome = Self.resolveOpenGrokHome(environment: context.environment)
+                let relay = GrokComConfig.default(environment: context.environment)
+                let lease: LiveLeaderClientLease
+                do {
+                    lease = try await dependencies.makeLeaderClient(
+                        LiveLeaderClientLaunchConfiguration(
+                            workingDirectory: cwd,
+                            openGrokHome: openGrokHome,
+                            relayURL: relay.grokWSURL,
+                            relayOrigin: relay.grokWSOrigin,
+                            socketOverride: options.common.leaderSocket,
+                            environment: context.environment,
+                            clientType: options.mode == .headless ? "grok-p" : "grok-tui",
+                            mode: options.mode == .headless ? .headless : .stdio,
+                            capabilities: ACPLeaderClientCapabilities(
+                                clientVersion: OpenGrokCLIVersion.installed(environment: context.environment),
+                                terminal: options.mode == .interactive,
+                                fsRead: true,
+                                fsWrite: true
+                            )
+                        )
+                    )
+                } catch {
+                    await interactiveInput?.close()
+                    throw error
+                }
                 do {
                     return try await Self.makeLeaderLaunchSession(
                         options: options,
@@ -1626,7 +1675,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         context: context,
                         terminal: dependencies.terminal,
                         interactiveInput: interactiveInput,
-                        makeTerminalSink: dependencies.makeTerminalSink
+                        terminalSink: interactiveSink
                     )
                 } catch {
                     await interactiveInput?.close()
@@ -1634,18 +1683,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     throw error
                 }
             }
-            // The interactive surface is created BEFORE the foundation so the
-            // ask-user/plan-approval coordinators can be gated on what will
-            // actually exist: stdout being a TTY says nothing about stdin, and
-            // a coordinator without its presenter advertises a tool no one can
-            // answer (wave 14 review finding). Cost: raw mode is entered a few
-            // hundred milliseconds earlier, so a foundation error printed to
-            // stderr renders staircased — error paths only, and the input is
-            // closed on that throw below.
-            let interactiveInput = options.mode == .interactive && dependencies.terminal.isTTY()
-                ? try await dependencies.makeInteractiveInput()
-                : nil
-            let interactiveSink = interactiveInput != nil ? dependencies.makeTerminalSink() : nil
+            // The already-open trust surface remains the sole input and sink;
+            // foundation authorization must reflect the presenter that exists.
             let foundation: LiveSessionFoundation
             do {
                 foundation = try await Self.makeSessionFoundation(
@@ -2623,6 +2662,43 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 )
             }
         }
+
+        return CLIApplicationLauncher { command, context in
+            let inheritedLifecycleLease = LiveManagedPolicyLifecycle.acquireSessionLease(
+                environment: context.environment
+            )
+            do {
+                let session = try await activeLauncher.start(command, context)
+                let lifecycleLease = inheritedLifecycleLease
+                    ?? LiveManagedPolicyLifecycle.acquireSessionLease(
+                        environment: context.environment
+                    )
+                return CLIApplicationSession(
+                    waitForExit: {
+                        try await session.waitForExit()
+                    },
+                    shutdown: {
+                        await session.shutdown()
+                        if let lifecycleLease {
+                            lifecycleLease.release()
+                        } else {
+                            LiveManagedPolicyLifecycle.stopIfUnleased(
+                                environment: context.environment
+                            )
+                        }
+                    }
+                )
+            } catch {
+                if let inheritedLifecycleLease {
+                    inheritedLifecycleLease.release()
+                } else {
+                    LiveManagedPolicyLifecycle.stopIfUnleased(
+                        environment: context.environment
+                    )
+                }
+                throw error
+            }
+        }
     }
 
     private static func makeLeaderLaunchSession(
@@ -2633,7 +2709,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         context: CLIApplicationContext,
         terminal: OpenGrokLiveTerminal,
         interactiveInput: OpenGrokLiveInteractiveInput?,
-        makeTerminalSink: @escaping @Sendable () -> (any PagerTerminalSink)?
+        terminalSink: (any PagerTerminalSink)?
     ) async throws -> CLIApplicationSession {
         let runtime = LiveLeaderPagerRuntimeAdapter(
             client: lease.client,
@@ -2654,7 +2730,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 configScreenMode: uiConfiguration.config.screenMode,
                 screenModeEnvOverride: LiveScreenModeRelaunch.takeScreenModeEnvOverride()
             )
-            if let interactiveInput, let terminalSink = makeTerminalSink() {
+            if let interactiveInput, let terminalSink {
                 let baseRequest = OpenGrokPagerRequest(
                     prompt: prompt,
                     mode: pagerMode,
@@ -3256,6 +3332,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         if !managedPolicyAlreadyEnforced {
             try await LiveManagedPolicyGate.enforce(environment: context.environment)
         }
+        LiveManagedPolicyLifecycle.start(environment: context.environment)
         let invocationCwd = try resolveWorkingDirectory(options.common.cwd)
         let openGrokHome = resolveOpenGrokHome(environment: context.environment)
         let sourceCwd = try await resolveResumeWorkingDirectory(
@@ -4959,7 +5036,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         return merged
     }
 
-    private static func resolveProvider(_ value: String) throws -> ModelProvider {
+    static func resolveProvider(_ value: String) throws -> ModelProvider {
         switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "xai", "grok":
             return .xai

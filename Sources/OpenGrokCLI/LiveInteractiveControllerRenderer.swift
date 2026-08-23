@@ -1423,11 +1423,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     ///    fetch lands, it feeds this parameter and the same resolvers keep
     ///    upstream's env-over-remote precedence
     ///    (acp_handler/settings.rs:135-150).
-    ///  - `trustDone` is true because this port decides folder trust
-    ///    synchronously before the renderer exists
-    ///    (`LiveSecurityContext.resolve`; undecided is treated untrusted) —
-    ///    there is no pending trust question for a live renderer to wait
-    ///    on, unlike upstream's `TrustState`.
+    ///  - `trustDone` is true because launch resolves the interactive folder
+    ///    trust preflight before constructing this renderer. Refused folders
+    ///    never reach this surface; accepted answers are durably verified.
     func refreshPrivacyBannerState(remoteSettings: RemoteSettings? = nil) async {
         let env = environment
         let manager = AuthManager(
@@ -2741,6 +2739,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // fresh from disk immediately.
             catalogStore?.refreshCredentialSnapshot()
             catalogStore?.spawnBackgroundRefresh()
+            let managedEnvironment = environment
+            LiveManagedPolicyLifecycle.postLoginInBackground(
+                environment: managedEnvironment,
+                authenticated: auth
+            )
             Task { await self.reconcileModelStateAfterCatalogRefresh() }
         case .failure(let error):
             finishWaveEAuthFailure(
@@ -3254,6 +3257,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             ))
             return
         }
+        LiveManagedPolicyLifecycle.stop(environment: environment)
+        LiveManagedPolicyLifecycle.clearOrphan(environment: environment)
+        LiveManagedPolicyLifecycle.start(environment: environment)
         let codexRemains = isCodexLoggedIn(
             at: OpenGrokAuthPaths.codexAuthFileURL(environment: environment)
         )
