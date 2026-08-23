@@ -226,13 +226,13 @@ enum LiveStartupAuthenticationReadiness {
         }
 
         let resolved: String
-        if executable.hasPrefix("/") {
+        if isAbsoluteExecutablePath(executable) {
             resolved = executable
         } else {
             guard !executable.contains("/"),
                   !executable.contains("\\"),
                   let path = resolveExecutablePath(executable, environment: environment),
-                  path.hasPrefix("/") else {
+                  isAbsoluteExecutablePath(path) else {
                 return false
             }
             resolved = path
@@ -240,16 +240,57 @@ enum LiveStartupAuthenticationReadiness {
 
         let executableURL = URL(fileURLWithPath: resolved).standardizedFileURL
             .resolvingSymlinksInPath()
-        guard FileManager.default.isExecutableFile(atPath: executableURL.path),
-              (try? executableURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+        guard (try? executableURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
             return false
         }
+        #if os(Windows)
+        let executableExtensions = (environment["PATHEXT"] ?? ".COM;.EXE;.BAT;.CMD")
+            .split(separator: ";")
+        let extensionName = "." + executableURL.pathExtension
+        guard executableExtensions.contains(where: {
+            String($0).caseInsensitiveCompare(extensionName) == .orderedSame
+        }) else {
+            return false
+        }
+        #else
+        guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
+            return false
+        }
+        #endif
 
         let projectURL = URL(
             fileURLWithPath: workingDirectory ?? FileManager.default.currentDirectoryPath,
             isDirectory: true
         ).standardizedFileURL.resolvingSymlinksInPath()
-        return executableURL.path != projectURL.path
-            && !executableURL.path.hasPrefix(projectURL.path + "/")
+        #if os(Windows)
+        let executablePath = executableURL.path.replacingOccurrences(of: "\\", with: "/")
+            .lowercased()
+        let projectPath = projectURL.path.replacingOccurrences(of: "\\", with: "/")
+            .lowercased()
+        #else
+        let executablePath = executableURL.path
+        let projectPath = projectURL.path
+        #endif
+        return executablePath != projectPath
+            && !executablePath.hasPrefix(projectPath + "/")
+    }
+
+    private static func isAbsoluteExecutablePath(_ path: String) -> Bool {
+        #if os(Windows)
+        let bytes = Array(path.utf8)
+        if bytes.count >= 3,
+           ((65...90).contains(bytes[0]) || (97...122).contains(bytes[0])),
+           bytes[1] == 58,
+           bytes[2] == 47 || bytes[2] == 92 {
+            return true
+        }
+        guard path.hasPrefix("\\\\") || path.hasPrefix("//") else {
+            return false
+        }
+        return path.replacingOccurrences(of: "\\", with: "/")
+            .split(separator: "/", omittingEmptySubsequences: true).count >= 2
+        #else
+        return path.hasPrefix("/")
+        #endif
     }
 }

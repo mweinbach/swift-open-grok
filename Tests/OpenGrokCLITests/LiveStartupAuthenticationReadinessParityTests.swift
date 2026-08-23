@@ -329,10 +329,19 @@ struct LiveStartupAuthenticationReadinessParityTests {
         let fixture = try StartupAuthenticationFixture()
         defer { fixture.dispose() }
         let marker = fixture.root.appendingPathComponent("auth-command-was-executed")
+        #if os(Windows)
+        let systemRoot = ProcessInfo.processInfo.environment["SystemRoot"] ?? #"C:\Windows"#
+        let command = URL(fileURLWithPath: systemRoot)
+            .appendingPathComponent("System32")
+            .appendingPathComponent("cmd.exe")
+            .path
+        #else
+        let command = "/usr/bin/touch"
+        #endif
         try fixture.configureOwner("""
         [auth_provider.owner_command]
-        command = "/usr/bin/touch"
-        args = ["\(marker.path)"]
+        command = '\(command)'
+        args = ['\(marker.path)']
 
         [model.owner-auth]
         model = "private-routing-slug"
@@ -349,6 +358,16 @@ struct LiveStartupAuthenticationReadinessParityTests {
     func namedAuthenticationRequiresTrustedExecutable() async throws {
         let fixture = try StartupAuthenticationFixture()
         defer { fixture.dispose() }
+        #if os(Windows)
+        let ownerBinary = fixture.root.appendingPathComponent("owner-auth-command.txt")
+        let projectBinary = fixture.project.appendingPathComponent("project-auth-command.cmd")
+        try "not an executable\n".write(to: ownerBinary, atomically: true, encoding: .utf8)
+        try "@echo off\r\nexit /b 0\r\n".write(
+            to: projectBinary,
+            atomically: true,
+            encoding: .utf8
+        )
+        #else
         let ownerBinary = fixture.root.appendingPathComponent("owner-auth-command")
         let projectBinary = fixture.project.appendingPathComponent("project-auth-command")
         try "#!/bin/sh\nexit 0\n".write(to: ownerBinary, atomically: true, encoding: .utf8)
@@ -361,6 +380,7 @@ struct LiveStartupAuthenticationReadinessParityTests {
             [.posixPermissions: 0o755],
             ofItemAtPath: projectBinary.path
         )
+        #endif
 
         for command in [
             fixture.root.appendingPathComponent("does-not-exist").path,
@@ -369,7 +389,7 @@ struct LiveStartupAuthenticationReadinessParityTests {
         ] {
             try fixture.configureOwner("""
             [auth_provider.owner_command]
-            command = "\(command)"
+            command = '\(command)'
             args = []
 
             [model.owner-auth]
@@ -381,13 +401,23 @@ struct LiveStartupAuthenticationReadinessParityTests {
             #expect(await fixture.ready(model: "owner-auth") == false)
         }
 
+        #if os(Windows)
+        let systemRoot = ProcessInfo.processInfo.environment["SystemRoot"] ?? #"C:\Windows"#
+        let executableName = "cmd"
+        let ownerExecutableDirectory = URL(fileURLWithPath: systemRoot)
+            .appendingPathComponent("System32")
+            .path
+        #else
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o755],
             ofItemAtPath: ownerBinary.path
         )
+        let executableName = "owner-auth-command"
+        let ownerExecutableDirectory = fixture.root.path
+        #endif
         try fixture.configureOwner("""
         [auth_provider.owner_command]
-        command = "owner-auth-command"
+        command = '\(executableName)'
 
         [model.owner-auth]
         model = "private-routing-slug"
@@ -396,10 +426,24 @@ struct LiveStartupAuthenticationReadinessParityTests {
         auth_provider = "owner_command"
         """)
         #expect(await fixture.ready(model: "owner-auth", extra: [
-            "PATH": fixture.root.path,
+            "PATH": ownerExecutableDirectory,
+            "PATHEXT": ".EXE;.CMD",
         ]))
+
+        let projectCommandName = "project-auth-command"
+        try fixture.configureOwner("""
+        [auth_provider.owner_command]
+        command = '\(projectCommandName)'
+
+        [model.owner-auth]
+        model = "private-routing-slug"
+        provider = "fireworks"
+        base_url = "https://api.fireworks.ai/inference/v1"
+        auth_provider = "owner_command"
+        """)
         #expect(await fixture.ready(model: "owner-auth", extra: [
             "PATH": fixture.project.path,
+            "PATHEXT": ".EXE;.CMD",
         ]) == false)
     }
 
