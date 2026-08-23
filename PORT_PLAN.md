@@ -2,7 +2,7 @@
 
 **Planning baseline:** 2026-07-20 (inventory and reference pin refreshed 2026-08-22)
 **Destination:** `/Users/mweinbach/Projects/swift-open-grok`
-**Read-only reference:** `xai-org/grok-build` at `538a16dfb6b5989d835bc1503b600b4d2be9aad6` (`1.0.0-open-grok.81`), local clone `/Users/mweinbach/Projects/grok-build`. Current protocol-fixture and executable provenance is recorded in `PORT_STATUS.md`.
+**Read-only reference:** `xai-org/grok-build` at `448a2afebcff7878465e8f67cd9c995c3ba00b9b` (`1.0.0-open-grok.81`), local clone `/Users/mweinbach/Projects/grok-build`. Current protocol-fixture and executable provenance is recorded in `PORT_STATUS.md`.
 **SwiftPM baseline:** `swift-tools-version: 6.1`
 **Reference inventory:** 93 root Cargo workspace members + 1 standalone Markdown fuzz crate = **94 mapped crates**; five previously omitted workspace members are identified in `CRATE_MAP.md`.
 **Swift source/test inventory (directory recount, 2026-08-22):** **106** `Sources/` target directories and **106** `Tests/` target directories. Workers must not invoke SwiftPM; only `zsh workflows/swift-safe-verify.zsh` via the sole integration agent.
@@ -124,7 +124,7 @@ Create the package/product topology and the only integration-owned root surfaces
 - **Acceptance:**
   - Package.swift declares swift-tools-version 6.1, an executable product named open-grok, and only target edges approved by the crate map; swift package describe succeeds after each integration batch.
   - A deterministic generation plugin can produce ACP/protocol fixtures without network access and fails when checked-in generated output is stale.
-  - PORT_PLAN.md, CRATE_MAP.md, and PORT_STATUS.md remain the canonical ownership/dependency trackers and enumerate all 83 workspace crates plus xai-grok-markdown-fuzz.
+  - PORT_PLAN.md, CRATE_MAP.md, and PORT_STATUS.md remain the canonical ownership/dependency trackers and enumerate all 93 root workspace crates plus the standalone xai-grok-markdown-fuzz crate.
   - Distributed LICENSE, NOTICE, and THIRD-PARTY-NOTICES inputs retain Codex, Ratatui, Mermaid/layout, Roboto, and transitive-package obligations.
 
 #### W0-S2 — Hermetic test support
@@ -426,6 +426,7 @@ Port folder trust, permission rule parsing/evaluation, filesystem/process mediat
   - Permission order is plan edit gate -> fail-open PreToolUse hooks -> plan-file auto-approval -> permission engine -> dispatch, with deny > ask > allow and exact rule-source audit data.
   - Rule DSL and bash segmentation match Rust for command chains, redirections, subshells, environment prefixes, quoted arguments, paths, network, and tool groups.
   - Folder trust, per-project rules, session grants, CLI allow/deny, permission modes, no-ask behavior, and YOLO produce deterministic decisions with deny/fail-closed tests.
+  - New sessions default to the workspace sandbox; requirement > CLI > environment > config precedence, explicit `off`, and persisted resume profiles remain authoritative.
   - Filesystem and process operations acquire canonical path/resource locks, enforce workspace/sandbox capabilities, and cannot race permission approval against changed arguments.
 
 #### W4-S4 — Computer Hub and workspace client

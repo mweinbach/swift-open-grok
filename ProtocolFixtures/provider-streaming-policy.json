@@ -1,6 +1,6 @@
 {
   "$schema": "open-grok/protocol-fixtures/provider-streaming-policy",
-  "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
+  "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
   "providers": [
     "xai",
     "codex",
@@ -120,7 +120,7 @@
   },
   "provenance": {
     "source": "xai-grok-sampling-types provider-local streaming gate, xai-grok-sampler Codex execution policy, and xai-grok-code-mode-protocol nested progress wire",
-    "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
+    "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
     "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
     "pinVerdict": "recaptured",
     "recapturedFields": [
@@ -131,7 +131,7 @@
     ],
     "keyProvenance": {
       "providers/streamToolCalls": "crates/codegen/xai-grok-sampling-types/src/types.rs:1714-1721,1864-1870,2265-2300; xai-grok-sampler/src/client.rs:2764-2774",
-      "codexPermissions": "crates/codegen/xai-grok-sampler/src/config.rs:27-49,164; xai-grok-sampler/src/provider.rs:867-945; HEAD 538a16df restores codex_permissions in streaming/session fixtures",
+      "codexPermissions": "crates/codegen/xai-grok-sampler/src/config.rs:27-49,164; xai-grok-sampler/src/provider.rs:867-945; release-baseline commit 538a16df restores codex_permissions in streaming/session fixtures",
       "nestedToolProgress": "crates/codegen/xai-grok-code-mode-protocol/src/progress.rs:24-48; absent Option payload uses serde skip_serializing_if and the bounded channel capacity is 64"
     },
     "evidence": [

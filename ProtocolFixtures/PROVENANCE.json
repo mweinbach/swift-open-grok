@@ -1,10 +1,10 @@
 {
   "$schema": "open-grok/protocol-fixtures/provenance",
-  "generatedAt": "2026-08-22",
-  "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
+  "generatedAt": "2026-08-23",
+  "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
   "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
   "note": "Fixtures are provenance-labelled compatibility artifacts for implemented foundation formats. Binary goldens are re-encoded or structurally decoded in tests (OTLP, GCRX, git zlib metadata, hunk/PTY/tracing/storage keys) rather than digest-only validation.",
-  "recaptureNote": "Every entry was re-evaluated against the 2026-08-22 re-pin from 650c1db7 (0.1.220-open-grok.58) to 538a16df (1.0.0-open-grok.81), a 178-commit upstream delta. The CLI version, Linux x86_64/aarch64 distribution support, and fixed-width crash release stamp were recaptured; SQLite gained a real shared 10s busy-retry budget; provider-local streamed-tool-call gates, Codex execution permissions, and bounded nested Code Mode progress are recorded in a new fixture. Other families are marked unchanged only when their asserted source surface is unchanged or an additive/comment-only source delta cannot change the captured wire bytes.",
+  "recaptureNote": "Every entry was re-evaluated against the 2026-08-23 UTC advance from release baseline 538a16df to 448a2afe, a seven-commit upstream delta; OPEN_GROK_VERSION remains 1.0.0-open-grok.81 and the original historical reference remains 650c1db7. The earlier 178-commit 650c1db7..538a16df advance recaptured the CLI release, GNU Linux x86_64/aarch64 distribution, fixed-width crash release stamp, shared SQLite busy-retry budget, provider-local streaming, Codex permissions, and nested progress. The new delta adds workspace-by-default sandbox confinement with explicit opt-out and resume pinning, sanitized ACP MCP server/tool icon wire fields, authentic command/HTTP hook runner identity, browser-style prompt selection, object-free Git HEAD resolution, and a documentation-only upstream snapshot note. The config fixture now captures sandbox precedence; icon and hook contracts have dedicated recaptured fixtures, while prior unchanged fixture source surfaces and release-stamped binary goldens remain unchanged.",
   "method": "Hand-derivation from immutable Rust source with file:line provenance, cross-checked against production Swift targets. Both revisions and every family-level diff were read through git plumbing from the read-only reference clone at /Users/mweinbach/Projects/grok-build; release-stamped binary goldens were structurally re-encoded and the manifest was regenerated from actual file bytes.",
   "entries": [
     {
@@ -14,13 +14,24 @@
       "note": "This file."
     },
     {
+      "file": "acp-mcp-icons.json",
+      "verdict": "recaptured",
+      "family": "acp-mcp-icons",
+      "referenceSources": [
+        "crates/codegen/xai-grok-mcp/src/servers.rs",
+        "crates/codegen/xai-grok-shell/src/extensions/mcp.rs",
+        "crates/codegen/xai-grok-shell/src/session/acp_session_impl/mcp.rs"
+      ],
+      "evidence": "Commit ac7c8953 adds sanitized server-level and per-tool icons to the x.ai/mcp/list ACP catalog, with camelCase mimeType, omitted empty icon arrays, exact https:// or data:image/ source prefixes, and upstream byte/count caps; the fixture reproduces the reference's exact serialized server/tool example."
+    },
+    {
       "file": "acp-methods.json",
       "verdict": "unchanged (verified)",
       "family": "acp",
       "referenceSources": [
         "crates/codegen/xai-acp-lib"
       ],
-      "evidence": "git diff 650c1db7..538a16df -- crates/codegen/xai-acp-lib => empty (source and Cargo.toml both untouched)."
+      "evidence": "git diff 650c1db7..538a16df and git diff 538a16df..448a2afe -- crates/codegen/xai-acp-lib => empty (source and Cargo.toml both untouched); new MCP extension payload fields are captured separately in acp-mcp-icons.json."
     },
     {
       "file": "cli-version-and-home.json",
@@ -38,15 +49,17 @@
     },
     {
       "file": "config-workspace-codemode-keys.json",
-      "verdict": "unchanged (verified)",
-      "family": "config/workspace/code-mode keys",
+      "verdict": "recaptured",
+      "family": "config/workspace/sandbox/code-mode keys",
       "referenceSources": [
         "crates/codegen/xai-grok-config-types/src/flags.rs",
         "crates/codegen/xai-grok-config-types/src/permission.rs",
         "crates/codegen/xai-grok-workspace-types/src/types/permission.rs",
+        "crates/codegen/xai-grok-shell/src/agent/config.rs",
+        "crates/codegen/xai-grok-shell/tests/sandbox_requirements_pin.rs",
         "crates/codegen/xai-grok-code-mode-protocol/src/runtime.rs"
       ],
-      "evidence": "git diff 650c1db7..538a16df is empty for the asserted ConfigSource, RuleAction, workspace permission, and Code Mode runtime-default surfaces. The Swift Code Mode exec default now matches the reference value of 30_000ms."
+      "evidence": "Historical git diff 650c1db7..538a16df leaves the asserted ConfigSource, RuleAction, workspace permission, and Code Mode runtime-default surfaces unchanged; commit 448a2afe changes new-session sandbox fallback from off to workspace while preserving requirement > CLI > GROK_SANDBOX > config precedence, explicit off overrides, and persisted resume profiles."
     },
     {
       "file": "crash-gcrx-format.json",
@@ -84,6 +97,19 @@
         "crates/codegen/xai-gix-status"
       ],
       "evidence": "git diff 650c1db7..538a16df -- crates/codegen/xai-gix-status => empty."
+    },
+    {
+      "file": "hook-runtime-identity.json",
+      "verdict": "recaptured",
+      "family": "hook-runtime-identity",
+      "referenceSources": [
+        "crates/codegen/xai-grok-hooks/src/config.rs",
+        "crates/codegen/xai-grok-hooks/src/env_expand.rs",
+        "crates/codegen/xai-grok-hooks/src/runner/command.rs",
+        "crates/codegen/xai-grok-hooks/src/runner/http.rs",
+        "crates/codegen/xai-grok-agent/src/plugins/hooks_adapter.rs"
+      ],
+      "evidence": "Commit 9cbf5c15 reserves the five runner identity environment names, ignores ambient spoofing during configuration/plugin expansion, strips user overrides, and makes authentic event/hook/session/workspace identity win for both command children and pre-SSRF HTTP URL expansion."
     },
     {
       "file": "hunk-tracker-snapshot.json",
@@ -170,6 +196,7 @@
   "openPortDrift": [],
   "files": [
     "PROVENANCE.json",
+    "acp-mcp-icons.json",
     "acp-methods.json",
     "cli-version-and-home.json",
     "config-workspace-codemode-keys.json",
@@ -177,6 +204,7 @@
     "crash-gcrx-sample.bin",
     "git-loose-blob-hello.zlib",
     "git-object-and-index.json",
+    "hook-runtime-identity.json",
     "hunk-tracker-snapshot.json",
     "otlp-export-trace-grpc.bin",
     "otlp-export-trace-http.pb",

@@ -25,6 +25,78 @@
     "ask",
     "allow"
   ],
+  "sandboxProfile": {
+    "default": "workspace",
+    "environmentVariable": "GROK_SANDBOX",
+    "resolutionOrder": [
+      "requirement",
+      "cli",
+      "env",
+      "config",
+      "default"
+    ],
+    "explicitOffAllowed": true,
+    "persistedResumeProfileOverridesDefault": true,
+    "vectors": [
+      {
+        "requirement": null,
+        "cli": null,
+        "environment": null,
+        "config": null,
+        "expected": "workspace",
+        "source": "default"
+      },
+      {
+        "requirement": "strict",
+        "cli": "off",
+        "environment": "read-only",
+        "config": "off",
+        "expected": "strict",
+        "source": "requirement"
+      },
+      {
+        "requirement": null,
+        "cli": "off",
+        "environment": "strict",
+        "config": "workspace",
+        "expected": "off",
+        "source": "cli"
+      },
+      {
+        "requirement": null,
+        "cli": null,
+        "environment": "read-only",
+        "config": "off",
+        "expected": "read-only",
+        "source": "env"
+      },
+      {
+        "requirement": null,
+        "cli": null,
+        "environment": null,
+        "config": "off",
+        "expected": "off",
+        "source": "config"
+      }
+    ],
+    "resumeVectors": [
+      {
+        "persisted": "off",
+        "cli": null,
+        "expected": "off"
+      },
+      {
+        "persisted": "strict",
+        "cli": null,
+        "expected": "strict"
+      },
+      {
+        "persisted": "off",
+        "cli": "strict",
+        "result": "conflict"
+      }
+    ]
+  },
   "codeModeRuntimeDefaults": {
     "DEFAULT_EXEC_YIELD_TIME_MS": 30000,
     "DEFAULT_WAIT_YIELD_TIME_MS": 10000,
@@ -53,19 +125,23 @@
       "allow"
     ]
   },
-  "notes": "Checked-in key-order fixtures for implemented foundation contracts, re-evaluated against Rust revision 538a16df with per-key source provenance.",
-  "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
+  "notes": "Checked-in key-order fixtures for implemented foundation contracts, re-evaluated against Rust revision 448a2afe with per-key source provenance and the secure new-session sandbox default.",
+  "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
   "portDrift": {},
   "provenance": {
-    "source": "xai-grok-config-types (ConfigSource, RuleAction) + xai-grok-code-mode-protocol (runtime defaults), cross-checked against OpenGrokConfigTypes/OpenGrokWorkspaceTypes/OpenGrokCodeModeProtocol",
-    "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
+    "source": "xai-grok-config-types (ConfigSource, RuleAction), xai-grok-shell (sandbox profile defaults), and xai-grok-code-mode-protocol (runtime defaults), cross-checked against live Swift composition and foundation targets",
+    "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
     "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
-    "pinVerdict": "unchanged (verified)",
+    "pinVerdict": "recaptured",
+    "recapturedFields": [
+      "sandboxProfile"
+    ],
     "keyProvenance": {
       "configSourceOrder": "crates/codegen/xai-grok-config-types/src/flags.rs:9-19 (declaration order; strum serialize_all = snake_case at :8). Mirrored by Sources/OpenGrokConfigTypes/Flags.swift:14-23.",
       "boolFlagResolutionPrecedence": "crates/codegen/xai-grok-config-types/src/flags.rs:39 (doc comment on the bool-flag resolver)",
       "permissionRuleActions": "crates/codegen/xai-grok-config-types/src/permission.rs:40-45; Deny is #[default] per the CWE-1188 note at :35-37; serde rename_all = lowercase at :39",
       "workspacePermissionOrder": "Evaluation precedence deny > ask > allow, asserted by the PORT_PLAN.md global completion gate and by the allow/deny/ask policy lists in Sources/OpenGrokWorkspaceTypes/WorkspaceTypes.swift:220-232",
+      "sandboxProfile": "crates/codegen/xai-grok-shell/src/agent/config.rs:1276-1286; crates/codegen/xai-grok-shell/tests/sandbox_requirements_pin.rs:6-66; docs/agents/permissions-and-sandbox.md:314-319",
       "codeModeRuntimeDefaults": "crates/codegen/xai-grok-code-mode-protocol/src/runtime.rs:11-13"
     },
     "recaptureNotes": [
@@ -77,7 +153,8 @@
       "git diff 650c1db7..538a16df -- crates/codegen/xai-grok-config-types/src/flags.rs => empty (ConfigSource unchanged at the current pin)",
       "git diff 650c1db7..538a16df -- crates/codegen/xai-grok-config-types/src/permission.rs => empty (RuleAction unchanged at the current pin)",
       "git diff 650c1db7..538a16df -- crates/codegen/xai-grok-workspace-types/src/types/permission.rs => empty (PermissionDecision and policy shape unchanged)",
-      "git diff 650c1db7..538a16df -- crates/codegen/xai-grok-code-mode-protocol/src/runtime.rs => empty (the 30_000ms exec default is unchanged; newly added nested-progress transport is covered by provider-streaming-policy.json)"
+      "git diff 650c1db7..538a16df -- crates/codegen/xai-grok-code-mode-protocol/src/runtime.rs => empty (the 30_000ms exec default is unchanged; newly added nested-progress transport is covered by provider-streaming-policy.json)",
+      "Commit 448a2afe changes SandboxSettingsConfig::resolve_profile's final fallback from off to workspace; requirement > CLI > GROK_SANDBOX > config > default precedence, explicit CLI/config off, and persisted resume profile pinning remain intact."
     ]
   }
 }

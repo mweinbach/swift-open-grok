@@ -1,0 +1,100 @@
+{
+  "$schema": "open-grok/protocol-fixtures/hook-runtime-identity",
+  "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+  "runnerOwnedEnvironmentKeys": [
+    "GROK_HOOK_EVENT",
+    "GROK_HOOK_NAME",
+    "GROK_SESSION_ID",
+    "GROK_WORKSPACE_ROOT",
+    "CLAUDE_PROJECT_DIR"
+  ],
+  "loadTimeExpansion": {
+    "reservedUserEnvironmentKeysStripped": true,
+    "runnerIdentityIgnoresAmbientProcessValues": true,
+    "runnerIdentityReferencesRemainUnexpanded": true,
+    "hookOwnedEnvironmentOverridesAmbientProcessValues": true,
+    "shellParameterModifierFormsRemainUnexpanded": true,
+    "commandAndHttpUseIdenticalRunnerIdentityPolicy": true,
+    "pluginCommandsUseIdenticalRunnerIdentityPolicy": true,
+    "vectors": [
+      {
+        "input": "echo ${GROK_SESSION_ID}",
+        "ambientEnvironment": {
+          "GROK_SESSION_ID": "spoofed-ambient-session"
+        },
+        "expected": "echo ${GROK_SESSION_ID}"
+      },
+      {
+        "input": "https://example.com/${GROK_SESSION_ID}",
+        "ambientEnvironment": {
+          "GROK_SESSION_ID": "spoofed-ambient-session"
+        },
+        "expected": "https://example.com/${GROK_SESSION_ID}"
+      },
+      {
+        "input": "${CLAUDE_PROJECT_DIR:-.}/${GROK_SESSION_ID}",
+        "ambientEnvironment": {
+          "CLAUDE_PROJECT_DIR": "/spoofed/workspace",
+          "GROK_SESSION_ID": "spoofed-ambient-session"
+        },
+        "expected": "${CLAUDE_PROJECT_DIR:-.}/${GROK_SESSION_ID}"
+      },
+      {
+        "input": "${HOOK_OWNED_VALUE}/check",
+        "ambientEnvironment": {
+          "HOOK_OWNED_VALUE": "ambient"
+        },
+        "hookEnvironment": {
+          "HOOK_OWNED_VALUE": "hook-owned"
+        },
+        "expected": "hook-owned/check"
+      }
+    ]
+  },
+  "runtimeIdentity": {
+    "event": "pre_tool_use",
+    "hookName": "project:pre_tool_use[0].hooks[0]",
+    "sessionId": "authentic-session",
+    "workspaceRoot": "/workspace/authentic",
+    "values": {
+      "GROK_HOOK_EVENT": "pre_tool_use",
+      "GROK_HOOK_NAME": "project:pre_tool_use[0].hooks[0]",
+      "GROK_SESSION_ID": "authentic-session",
+      "GROK_WORKSPACE_ROOT": "/workspace/authentic",
+      "CLAUDE_PROJECT_DIR": "/workspace/authentic"
+    },
+    "runnerIdentityOverridesUserAndPluginEnvironment": true,
+    "commandChildReceivesAuthenticIdentity": true,
+    "httpUrlExpandsAuthenticIdentityBeforeSsrfValidation": true,
+    "httpUrlVector": {
+      "input": "https://example.com/hooks/${GROK_SESSION_ID}",
+      "hookEnvironment": {
+        "GROK_SESSION_ID": "spoofed-session"
+      },
+      "expected": "https://example.com/hooks/authentic-session"
+    }
+  },
+  "provenance": {
+    "source": "xai-grok-hooks runner-owned environment, parse-time expansion, command spawn, HTTP URL expansion, and xai-grok-agent plugin hook adapter",
+    "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+    "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
+    "pinVerdict": "recaptured",
+    "recapturedFields": [
+      "runnerOwnedEnvironmentKeys",
+      "loadTimeExpansion",
+      "runtimeIdentity"
+    ],
+    "keyProvenance": {
+      "runnerOwnedEnvironmentKeys": "crates/codegen/xai-grok-hooks/src/config.rs:205-220",
+      "loadTimeExpansion": "crates/codegen/xai-grok-hooks/src/config.rs:541-575,598-610; crates/codegen/xai-grok-hooks/src/env_expand.rs:117-157",
+      "pluginCommands": "crates/codegen/xai-grok-agent/src/plugins/hooks_adapter.rs:125-145",
+      "commandChildIdentity": "crates/codegen/xai-grok-hooks/src/runner/command.rs:147-175",
+      "httpUrlIdentity": "crates/codegen/xai-grok-hooks/src/runner/http.rs:150-164"
+    },
+    "evidence": [
+      "Commit 9cbf5c15 centralizes the five runner-reserved environment names and preserves their unresolved command/HTTP references at configuration and plugin load time even when the parent process contains spoofed ambient values.",
+      "crates/codegen/xai-grok-hooks/src/config.rs:541-575,598-610 strips user-provided reserved keys before expansion; hook-owned nonreserved values retain precedence over ambient process values and shell modifier forms remain literal.",
+      "crates/codegen/xai-grok-hooks/src/runner/command.rs:147-175 and runner/http.rs:150-164 inject authentic event, hook, session, and workspace identity after untrusted extra_env, so command children and SSRF-validated HTTP URL expansion observe the same authoritative values."
+    ]
+  }
+}

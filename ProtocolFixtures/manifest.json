@@ -1,32 +1,37 @@
 {
   "version": 1,
-  "generatedAt": "2026-08-22",
-  "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
+  "generatedAt": "2026-08-23",
+  "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
   "files": [
     {
       "path": "ProtocolFixtures/PROVENANCE.json",
-      "sizeBytes": 9545,
-      "sha256": "f5af5477eabfe6995552531dc72ad21f2f3f7ddc68c8f87f6d59af647906a5df"
+      "sizeBytes": 11802,
+      "sha256": "f52187df893a442635564e6535325d1060bd5437574a89bf17654911d91c79cf"
+    },
+    {
+      "path": "ProtocolFixtures/acp-mcp-icons.json",
+      "sizeBytes": 3969,
+      "sha256": "d8fb7760568da5ea10f4c2ceebb0b34864e7ed38e9c6de8bc013a7d9c1383ee7"
     },
     {
       "path": "ProtocolFixtures/acp-methods.json",
-      "sizeBytes": 1233,
-      "sha256": "1e9b826ad5e8a58e3dcebc2b51096b3cf2dff7d0f0aaa910ad6cf2e2cc57a302"
+      "sizeBytes": 1390,
+      "sha256": "0be2709610efecdd4e537efb651b5f99105ae1013fb6185b88176fb717d02ef8"
     },
     {
       "path": "ProtocolFixtures/cli-version-and-home.json",
       "sizeBytes": 2388,
-      "sha256": "7fa3f0d744137df8a4e7939f8c4fa6f964352f887dff194e413f738fa1717087"
+      "sha256": "8acc38d0542079d9cc78e18a53c64683bd5a52374b74481b94b766ce19eac5a4"
     },
     {
       "path": "ProtocolFixtures/config-workspace-codemode-keys.json",
-      "sizeBytes": 4201,
-      "sha256": "85fcd68ca9b9f36ba52d24c2cd54b22f810583cb566fba875025973df9516bcf"
+      "sizeBytes": 6324,
+      "sha256": "5ba5ebb1373af1556762f143aef63b46eef88aa30b16f1eaa892034dcfc30c6a"
     },
     {
       "path": "ProtocolFixtures/crash-gcrx-format.json",
       "sizeBytes": 2602,
-      "sha256": "3b6de64fcad9ba88a1c02989426c03bf511436d5af1dcb6b90d82caf9e8498f0"
+      "sha256": "3114a84dc4bef37158487d296108210bda9dbc3beccc87e9fee3c82b950ddcc0"
     },
     {
       "path": "ProtocolFixtures/crash-gcrx-sample.bin",
@@ -41,12 +46,17 @@
     {
       "path": "ProtocolFixtures/git-object-and-index.json",
       "sizeBytes": 1635,
-      "sha256": "c57d9b7b0d01d595bb330f0a7c37078ce4e09680b4560592ca34d9c09e5c617b"
+      "sha256": "4faa11a22d93e8aec627943ceb5786b646ba1adf76865249fe4bf4ca2b9bef1e"
+    },
+    {
+      "path": "ProtocolFixtures/hook-runtime-identity.json",
+      "sizeBytes": 4425,
+      "sha256": "c4b19c685b50b1b478ad9606929c8a7109e7094e60115c922e87f26076729daa"
     },
     {
       "path": "ProtocolFixtures/hunk-tracker-snapshot.json",
       "sizeBytes": 1816,
-      "sha256": "879d4c855c089fa91434a487ef926569357a0befe96096605138dde4da39ed6b"
+      "sha256": "7466ad5e7d84c8ccd2ad001e68d1450b0acb92819c81e1ddf661a24c84dfd653"
     },
     {
       "path": "ProtocolFixtures/otlp-export-trace-grpc.bin",
@@ -61,27 +71,27 @@
     {
       "path": "ProtocolFixtures/otlp-span-export-shape.json",
       "sizeBytes": 2632,
-      "sha256": "d1f12197f63b7df8d5a69714d7dc1b9e011d72b45a9d2b187c44a0d2e231e888"
+      "sha256": "6975551ae43c8513f2a2af6117962c020308a03f51e905e28da40fecee4c982d"
     },
     {
       "path": "ProtocolFixtures/provider-streaming-policy.json",
-      "sizeBytes": 4453,
-      "sha256": "3365cad89cc2e969737ec61255edf9a077892e37ddb28d8605489508a0e32391"
+      "sizeBytes": 4472,
+      "sha256": "d46a630971eef4625c641775b7af5a531c900c2bf8d4d3669cf2c2c542702e53"
     },
     {
       "path": "ProtocolFixtures/pty-process-signals.json",
       "sizeBytes": 1215,
-      "sha256": "26215bdb2e8eb46271662f2dcce4f7039df2d0f0200c8f5007b29b4c4ad82d3d"
+      "sha256": "b41f696127a900184d357bfbaf9693ca8c47f899ace856fb5ee096b587ae8522"
     },
     {
       "path": "ProtocolFixtures/sqlite-journal-modes.json",
       "sizeBytes": 2592,
-      "sha256": "d2003e3237b504503b6f9814a58a82f7300d23c138ee22a680a574f9608c37dd"
+      "sha256": "08fa2d9ee128992bafa5dc6006cd5fd5793ca70920b298b607bfda0cadc6377f"
     },
     {
       "path": "ProtocolFixtures/tracing-w3c-traceparent.json",
       "sizeBytes": 1851,
-      "sha256": "4aca24cbef4747c8c66a14971705014d095bb97a3df5a98cd42d2c971a2327b3"
+      "sha256": "263cd190d3fbe019737a92d55943c7f7e1eedaadb7c8e930f1d8e419993f31bb"
     }
   ]
 }

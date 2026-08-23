@@ -34,10 +34,10 @@
     "nFrames": 0,
     "appVersion": "1.0.0-open-grok.81"
   },
-  "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
+  "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
   "provenance": {
     "source": "OpenGrokCrashHandler.CrashBlobFormat / CrashBlob.serialize vs xai-crash-handler",
-    "referenceRevision": "538a16dfb6b5989d835bc1503b600b4d2be9aad6",
+    "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
     "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
     "pinVerdict": "recaptured",
     "recapturedFields": [

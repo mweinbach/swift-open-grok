@@ -4,7 +4,7 @@
 // distribution machinery (W11-S1).
 //
 // Every rule in this target is transcribed from a concrete artifact in the
-// read-only Rust reference at `538a16dfb6b5989d835bc1503b600b4d2be9aad6`:
+// read-only Rust reference at `448a2afebcff7878465e8f67cd9c995c3ba00b9b`:
 //
 //   * `scripts/build-macos-release.sh`    — macOS artifact name, target triple,
 //                                           version regex, `.sha256` line format,
@@ -42,7 +42,7 @@ import Foundation
 public enum OpenGrokDistributionSupport {
     /// The Rust reference revision every rule in this target was transcribed
     /// from. Kept in lockstep with `ProtocolFixtures/PROVENANCE.json`.
-    public static let referenceRevision = "538a16dfb6b5989d835bc1503b600b4d2be9aad6"
+    public static let referenceRevision = "448a2afebcff7878465e8f67cd9c995c3ba00b9b"
 
     /// The upstream release pinned at ``referenceRevision`` (`OPEN_GROK_VERSION`).
     public static let referencePinnedRelease = "1.0.0-open-grok.81"

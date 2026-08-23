@@ -1,0 +1,128 @@
+{
+  "$schema": "open-grok/protocol-fixtures/acp-mcp-icons",
+  "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+  "method": "x.ai/mcp/list",
+  "serverIconsKey": "icons",
+  "toolIconsPath": "session.tools[].icons",
+  "iconWireKeys": [
+    "src",
+    "mimeType",
+    "sizes",
+    "theme"
+  ],
+  "acceptedSourcePrefixes": [
+    "https://",
+    "data:image/"
+  ],
+  "rejectedSourceExamples": [
+    "",
+    "   ",
+    "http://example.com/icon.png",
+    "javascript:alert(1)",
+    "file:///private/session.json",
+    "HTTPS://example.com/icon.png",
+    "data:text/html,secret"
+  ],
+  "limits": {
+    "maximumIconsPerEntity": 8,
+    "maximumSourceBytes": 65536,
+    "maximumMimeTypeBytes": 128,
+    "maximumSizes": 8,
+    "maximumSizeTokenBytes": 32
+  },
+  "themes": [
+    "light",
+    "dark"
+  ],
+  "omission": {
+    "emptyServerIconsOmitted": true,
+    "emptyToolIconsOmitted": true,
+    "absentOptionalMetadataOmitted": true,
+    "unknownThemesOmitted": true,
+    "invalidOptionalMetadataDropped": true
+  },
+  "examples": {
+    "serverWithToolIcons": {
+      "name": "custom",
+      "icons": [
+        {
+          "src": "https://example.com/icon.png",
+          "mimeType": "image/png",
+          "sizes": [
+            "48x48"
+          ],
+          "theme": "dark"
+        }
+      ],
+      "source": "local",
+      "type": "http",
+      "url": "https://example.com/mcp",
+      "session": {
+        "enabled": true,
+        "status": "ready",
+        "tools": [
+          {
+            "name": "search",
+            "icons": [
+              {
+                "src": "https://example.com/icon.png",
+                "mimeType": "image/png",
+                "sizes": [
+                  "48x48"
+                ],
+                "theme": "dark"
+              }
+            ],
+            "enabled": true
+          }
+        ]
+      }
+    },
+    "serverWithoutIcons": {
+      "name": "legacy",
+      "source": "local",
+      "type": "http",
+      "url": "https://example.com/mcp",
+      "session": {
+        "enabled": true,
+        "status": "ready",
+        "tools": [
+          {
+            "name": "search",
+            "enabled": true
+          }
+        ]
+      }
+    },
+    "minimalIcon": {
+      "src": "data:image/png;base64,AAAA"
+    }
+  },
+  "provenance": {
+    "source": "xai-grok-mcp sanitized icon ingestion and xai-grok-shell ACP MCP server/tool catalog serialization",
+    "referenceRevision": "448a2afebcff7878465e8f67cd9c995c3ba00b9b",
+    "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
+    "pinVerdict": "recaptured",
+    "recapturedFields": [
+      "serverIconsKey",
+      "toolIconsPath",
+      "iconWireKeys",
+      "acceptedSourcePrefixes",
+      "limits",
+      "themes",
+      "omission",
+      "examples"
+    ],
+    "keyProvenance": {
+      "iconWireKeys/acceptedSourcePrefixes/limits/themes": "crates/codegen/xai-grok-mcp/src/servers.rs:100-176",
+      "serverIconsKey/toolIconsPath": "crates/codegen/xai-grok-shell/src/extensions/mcp.rs:79-97,166-179",
+      "omission/examples": "crates/codegen/xai-grok-shell/src/extensions/mcp.rs:2198-2248",
+      "toolRefresh": "crates/codegen/xai-grok-mcp/src/servers.rs:576-581; crates/codegen/xai-grok-shell/src/session/acp_session_impl/mcp.rs:84-112"
+    },
+    "evidence": [
+      "Commit ac7c8953 adds server-level icons and session.tools[].icons to x.ai/mcp/list; serde omits empty arrays and absent icon metadata, while mimeType remains camelCase.",
+      "crates/codegen/xai-grok-mcp/src/servers.rs:100-176 accepts only trimmed case-sensitive https:// or data:image/ sources and caps each entity at 8 valid icons, source at 65536 UTF-8 bytes, MIME type at 128 bytes, and 8 size tokens at 32 bytes each.",
+      "crates/codegen/xai-grok-shell/src/extensions/mcp.rs:2206-2248 serializes the exact server/tool icon example captured above; unknown SDK themes and invalid optional metadata are omitted rather than rejecting an otherwise valid icon."
+    ]
+  }
+}
