@@ -7,6 +7,7 @@
 import Foundation
 
 #if os(Windows)
+import COpenGrokSockets
 import WinSDK
 #elseif canImport(Darwin)
 import Darwin
@@ -76,7 +77,7 @@ public struct AdvisoryLockOptions: Sendable, Equatable {
     public var nonBlocking: Bool
     /// Create the lock file if missing (default true).
     public var create: Bool
-    /// Unix mode for a newly created lock file (default `0o600`).
+    /// File mode; the default `0o600` also enforces an owner-only Windows DACL.
     public var mode: UInt32
 
     public init(nonBlocking: Bool = false, create: Bool = true, mode: UInt32 = 0o600) {
@@ -101,30 +102,65 @@ public enum AdvisoryFileLock: Sendable {
             withIntermediateDirectories: true
         )
 
-        let disposition = options.create ? DWORD(OPEN_ALWAYS) : DWORD(OPEN_EXISTING)
-        let rawHandle = path.path.withCString(encodedAs: UTF16.self) { pointer in
-            CreateFileW(
-                pointer,
-                DWORD(GENERIC_READ) | DWORD(GENERIC_WRITE),
-                DWORD(FILE_SHARE_READ) | DWORD(FILE_SHARE_WRITE) | DWORD(FILE_SHARE_DELETE),
-                nil,
-                disposition,
-                DWORD(FILE_ATTRIBUTE_NORMAL) | DWORD(FILE_FLAG_OPEN_REPARSE_POINT),
-                nil
-            )
-        }
-        guard let handle = rawHandle, handle != INVALID_HANDLE_VALUE else {
-            let code = GetLastError()
-            if code == DWORD(ERROR_FILE_NOT_FOUND) || code == DWORD(ERROR_PATH_NOT_FOUND) {
-                throw FileUtilsError.notFound(path: path.path)
+        let handle: HANDLE
+        if options.mode == 0o600 {
+            var ownerPrivate: OGSocketHandle = -1
+            let result = path.path.withCString { pointer in
+                og_file_open_owner_only_lock(pointer, options.create ? 1 : 0, &ownerPrivate)
             }
-            if code == DWORD(ERROR_ACCESS_DENIED) {
-                throw FileUtilsError.permissionDenied(
+            guard result == 0 else {
+                let code = DWORD(og_socket_last_error_code())
+                let detail = String(cString: og_socket_last_error_message())
+                if code == DWORD(ERROR_FILE_NOT_FOUND) || code == DWORD(ERROR_PATH_NOT_FOUND) {
+                    throw FileUtilsError.notFound(path: path.path)
+                }
+                if code == DWORD(ERROR_REPARSE_TAG_INVALID) {
+                    throw FileUtilsError.symlinkEncountered(path: path.path)
+                }
+                if code == DWORD(ERROR_ACCESS_DENIED) {
+                    throw FileUtilsError.permissionDenied(
+                        path: path.path,
+                        detail: "open owner-private lock: \(detail)"
+                    )
+                }
+                throw FileUtilsError.io(
                     path: path.path,
-                    detail: "open lock: Windows error \(code)"
+                    detail: "open owner-private lock: \(detail.isEmpty ? "Windows error \(code)" : detail)"
                 )
             }
-            throw FileUtilsError.io(path: path.path, detail: "open lock: Windows error \(code)")
+            guard let opened = HANDLE(bitPattern: Int(ownerPrivate)),
+                  opened != INVALID_HANDLE_VALUE else {
+                _ = og_file_handle_close(ownerPrivate)
+                throw FileUtilsError.io(path: path.path, detail: "open owner-private lock: invalid handle")
+            }
+            handle = opened
+        } else {
+            let disposition = options.create ? DWORD(OPEN_ALWAYS) : DWORD(OPEN_EXISTING)
+            let rawHandle = path.path.withCString(encodedAs: UTF16.self) { pointer in
+                CreateFileW(
+                    pointer,
+                    DWORD(GENERIC_READ) | DWORD(GENERIC_WRITE),
+                    DWORD(FILE_SHARE_READ) | DWORD(FILE_SHARE_WRITE) | DWORD(FILE_SHARE_DELETE),
+                    nil,
+                    disposition,
+                    DWORD(FILE_ATTRIBUTE_NORMAL) | DWORD(FILE_FLAG_OPEN_REPARSE_POINT),
+                    nil
+                )
+            }
+            guard let opened = rawHandle, opened != INVALID_HANDLE_VALUE else {
+                let code = GetLastError()
+                if code == DWORD(ERROR_FILE_NOT_FOUND) || code == DWORD(ERROR_PATH_NOT_FOUND) {
+                    throw FileUtilsError.notFound(path: path.path)
+                }
+                if code == DWORD(ERROR_ACCESS_DENIED) {
+                    throw FileUtilsError.permissionDenied(
+                        path: path.path,
+                        detail: "open lock: Windows error \(code)"
+                    )
+                }
+                throw FileUtilsError.io(path: path.path, detail: "open lock: Windows error \(code)")
+            }
+            handle = opened
         }
 
         var information = BY_HANDLE_FILE_INFORMATION()

@@ -72,6 +72,7 @@ int og_file_lock_release(OGSocketHandle handle);
 int64_t og_file_canonical_path(const char *path, char *buffer, size_t capacity);
 int og_file_create_owner_only(const char *path, OGSocketHandle *handle);
 int og_file_open_owner_only_append(const char *path, OGSocketHandle *handle);
+int og_file_open_owner_only_lock(const char *path, int create, OGSocketHandle *handle);
 int64_t og_file_handle_write_all(OGSocketHandle handle, const void *buffer, size_t length);
 int og_file_handle_flush(OGSocketHandle handle);
 int og_file_handle_close(OGSocketHandle handle);

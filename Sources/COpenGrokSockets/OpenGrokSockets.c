@@ -1580,7 +1580,13 @@ static int og_validate_owner_only_file_handle(HANDLE file) {
     return -1;
 }
 
-int og_file_open_owner_only_append(const char *path, OGSocketHandle *handle) {
+static int og_file_open_owner_only_handle(
+    const char *path,
+    DWORD access,
+    DWORD sharing,
+    DWORD disposition,
+    OGSocketHandle *handle
+) {
     if (!path || !handle) {
         og_set_error(ERROR_INVALID_PARAMETER, "invalid owner-only append arguments");
         return -1;
@@ -1623,10 +1629,10 @@ int og_file_open_owner_only_append(const char *path, OGSocketHandle *handle) {
 
     HANDLE file = CreateFileW(
         wide,
-        FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | SYNCHRONIZE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        access,
+        sharing,
         &attributes,
-        OPEN_ALWAYS,
+        disposition,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
         NULL
     );
@@ -1673,6 +1679,26 @@ int og_file_open_owner_only_append(const char *path, OGSocketHandle *handle) {
 
     *handle = (OGSocketHandle)(uintptr_t)file;
     return 0;
+}
+
+int og_file_open_owner_only_append(const char *path, OGSocketHandle *handle) {
+    return og_file_open_owner_only_handle(
+        path,
+        FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        OPEN_ALWAYS,
+        handle
+    );
+}
+
+int og_file_open_owner_only_lock(const char *path, int create, OGSocketHandle *handle) {
+    return og_file_open_owner_only_handle(
+        path,
+        GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        create ? OPEN_ALWAYS : OPEN_EXISTING,
+        handle
+    );
 }
 
 int64_t og_file_handle_write_all(OGSocketHandle handle, const void *buffer, size_t length) {
@@ -1991,6 +2017,11 @@ int og_file_create_owner_only(const char *path, OGSocketHandle *handle) {
 int og_file_open_owner_only_append(const char *path, OGSocketHandle *handle) {
     (void)path; (void)handle;
     og_set_error(ENOTSUP, "owner-only native append handles are only available on Windows");
+    return -1;
+}
+int og_file_open_owner_only_lock(const char *path, int create, OGSocketHandle *handle) {
+    (void)path; (void)create; (void)handle;
+    og_set_error(ENOTSUP, "owner-only native lock handles are only available on Windows");
     return -1;
 }
 int64_t og_file_handle_write_all(OGSocketHandle handle, const void *buffer, size_t length) {
