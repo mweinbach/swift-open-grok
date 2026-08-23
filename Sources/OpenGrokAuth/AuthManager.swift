@@ -308,6 +308,7 @@ public actor AuthManager {
         let ok = await refreshFlight.run {
             await self.performRefresh(reason: reason)
         }
+        try Task.checkCancellation()
         if ok, let auth = cached {
             if reason == .serverRejected || !isExpired(auth, environment: environment) {
                 return auth
@@ -323,6 +324,7 @@ public actor AuthManager {
     }
 
     private func performRefresh(reason: RefreshReason) async -> Bool {
+        guard !Task.isCancelled else { return false }
         let diskAuth: GrokAuth? = {
             guard let store = try? readAuthJSON(at: path) else { return nil }
             return lookupAuth(store, scope: scope)
@@ -351,6 +353,11 @@ public actor AuthManager {
         guard let refresher else { return false }
 
         let outcome = await refresher.refresh(reason: reason, current: credential)
+        do {
+            try Task.checkCancellation()
+        } catch {
+            return false
+        }
         switch outcome {
         case .success(let auth):
             do {

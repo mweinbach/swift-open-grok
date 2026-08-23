@@ -170,18 +170,78 @@ public struct AuthRetryTransport: HTTPTransport, Sendable {
 
 /// Concurrent refresh single-flight: only one refresh runs; waiters share result.
 public actor RefreshSingleFlight {
-    private var inFlight: Task<Bool, Never>?
+    private final class Flight: @unchecked Sendable {
+        private let lock = NSLock()
+        private var participants: Set<UUID>
+        private var cancelled = false
+        let task: Task<Bool, Never>
+
+        init(
+            participant: UUID,
+            body: @escaping @Sendable () async -> Bool
+        ) {
+            participants = [participant]
+            task = Task { await body() }
+        }
+
+        func join(_ participant: UUID) -> Bool {
+            lock.withLock {
+                guard !cancelled else { return false }
+                participants.insert(participant)
+                return true
+            }
+        }
+
+        func cancel(_ participant: UUID) {
+            lock.withLock {
+                guard participants.remove(participant) != nil,
+                      participants.isEmpty
+                else { return }
+                cancelled = true
+                task.cancel()
+            }
+        }
+
+        func finish(_ participant: UUID) -> Bool {
+            lock.withLock {
+                participants.remove(participant)
+                return participants.isEmpty
+            }
+        }
+
+        var participantCount: Int {
+            lock.withLock { participants.count }
+        }
+    }
+
+    private var inFlight: Flight?
 
     public init() {}
 
     public func run(_ body: @escaping @Sendable () async -> Bool) async -> Bool {
-        if let existing = inFlight {
-            return await existing.value
+        guard !Task.isCancelled else { return false }
+
+        let participant = UUID()
+        let flight: Flight
+        if let existing = inFlight, existing.join(participant) {
+            flight = existing
+        } else {
+            flight = Flight(participant: participant, body: body)
+            inFlight = flight
         }
-        let task = Task { await body() }
-        inFlight = task
-        let result = await task.value
-        inFlight = nil
-        return result
+
+        let result = await withTaskCancellationHandler {
+            await flight.task.value
+        } onCancel: {
+            flight.cancel(participant)
+        }
+        if flight.finish(participant), inFlight === flight {
+            inFlight = nil
+        }
+        return Task.isCancelled ? false : result
+    }
+
+    var activeWaiterCount: Int {
+        inFlight?.participantCount ?? 0
     }
 }
