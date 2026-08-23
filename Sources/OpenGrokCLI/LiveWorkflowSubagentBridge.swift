@@ -47,9 +47,10 @@ struct LiveWorkflowSubagentBridge: Sendable {
             throw RhaiHostError.cancelled
         }
         let validated = try validate(options: options, environment: environment)
-        // The coordinator belongs to the whole parent session; label-derived
-        // workflow row identifiers are only unique inside one workflow run.
-        let originalChildID = UUID().uuidString.lowercased()
+        // The host allocates this globally unique identifier before publishing
+        // progress. Keep the dashboard row, coordinator task, and durable child
+        // session on that one identity; a correction retry gets its own child.
+        let originalChildID = agentID
         await emit(.started(agentID: agentID, label: options.label, phase: options.phase))
 
         var childID = originalChildID
@@ -332,7 +333,10 @@ private struct LiveWorkflowSchemaContract: Sendable {
     private static func validateSupportedKeywords(_ value: JSONValue) throws {
         switch value {
         case .object(let object):
-            if let reference = object["$ref"]?.stringValue {
+            if let rawReference = object["$ref"] {
+                guard let reference = rawReference.stringValue else {
+                    throw invalidKeyword("$ref", expected: "a string")
+                }
                 if !reference.hasPrefix("#") {
                     throw RhaiHostError.failed(
                         "output_schema is not a valid self-contained JSON Schema: "
@@ -342,6 +346,76 @@ private struct LiveWorkflowSchemaContract: Sendable {
                 throw RhaiHostError.failed(
                     "output_schema local JSON Schema references are not supported"
                 )
+            }
+
+            if let type = object["type"] {
+                let allowed = Set(["null", "boolean", "object", "array", "number", "string", "integer"])
+                if let name = type.stringValue {
+                    guard allowed.contains(name) else {
+                        throw invalidKeyword("type", expected: "a valid JSON Schema type")
+                    }
+                } else if let names = type.arrayValue {
+                    let strings = names.compactMap(\.stringValue)
+                    guard !strings.isEmpty,
+                          strings.count == names.count,
+                          Set(strings).count == strings.count,
+                          strings.allSatisfy(allowed.contains)
+                    else {
+                        throw invalidKeyword(
+                            "type",
+                            expected: "a non-empty array of unique valid JSON Schema types"
+                        )
+                    }
+                } else {
+                    throw invalidKeyword("type", expected: "a string or array of strings")
+                }
+            }
+            if let enumeration = object["enum"] {
+                guard let values = enumeration.arrayValue, !values.isEmpty else {
+                    throw invalidKeyword("enum", expected: "a non-empty array")
+                }
+            }
+            if let required = object["required"] {
+                guard let names = required.arrayValue else {
+                    throw invalidKeyword("required", expected: "an array of unique strings")
+                }
+                let strings = names.compactMap(\.stringValue)
+                guard strings.count == names.count, Set(strings).count == strings.count else {
+                    throw invalidKeyword("required", expected: "an array of unique strings")
+                }
+            }
+            for keyword in ["properties", "$defs", "definitions"] {
+                if let value = object[keyword], value.objectValue == nil {
+                    throw invalidKeyword(keyword, expected: "an object of schemas")
+                }
+            }
+            for keyword in ["items", "additionalProperties"] {
+                if let nested = object[keyword],
+                   nested.objectValue == nil,
+                   nested.boolValue == nil {
+                    throw invalidKeyword(keyword, expected: "a schema")
+                }
+            }
+            for keyword in ["allOf", "anyOf", "oneOf"] {
+                if let value = object[keyword] {
+                    guard let schemas = value.arrayValue, !schemas.isEmpty else {
+                        throw invalidKeyword(keyword, expected: "a non-empty array of schemas")
+                    }
+                }
+            }
+            for keyword in [
+                "minProperties", "maxProperties", "minItems", "maxItems",
+                "minLength", "maxLength",
+            ] {
+                if let value = object[keyword],
+                   value.int64Value.map({ $0 >= 0 }) != true {
+                    throw invalidKeyword(keyword, expected: "a non-negative integer")
+                }
+            }
+            for keyword in ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"] {
+                if let value = object[keyword], value.doubleValue == nil {
+                    throw invalidKeyword(keyword, expected: "a number")
+                }
             }
             for keyword in [
                 "pattern", "patternProperties", "$dynamicRef", "$recursiveRef",
@@ -375,8 +449,23 @@ private struct LiveWorkflowSchemaContract: Sendable {
                     }
                 }
             }
-        default:
+        case .bool:
             break
+        default:
+            throw RhaiHostError.failed(
+                "output_schema is not a valid self-contained JSON Schema: "
+                    + "every schema must be an object or boolean"
+            )
         }
+    }
+
+    private static func invalidKeyword(
+        _ keyword: String,
+        expected: String
+    ) -> RhaiHostError {
+        .failed(
+            "output_schema is not a valid self-contained JSON Schema: "
+                + "keyword '\(keyword)' must be \(expected)"
+        )
     }
 }

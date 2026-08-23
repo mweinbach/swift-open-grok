@@ -183,6 +183,9 @@ actor LiveWorkflowHost: RhaiWorkflowHost {
     }
 
     private func nextAgentID(label: String?) -> String {
+        if environment.subagentBridge != nil {
+            return UUID().uuidString.lowercased()
+        }
         agentSequence += 1
         let slug = label.map { Self.slug($0) } ?? "agent"
         return "\(slug)-\(agentSequence)"

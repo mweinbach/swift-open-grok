@@ -186,7 +186,8 @@ private struct WorkflowBridgeFixture {
         runID: String = "workflow-bridge-run",
         provenance: LiveWorkflowSourceProvenance = .untrusted,
         parentCapability: ToolCapabilityMode = .all,
-        supportsReasoningEffort: Bool = false
+        supportsReasoningEffort: Bool = false,
+        progress: RhaiWorkflowProgressBoard = RhaiWorkflowProgressBoard()
     ) -> LiveWorkflowHost {
         let context = RhaiWorkflowRunContext(
             runID: runID,
@@ -194,7 +195,8 @@ private struct WorkflowBridgeFixture {
             arguments: .object([:]),
             agentBudget: 20,
             journalURL: nil,
-            cancellation: RhaiCancellationToken()
+            cancellation: RhaiCancellationToken(),
+            progress: progress
         )
         let bridge = LiveWorkflowSubagentBridge(
             host: rootHost,
@@ -252,6 +254,30 @@ private struct WorkflowBridgeFixture {
 
 @Suite("Live workflow production subagent bridge parity", .serialized)
 struct LiveWorkflowSubagentBridgeParityTests {
+    @Test("real workflow progress, coordinator, result, and session share one child id")
+    func realChildIdentityIsConsistentAcrossEveryLiveSurface() async throws {
+        let fixture = try WorkflowBridgeFixture()
+        defer { Task { await fixture.dispose() } }
+        let progress = RhaiWorkflowProgressBoard()
+        let workflow = fixture.workflowHost(progress: progress)
+
+        let result = try await workflow.spawnAgent(RhaiAgentOptions(
+            prompt: "prove the actual child identity",
+            label: "human-facing label"
+        ))
+        let row = try #require((await progress.snapshot()).agents.first)
+        let completed = try #require((await fixture.rootHost.coordinator.listCompleted()).first)
+        let request = try #require((await fixture.observer.snapshot()).first?.request)
+
+        #expect(result.agentID == row.agentID)
+        #expect(result.agentID == completed.request.id)
+        #expect(result.agentID == request.sessionID)
+        #expect(UUID(uuidString: result.agentID) != nil)
+        #expect(row.label == "human-facing label")
+        #expect(row.state == .succeeded)
+        #expect(try await fixture.store.loadIfPresent(sessionID: result.agentID) != nil)
+    }
+
     @Test("workflow children have real run ownership and never surface in parent turn output")
     func realChildOwnershipAndCompletionPrivacy() async throws {
         let fixture = try WorkflowBridgeFixture()
@@ -723,6 +749,41 @@ struct LiveWorkflowSubagentBridgeParityTests {
         #expect(observations.isEmpty)
         let completed = await fixture.rootHost.coordinator.listCompleted()
         #expect(completed.isEmpty)
+    }
+
+    @Test("malformed supported schema keywords fail before child or provider admission")
+    func malformedSupportedSchemaGrammarHasNoLiveSideEffects() async throws {
+        let fixture = try WorkflowBridgeFixture()
+        defer { Task { await fixture.dispose() } }
+        let workflow = fixture.workflowHost()
+        let schemas: [JSONValue] = [
+            .object(["$ref": .number(.int64(7))]),
+            .object(["type": .string("filesystem")]),
+            .object(["type": .array([.string("string"), .number(.int64(1))])]),
+            .object(["required": .string("answer")]),
+            .object(["properties": .array([])]),
+            .object(["properties": .object(["answer": .string("not-a-schema")])]),
+            .object(["additionalProperties": .string("yes")]),
+            .object(["items": .array([])]),
+            .object(["allOf": .object([:])]),
+            .object(["minItems": .number(.int64(-1))]),
+            .object(["minimum": .string("zero")]),
+            .object(["enum": .array([])]),
+        ]
+
+        for schema in schemas {
+            do {
+                let result = try await workflow.spawnAgent(RhaiAgentOptions(
+                    prompt: "this must never reach a child",
+                    outputSchema: schema
+                ))
+                Issue.record("malformed schema unexpectedly ran: \(result)")
+            } catch is RhaiHostError {}
+        }
+
+        #expect((await fixture.observer.snapshot()).isEmpty)
+        #expect((await fixture.rootHost.coordinator.listActive()).isEmpty)
+        #expect((await fixture.rootHost.coordinator.listCompleted()).isEmpty)
     }
 
     @Test("built-in fork fails closed when parent conversation provider authority is stale")
