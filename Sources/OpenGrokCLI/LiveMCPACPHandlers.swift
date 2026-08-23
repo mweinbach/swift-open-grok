@@ -33,10 +33,12 @@
 //     a live reconnect that registers the server's tools into the running
 //     toolset. The setup-schema pre-check (mcp.rs:1541-1562) is skipped:
 //     no setup surface exists here.
-//   * `upsert` (mcp.rs:1874-1900) — persist to the user `config.toml`
+//   * `upsert` (mcp.rs:1874-1900) — after authenticating the owning ACP
+//     session, persist to the user `config.toml`
 //     (`upsertMCPServer` + `writeConfigFile`, the same write `mcp add`
 //     performs), then live-swap the server in the running session.
-//   * `delete` (mcp.rs:1910-1941) — remove from the user `config.toml`,
+//   * `delete` (mcp.rs:1910-1941) — after the same owner gate, remove from
+//     the user `config.toml`,
 //     then live teardown (tools unregistered, client shut down).
 //   * `toggle` (mcp.rs:1714-1820) — persist to `disabled_mcp_servers` in
 //     the user `config.toml`, then live-swap (connect or teardown). Emits
@@ -92,6 +94,7 @@ actor LiveMCPACPState {
     let toolset: FinalizedToolset
     private var outcomes: [String: MCPServerConnection]
     private var sdkSessions: [String: SDKSession] = [:]
+    private var attachedSessionIDs: Set<String> = []
 
     init(
         connections: MCPSessionConnections,
@@ -114,6 +117,17 @@ actor LiveMCPACPState {
 
     func removeOutcome(name: String) {
         outcomes.removeValue(forKey: name)
+    }
+
+    func recordAttachedSession(_ sessionID: String) {
+        attachedSessionIDs.insert(sessionID)
+    }
+
+    /// No-session call/read is retained only for an isolated handler used
+    /// without an ACP session. Once any client-owned or SDK-backed session
+    /// has touched this pool, an omitted identity could select shared state.
+    func permitsUnscopedDirectAccess() -> Bool {
+        attachedSessionIDs.isEmpty && sdkSessions.isEmpty
     }
 
     func beginSDKSession(_ registry: MCPACPBridgeRegistry, sessionID: String) -> Bool {
@@ -248,6 +262,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
 
     func attachLifecycle(sessionID: String) async {
         guard !sessionID.isEmpty else { return }
+        await state.recordAttachedSession(sessionID)
         await state.connections.attachLifecycle(
             gateway: gateway,
             state: state,
@@ -495,9 +510,48 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
     /// upstream resolves the handle and refuses with
     /// `invalid_params().data("session not found")` (mcp.rs:1201, 1234,
     /// 1504, 1531, 1892, 1929).
-    private func requireSession(_ sessionID: String) async throws {
-        guard await gateway.sessionExists(AcpSessionId(sessionID)) else {
+    private func requireOwnedSession(_ sessionID: String) async throws {
+        guard await gateway.ownsSession(AcpSessionId(sessionID)) else {
             throw invalidParams("session not found")
+        }
+    }
+
+    /// MCP extension requests historically mix serde's `session_id` with
+    /// ACP's `sessionId`. Accept either spelling, but never let one field
+    /// authorize a different session from the one used by the operation.
+    private func canonicalSessionID(
+        in params: JSONValue,
+        requiredField: String = "sessionId"
+    ) throws -> String {
+        let camel = params["sessionId"]?.stringValue
+        let snake = params["session_id"]?.stringValue
+        if let camel, let snake, camel != snake {
+            throw invalidParams("invalid params: conflicting fields `sessionId` and `session_id`")
+        }
+        guard let sessionID = camel ?? snake, !sessionID.isEmpty else {
+            throw invalidParams("invalid params: missing field `\(requiredField)`")
+        }
+        return sessionID
+    }
+
+    private func optionalCanonicalSessionID(in params: JSONValue) throws -> String? {
+        let camel = params["sessionId"]?.stringValue
+        let snake = params["session_id"]?.stringValue
+        if let camel, let snake, camel != snake {
+            throw invalidParams("invalid params: conflicting fields `sessionId` and `session_id`")
+        }
+        guard let sessionID = camel ?? snake else { return nil }
+        guard !sessionID.isEmpty else {
+            throw invalidParams("invalid params: empty session identity")
+        }
+        return sessionID
+    }
+
+    private func authorizeOptionalSession(_ sessionID: String?) async throws {
+        if let sessionID {
+            try await requireOwnedSession(sessionID)
+        } else if !(await state.permitsUnscopedDirectAccess()) {
+            throw invalidParams("invalid params: missing field `sessionId`")
         }
     }
 
@@ -527,13 +581,13 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
     /// session that does NOT resolve still returns the plain catalog —
     /// upstream logs and continues (mcp.rs:932-937), never errors.
     private func handleList(_ params: JSONValue) async throws -> JSONValue {
-        let sessionID = params["sessionId"]?.stringValue
+        let sessionID = try optionalCanonicalSessionID(in: params)
         // `cache:false` invalidates the managed-MCP caches upstream
         // (mcp.rs:921-924); this port has no managed cache, so the flag is
         // accepted and changes nothing — recorded in the file header.
         let annotate: Bool
         if let sessionID {
-            annotate = await gateway.sessionExists(AcpSessionId(sessionID))
+            annotate = await gateway.ownsSession(AcpSessionId(sessionID))
         } else {
             annotate = false
         }
@@ -702,10 +756,8 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
               let tool = params["tool"]?.stringValue else {
             throw invalidParams("invalid params: missing field `server` or `tool`")
         }
-        let sessionID = params["sessionId"]?.stringValue
-        if let sessionID {
-            try await requireSession(sessionID)
-        }
+        let sessionID = try optionalCanonicalSessionID(in: params)
+        try await authorizeOptionalSession(sessionID)
         let serverURL = params["serverUrl"]?.stringValue
         let arguments = params["arguments"] ?? .null
 
@@ -795,10 +847,8 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
               let uri = params["uri"]?.stringValue else {
             throw invalidParams("invalid params: missing field `server` or `uri`")
         }
-        let sessionID = params["sessionId"]?.stringValue
-        if let sessionID {
-            try await requireSession(sessionID)
-        }
+        let sessionID = try optionalCanonicalSessionID(in: params)
+        try await authorizeOptionalSession(sessionID)
         let client = try await authorizedClient(named: server, sessionID: sessionID)
 
         let result: MCPReadResourceResult
@@ -836,10 +886,8 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
     /// (run_loop.rs:1750-1762). These two request/response structs have no
     /// serde rename upstream, so the wire spelling is snake_case.
     private func handleAuthStatus(_ params: JSONValue) async throws -> JSONValue {
-        guard let sessionID = params["session_id"]?.stringValue else {
-            throw invalidParams("invalid params: missing field `session_id`")
-        }
-        try await requireSession(sessionID)
+        let sessionID = try canonicalSessionID(in: params, requiredField: "session_id")
+        try await requireOwnedSession(sessionID)
         let entries = await state.authRequiredServers().map { name in
             JSONValue.object([
                 "server_name": .string(name),
@@ -859,11 +907,11 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
     /// the server and registers its tools into the live toolset, the port of
     /// upstream's post-auth `get_tool_registrations` + register loop.
     private func handleAuthTrigger(_ params: JSONValue) async throws -> JSONValue {
-        guard let sessionID = params["session_id"]?.stringValue,
-              let serverName = params["server_name"]?.stringValue else {
+        let sessionID = try canonicalSessionID(in: params, requiredField: "session_id")
+        guard let serverName = params["server_name"]?.stringValue else {
             throw invalidParams("invalid params: missing field `session_id` or `server_name`")
         }
-        try await requireSession(sessionID)
+        try await requireOwnedSession(sessionID)
 
         // Managed connectors authenticate at grok.com, byte-copy of the
         // refusal (acp_session_impl/mcp.rs:406-408).
@@ -969,16 +1017,21 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
 
     // MARK: x.ai/mcp/upsert
 
-    /// `handle_upsert` (mcp.rs:1874-1900): persist to config.toml FIRST,
-    /// then live-add through the running session. Upstream reuses its
+    /// `handle_upsert` (mcp.rs:1874-1900): authenticate this runtime's
+    /// first-driver owner before config.toml is touched, then persist and
+    /// live-add through the running session. Upstream performs lookup after
+    /// persistence; doing so in a multi-client runtime lets an unauthenticated
+    /// request mutate durable user state, so the port deliberately tightens
+    /// that ordering without changing the successful response. Upstream reuses its
     /// toggle path for the live half; this port's equivalent is a fresh
     /// `LiveMCPComposition.connect` after tearing down any previous client
     /// with the same name.
     private func handleUpsert(_ params: JSONValue) async throws -> JSONValue {
-        guard let sessionID = params["session_id"]?.stringValue,
-              let serverName = params["server_name"]?.stringValue else {
+        let sessionID = try canonicalSessionID(in: params, requiredField: "session_id")
+        guard let serverName = params["server_name"]?.stringValue else {
             throw invalidParams("invalid params: missing field `session_id` or `server_name`")
         }
+        try await requireOwnedSession(sessionID)
         let config: McpServerConfig
         do {
             config = try params.decode(McpServerConfig.self)
@@ -1013,11 +1066,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
             throw invalidParams("server config is disabled")
         }
 
-        // 3. Session lookup AFTER the persist, upstream's order
-        //    (mcp.rs:1890-1892).
-        try await requireSession(sessionID)
-
-        // 4. Live swap: tear down any previous client under this name, then
+        // 3. Live swap: tear down any previous client under this name, then
         //    connect the new declaration and register its tools.
         let connections = state.connections
         let toolset = state.toolset
@@ -1064,9 +1113,8 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
     /// no plugin registry — those subsystems are explicitly out of scope and
     /// their conditional branches are absent rather than stubbed.
     private func handleToggle(_ params: JSONValue) async throws -> JSONValue {
-        guard let sessionID = params["session_id"]?.stringValue
-                ?? params["sessionId"]?.stringValue,
-              let serverName = params["server_name"]?.stringValue
+        let sessionID = try canonicalSessionID(in: params, requiredField: "session_id")
+        guard let serverName = params["server_name"]?.stringValue
                 ?? params["serverName"]?.stringValue else {
             throw invalidParams("invalid params: missing field `session_id` or `server_name`")
         }
@@ -1077,7 +1125,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
             throw invalidParams("invalid params: missing field `enabled`")
         }
 
-        try await requireSession(sessionID)
+        try await requireOwnedSession(sessionID)
 
         if enabled,
            let declaration = declarations().servers.first(where: { $0.name == serverName }) {
@@ -1153,9 +1201,8 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
     /// `handle_toggle_tool` (mcp.rs:1833-1870): persist per-tool disable,
     /// then live unregister/re-register the single qualified tool.
     private func handleToggleTool(_ params: JSONValue) async throws -> JSONValue {
-        guard let sessionID = params["session_id"]?.stringValue
-                ?? params["sessionId"]?.stringValue,
-              let serverName = params["server_name"]?.stringValue
+        let sessionID = try canonicalSessionID(in: params, requiredField: "session_id")
+        guard let serverName = params["server_name"]?.stringValue
                 ?? params["serverName"]?.stringValue,
               let toolName = params["tool_name"]?.stringValue
                 ?? params["toolName"]?.stringValue else {
@@ -1170,7 +1217,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
             throw invalidParams("invalid params: missing field `enabled`")
         }
 
-        try await requireSession(sessionID)
+        try await requireOwnedSession(sessionID)
 
         // 1. Persist the per-tool disable/enable to config.toml FIRST.
         var root = LiveMCPComposition.loadForEdit(at: userConfigPath) ?? .table(TOMLTable())
@@ -1233,16 +1280,18 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
 
     // MARK: x.ai/mcp/delete
 
-    /// `handle_delete` (mcp.rs:1910-1941): config removal first — refusing
+    /// `handle_delete` (mcp.rs:1910-1941): after owner authentication,
+    /// config removal first — refusing
     /// names that were never locally configured with the byte-exact copy —
     /// then the live teardown. Also clears `disabled_mcp_servers` for the
     /// deleted name (mcp.rs:1936-1938) so a recreate does not inherit a
     /// stale disable.
     private func handleDelete(_ params: JSONValue) async throws -> JSONValue {
-        guard let sessionID = params["session_id"]?.stringValue,
-              let serverName = params["server_name"]?.stringValue else {
+        let sessionID = try canonicalSessionID(in: params, requiredField: "session_id")
+        guard let serverName = params["server_name"]?.stringValue else {
             throw invalidParams("invalid params: missing field `session_id` or `server_name`")
         }
+        try await requireOwnedSession(sessionID)
 
         var existed = false
         var deletedDeclaration: MCPServerDeclaration?
@@ -1267,8 +1316,6 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
                 "server '\(serverName)' not found in config.toml (only locally-configured servers can be deleted)"
             )
         }
-
-        try await requireSession(sessionID)
 
         // Live teardown (mcp.rs:1926-1934): the tools leave the advertised
         // set and the client shuts down.
