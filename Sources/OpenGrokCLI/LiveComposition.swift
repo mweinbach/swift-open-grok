@@ -1450,6 +1450,22 @@ private final class LiveSessionExportBoundaryRegistry: @unchecked Sendable {
     }
 }
 
+private final class LiveLeaderTerminalSinkHandoff: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sink: (any PagerTerminalSink)?
+
+    init(_ sink: (any PagerTerminalSink)?) {
+        self.sink = sink
+    }
+
+    func take() -> (any PagerTerminalSink)? {
+        lock.withLock {
+            defer { sink = nil }
+            return sink
+        }
+    }
+}
+
 public struct OpenGrokLiveApplicationLauncher: Sendable {
     private let dependencies: OpenGrokLiveCompositionDependencies
     private let updateServices: LiveUpdateServices
@@ -1667,6 +1683,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     throw error
                 }
                 do {
+                    let sinkHandoff = LiveLeaderTerminalSinkHandoff(interactiveSink)
                     return try await Self.makeLeaderLaunchSession(
                         options: options,
                         prompt: prompt,
@@ -1675,7 +1692,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         context: context,
                         terminal: dependencies.terminal,
                         interactiveInput: interactiveInput,
-                        terminalSink: interactiveSink
+                        makeTerminalSink: { sinkHandoff.take() }
                     )
                 } catch {
                     await interactiveInput?.close()
@@ -2709,7 +2726,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         context: CLIApplicationContext,
         terminal: OpenGrokLiveTerminal,
         interactiveInput: OpenGrokLiveInteractiveInput?,
-        terminalSink: (any PagerTerminalSink)?
+        makeTerminalSink: @escaping @Sendable () -> (any PagerTerminalSink)?
     ) async throws -> CLIApplicationSession {
         let runtime = LiveLeaderPagerRuntimeAdapter(
             client: lease.client,
@@ -2730,7 +2747,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 configScreenMode: uiConfiguration.config.screenMode,
                 screenModeEnvOverride: LiveScreenModeRelaunch.takeScreenModeEnvOverride()
             )
-            if let interactiveInput, let terminalSink {
+            if let interactiveInput, let terminalSink = makeTerminalSink() {
                 let baseRequest = OpenGrokPagerRequest(
                     prompt: prompt,
                     mode: pagerMode,
