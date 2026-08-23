@@ -10,6 +10,7 @@ import OpenGrokConfig
 import OpenGrokConfigTypes
 import OpenGrokDiagnostics
 import OpenGrokFileTools
+import OpenGrokFileUtils
 import OpenGrokFastWorktree
 import OpenGrokHTTP
 import OpenGrokHooks
@@ -74,6 +75,8 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
     /// Exact Code Mode wrapper identities; names alone can belong to plugins.
     /// Optional so sessions predating transport provenance still decode.
     var codeModeTransportCallIDs: [String]?
+    /// Durable child-only input, consumed atomically with its first real user turn.
+    var pendingFirstPrompt: LivePendingForkDirective?
 
     init(
         sessionID: String,
@@ -91,7 +94,8 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         usageSnapshot: LiveSessionUsageSnapshot? = nil,
         title: String? = nil,
         toolOutcomes: ToolCallOutcomeMap? = nil,
-        codeModeTransportCallIDs: [String]? = nil
+        codeModeTransportCallIDs: [String]? = nil,
+        pendingFirstPrompt: LivePendingForkDirective? = nil
     ) {
         self.sessionID = sessionID
         self.workingDirectory = workingDirectory
@@ -109,6 +113,7 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         self.title = title
         self.toolOutcomes = toolOutcomes
         self.codeModeTransportCallIDs = codeModeTransportCallIDs
+        self.pendingFirstPrompt = pendingFirstPrompt
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -128,6 +133,7 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         case title
         case toolOutcomes = "tool_outcomes"
         case codeModeTransportCallIDs = "code_mode_transport_call_ids"
+        case pendingFirstPrompt = "pending_first_prompt"
     }
 
     // Explicit so `tool_outcomes` cannot silently vanish on a future
@@ -152,6 +158,10 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         title = try c.decodeIfPresent(String.self, forKey: .title)
         toolOutcomes = try c.decodeIfPresent(ToolCallOutcomeMap.self, forKey: .toolOutcomes)
         codeModeTransportCallIDs = try c.decodeIfPresent([String].self, forKey: .codeModeTransportCallIDs)
+        pendingFirstPrompt = try c.decodeIfPresent(
+            LivePendingForkDirective.self,
+            forKey: .pendingFirstPrompt
+        )
     }
 
     func encode(to encoder: Encoder) throws {
@@ -172,6 +182,7 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         try c.encodeIfPresent(title, forKey: .title)
         try c.encodeIfPresent(toolOutcomes, forKey: .toolOutcomes)
         try c.encodeIfPresent(codeModeTransportCallIDs, forKey: .codeModeTransportCallIDs)
+        try c.encodeIfPresent(pendingFirstPrompt, forKey: .pendingFirstPrompt)
     }
 
     static func new(
@@ -199,6 +210,8 @@ actor LiveConversationStore {
     private let sessionsDirectory: URL
     private let documentStore: SessionDocumentStore
     private let fileManager: FileManager
+    /// The lock survives every suspension between claim and genuine user commit.
+    private var pendingFirstPromptLeases: [String: AdvisoryLock] = [:]
 
     init(openGrokHome: URL, fileManager: FileManager = .default) {
         self.sessionsDirectory = openGrokHome
@@ -315,13 +328,62 @@ actor LiveConversationStore {
             }
     }
 
-    func save(_ record: LiveConversationRecord) throws {
+    func save(_ input: LiveConversationRecord) throws {
+        var record = input
         try Self.validateSessionID(record.sessionID)
         do {
             let existing = try documentStore.load(
                 sessionID: record.sessionID,
                 cwd: record.workingDirectory
             )
+            let persistedPending: LivePendingForkDirective?
+            if let value = existing?.summary.extra["pending_first_prompt"], value != .null {
+                persistedPending = try value.decode(LivePendingForkDirective.self)
+            } else {
+                persistedPending = nil
+            }
+            if let persistedPending {
+                try persistedPending.validate(record: record)
+                if let incoming = record.pendingFirstPrompt {
+                    try incoming.validate(record: record)
+                    guard incoming.sessionID == persistedPending.sessionID,
+                          incoming.parentSessionID == persistedPending.parentSessionID,
+                          incoming.directive == persistedPending.directive,
+                          incoming.inheritedPrefixDigest == persistedPending.inheritedPrefixDigest
+                    else {
+                        throw CLIApplicationError.failed(
+                            "pending fork directive cannot be replaced before its first user turn"
+                        )
+                    }
+                    if incoming.claimID == nil, persistedPending.claimID != nil {
+                        record.pendingFirstPrompt = persistedPending
+                    }
+                } else {
+                    record.pendingFirstPrompt = persistedPending
+                }
+            }
+
+            var consumedPendingPrompt = false
+            if let pending = record.pendingFirstPrompt {
+                try pending.validate(record: record)
+                let firstChildUser = record.items.dropFirst(pending.inheritedItemCount)
+                    .first { item in
+                        guard case .user(let user) = item else { return false }
+                        return user.syntheticReason == nil
+                    }
+                if let firstChildUser {
+                    guard firstChildUser.textContent() == pending.directive,
+                          pending.claimID != nil,
+                          pendingFirstPromptLeases[record.sessionID] != nil
+                    else {
+                        throw CLIApplicationError.failed(
+                            "pending fork directive must be the child's first claimed user turn"
+                        )
+                    }
+                    record.pendingFirstPrompt = nil
+                    consumedPendingPrompt = true
+                }
+            }
             let state = try Self.persistedState(for: record, preserving: existing)
             try documentStore.save(state)
 
@@ -337,9 +399,68 @@ actor LiveConversationStore {
                 to: fileURL(sessionID: record.sessionID),
                 fileManager: fileManager
             )
+            if consumedPendingPrompt {
+                pendingFirstPromptLeases.removeValue(forKey: record.sessionID)?.release()
+            }
         } catch {
             throw CLIApplicationError.failed("failed to save session \(record.sessionID): \(error)")
         }
+    }
+
+    /// Claim after workspace trust and provider authority have been resolved.
+    /// A crashed owner's OS-held lease disappears; the still-durable marker can
+    /// then be reclaimed without replaying a turn already present on disk.
+    func claimPendingFirstPrompt(
+        sessionID: String,
+        workingDirectory: URL
+    ) throws -> String? {
+        try Self.validateSessionID(sessionID)
+        guard pendingFirstPromptLeases[sessionID] == nil else {
+            throw CLIApplicationError.failed("pending fork directive is already running")
+        }
+        guard let initial = try loadIfPresent(sessionID: sessionID),
+              let pending = initial.pendingFirstPrompt
+        else { return nil }
+        try pending.validate(record: initial, workingDirectory: workingDirectory)
+
+        let directory = try documentStore.sessionDirectory(
+            sessionID: sessionID,
+            cwd: initial.workingDirectory
+        )
+        let lock: AdvisoryLock
+        do {
+            lock = try AdvisoryFileLock.acquire(
+                at: directory.appendingPathComponent("pending-first-prompt.lock"),
+                options: AdvisoryLockOptions(nonBlocking: true, create: true, mode: 0o600)
+            )
+        } catch {
+            throw CLIApplicationError.failed(
+                "pending fork directive is claimed by another live process: \(error)"
+            )
+        }
+        pendingFirstPromptLeases[sessionID] = lock
+        do {
+            guard var current = try loadIfPresent(sessionID: sessionID),
+                  var currentPending = current.pendingFirstPrompt
+            else {
+                pendingFirstPromptLeases.removeValue(forKey: sessionID)?.release()
+                return nil
+            }
+            try currentPending.validate(record: current, workingDirectory: workingDirectory)
+            currentPending.claimID = UUID().uuidString.lowercased()
+            current.pendingFirstPrompt = currentPending
+            try save(current)
+            return currentPending.directive
+        } catch {
+            pendingFirstPromptLeases.removeValue(forKey: sessionID)?.release()
+            throw error
+        }
+    }
+
+    /// Setup/cancellation failure must release the process lease without
+    /// deleting the durable directive or manufacturing a transcript item.
+    func releasePendingFirstPromptClaim(sessionID: String) {
+        pendingFirstPromptLeases.removeValue(forKey: sessionID)?.release()
     }
 
     func eventLogURL(sessionID: String, workingDirectory: String) throws -> URL {
@@ -376,7 +497,8 @@ actor LiveConversationStore {
     func fork(
         sourceSessionID: String,
         destinationSessionID: String,
-        workingDirectory: URL
+        workingDirectory: URL,
+        pendingFirstPrompt: String? = nil
     ) throws -> LiveConversationRecord {
         try Self.validateSessionID(sourceSessionID)
         try Self.validateSessionID(destinationSessionID)
@@ -411,6 +533,15 @@ actor LiveConversationStore {
         }
 
         let now = Date()
+        let directive = try pendingFirstPrompt.map {
+            try LivePendingForkDirective(
+                sessionID: destinationSessionID,
+                parentSessionID: source.sessionID,
+                workingDirectory: workingDirectory,
+                directive: $0,
+                inheritedItems: source.items
+            )
+        }
         let child = LiveConversationRecord(
             sessionID: destinationSessionID,
             workingDirectory: workingDirectory.standardizedFileURL.path,
@@ -426,7 +557,8 @@ actor LiveConversationStore {
             everUsedNonXAI: source.everUsedNonXAI,
             title: source.title,
             toolOutcomes: source.toolOutcomes,
-            codeModeTransportCallIDs: source.codeModeTransportCallIDs
+            codeModeTransportCallIDs: source.codeModeTransportCallIDs,
+            pendingFirstPrompt: directive
         )
 
         do {
@@ -608,6 +740,11 @@ actor LiveConversationStore {
         } else if extra["code_mode_transport_call_ids"] != nil {
             extra["code_mode_transport_call_ids"] = .null
         }
+        if let pending = record.pendingFirstPrompt {
+            extra["pending_first_prompt"] = try JSONValue.encode(pending)
+        } else if extra["pending_first_prompt"] != nil {
+            extra["pending_first_prompt"] = .null
+        }
         if let usageSnapshot = record.usageSnapshot {
             extra["session_usage"] = try JSONValue.encode(usageSnapshot)
         } else if extra["session_usage"] != nil {
@@ -712,6 +849,12 @@ actor LiveConversationStore {
             usageSnapshot = nil
         }
         let exportBoundaryMissing = extra["swift_legacy_export_boundary_missing"]?.boolValue == true
+        let pendingFirstPrompt: LivePendingForkDirective?
+        if let value = extra["pending_first_prompt"], value != .null {
+            pendingFirstPrompt = try value.decode(LivePendingForkDirective.self)
+        } else {
+            pendingFirstPrompt = nil
+        }
 
         return LiveConversationRecord(
             sessionID: state.summary.sessionID.rawValue,
@@ -731,7 +874,8 @@ actor LiveConversationStore {
             usageSnapshot: usageSnapshot,
             title: extra["generated_title"]?.stringValue ?? extra["title"]?.stringValue,
             toolOutcomes: toolOutcomes,
-            codeModeTransportCallIDs: codeModeTransportCallIDs
+            codeModeTransportCallIDs: codeModeTransportCallIDs,
+            pendingFirstPrompt: pendingFirstPrompt
         )
     }
 
@@ -1245,6 +1389,14 @@ actor LiveConversationHistory {
         record.items = items
         record.updatedAt = Date()
         try await store.save(record)
+        if let pending = record.pendingFirstPrompt,
+           let firstChildUser = items.dropFirst(pending.inheritedItemCount).first(where: { item in
+               guard case .user(let user) = item else { return false }
+               return user.syntheticReason == nil
+           }),
+           firstChildUser.textContent() == pending.directive {
+            record.pendingFirstPrompt = nil
+        }
         usageHandle.replaceConversation(items)
     }
 

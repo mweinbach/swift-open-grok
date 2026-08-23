@@ -44,16 +44,6 @@ enum LivePagerForkCommand {
 
     static let worktreeRequiresGit = "Cannot create worktree: not in a git repository"
 
-    /// RECORDED DIVERGENCE: upstream's directive becomes the forked agent's
-    /// first prompt. The port's session record persists no pending prompt
-    /// (`LiveConversationRecord` carries items + rewind only), so nothing
-    /// can carry the directive into the forked session — refuse the form
-    /// instead of forking and silently dropping the text.
-    static let directiveRefusal =
-        "/fork with a directive is not available in this version: the forked "
-        + "session's record cannot store a queued first prompt. Run /fork "
-        + "without a directive, then open the fork and send it there."
-
     /// `tasks.rs:34` — the copy is upstream's, reused for `/fork` because
     /// both are session-scoped and this is the port's only session-less
     /// state (renderer constructions without a session id or store).

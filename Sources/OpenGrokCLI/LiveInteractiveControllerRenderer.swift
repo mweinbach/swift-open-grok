@@ -2446,9 +2446,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// A worktree fork uses the same transactional source-bound preparation
     /// as `--resume <parent> --worktree`, but keeps this session active: its
     /// immutable file-tool and sandbox authority cannot follow a new root.
-    /// Directives still refuse before either kind of fork because there is no
-    /// durable first-prompt channel. Bare `/fork` and `--no-worktree` retain
-    /// the existing in-place behavior; the worktree-choice modal is unwired.
+    /// Directives remain outside both transcripts until the authorized child
+    /// resumes and submits its durable, workspace-bound first user turn.
     func performFork(worktreeOverride: Bool?, directive: String?) async {
         guard !sessionID.isEmpty else {
             note(LivePagerForkCommand.noActiveSession)
@@ -2461,15 +2460,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             note("Session forking is unavailable: this session has no session store.")
             return
         }
-        if directive != nil {
-            // Refused BEFORE the disk fork: forking and dropping the
-            // directive would silently lose user text (AGENTS.md §3).
-            note(LivePagerForkCommand.directiveRefusal)
-            return
-        }
         if worktreeOverride == true {
             do {
-                let child = try await performWorktreeFork(using: conversationStore)
+                let child = try await performWorktreeFork(
+                    using: conversationStore,
+                    directive: directive
+                )
                 note(LivePagerForkCommand.worktreeForkedNote(sessionID: child.sessionID))
             } catch let error as CLIApplicationError {
                 note(error.description)
@@ -2483,7 +2479,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             let child = try await conversationStore.fork(
                 sourceSessionID: sessionID,
                 destinationSessionID: destinationID,
-                workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true)
+                workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true),
+                pendingFirstPrompt: directive
             )
             note(LivePagerForkCommand.forkedNote(sessionID: child.sessionID))
         } catch let error as CLIApplicationError {

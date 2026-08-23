@@ -4,7 +4,8 @@ extension LiveInteractiveControllerRenderer {
     /// Create a dormant peer without borrowing this process's workspace-bound
     /// handlers. Its eventual `--resume` bootstraps a separate security stack.
     func performWorktreeFork(
-        using conversationStore: LiveConversationStore
+        using conversationStore: LiveConversationStore,
+        directive: String? = nil
     ) async throws -> LiveConversationRecord {
         guard let toolExecutor else {
             throw CLIApplicationError.failed(
@@ -88,7 +89,8 @@ extension LiveInteractiveControllerRenderer {
             var child = try await conversationStore.fork(
                 sourceSessionID: source.sessionID,
                 destinationSessionID: childSessionID,
-                workingDirectory: preparation.effectiveDirectory
+                workingDirectory: preparation.effectiveDirectory,
+                pendingFirstPrompt: directive
             )
             childPersisted = true
             try Task.checkCancellation()

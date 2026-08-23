@@ -634,8 +634,8 @@ struct LivePagerForkReachabilityTests {
         await session.executor.shutdown()
     }
 
-    @Test("/fork with a directive refuses BEFORE the disk fork — the text is never dropped")
-    func forkDirectiveRefusesWithoutForking() async throws {
+    @Test("/fork persists a child-bound first directive without changing either transcript")
+    func forkDirectivePersistsOutsideTheInheritedTranscript() async throws {
         let workspace = ForkTasksWorkspace()
         defer { workspace.cleanup() }
         let store = LiveConversationStore(openGrokHome: workspace.grokHome)
@@ -649,20 +649,30 @@ struct LivePagerForkReachabilityTests {
             store: store
         )
 
+        let directive = "explore the rate-limit hypothesis"
         try await session.renderer.render(.overlay(.fork(
             worktreeOverride: nil,
-            directive: "explore the rate-limit hypothesis"
+            directive: directive
         )))
 
-        await session.waitForPaint(of: "/fork with a directive is not available")
-        let directiveRefusalVisible = session.paintedContains(LivePagerForkCommand.directiveRefusal)
-        #expect(directiveRefusalVisible)
-        #expect(workspace.storedSessionIDs() == [source.sessionID])
+        await session.waitForPaint(of: "Forked this session as")
+        let childIDs = workspace.storedSessionIDs().filter { $0 != source.sessionID }
+        try #require(childIDs.count == 1)
+        let restartedStore = LiveConversationStore(openGrokHome: workspace.grokHome)
+        let child = try await restartedStore.load(sessionID: childIDs[0])
+        let pending = try #require(child.pendingFirstPrompt)
+        #expect(pending.directive == directive)
+        #expect(pending.sessionID == child.sessionID)
+        #expect(pending.parentSessionID == source.sessionID)
+        #expect(pending.inheritedItemCount == source.items.count)
+        #expect(child.items == source.items)
+        #expect(try await restartedStore.load(sessionID: source.sessionID) == source)
         try await session.renderer.restoreTerminal()
+        await session.executor.shutdown()
     }
 
-    @Test("a worktree directive is refused before git, worktree, registry, or session mutation")
-    func forkWorktreeDirectiveRefusesBeforeCreation() async throws {
+    @Test("a worktree directive binds to the actual isolated child without executing in its parent")
+    func forkWorktreeDirectivePersistsInsideAuthorizedChild() async throws {
         let workspace = ForkTasksWorkspace()
         defer { workspace.cleanup() }
         try workspace.initializeRepository()
@@ -681,23 +691,120 @@ struct LivePagerForkReachabilityTests {
             store: store
         )
 
+        let directive = "preserve this user-authored directive"
         try await session.renderer.render(.overlay(.fork(
             worktreeOverride: true,
-            directive: "preserve this user-authored directive"
+            directive: directive
         )))
 
-        await session.waitForPaint(of: LivePagerForkCommand.directiveRefusal)
+        await session.waitForPaint(of: "Forked this session into a worktree")
         let registryRecords = try WorktreeRegistry(openGrokHome: workspace.grokHome).records()
         let worktrees = try workspace.pooledWorktrees()
         let parentAfter = try await store.load(sessionID: source.sessionID)
-        let directiveRefusalVisible = session.paintedContains(LivePagerForkCommand.directiveRefusal)
-        #expect(directiveRefusalVisible)
-        #expect(workspace.storedSessionIDs() == [source.sessionID])
-        #expect(registryRecords.isEmpty)
-        #expect(worktrees.isEmpty)
+        let childIDs = workspace.storedSessionIDs().filter { $0 != source.sessionID }
+        try #require(childIDs.count == 1)
+        let child = try await store.load(sessionID: childIDs[0])
+        let pending = try #require(child.pendingFirstPrompt)
+        #expect(pending.directive == directive)
+        #expect(pending.sessionID == child.sessionID)
+        #expect(pending.parentSessionID == source.sessionID)
+        #expect(pending.workingDirectory == child.workingDirectory)
+        #expect(child.items == source.items)
+        #expect(!LiveToolExecutor.workspaceRootsMatch(
+            URL(fileURLWithPath: child.workingDirectory), workspace.root
+        ))
+        #expect(registryRecords.count == 1)
+        #expect(!worktrees.isEmpty)
         #expect(parentAfter == parentBefore)
         try await session.renderer.restoreTerminal()
         await session.executor.shutdown()
+    }
+
+    @Test("directive leases exclude peers, recover after release, and clear only with the real user turn")
+    func pendingForkDirectiveIsDurableExclusiveAndExactlyOnce() async throws {
+        let workspace = ForkTasksWorkspace()
+        defer { workspace.cleanup() }
+        let store = LiveConversationStore(openGrokHome: workspace.grokHome)
+        let source = try await seedSourceSession(
+            workspace,
+            store: store,
+            sessionID: "fork-directive-lease-parent",
+            rewindBytes: nil
+        )
+        let child = try await store.fork(
+            sourceSessionID: source.sessionID,
+            destinationSessionID: "fork-directive-lease-child",
+            workingDirectory: workspace.root,
+            pendingFirstPrompt: "run only once"
+        )
+        let peer = LiveConversationStore(openGrokHome: workspace.grokHome)
+
+        #expect(try await store.claimPendingFirstPrompt(
+            sessionID: child.sessionID,
+            workingDirectory: workspace.root
+        ) == "run only once")
+        await #expect(throws: CLIApplicationError.self) {
+            _ = try await peer.claimPendingFirstPrompt(
+                sessionID: child.sessionID,
+                workingDirectory: workspace.root
+            )
+        }
+        await store.releasePendingFirstPromptClaim(sessionID: child.sessionID)
+
+        #expect(try await peer.claimPendingFirstPrompt(
+            sessionID: child.sessionID,
+            workingDirectory: workspace.root
+        ) == "run only once")
+        var delivered = try await peer.load(sessionID: child.sessionID)
+        #expect(delivered.items == source.items)
+        delivered.items.append(.user("run only once"))
+        try await peer.save(delivered)
+
+        let restarted = LiveConversationStore(openGrokHome: workspace.grokHome)
+        let committed = try await restarted.load(sessionID: child.sessionID)
+        #expect(committed.pendingFirstPrompt == nil)
+        #expect(committed.items.filter { item in
+            guard case .user(let user) = item else { return false }
+            return user.syntheticReason == nil && item.textContent() == "run only once"
+        }.count == 1)
+        #expect(try await restarted.claimPendingFirstPrompt(
+            sessionID: child.sessionID,
+            workingDirectory: workspace.root
+        ) == nil)
+    }
+
+    @Test("fork directives reject cross-workspace claims and modified inherited conversation")
+    func pendingForkDirectiveRejectsForeignAuthorityAndChangedPrefix() async throws {
+        let workspace = ForkTasksWorkspace()
+        defer { workspace.cleanup() }
+        let store = LiveConversationStore(openGrokHome: workspace.grokHome)
+        let source = try await seedSourceSession(
+            workspace,
+            store: store,
+            sessionID: "fork-directive-security-parent",
+            rewindBytes: nil
+        )
+        let child = try await store.fork(
+            sourceSessionID: source.sessionID,
+            destinationSessionID: "fork-directive-security-child",
+            workingDirectory: workspace.root,
+            pendingFirstPrompt: "safe child-only action"
+        )
+
+        await #expect(throws: CLIApplicationError.self) {
+            _ = try await store.claimPendingFirstPrompt(
+                sessionID: child.sessionID,
+                workingDirectory: workspace.grokHome
+            )
+        }
+        var modified = child
+        modified.items[0] = .user("a rewritten inherited instruction")
+        await #expect(throws: CLIApplicationError.self) {
+            try await store.save(modified)
+        }
+        let preserved = try await store.load(sessionID: child.sessionID)
+        #expect(preserved.items == source.items)
+        #expect(preserved.pendingFirstPrompt?.directive == "safe child-only action")
     }
 
     @Test("/fork with no stored source surfaces the store's own error")
