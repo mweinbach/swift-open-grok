@@ -33,18 +33,16 @@ enum LivePagerForkCommand {
             + "on both in parallel."
     }
 
-    /// RECORDED DIVERGENCE: upstream `--worktree` forks the session into a
-    /// fresh git worktree (`dispatch_fork_resolved`). The port's worktree
-    /// launcher (`LiveWorktreeLaunch`) only starts *fresh* sessions at
-    /// process launch — its own parser refuses `--fork-session --worktree`
-    /// — so there is no backing that both forks and isolates. Refuse and
-    /// name what exists rather than forking without the isolation the user
-    /// asked for.
-    static let worktreeRefusal =
-        "/fork --worktree is not available in this version: the worktree "
-        + "launcher only starts fresh sessions, and a session fork cannot be "
-        + "combined with a worktree yet. Run /fork without flags to fork in "
-        + "place, or `open-grok --worktree [name]` for a fresh worktree session."
+    /// A worktree lives outside the current executor's immutable workspace
+    /// boundary. Unlike an in-place fork, opening it requires a fresh process
+    /// that resolves trust, sandbox, and file-tool authority for its own root.
+    static func worktreeForkedNote(sessionID: String) -> String {
+        "Forked this session into a worktree as \(sessionID). "
+            + "Run `open-grok --resume \(sessionID)` in another terminal "
+            + "to open the isolated session."
+    }
+
+    static let worktreeRequiresGit = "Cannot create worktree: not in a git repository"
 
     /// RECORDED DIVERGENCE: upstream's directive becomes the forked agent's
     /// first prompt. The port's session record persists no pending prompt

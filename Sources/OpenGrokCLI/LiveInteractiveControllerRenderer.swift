@@ -2444,12 +2444,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// (`resolveConversationRecord`: `options.sessionID ?? UUID().uuidString`)
     /// — one id scheme, not two.
     ///
-    /// Arms this port cannot back refuse by name (`LivePagerForkCommand`):
-    /// `--worktree` (no fork-into-worktree backing) and a directive (no
-    /// persisted first-prompt channel). Upstream's bare-`/fork` worktree
-    /// question modal is skipped — with the worktree arm refused, the
-    /// question has exactly one honest answer, so bare `/fork` and
-    /// `--no-worktree` both fork in place (recorded divergence).
+    /// A worktree fork uses the same transactional source-bound preparation
+    /// as `--resume <parent> --worktree`, but keeps this session active: its
+    /// immutable file-tool and sandbox authority cannot follow a new root.
+    /// Directives still refuse before either kind of fork because there is no
+    /// durable first-prompt channel. Bare `/fork` and `--no-worktree` retain
+    /// the existing in-place behavior; the worktree-choice modal is unwired.
     func performFork(worktreeOverride: Bool?, directive: String?) async {
         guard !sessionID.isEmpty else {
             note(LivePagerForkCommand.noActiveSession)
@@ -2462,14 +2462,21 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             note("Session forking is unavailable: this session has no session store.")
             return
         }
-        if worktreeOverride == true {
-            note(LivePagerForkCommand.worktreeRefusal)
-            return
-        }
         if directive != nil {
             // Refused BEFORE the disk fork: forking and dropping the
             // directive would silently lose user text (AGENTS.md §3).
             note(LivePagerForkCommand.directiveRefusal)
+            return
+        }
+        if worktreeOverride == true {
+            do {
+                let child = try await performWorktreeFork(using: conversationStore)
+                note(LivePagerForkCommand.worktreeForkedNote(sessionID: child.sessionID))
+            } catch let error as CLIApplicationError {
+                note(error.description)
+            } catch {
+                note("failed to fork session \(sessionID) into a worktree: \(error)")
+            }
             return
         }
         let destinationID = UUID().uuidString

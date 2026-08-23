@@ -10,6 +10,7 @@
 // pinned in `Tests/OpenGrokPagerTests/PagerForkTasksCommandTests.swift`.
 
 import Foundation
+import OpenGrokFastWorktree
 import OpenGrokPager
 import OpenGrokPagerRender
 import OpenGrokSamplingTypes
@@ -150,6 +151,75 @@ private struct ForkTasksWorkspace {
             .filter { $0.pathExtension == "json" }
             .map { $0.deletingPathExtension().lastPathComponent }
             .sorted()
+    }
+
+    func initializeRepository(at directory: URL? = nil) throws {
+        let repository = directory ?? root
+        try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+        let hooks = repository.appendingPathComponent("isolated-hooks", isDirectory: true)
+        try FileManager.default.createDirectory(at: hooks, withIntermediateDirectories: true)
+
+        for arguments in [
+            ["init"],
+            ["config", "user.name", "Pager Fork Parity"],
+            ["config", "user.email", "pager-fork@example.test"],
+            ["config", "commit.gpgsign", "false"],
+            ["config", "core.hooksPath", hooks.path],
+        ] {
+            let result = try runGit(arguments, cwd: repository)
+            guard result.exitCode == 0 else {
+                throw CLIApplicationError.failed(
+                    "could not initialize pager fork repository: \(result.stderr)"
+                )
+            }
+        }
+
+        try "committed source\n".write(
+            to: repository.appendingPathComponent("tracked.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "isolated-hooks/\nignored-source.txt\n".write(
+            to: repository.appendingPathComponent(".gitignore"),
+            atomically: true,
+            encoding: .utf8
+        )
+        for arguments in [
+            ["add", "tracked.txt", ".gitignore"],
+            ["commit", "-m", "Initialize pager worktree fork fixture"],
+        ] {
+            let result = try runGit(arguments, cwd: repository)
+            guard result.exitCode == 0 else {
+                throw CLIApplicationError.failed(
+                    "could not commit pager fork repository: \(result.stderr)"
+                )
+            }
+        }
+
+        try "dirty source\n".write(
+            to: repository.appendingPathComponent("tracked.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "untracked source\n".write(
+            to: repository.appendingPathComponent("untracked-source.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "ignored source\n".write(
+            to: repository.appendingPathComponent("ignored-source.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+    }
+
+    func pooledWorktrees() throws -> [URL] {
+        let pool = WorktreeRegistry(openGrokHome: grokHome).poolRoot
+        guard FileManager.default.fileExists(atPath: pool.path) else { return [] }
+        return try FileManager.default.contentsOfDirectory(
+            at: pool,
+            includingPropertiesForKeys: nil
+        )
     }
 
     func cleanup() {
@@ -335,14 +405,22 @@ struct LivePagerForkReachabilityTests {
         try await session.renderer.restoreTerminal()
     }
 
-    @Test("/fork --worktree refuses by name and writes nothing")
-    func forkWorktreeRefuses() async throws {
+    @Test("/fork --worktree persists a distinct linked dirty worktree and keeps the parent active")
+    func forkWorktreeCreatesIsolatedPersistentChild() async throws {
         let workspace = ForkTasksWorkspace()
         defer { workspace.cleanup() }
+        try workspace.initializeRepository()
         let store = LiveConversationStore(openGrokHome: workspace.grokHome)
-        let source = try await seedSourceSession(
-            workspace, store: store, sessionID: "fork-live-worktree", rewindBytes: nil
+        let rewindBytes = Data("{\"prompt_index\":7}\n".utf8)
+        var source = try await seedSourceSession(
+            workspace,
+            store: store,
+            sessionID: "fork-live-worktree",
+            rewindBytes: rewindBytes
         )
+        source.everUsedNonXAI = true
+        try await store.save(source)
+        let parentBefore = try await store.load(sessionID: source.sessionID)
         let session = try await ForkTasksSession.start(
             workspace,
             sessionID: source.sessionID,
@@ -352,11 +430,166 @@ struct LivePagerForkReachabilityTests {
 
         try await session.renderer.render(.overlay(.fork(worktreeOverride: true, directive: nil)))
 
-        await session.waitForPaint(of: "/fork --worktree is not available")
-        #expect(session.paintedContains(LivePagerForkCommand.worktreeRefusal))
-        // Refusal means refusal: no record appeared.
-        #expect(workspace.storedSessionIDs() == [source.sessionID])
+        await session.waitForPaint(of: "Forked this session into a worktree as")
+        let childIDs = workspace.storedSessionIDs().filter { $0 != source.sessionID }
+        try #require(childIDs.count == 1, "exactly one worktree child, found \(childIDs)")
+        let childID = childIDs[0]
+        let child = try await store.load(sessionID: childID)
+        let childDirectory = URL(fileURLWithPath: child.workingDirectory, isDirectory: true)
+        let sourceIdentity = try discoverGitRepo(at: workspace.root)
+        let childIdentity = try discoverGitRepo(at: childDirectory)
+        let childRewind = try Data(contentsOf: LiveRewindStore.rewindFileURL(
+            openGrokHome: workspace.grokHome,
+            sessionID: childID
+        ))
+        let dirtyTracked = try String(
+            contentsOf: childDirectory.appendingPathComponent("tracked.txt"),
+            encoding: .utf8
+        )
+        let untracked = try String(
+            contentsOf: childDirectory.appendingPathComponent("untracked-source.txt"),
+            encoding: .utf8
+        )
+        let registryRecords = try WorktreeRegistry(openGrokHome: workspace.grokHome).records()
+        let registryRecord = try #require(registryRecords.first)
+        let parentAfter = try await store.load(sessionID: source.sessionID)
+        let currentSessionID = await session.renderer.sessionID
+        let currentWorkingDirectory = await session.renderer.workingDirectory
+
+        #expect(child.sessionID != source.sessionID)
+        #expect(child.parentSessionID == source.sessionID)
+        #expect(child.sessionKind == "worktree")
+        #expect(child.items == parentBefore.items)
+        #expect(child.everUsedNonXAI == true)
+        #expect(!LiveToolExecutor.workspaceRootsMatch(childDirectory, workspace.root))
+        #expect(LiveToolExecutor.workspaceRootsMatch(sourceIdentity.commonDir, childIdentity.commonDir))
+        #expect(dirtyTracked == "dirty source\n")
+        #expect(untracked == "untracked source\n")
+        #expect(!FileManager.default.fileExists(
+            atPath: childDirectory.appendingPathComponent("ignored-source.txt").path
+        ))
+        #expect(childRewind == rewindBytes)
+        #expect(registryRecords.count == 1)
+        #expect(registryRecord.sessionID == childID)
+        #expect(registryRecord.creationMode == .linked)
+        #expect(LiveToolExecutor.workspaceRootsMatch(registryRecord.url, childDirectory))
+        #expect(parentAfter == parentBefore)
+        #expect(currentSessionID == source.sessionID)
+        #expect(currentWorkingDirectory == workspace.root.path)
+        #expect(session.paintedContains("open-grok --resume \(childID)"))
+        #expect(!session.paintedContains("Open it here with /resume \(childID)"))
         try await session.renderer.restoreTerminal()
+        await session.executor.shutdown()
+    }
+
+    @Test("/fork --worktree outside git refuses before creating a child or worktree")
+    func forkWorktreeOutsideRepositoryFailsBeforeMutation() async throws {
+        let workspace = ForkTasksWorkspace()
+        defer { workspace.cleanup() }
+        let store = LiveConversationStore(openGrokHome: workspace.grokHome)
+        let source = try await seedSourceSession(
+            workspace,
+            store: store,
+            sessionID: "fork-live-worktree-no-git",
+            rewindBytes: nil
+        )
+        let parentBefore = try await store.load(sessionID: source.sessionID)
+        let session = try await ForkTasksSession.start(
+            workspace,
+            sessionID: source.sessionID,
+            backend: ForkInertShellBackend(),
+            store: store
+        )
+
+        try await session.renderer.render(.overlay(.fork(worktreeOverride: true, directive: nil)))
+
+        await session.waitForPaint(of: LivePagerForkCommand.worktreeRequiresGit)
+        let registryRecords = try WorktreeRegistry(openGrokHome: workspace.grokHome).records()
+        let worktrees = try workspace.pooledWorktrees()
+        let parentAfter = try await store.load(sessionID: source.sessionID)
+        #expect(session.paintedContains(LivePagerForkCommand.worktreeRequiresGit))
+        #expect(workspace.storedSessionIDs() == [source.sessionID])
+        #expect(registryRecords.isEmpty)
+        #expect(worktrees.isEmpty)
+        #expect(parentAfter == parentBefore)
+        try await session.renderer.restoreTerminal()
+        await session.executor.shutdown()
+    }
+
+    @Test("a failed legacy-session fork reclaims its real linked worktree and registry row")
+    func failedWorktreeForkRollsBackWorktreeAndRegistry() async throws {
+        let workspace = ForkTasksWorkspace()
+        defer { workspace.cleanup() }
+        try workspace.initializeRepository()
+        let store = LiveConversationStore(openGrokHome: workspace.grokHome)
+        var source = try await seedSourceSession(
+            workspace,
+            store: store,
+            sessionID: "fork-live-worktree-legacy",
+            rewindBytes: nil
+        )
+        source.everUsedNonXAI = nil
+        try await store.save(source)
+        let parentBefore = try await store.load(sessionID: source.sessionID)
+        let session = try await ForkTasksSession.start(
+            workspace,
+            sessionID: source.sessionID,
+            backend: ForkInertShellBackend(),
+            store: store
+        )
+
+        try await session.renderer.render(.overlay(.fork(worktreeOverride: true, directive: nil)))
+
+        await session.waitForPaint(of: "cannot fork legacy session")
+        let registryRecords = try WorktreeRegistry(openGrokHome: workspace.grokHome).records()
+        let worktrees = try workspace.pooledWorktrees()
+        let parentAfter = try await store.load(sessionID: source.sessionID)
+        #expect(session.paintedContains("cannot fork legacy session"))
+        #expect(session.paintedContains("ever_used_codex export-boundary marker"))
+        #expect(workspace.storedSessionIDs() == [source.sessionID])
+        #expect(registryRecords.isEmpty)
+        #expect(worktrees.isEmpty)
+        #expect(parentAfter == parentBefore)
+        try await session.renderer.restoreTerminal()
+        await session.executor.shutdown()
+    }
+
+    @Test("a foreign persisted source cannot borrow the current pager's workspace authority")
+    func foreignSourceWorktreeForkFailsBeforeCreation() async throws {
+        let workspace = ForkTasksWorkspace()
+        defer { workspace.cleanup() }
+        try workspace.initializeRepository()
+        let foreign = workspace.root.deletingLastPathComponent()
+            .appendingPathComponent("foreign-repository", isDirectory: true)
+        try workspace.initializeRepository(at: foreign)
+        let store = LiveConversationStore(openGrokHome: workspace.grokHome)
+        var source = LiveConversationRecord.new(
+            sessionID: "fork-live-worktree-foreign",
+            workingDirectory: foreign
+        )
+        source.items = [.user("foreign source transcript")]
+        try await store.save(source)
+        let parentBefore = try await store.load(sessionID: source.sessionID)
+        let session = try await ForkTasksSession.start(
+            workspace,
+            sessionID: source.sessionID,
+            backend: ForkInertShellBackend(),
+            store: store
+        )
+
+        try await session.renderer.render(.overlay(.fork(worktreeOverride: true, directive: nil)))
+
+        await session.waitForPaint(of: "differs from this authorized workspace")
+        let registryRecords = try WorktreeRegistry(openGrokHome: workspace.grokHome).records()
+        let worktrees = try workspace.pooledWorktrees()
+        let parentAfter = try await store.load(sessionID: source.sessionID)
+        #expect(session.paintedContains("differs from this authorized workspace"))
+        #expect(workspace.storedSessionIDs() == [source.sessionID])
+        #expect(registryRecords.isEmpty)
+        #expect(worktrees.isEmpty)
+        #expect(parentAfter == parentBefore)
+        try await session.renderer.restoreTerminal()
+        await session.executor.shutdown()
     }
 
     @Test("/fork with a directive refuses BEFORE the disk fork — the text is never dropped")
@@ -383,6 +616,44 @@ struct LivePagerForkReachabilityTests {
         #expect(session.paintedContains(LivePagerForkCommand.directiveRefusal))
         #expect(workspace.storedSessionIDs() == [source.sessionID])
         try await session.renderer.restoreTerminal()
+    }
+
+    @Test("a worktree directive is refused before git, worktree, registry, or session mutation")
+    func forkWorktreeDirectiveRefusesBeforeCreation() async throws {
+        let workspace = ForkTasksWorkspace()
+        defer { workspace.cleanup() }
+        try workspace.initializeRepository()
+        let store = LiveConversationStore(openGrokHome: workspace.grokHome)
+        let source = try await seedSourceSession(
+            workspace,
+            store: store,
+            sessionID: "fork-live-worktree-directive",
+            rewindBytes: nil
+        )
+        let parentBefore = try await store.load(sessionID: source.sessionID)
+        let session = try await ForkTasksSession.start(
+            workspace,
+            sessionID: source.sessionID,
+            backend: ForkInertShellBackend(),
+            store: store
+        )
+
+        try await session.renderer.render(.overlay(.fork(
+            worktreeOverride: true,
+            directive: "preserve this user-authored directive"
+        )))
+
+        await session.waitForPaint(of: LivePagerForkCommand.directiveRefusal)
+        let registryRecords = try WorktreeRegistry(openGrokHome: workspace.grokHome).records()
+        let worktrees = try workspace.pooledWorktrees()
+        let parentAfter = try await store.load(sessionID: source.sessionID)
+        #expect(session.paintedContains(LivePagerForkCommand.directiveRefusal))
+        #expect(workspace.storedSessionIDs() == [source.sessionID])
+        #expect(registryRecords.isEmpty)
+        #expect(worktrees.isEmpty)
+        #expect(parentAfter == parentBefore)
+        try await session.renderer.restoreTerminal()
+        await session.executor.shutdown()
     }
 
     @Test("/fork with no stored source surfaces the store's own error")
