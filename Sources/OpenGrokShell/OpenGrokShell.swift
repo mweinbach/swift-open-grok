@@ -1042,6 +1042,21 @@ public actor OpenGrokShell: OpenGrokShellFacade {
         summary.cwd = request.cwd.path
         summary.currentModelID = providerSnapshot.modelID
         summary.everUsedCodex = summary.everUsedCodex || providerSnapshot.everUsedNonXAI
+        if restoredState == nil {
+            let gitMetadata = WorkspaceSessionGitMetadata.resolve(at: request.cwd)
+            if let root = gitMetadata.gitRootDirectory {
+                summary.extra["git_root_dir"] = .string(root)
+            }
+            if !gitMetadata.gitRemotes.isEmpty {
+                summary.extra["git_remotes"] = .array(gitMetadata.gitRemotes.map(JSONValue.string))
+            }
+            if let commit = gitMetadata.headCommit {
+                summary.extra["head_commit"] = .string(commit)
+            }
+            if let branch = gitMetadata.headBranch {
+                summary.extra["head_branch"] = .string(branch)
+            }
+        }
         var persistedState = restoredState ?? PersistedSessionState(summary: summary)
         persistedState.summary = summary
         let managed = ManagedSession(

@@ -286,7 +286,8 @@ public struct SessionDocumentStore: Sendable {
         from sourceSessionID: String,
         sourceCWD: String,
         to destinationSessionID: String,
-        destinationCWD: String
+        destinationCWD: String,
+        destinationGitMetadata: [String: JSONValue] = [:]
     ) throws -> PersistedSessionState {
         try Self.validateSessionID(sourceSessionID)
         try Self.validateSessionID(destinationSessionID)
@@ -312,6 +313,12 @@ public struct SessionDocumentStore: Sendable {
         state.summary.extra["cache_affinity_id"] = .string(
             state.summary.extra["cache_affinity_id"]?.stringValue ?? sourceSessionID
         )
+        for key in ["git_root_dir", "git_remotes", "head_commit", "head_branch"] {
+            state.summary.extra.removeValue(forKey: key)
+            if let value = destinationGitMetadata[key] {
+                state.summary.extra[key] = value
+            }
+        }
         state.updates = try state.updates.map { update in
             try SessionUpdateEnvelope(
                 timestamp: update.timestamp,

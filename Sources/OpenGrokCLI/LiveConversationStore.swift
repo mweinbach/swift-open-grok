@@ -77,6 +77,10 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
     var codeModeTransportCallIDs: [String]?
     /// Durable child-only input, consumed atomically with its first real user turn.
     var pendingFirstPrompt: LivePendingForkDirective?
+    var gitRootDirectory: String?
+    var gitRemotes: [String]
+    var headCommit: String?
+    var headBranch: String?
 
     init(
         sessionID: String,
@@ -95,7 +99,11 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         title: String? = nil,
         toolOutcomes: ToolCallOutcomeMap? = nil,
         codeModeTransportCallIDs: [String]? = nil,
-        pendingFirstPrompt: LivePendingForkDirective? = nil
+        pendingFirstPrompt: LivePendingForkDirective? = nil,
+        gitRootDirectory: String? = nil,
+        gitRemotes: [String] = [],
+        headCommit: String? = nil,
+        headBranch: String? = nil
     ) {
         self.sessionID = sessionID
         self.workingDirectory = workingDirectory
@@ -114,6 +122,10 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         self.toolOutcomes = toolOutcomes
         self.codeModeTransportCallIDs = codeModeTransportCallIDs
         self.pendingFirstPrompt = pendingFirstPrompt
+        self.gitRootDirectory = gitRootDirectory
+        self.gitRemotes = gitRemotes
+        self.headCommit = headCommit
+        self.headBranch = headBranch
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -134,6 +146,10 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         case toolOutcomes = "tool_outcomes"
         case codeModeTransportCallIDs = "code_mode_transport_call_ids"
         case pendingFirstPrompt = "pending_first_prompt"
+        case gitRootDirectory = "git_root_dir"
+        case gitRemotes = "git_remotes"
+        case headCommit = "head_commit"
+        case headBranch = "head_branch"
     }
 
     // Explicit so `tool_outcomes` cannot silently vanish on a future
@@ -162,6 +178,10 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
             LivePendingForkDirective.self,
             forKey: .pendingFirstPrompt
         )
+        gitRootDirectory = try c.decodeIfPresent(String.self, forKey: .gitRootDirectory)
+        gitRemotes = try c.decodeIfPresent([String].self, forKey: .gitRemotes) ?? []
+        headCommit = try c.decodeIfPresent(String.self, forKey: .headCommit)
+        headBranch = try c.decodeIfPresent(String.self, forKey: .headBranch)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -183,6 +203,12 @@ struct LiveConversationRecord: Codable, Sendable, Equatable {
         try c.encodeIfPresent(toolOutcomes, forKey: .toolOutcomes)
         try c.encodeIfPresent(codeModeTransportCallIDs, forKey: .codeModeTransportCallIDs)
         try c.encodeIfPresent(pendingFirstPrompt, forKey: .pendingFirstPrompt)
+        try c.encodeIfPresent(gitRootDirectory, forKey: .gitRootDirectory)
+        if !gitRemotes.isEmpty {
+            try c.encode(gitRemotes, forKey: .gitRemotes)
+        }
+        try c.encodeIfPresent(headCommit, forKey: .headCommit)
+        try c.encodeIfPresent(headBranch, forKey: .headBranch)
     }
 
     static func new(
@@ -336,6 +362,16 @@ actor LiveConversationStore {
                 sessionID: record.sessionID,
                 cwd: record.workingDirectory
             )
+            if let existing {
+                try Self.restoreGitMetadata(from: existing.summary.extra, into: &record)
+            } else {
+                Self.applyGitMetadata(
+                    WorkspaceSessionGitMetadata.resolve(
+                        at: URL(fileURLWithPath: record.workingDirectory, isDirectory: true)
+                    ),
+                    to: &record
+                )
+            }
             let persistedPending: LivePendingForkDirective?
             if let value = existing?.summary.extra["pending_first_prompt"], value != .null {
                 persistedPending = try value.decode(LivePendingForkDirective.self)
@@ -542,6 +578,7 @@ actor LiveConversationStore {
                 inheritedItems: source.items
             )
         }
+        let childGitMetadata = WorkspaceSessionGitMetadata.resolve(at: workingDirectory)
         let child = LiveConversationRecord(
             sessionID: destinationSessionID,
             workingDirectory: workingDirectory.standardizedFileURL.path,
@@ -558,7 +595,11 @@ actor LiveConversationStore {
             title: source.title,
             toolOutcomes: source.toolOutcomes,
             codeModeTransportCallIDs: source.codeModeTransportCallIDs,
-            pendingFirstPrompt: directive
+            pendingFirstPrompt: directive,
+            gitRootDirectory: childGitMetadata.gitRootDirectory,
+            gitRemotes: childGitMetadata.gitRemotes,
+            headCommit: childGitMetadata.headCommit,
+            headBranch: childGitMetadata.headBranch
         )
 
         do {
@@ -570,7 +611,8 @@ actor LiveConversationStore {
                 from: sourceSessionID,
                 sourceCWD: source.workingDirectory,
                 to: destinationSessionID,
-                destinationCWD: child.workingDirectory
+                destinationCWD: child.workingDirectory,
+                destinationGitMetadata: Self.gitMetadataFields(for: child)
             )
             try save(child)
             if fileManager.fileExists(atPath: sourceRewindURL.path) {
@@ -711,6 +753,10 @@ actor LiveConversationStore {
         }
 
         var extra = existing?.summary.extra ?? [:]
+        for key in Self.gitMetadataKeys {
+            extra.removeValue(forKey: key)
+        }
+        extra.merge(gitMetadataFields(for: record)) { _, current in current }
         if let cacheAffinityID = record.cacheAffinityID,
            !cacheAffinityID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {
@@ -875,8 +921,60 @@ actor LiveConversationStore {
             title: extra["generated_title"]?.stringValue ?? extra["title"]?.stringValue,
             toolOutcomes: toolOutcomes,
             codeModeTransportCallIDs: codeModeTransportCallIDs,
-            pendingFirstPrompt: pendingFirstPrompt
+            pendingFirstPrompt: pendingFirstPrompt,
+            gitRootDirectory: extra["git_root_dir"]?.stringValue,
+            gitRemotes: try gitRemotes(from: extra),
+            headCommit: extra["head_commit"]?.stringValue,
+            headBranch: extra["head_branch"]?.stringValue
         )
+    }
+
+    private static let gitMetadataKeys = [
+        "git_root_dir", "git_remotes", "head_commit", "head_branch",
+    ]
+
+    private static func applyGitMetadata(
+        _ metadata: WorkspaceSessionGitMetadata,
+        to record: inout LiveConversationRecord
+    ) {
+        record.gitRootDirectory = metadata.gitRootDirectory
+        record.gitRemotes = metadata.gitRemotes
+        record.headCommit = metadata.headCommit
+        record.headBranch = metadata.headBranch
+    }
+
+    private static func restoreGitMetadata(
+        from metadata: [String: JSONValue],
+        into record: inout LiveConversationRecord
+    ) throws {
+        record.gitRootDirectory = metadata["git_root_dir"]?.stringValue
+        record.gitRemotes = try gitRemotes(from: metadata)
+        record.headCommit = metadata["head_commit"]?.stringValue
+        record.headBranch = metadata["head_branch"]?.stringValue
+    }
+
+    private static func gitRemotes(from metadata: [String: JSONValue]) throws -> [String] {
+        guard let value = metadata["git_remotes"], value != .null else { return [] }
+        return try value.decode([String].self)
+    }
+
+    private static func gitMetadataFields(
+        for record: LiveConversationRecord
+    ) -> [String: JSONValue] {
+        var metadata: [String: JSONValue] = [:]
+        if let root = record.gitRootDirectory {
+            metadata["git_root_dir"] = .string(root)
+        }
+        if !record.gitRemotes.isEmpty {
+            metadata["git_remotes"] = .array(record.gitRemotes.map(JSONValue.string))
+        }
+        if let commit = record.headCommit {
+            metadata["head_commit"] = .string(commit)
+        }
+        if let branch = record.headBranch {
+            metadata["head_branch"] = .string(branch)
+        }
+        return metadata
     }
 
     private static func setMetadata(
