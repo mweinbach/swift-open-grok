@@ -153,19 +153,31 @@ public enum LiveExportComposition {
     ) throws -> [SessionUpdateEnvelope] {
         let manager = FileManager.default
         let root = openGrokHome.appendingPathComponent("sessions", isDirectory: true)
-        guard manager.fileExists(atPath: root.path) else {
+        guard try pathExists(root) else {
             throw notFound(sessionID)
         }
         try requireRealDirectory(root, root: nil)
+        #if os(Windows)
+        let canonicalRoot = root.standardizedFileURL
+        #else
         let canonicalRoot = root.resolvingSymlinksInPath().standardizedFileURL
+        #endif
 
         let workspaces: [URL]
         do {
+            #if os(Windows)
+            workspaces = try WindowsSecurePath.contentsOfDirectory(
+                at: root,
+                maximumEntries: maximumWorkspaceDirectories,
+                skipsHiddenFiles: true
+            )
+            #else
             workspaces = try manager.contentsOfDirectory(
                 at: root,
                 includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
                 options: [.skipsHiddenFiles]
             )
+            #endif
         } catch {
             throw CLIApplicationError.failed("Failed to inspect session history: \(error)")
         }
@@ -175,6 +187,16 @@ public enum LiveExportComposition {
 
         var matchingJournals: [ExportReplayJournal] = []
         for workspace in workspaces {
+            #if os(Windows)
+            let values: WindowsSecurePath.Metadata
+            do {
+                guard let metadata = try WindowsSecurePath.metadata(at: workspace) else { continue }
+                values = metadata
+            } catch {
+                throw CLIApplicationError.failed("Failed to inspect session workspace: \(error)")
+            }
+            guard values.isDirectory, !values.isReparsePoint else { continue }
+            #else
             let values: URLResourceValues
             do {
                 values = try workspace.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
@@ -183,13 +205,14 @@ public enum LiveExportComposition {
             }
             guard values.isDirectory == true else { continue }
             guard values.isSymbolicLink != true else { continue }
+            #endif
             let directory = workspace.appendingPathComponent(sessionID, isDirectory: true)
-            guard manager.fileExists(atPath: directory.path) else { continue }
+            guard try pathExists(directory) else { continue }
             try requireRealDirectory(workspace, root: canonicalRoot)
             try requireRealDirectory(directory, root: canonicalRoot)
 
             let summary = directory.appendingPathComponent(SessionDocumentStore.summaryFileName)
-            guard manager.fileExists(atPath: summary.path) else { continue }
+            guard try pathExists(summary) else { continue }
             let summaryBytes = try readPrivateRegularFile(
                 summary,
                 root: canonicalRoot,
@@ -248,7 +271,7 @@ public enum LiveExportComposition {
             }
 
             let journal = directory.appendingPathComponent(SessionDocumentStore.updatesFileName)
-            guard manager.fileExists(atPath: journal.path) else { continue }
+            guard try pathExists(journal) else { continue }
             let journalBytes = try readPrivateRegularFile(
                 journal,
                 root: canonicalRoot,
@@ -304,6 +327,31 @@ public enum LiveExportComposition {
     }
 
     private static func requireRealDirectory(_ directory: URL, root: URL?) throws {
+        #if os(Windows)
+        let values: WindowsSecurePath.Metadata
+        let native: String
+        do {
+            guard let metadata = try WindowsSecurePath.metadata(at: directory) else {
+                throw CLIApplicationError.failed("Session history directory does not exist.")
+            }
+            values = metadata
+            native = try WindowsSecurePath.extendedLengthPath(directory.path)
+        } catch let error as CLIApplicationError {
+            throw error
+        } catch {
+            throw CLIApplicationError.failed("Failed to inspect session directory: \(error)")
+        }
+        guard values.isDirectory, !values.isReparsePoint else {
+            throw CLIApplicationError.failed("Session history must use real private directories.")
+        }
+        guard native.withCString({ path in
+            og_path_is_private_to_current_user(path, 1)
+        }) == 1 else {
+            throw CLIApplicationError.failed(
+                "Session history directory is not private to the current Windows user."
+            )
+        }
+        #else
         let values: URLResourceValues
         do {
             values = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
@@ -313,17 +361,13 @@ public enum LiveExportComposition {
         guard values.isDirectory == true, values.isSymbolicLink != true else {
             throw CLIApplicationError.failed("Session history must use real private directories.")
         }
-        #if os(Windows)
-        guard directory.path.withCString({ path in
-            og_path_is_private_to_current_user(path, 1)
-        }) == 1 else {
-            throw CLIApplicationError.failed(
-                "Session history directory is not private to the current Windows user."
-            )
-        }
         #endif
         if let root {
+            #if os(Windows)
+            let resolved = directory.standardizedFileURL
+            #else
             let resolved = directory.resolvingSymlinksInPath().standardizedFileURL
+            #endif
             guard isStrictDescendant(resolved, of: root) else {
                 throw CLIApplicationError.failed("Session directory escapes the private history root.")
             }
@@ -335,6 +379,20 @@ public enum LiveExportComposition {
         root: URL,
         maximumBytes: Int
     ) throws -> Data {
+        #if os(Windows)
+        guard isStrictDescendant(file.standardizedFileURL, of: root) else {
+            throw CLIApplicationError.failed("Session document must be a contained regular file.")
+        }
+        do {
+            return try PathSecurity.readNoFollow(
+                file,
+                maximumBytes: maximumBytes,
+                requireOwnerOnly: true
+            )
+        } catch {
+            throw CLIApplicationError.failed("Failed to securely read session document: \(error)")
+        }
+        #else
         let values: URLResourceValues
         do {
             values = try file.resourceValues(forKeys: [
@@ -373,6 +431,19 @@ public enum LiveExportComposition {
         } catch {
             throw CLIApplicationError.failed("Failed to securely read session document: \(error)")
         }
+        #endif
+    }
+
+    private static func pathExists(_ path: URL) throws -> Bool {
+        #if os(Windows)
+        do {
+            return try WindowsSecurePath.metadata(at: path) != nil
+        } catch {
+            throw CLIApplicationError.failed("Failed to inspect session history path: \(error)")
+        }
+        #else
+        return FileManager.default.fileExists(atPath: path.path)
+        #endif
     }
 
     /// Rust: `session/storage/mod.rs:1378-1469`; a rewind removes its marker

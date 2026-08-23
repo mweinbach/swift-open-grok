@@ -52,7 +52,8 @@ public enum SecureFile: Sendable {
     public static func isOwnerOnly(at path: URL) throws -> Bool {
         #if os(Windows)
         try PathSecurity.rejectHostileLexical(path.path)
-        let result = path.path.withCString { og_file_is_owner_only($0) }
+        let native = try WindowsSecurePath.extendedLengthPath(path.path)
+        let result = native.withCString { og_file_is_owner_only($0) }
         if result >= 0 { return result == 1 }
         throw windowsSecureFileError(path: path.path, operation: "inspect owner-only DACL")
         #else
@@ -71,7 +72,8 @@ public enum SecureFile: Sendable {
 private func ensureOwnerOnlyPermissionsInner(at path: URL) throws {
     #if os(Windows)
     try PathSecurity.rejectHostileLexical(path.path)
-    let result = path.path.withCString { og_file_apply_owner_only($0) }
+    let native = try WindowsSecurePath.extendedLengthPath(path.path)
+    let result = native.withCString { og_file_apply_owner_only($0) }
     if result == 0 { return }
     let code = Int(og_socket_last_error_code())
     if code == Int(ERROR_FILE_NOT_FOUND) || code == Int(ERROR_PATH_NOT_FOUND) {

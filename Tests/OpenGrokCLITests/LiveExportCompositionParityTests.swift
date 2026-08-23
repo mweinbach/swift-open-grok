@@ -653,6 +653,99 @@ struct LiveExportCompositionParityTests {
         #expect(errors.contents.isEmpty)
     }
 
+    @Test("owner-private sessions beyond MAX_PATH export through the real stdout, file, and clipboard routes")
+    func windowsExtendedLengthSessionsReachEveryExportDestination() async throws {
+        let fixture = try LiveExportFixture.make()
+        defer { fixture.clean() }
+        let deepState = fixture.root.appendingPathComponent(
+            String(repeating: "s", count: 120),
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: deepState, withIntermediateDirectories: true)
+        let deep = LiveExportFixture(
+            root: fixture.root,
+            state: deepState,
+            userHome: fixture.userHome,
+            workspace: fixture.workspace
+        )
+        let sessionID = UUID().uuidString
+        let prompt = "Owner-private transcript beyond the Windows MAX_PATH boundary"
+        let store = SessionDocumentStore(grokHome: deepState)
+        let directory = try store.sessionDirectory(sessionID: sessionID, cwd: fixture.workspace.path)
+        #expect(directory.path.utf16.count > 260)
+
+        let history = try JSONValue.encode(ConversationItem.user(prompt))
+        let update = SessionUpdateEnvelope(
+            timestamp: 123,
+            method: "session/update",
+            params: .object([
+                "sessionId": .string(sessionID),
+                "update": .object([
+                    "sessionUpdate": .string("user_message_chunk"),
+                    "content": .object([
+                        "type": .string("text"),
+                        "text": .string(prompt),
+                    ]),
+                ]),
+            ])
+        )
+        try store.save(PersistedSessionState(
+            summary: SessionSummary(
+                sessionID: SessionID(sessionID),
+                cwd: fixture.workspace.path,
+                currentModelID: "grok-code-fast-1"
+            ),
+            chatHistory: [history],
+            updates: [update]
+        ))
+
+        let summary = directory.appendingPathComponent(SessionDocumentStore.summaryFileName)
+        let journal = directory.appendingPathComponent(SessionDocumentStore.updatesFileName)
+        let lock = directory.appendingPathComponent("\(SessionDocumentStore.summaryFileName).lock")
+        let summaryPrivate = try SecureFile.isOwnerOnly(at: summary)
+        let journalPrivate = try SecureFile.isOwnerOnly(at: journal)
+        let lockPrivate = try SecureFile.isOwnerOnly(at: lock)
+        #expect(summaryPrivate)
+        #expect(journalPrivate)
+        #expect(lockPrivate)
+        #expect(lock.path.utf16.count > 260)
+        for ancestor in [
+            deepState.appendingPathComponent("sessions", isDirectory: true),
+            directory.deletingLastPathComponent(),
+            directory,
+        ] {
+            let native = try WindowsSecurePath.extendedLengthPath(ancestor.path)
+            let ownerPrivate = native.withCString { og_path_is_private_to_current_user($0, 1) }
+            #expect(ownerPrivate == 1)
+        }
+
+        let markdown = "## User\n\n\(prompt)"
+        let (stdoutStreams, stdout, stdoutErrors) = CLIStreams.buffered()
+        try await deep.launch(["export", sessionID], streams: stdoutStreams)
+        #expect(stdout.contents == markdown + "\n")
+        #expect(stdoutErrors.contents.isEmpty)
+
+        let destination = fixture.root.appendingPathComponent("long-session-export.md")
+        let (fileStreams, fileOutput, fileErrors) = CLIStreams.buffered()
+        try await deep.launch(["export", sessionID, destination.path], streams: fileStreams)
+        let written = try String(contentsOf: destination, encoding: .utf8)
+        #expect(written == markdown)
+        #expect(fileOutput.contents.isEmpty)
+        #expect(fileErrors.contents.contains("Conversation exported to"))
+
+        let clipboard = ExportClipboardCapture()
+        let services = LiveExportServices { text, _ in await clipboard.append(text) }
+        let (clipboardStreams, clipboardOutput, clipboardErrors) = CLIStreams.buffered()
+        try await deep.runInjected(
+            ["export", sessionID, "--clipboard"],
+            streams: clipboardStreams,
+            services: services
+        )
+        #expect(await clipboard.snapshot() == [markdown])
+        #expect(clipboardOutput.contents.isEmpty)
+        #expect(clipboardErrors.contents.contains("Conversation copied to clipboard"))
+    }
+
     @Test("Windows export refuses an independently verified permissive sessions-root DACL")
     func windowsRejectsPermissiveSessionDirectory() async throws {
         let fixture = try LiveExportFixture.make()

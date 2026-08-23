@@ -1364,9 +1364,12 @@ static int og_private_path_metadata(
     return 1;
 }
 
-int og_path_is_private_to_current_user(const char *path, int require_directory) {
-    HANDLE handle = og_open_private_path(path);
-    if (handle == INVALID_HANDLE_VALUE) return -1;
+int og_file_handle_is_private_to_current_user(OGSocketHandle raw_handle, int require_directory) {
+    if (raw_handle == OG_SOCKET_INVALID || raw_handle == 0) {
+        og_set_error(ERROR_INVALID_HANDLE, "invalid owner-only file handle");
+        return -1;
+    }
+    HANDLE handle = (HANDLE)(uintptr_t)raw_handle;
     PSID owner = NULL;
     PACL dacl = NULL;
     PSECURITY_DESCRIPTOR security = NULL;
@@ -1377,7 +1380,6 @@ int og_path_is_private_to_current_user(const char *path, int require_directory) 
         &dacl,
         &security
     );
-    CloseHandle(handle);
     if (metadata <= 0) return metadata;
     if (!dacl) {
         LocalFree(security);
@@ -1387,7 +1389,7 @@ int og_path_is_private_to_current_user(const char *path, int require_directory) 
         SECURITY_DESCRIPTOR_CONTROL control = 0;
         DWORD revision = 0;
         if (!GetSecurityDescriptorControl(security, &control, &revision)) {
-            og_set_windows_error("could not inspect session-bus directory DACL inheritance");
+            og_set_windows_error("could not inspect owner-only DACL inheritance");
             LocalFree(security);
             return -1;
         }
@@ -1427,6 +1429,17 @@ int og_path_is_private_to_current_user(const char *path, int require_directory) 
     }
     LocalFree(security);
     return owner_allowed;
+}
+
+int og_path_is_private_to_current_user(const char *path, int require_directory) {
+    HANDLE handle = og_open_private_path(path);
+    if (handle == INVALID_HANDLE_VALUE) return -1;
+    int result = og_file_handle_is_private_to_current_user(
+        (OGSocketHandle)(uintptr_t)handle,
+        require_directory
+    );
+    CloseHandle(handle);
+    return result;
 }
 
 int og_directory_secure_current_user(const char *path) {
@@ -2083,6 +2096,11 @@ int og_directory_secure_current_user(const char *path) {
 int og_path_is_private_to_current_user(const char *path, int require_directory) {
     (void)path; (void)require_directory;
     og_set_error(ENOTSUP, "owner-only DACL inspection is only available on Windows");
+    return -1;
+}
+int og_file_handle_is_private_to_current_user(OGSocketHandle handle, int require_directory) {
+    (void)handle; (void)require_directory;
+    og_set_error(ENOTSUP, "owner-only handle inspection is only available on Windows");
     return -1;
 }
 

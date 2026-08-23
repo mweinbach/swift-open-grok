@@ -97,15 +97,19 @@ public enum AdvisoryFileLock: Sendable {
     ) throws -> AdvisoryLock {
         #if os(Windows)
         try PathSecurity.rejectHostileLexical(path.path)
-        try FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
+        let native = try WindowsSecurePath.extendedLengthPath(path.path)
+        let parent = path.deletingLastPathComponent()
+        if try WindowsSecurePath.metadata(at: parent) == nil {
+            try FileManager.default.createDirectory(
+                at: parent,
+                withIntermediateDirectories: true
+            )
+        }
 
         let handle: HANDLE
         if options.mode == 0o600 {
             var ownerPrivate: OGSocketHandle = -1
-            let result = path.path.withCString { pointer in
+            let result = native.withCString { pointer in
                 og_file_open_owner_only_lock(pointer, options.create ? 1 : 0, &ownerPrivate)
             }
             guard result == 0 else {
@@ -136,7 +140,7 @@ public enum AdvisoryFileLock: Sendable {
             handle = opened
         } else {
             let disposition = options.create ? DWORD(OPEN_ALWAYS) : DWORD(OPEN_EXISTING)
-            let rawHandle = path.path.withCString(encodedAs: UTF16.self) { pointer in
+            let rawHandle = native.withCString(encodedAs: UTF16.self) { pointer in
                 CreateFileW(
                     pointer,
                     DWORD(GENERIC_READ) | DWORD(GENERIC_WRITE),

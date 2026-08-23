@@ -13,7 +13,10 @@
 
 import Foundation
 
-#if canImport(Darwin)
+#if os(Windows)
+import COpenGrokSockets
+import WinSDK
+#elseif canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
@@ -109,22 +112,59 @@ public enum PathSecurity: Sendable {
     /// Opens the parent with `O_DIRECTORY|O_NOFOLLOW` (trailing parent symlink
     /// rejected) and the final name with `openat(O_NOFOLLOW)`.
     public static func readNoFollow(_ path: URL) throws -> Data {
+        try readNoFollow(path, maximumBytes: nil, requireOwnerOnly: false)
+    }
+
+    /// On Windows, bounds and owner identity are checked against the exact
+    /// no-delete-sharing handle from which every byte is subsequently read.
+    public static func readNoFollow(
+        _ path: URL,
+        maximumBytes: Int?,
+        requireOwnerOnly: Bool = false
+    ) throws -> Data {
         try rejectHostileLexical(path.path)
+        if let maximumBytes, maximumBytes < 0 {
+            throw FileUtilsError.hostilePath(path: path.path, reason: "negative secure-read byte bound")
+        }
         #if os(Windows)
-        if try isSymlink(path) {
-            throw FileUtilsError.symlinkEncountered(path: path.path)
-        }
-        do {
-            return try Data(contentsOf: path)
-        } catch {
-            throw FileUtilsError.io(path: path.path, detail: error.localizedDescription)
-        }
+        return try windowsReadNoFollow(
+            path,
+            maximumBytes: maximumBytes,
+            requireOwnerOnly: requireOwnerOnly
+        )
         #else
         let fd = try openFileNoFollow(at: path, flags: O_RDONLY)
         defer { close(fd) }
+        if maximumBytes != nil || requireOwnerOnly {
+            var information = stat()
+            guard fstat(fd, &information) == 0 else {
+                throw posixMap(path: path.path, op: "fstat")
+            }
+            if requireOwnerOnly,
+               information.st_uid != geteuid() || (information.st_mode & 0o777) != 0o600
+            {
+                throw FileUtilsError.permissionDenied(
+                    path: path.path,
+                    detail: "document is not private to the current user"
+                )
+            }
+            if let maximumBytes {
+                guard information.st_size >= 0,
+                      UInt64(information.st_size) <= UInt64(maximumBytes)
+                else {
+                    throw FileUtilsError.io(path: path.path, detail: "file exceeds secure-read byte bound")
+                }
+            }
+        }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
         do {
-            return try handle.readToEnd() ?? Data()
+            let bytes = try handle.readToEnd() ?? Data()
+            if let maximumBytes, bytes.count > maximumBytes {
+                throw FileUtilsError.io(path: path.path, detail: "file exceeds secure-read byte bound")
+            }
+            return bytes
+        } catch let error as FileUtilsError {
+            throw error
         } catch {
             throw FileUtilsError.io(path: path.path, detail: error.localizedDescription)
         }
@@ -176,7 +216,101 @@ public enum PathSecurity: Sendable {
 
     // MARK: - Descriptor-relative Unix helpers (internal / @testable)
 
-    #if !os(Windows)
+    #if os(Windows)
+    private static func windowsReadNoFollow(
+        _ path: URL,
+        maximumBytes: Int?,
+        requireOwnerOnly: Bool
+    ) throws -> Data {
+        let native = try WindowsSecurePath.extendedLengthPath(path.path)
+        let rawHandle = native.withCString(encodedAs: UTF16.self) { pointer in
+            CreateFileW(
+                pointer,
+                DWORD(GENERIC_READ) | DWORD(READ_CONTROL),
+                DWORD(FILE_SHARE_READ) | DWORD(FILE_SHARE_WRITE),
+                nil,
+                DWORD(OPEN_EXISTING),
+                DWORD(FILE_FLAG_OPEN_REPARSE_POINT),
+                nil
+            )
+        }
+        guard let handle = rawHandle, handle != INVALID_HANDLE_VALUE else {
+            throw WindowsSecurePath.windowsError(
+                path: path.path,
+                operation: "open no-follow document",
+                code: GetLastError()
+            )
+        }
+        defer { CloseHandle(handle) }
+
+        var information = BY_HANDLE_FILE_INFORMATION()
+        guard GetFileInformationByHandle(handle, &information) else {
+            throw WindowsSecurePath.windowsError(
+                path: path.path,
+                operation: "inspect no-follow document handle",
+                code: GetLastError()
+            )
+        }
+        if information.dwFileAttributes & DWORD(FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            throw FileUtilsError.symlinkEncountered(path: path.path)
+        }
+        guard information.dwFileAttributes & DWORD(FILE_ATTRIBUTE_DIRECTORY) == 0 else {
+            throw FileUtilsError.hostilePath(path: path.path, reason: "secure-read target is a directory")
+        }
+
+        if requireOwnerOnly {
+            try verifyWindowsOwnerPrivate(handle, path: path.path)
+        }
+
+        let size = (UInt64(information.nFileSizeHigh) << 32) | UInt64(information.nFileSizeLow)
+        guard size <= UInt64(Int.max) else {
+            throw FileUtilsError.io(path: path.path, detail: "secure-read file size overflows platform Int")
+        }
+        if let maximumBytes, size > UInt64(maximumBytes) {
+            throw FileUtilsError.io(path: path.path, detail: "file exceeds secure-read byte bound")
+        }
+
+        var result = Data()
+        result.reserveCapacity(Int(size))
+        var chunk = [UInt8](repeating: 0, count: 64 * 1_024)
+        while true {
+            var count: DWORD = 0
+            let succeeded = chunk.withUnsafeMutableBytes { bytes in
+                ReadFile(handle, bytes.baseAddress, DWORD(bytes.count), &count, nil)
+            }
+            guard succeeded else {
+                throw WindowsSecurePath.windowsError(
+                    path: path.path,
+                    operation: "read no-follow document handle",
+                    code: GetLastError()
+                )
+            }
+            if count == 0 {
+                if requireOwnerOnly {
+                    try verifyWindowsOwnerPrivate(handle, path: path.path)
+                }
+                return result
+            }
+            if let maximumBytes, Int(count) > maximumBytes - result.count {
+                throw FileUtilsError.io(path: path.path, detail: "file exceeds secure-read byte bound")
+            }
+            result.append(contentsOf: chunk.prefix(Int(count)))
+        }
+    }
+
+    private static func verifyWindowsOwnerPrivate(_ handle: HANDLE, path: String) throws {
+        let bridged = OGSocketHandle(Int(bitPattern: handle))
+        let ownerPrivate = og_file_handle_is_private_to_current_user(bridged, 0)
+        guard ownerPrivate == 1 else {
+            let detail = String(cString: og_socket_last_error_message())
+            throw FileUtilsError.permissionDenied(
+                path: path,
+                detail: ownerPrivate == 0 ? "document is not private to the current user"
+                    : "same-handle owner verification failed: \(detail)"
+            )
+        }
+    }
+    #else
     /// Open a directory. Trailing symlink components are rejected (`O_NOFOLLOW`).
     /// Returns an owned file descriptor; caller must `close`.
     static func openDirectoryNoFollow(at path: URL) throws -> Int32 {

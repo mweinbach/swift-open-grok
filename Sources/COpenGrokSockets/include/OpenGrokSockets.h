@@ -84,6 +84,7 @@ int og_file_apply_owner_only(const char *path);
 int og_file_is_owner_only(const char *path);
 int og_directory_secure_current_user(const char *path);
 int og_path_is_private_to_current_user(const char *path, int require_directory);
+int og_file_handle_is_private_to_current_user(OGSocketHandle handle, int require_directory);
 int og_socket_last_error_code(void);
 const char *og_socket_last_error_message(void);
 
