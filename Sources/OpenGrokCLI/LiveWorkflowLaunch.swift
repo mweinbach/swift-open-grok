@@ -24,6 +24,7 @@ enum LiveWorkflowLaunch {
     struct Session: Sendable {
         let sampler: OpenGrokLiveSampler
         let model: String
+        let supportsReasoningEffort: Bool
         let workspaceRoot: URL
         let sessionID: String
         let openGrokHome: URL
@@ -108,6 +109,7 @@ enum LiveWorkflowLaunch {
                     workspaceRoot: session.workspaceRoot,
                     systemPrompt: session.systemPrompt,
                     parentCapabilityMode: parentCapabilityMode(for: session.toolPolicy),
+                    supportsReasoningEffort: session.supportsReasoningEffort,
                     makeInvoker: { mode in
                         let executor = try await LiveToolExecutor(
                             processBackend: session.makeProcessBackend(),
@@ -129,7 +131,17 @@ enum LiveWorkflowLaunch {
                     context: context,
                     environment: environment,
                     scratchRoot: scratchRoot,
-                    maxConcurrentAgents: maxConcurrentAgents
+                    maxConcurrentAgents: maxConcurrentAgents,
+                    // Upstream's production session factory passes an empty
+                    // template registry; a project cannot invent one.
+                    templates: .empty,
+                    gitDiff: { commit, workingDirectory in
+                        try await LiveWorkflowGitDiff.run(
+                            commit,
+                            workingDirectory,
+                            environment: session.environment
+                        )
+                    }
                 )
             },
             finish: { context in
