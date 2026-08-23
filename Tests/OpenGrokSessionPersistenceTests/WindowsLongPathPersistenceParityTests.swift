@@ -5,6 +5,10 @@ import OpenGrokShellSessionSupport
 import Testing
 @testable import OpenGrokSessionPersistence
 
+#if os(Windows)
+import COpenGrokSockets
+#endif
+
 @Suite("Windows extended-length durable session persistence")
 struct WindowsLongPathPersistenceParityTests {
     @Test("durable history replacement survives an extended-length temporary sibling")
@@ -12,21 +16,26 @@ struct WindowsLongPathPersistenceParityTests {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
 
-        var directory = root
-        while directory.appendingPathComponent("chat_history.jsonl").path.utf16.count < 230 {
-            directory = directory.appendingPathComponent("durable-session-segment", isDirectory: true)
-        }
-
+        let filename = "chat_history.jsonl"
+        let segmentLength = max(1, 270 - root.path.utf16.count - filename.utf16.count - 2)
+        let directory = root.appendingPathComponent(
+            String(repeating: "s", count: segmentLength),
+            isDirectory: true
+        )
         let destination = directory.appendingPathComponent("chat_history.jsonl")
         let representativeTemporarySibling = directory.appendingPathComponent(
             ".chat_history.jsonl.\(UUID().uuidString).tmp"
         )
+        #expect(destination.path.utf16.count > 260)
         #expect(representativeTemporarySibling.path.utf16.count > 260)
 
         try RelocationFS.writeAtomicDurable(path: destination, data: Data("first\n".utf8))
         try RelocationFS.writeAtomicDurable(path: destination, data: Data("second\n".utf8))
 
         #expect(try String(contentsOf: destination, encoding: .utf8) == "second\n")
+        #if os(Windows)
+        try expectOwnerPrivateWindowsFile(destination)
+        #endif
         let siblings = try FileManager.default.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: nil
@@ -71,6 +80,12 @@ struct WindowsLongPathPersistenceParityTests {
         #expect(recovered.chatHistory == [first, second])
         #expect(recovered.summary.chatMessageCount == 2)
 
+        #if os(Windows)
+        for filename in ["chat_history.jsonl", "updates.jsonl", "state.json", "summary.json"] {
+            try expectOwnerPrivateWindowsFile(directory.appendingPathComponent(filename))
+        }
+        #endif
+
         let temporarySiblings = try FileManager.default.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: nil
@@ -112,6 +127,12 @@ struct WindowsLongPathPersistenceParityTests {
                 try RelocationFS.windowsExtendedLengthPath(path)
             }
         }
+    }
+
+    private func expectOwnerPrivateWindowsFile(_ path: URL) throws {
+        let extendedPath = try RelocationFS.windowsExtendedLengthPath(path.standardizedFileURL.path)
+        #expect(extendedPath.withCString { og_file_is_owner_only($0) } == 1)
+        #expect(extendedPath.withCString { og_path_is_private_to_current_user($0, 0) } == 1)
     }
     #endif
 

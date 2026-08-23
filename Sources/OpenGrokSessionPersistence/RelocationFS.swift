@@ -10,6 +10,7 @@ import OpenGrokFileUtils
 import OpenGrokShared
 
 #if os(Windows)
+import COpenGrokSockets
 import WinSDK
 #elseif canImport(Darwin)
 import Darwin
@@ -194,23 +195,34 @@ public enum RelocationFS: Sendable {
 
         let tempURL = parent.appendingPathComponent(".\(path.lastPathComponent).\(UUID().uuidString).tmp")
         do {
-            try data.write(to: tempURL, options: [.atomic])
-            #if !os(Windows)
-            let mode = permissions ?? 0o600
-            _ = chmod(tempURL.path, mode_t(mode))
-            #endif
-            try syncFile(tempURL)
-
             #if os(Windows)
+            try writeWindowsOwnerOnlyTemporaryFile(at: tempURL, data: data)
             try replaceWindowsItemDurably(at: path, with: tempURL)
             #else
+            try data.write(to: tempURL, options: [.atomic])
+            let mode = permissions ?? 0o600
+            _ = chmod(tempURL.path, mode_t(mode))
+            try syncFile(tempURL)
             try atomicallyReplaceItem(at: path, with: tempURL)
             #endif
             // Rename moves the already-synced inode; only its new directory
             // entry still needs a durability barrier.
             try? syncDirectory(parent)
         } catch {
+            #if os(Windows)
+            do {
+                try removeWindowsTemporaryFileIfPresent(tempURL)
+            } catch let cleanupError {
+                throw RelocationError.io(
+                    operation: "writeAtomicDurable",
+                    path: path.path,
+                    message: "\(error.localizedDescription); temporary cleanup failed: "
+                        + cleanupError.localizedDescription
+                )
+            }
+            #else
             _ = try? FileManager.default.removeItem(at: tempURL)
+            #endif
             throw RelocationError.io(operation: "writeAtomicDurable", path: path.path, message: error.localizedDescription)
         }
     }
@@ -274,6 +286,100 @@ public enum RelocationFS: Sendable {
 
         return extendedPrefix + String(localPath.prefix(2)) + "\\"
             + components.joined(separator: "\\")
+    }
+
+    private static func writeWindowsOwnerOnlyTemporaryFile(at path: URL, data: Data) throws {
+        let extendedPath = try windowsExtendedLengthPath(path.standardizedFileURL.path)
+        var handle: OGSocketHandle = -1
+        let created = extendedPath.withCString { og_file_create_owner_only($0, &handle) }
+        guard created == 0 else {
+            throw windowsNativeFileError(operation: "create owner-only session temporary", path: path)
+        }
+
+        do {
+            let secured = extendedPath.withCString { og_file_apply_owner_only($0) }
+            guard secured == 0 else {
+                throw windowsNativeFileError(operation: "protect session temporary DACL", path: path)
+            }
+
+            let ownerOnly = extendedPath.withCString { og_file_is_owner_only($0) }
+            guard ownerOnly == 1 else {
+                if ownerOnly < 0 {
+                    throw windowsNativeFileError(operation: "inspect session temporary DACL", path: path)
+                }
+                throw RelocationError.io(
+                    operation: "inspect session temporary DACL",
+                    path: path.path,
+                    message: "session temporary is not owner-private"
+                )
+            }
+
+            let currentUserOwnsFile = extendedPath.withCString {
+                og_path_is_private_to_current_user($0, 0)
+            }
+            guard currentUserOwnsFile == 1 else {
+                if currentUserOwnsFile < 0 {
+                    throw windowsNativeFileError(operation: "inspect session temporary owner", path: path)
+                }
+                throw RelocationError.io(
+                    operation: "inspect session temporary owner",
+                    path: path.path,
+                    message: "session temporary does not belong to the current user"
+                )
+            }
+
+            let written = data.withUnsafeBytes { bytes in
+                og_file_handle_write_all(handle, bytes.baseAddress, bytes.count)
+            }
+            guard written == Int64(data.count) else {
+                throw windowsNativeFileError(operation: "write owner-only session temporary", path: path)
+            }
+            guard og_file_handle_flush(handle) == 0 else {
+                throw windowsNativeFileError(operation: "flush owner-only session temporary", path: path)
+            }
+        } catch {
+            guard og_file_handle_close(handle) == 0 else {
+                let closeError = windowsNativeFileError(
+                    operation: "close failed session temporary",
+                    path: path
+                )
+                throw RelocationError.io(
+                    operation: "write owner-only session temporary",
+                    path: path.path,
+                    message: "\(error.localizedDescription); \(closeError.description)"
+                )
+            }
+            throw error
+        }
+
+        guard og_file_handle_close(handle) == 0 else {
+            throw windowsNativeFileError(operation: "close owner-only session temporary", path: path)
+        }
+    }
+
+    private static func removeWindowsTemporaryFileIfPresent(_ path: URL) throws {
+        let extendedPath = try windowsExtendedLengthPath(path.standardizedFileURL.path)
+        let removed = extendedPath.withCString(encodedAs: UTF16.self) { DeleteFileW($0) }
+        if removed { return }
+
+        let code = GetLastError()
+        guard code == DWORD(ERROR_FILE_NOT_FOUND) || code == DWORD(ERROR_PATH_NOT_FOUND) else {
+            throw RelocationError.io(
+                operation: "remove owner-only session temporary",
+                path: path.path,
+                message: "Windows error \(code)"
+            )
+        }
+    }
+
+    private static func windowsNativeFileError(operation: String, path: URL) -> RelocationError {
+        let code = og_socket_last_error_code()
+        let detail = String(cString: og_socket_last_error_message())
+        return .io(
+            operation: operation,
+            path: path.path,
+            message: detail.isEmpty ? "Windows error \(code)" : detail
+        )
     }
 
     private static func replaceWindowsItemDurably(at destination: URL, with source: URL) throws {
