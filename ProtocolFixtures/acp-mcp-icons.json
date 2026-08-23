@@ -1,6 +1,6 @@
 {
   "$schema": "open-grok/protocol-fixtures/acp-mcp-icons",
-  "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
+  "referenceRevision": "00e176c8fb4035701c24199bf9225973c1b13c20",
   "method": "x.ai/mcp/list",
   "serverIconsKey": "icons",
   "toolIconsPath": "session.tools[].icons",
@@ -100,8 +100,8 @@
   },
   "provenance": {
     "source": "xai-grok-mcp sanitized icon ingestion and xai-grok-shell ACP MCP server/tool catalog serialization",
-    "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
-    "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
+    "referenceRevision": "00e176c8fb4035701c24199bf9225973c1b13c20",
+    "previousReferenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
     "pinVerdict": "recaptured",
     "recapturedFields": [
       "serverIconsKey",

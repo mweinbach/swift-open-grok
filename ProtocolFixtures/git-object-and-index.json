@@ -20,11 +20,11 @@
     "notes": "Explicit non-parity when object is pack-only; no silent empty HEAD tree",
     "supported": false
   },
-  "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
+  "referenceRevision": "00e176c8fb4035701c24199bf9225973c1b13c20",
   "provenance": {
     "source": "generated-from-git-sha1-and-zlib-semantics, provenance-labelled against xai-gix-status",
-    "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
-    "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
+    "referenceRevision": "00e176c8fb4035701c24199bf9225973c1b13c20",
+    "previousReferenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
     "pinVerdict": "unchanged (verified)",
     "evidence": [
       "git diff 650c1db7..538a16df -- crates/codegen/xai-gix-status => empty (no source or Cargo.toml change)",

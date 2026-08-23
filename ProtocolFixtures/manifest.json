@@ -1,37 +1,37 @@
 {
   "version": 1,
   "generatedAt": "2026-08-23",
-  "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
+  "referenceRevision": "00e176c8fb4035701c24199bf9225973c1b13c20",
   "files": [
     {
       "path": "ProtocolFixtures/PROVENANCE.json",
-      "sizeBytes": 12093,
-      "sha256": "9b7a60b207b8fccfb4bb2aeed213baf484316983bb1c4b9d6ef0e9be68d32f94"
+      "sizeBytes": 11710,
+      "sha256": "3e091e0074fd8ee056d9d4fe1c951d141d8ba01fae7cceb31d529d2d69331b67"
     },
     {
       "path": "ProtocolFixtures/acp-mcp-icons.json",
       "sizeBytes": 3969,
-      "sha256": "22187765df7c7a0102bede5b207de316b73f08ecb4c8e00594940dfdc3950e7b"
+      "sha256": "65e0261663c7cdc9f90536ee79727919d2fbf0ce1dcff376acc1eeb752cb18ea"
     },
     {
       "path": "ProtocolFixtures/acp-methods.json",
       "sizeBytes": 1390,
-      "sha256": "ce629582b7d5a6a140e342cc4663264394d7efed0d6d2150b5283c69d936007f"
+      "sha256": "dbba9290c88c18398f73c76457d854fd87cc5bd861d6461bf358e696d1ad053a"
     },
     {
       "path": "ProtocolFixtures/cli-version-and-home.json",
-      "sizeBytes": 2484,
-      "sha256": "a7628e503a892e755913d7509fe6324f2073091bf89f1671fb7262956ba158c7"
+      "sizeBytes": 3724,
+      "sha256": "c7f085054a938d2e7f144df19968c64c8b7a9146fa4587952ce4542f43308427"
     },
     {
       "path": "ProtocolFixtures/config-workspace-codemode-keys.json",
       "sizeBytes": 6324,
-      "sha256": "01979827043325a3d125c7d41fd370546e4e037b939df8604cced8b6c168aabb"
+      "sha256": "991acfdc3aecc5a697726a0af17f336d697765208b4984a1b271f4b7efc8db00"
     },
     {
       "path": "ProtocolFixtures/crash-gcrx-format.json",
       "sizeBytes": 2602,
-      "sha256": "16806265c68ae0d65421e32051d314a97147328dde8b6f805a8fb16eb7e220d9"
+      "sha256": "d810b611ef4abb9b2a2796c379ce1aca3ed1ffd8aa484f601c6f66e700902dc3"
     },
     {
       "path": "ProtocolFixtures/crash-gcrx-sample.bin",
@@ -46,17 +46,17 @@
     {
       "path": "ProtocolFixtures/git-object-and-index.json",
       "sizeBytes": 1635,
-      "sha256": "4ac033f7715b901fdb44c91de46f402f779395c224a90d3c7b5ede75579b8baf"
+      "sha256": "f597b7add7072fb3cc4b19f1b5fe5400e099e6147d975d691d266496f973a9b2"
     },
     {
       "path": "ProtocolFixtures/hook-runtime-identity.json",
       "sizeBytes": 4425,
-      "sha256": "5ee0f1aa882ba68c8e0d3e93d3f04a19daa50900048fbad1074502b4d23b25e1"
+      "sha256": "1a7b0a40c7fd3f8f8874ea58a044cd90730dc1c91357528afe698c4561902508"
     },
     {
       "path": "ProtocolFixtures/hunk-tracker-snapshot.json",
       "sizeBytes": 1816,
-      "sha256": "25f7faa57dc349fb3229ef3a156afe110ecc1733c5d251604eaa387e86841cd1"
+      "sha256": "d96dc08b3726597ece5426ceb3b5d4e34fc89a3f01cba0fe4186bb256fae4266"
     },
     {
       "path": "ProtocolFixtures/otlp-export-trace-grpc.bin",
@@ -71,27 +71,27 @@
     {
       "path": "ProtocolFixtures/otlp-span-export-shape.json",
       "sizeBytes": 2632,
-      "sha256": "c0f8bc9da2104947e290e0772abb076b8c374de68485936ce2b156c3fa01c064"
+      "sha256": "e06fe9f64c6efb8a0c548bb4d657370751e1790bc1e71d9013fd627ae18407b7"
     },
     {
       "path": "ProtocolFixtures/provider-streaming-policy.json",
       "sizeBytes": 4472,
-      "sha256": "af24733d4f028b22fde321c4bdcac74c1df2d251166108cbb5e6289af8cd84f6"
+      "sha256": "0c7cd8f1fe97bbd3ec1317182b38dcfd31f68ec3a8a836cc069cd5e7b988729d"
     },
     {
       "path": "ProtocolFixtures/pty-process-signals.json",
       "sizeBytes": 1215,
-      "sha256": "4e378913f92dee0d8c48411e16d4e7f2d8f3860ae34062968507995c998d5411"
+      "sha256": "edafeaf40015291a17c722ed0bd9995c38fd743042c19a6b048f162412b31244"
     },
     {
       "path": "ProtocolFixtures/sqlite-journal-modes.json",
       "sizeBytes": 2592,
-      "sha256": "9ed507cf951664287c00ccfc72f77d4023aaa5febeadd8abdf1ba1b78f315255"
+      "sha256": "56290ba1063c481ae4ea98174aac4f430b4c30eacd64956446e41db2707f3d35"
     },
     {
       "path": "ProtocolFixtures/tracing-w3c-traceparent.json",
       "sizeBytes": 1851,
-      "sha256": "a1d3d1768c25f379ab7aab8e91c757daa714a121ede1ff58c8c66347a6659aa3"
+      "sha256": "becd681fbff3652a1d23ec60a3f69e98d71ec73bf73867206427344cae0083bf"
     }
   ]
 }

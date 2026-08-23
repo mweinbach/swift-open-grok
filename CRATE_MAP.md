@@ -1,7 +1,7 @@
 # Rust Crate to SwiftPM Target Map
 
 **Baseline:** 2026-07-20 (upstream inventory refreshed 2026-08-22).
-**Reference pin:** `xai-org/grok-build` at `b962dfa6dd9a49df96d28412eae3a8f5478b0dfa` (release `1.0.0-open-grok.82`). The original historical reference was `650c1db7c2e73c59cec88bf3c6359751d6cef1bd`; current protocol fixtures and release provenance use the newer pin recorded in `PORT_STATUS.md`.
+**Reference pin:** `xai-org/grok-build` at `00e176c8fb4035701c24199bf9225973c1b13c20` (release `1.0.0-open-grok.82`). The tagged `.82` release baseline was `b962dfa6dd9a49df96d28412eae3a8f5478b0dfa`, and the original historical reference was `650c1db7c2e73c59cec88bf3c6359751d6cef1bd`; current protocol fixtures and release provenance use the newer pin recorded in `PORT_STATUS.md`.
 **Count:** **93** root Cargo workspace packages plus `xai-grok-markdown-fuzz` in its own nested workspace = **94 mapped crates**. The August 22 Rust-first audit identified five real workspace crates omitted by the prior 89-row inventory: `xai-compaction-transcript`, `xai-fuzzy-file-search`, `xai-grok-active-sessions`, `xai-grok-foreign-sessions`, and `xai-grok-session-events`.
 
 **SwiftPM source/test inventory (directory recount, 2026-08-22):**

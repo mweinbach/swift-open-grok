@@ -1,10 +1,11 @@
 {
   "$schema": "open-grok/protocol-fixtures/provenance",
   "generatedAt": "2026-08-23",
-  "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
-  "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
+  "referenceRevision": "00e176c8fb4035701c24199bf9225973c1b13c20",
+  "previousReferenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
+  "originalReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
   "note": "Fixtures are provenance-labelled compatibility artifacts for implemented foundation formats. Binary goldens are re-encoded or structurally decoded in tests (OTLP, GCRX, git zlib metadata, hunk/PTY/tracing/storage keys) rather than digest-only validation.",
-  "recaptureNote": "Every entry was re-evaluated against the 2026-08-23 UTC advance from release baseline 538a16df (1.0.0-open-grok.81) to b962dfa6 (1.0.0-open-grok.82), an eight-commit upstream delta; the original historical reference remains 650c1db7. The earlier 178-commit 650c1db7..538a16df advance recaptured the .81 CLI release, GNU Linux x86_64/aarch64 distribution, fixed-width crash release stamp, shared SQLite busy-retry budget, provider-local streaming, Codex permissions, and nested progress. Seven subsequent commits through 448a2afe retained release .81 while adding workspace-by-default sandbox confinement with explicit opt-out and resume pinning, sanitized ACP MCP server/tool icon wire fields, authentic command/HTTP hook runner identity, browser-style prompt selection, object-free Git HEAD resolution, and a documentation-only upstream snapshot note. Final release commit b962dfa6 changes OPEN_GROK_VERSION to .82 and adds release notes without changing those runtime contracts; the CLI/build-plugin/generated-source/distribution defaults and fixed-width GCRX golden have been re-stamped to .82, while other binary wire artifacts remain unchanged.",
+  "recaptureNote": "Every entry was re-evaluated through 00e176c8 while the release remains 1.0.0-open-grok.82. Tagged release baseline b962dfa6 changed OPEN_GROK_VERSION to .82; three following commits changed only release-build caching/linking, and 00e176c8 moved release identity out of shared libraries into executable composition roots. The original historical reference remains 650c1db7. Existing binary wire artifacts remain unchanged; cli-version-and-home.json additionally captures BuildInfo registration, local/release classification, conflict rejection, package fallbacks, and optimized fail-closed behavior.",
   "method": "Hand-derivation from immutable Rust source with file:line provenance, cross-checked against production Swift targets. Both revisions and every family-level diff were read through git plumbing from the read-only reference clone at /Users/mweinbach/Projects/grok-build; release-stamped binary goldens were structurally re-encoded and the manifest was regenerated from actual file bytes.",
   "entries": [
     {
@@ -45,7 +46,7 @@
         "crates/codegen/xai-grok-config/src/paths.rs",
         "crates/codegen/xai-grok-paths"
       ],
-      "evidence": "OPEN_GROK_VERSION historically moved from 0.1.220-open-grok.58 to 1.0.0-open-grok.81, then release commit b962dfa6 advances it to 1.0.0-open-grok.82. install.sh:35-53 and scripts/build-linux-release.sh:9-26 continue to publish GNU Linux x86_64/aarch64 releases and their exact uname aliases. Version-library behavior and the branded home-policy contract are unchanged; config paths additionally harden session directories to mode 0700 without changing home selection."
+      "evidence": "OPEN_GROK_VERSION historically moved from 0.1.220-open-grok.58 to 1.0.0-open-grok.81, then release commit b962dfa6 advanced it to 1.0.0-open-grok.82. Commit 00e176c8 retains .82 while moving immutable version/commit identity into BuildInfo registered by executable composition roots; identical registration is idempotent, conflicts are rejected, and an uninitialized optimized process fails closed as a release build. install.sh:35-53 and scripts/build-linux-release.sh:9-26 continue to publish GNU Linux x86_64/aarch64 releases and their exact uname aliases."
     },
     {
       "file": "config-workspace-codemode-keys.json",

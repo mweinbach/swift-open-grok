@@ -20,11 +20,11 @@
     "start_time_unix_nano",
     "end_time_unix_nano"
   ],
-  "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
+  "referenceRevision": "00e176c8fb4035701c24199bf9225973c1b13c20",
   "provenance": {
     "source": "generated-from-swift-OTLPProtobuf-encoder-semantics",
-    "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
-    "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
+    "referenceRevision": "00e176c8fb4035701c24199bf9225973c1b13c20",
+    "previousReferenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
     "pinVerdict": "unchanged (verified)",
     "note": "Binary goldens match OpenGrokTelemetry.OTLPProtobuf with fixed nowNanos; not a hand-authored JSON summary of field names only.",
     "evidence": [

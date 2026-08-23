@@ -8,6 +8,19 @@
   "compiledVersionDefault": "1.0.0-open-grok.82",
   "referencePinnedRelease": "1.0.0-open-grok.82",
   "compiledVersionEnv": "GROK_VERSION",
+  "buildIdentity": {
+    "registeredByExecutableBeforeDispatch": true,
+    "registrationSource": "BuildInfo.from_compile_stamp(option_env!(\"GROK_VERSION\"), env!(\"VERSION_WITH_COMMIT\"))",
+    "identicalRegistrationIsIdempotent": true,
+    "conflictingRegistrationRejected": true,
+    "localBuildUsesPackageVersionAndCommitStamp": true,
+    "releaseBuildUsesExplicitReleaseAndCommitStamp": true,
+    "standaloneUninitializedVersionUsesPackageFallback": true,
+    "standaloneUninitializedVersionWithCommitUsesUnknownCommit": true,
+    "uninitializedDebugBuildKind": "local",
+    "uninitializedOptimizedBuildKind": "release",
+    "optimizedFallbackFailsClosedForFolderTrust": true
+  },
   "emptyTestVersionReturnsEmpty": true,
   "homeEnv": "OPENGROK_HOME",
   "homeFallback": "~/.opengrok",
@@ -25,22 +38,25 @@
     "Linux:aarch64": "linux-aarch64",
     "Linux:arm64": "linux-aarch64"
   },
-  "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
+  "referenceRevision": "00e176c8fb4035701c24199bf9225973c1b13c20",
   "testVersionEnv": "GROK_TEST_VERSION",
   "unimplementedStayUnavailable": true,
   "provenance": {
     "source": "OpenGrokVersion/OpenGrokCLI semantics vs Rust xai-grok-version + xai-grok-config path resolution",
-    "referenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
-    "previousReferenceRevision": "650c1db7c2e73c59cec88bf3c6359751d6cef1bd",
+    "referenceRevision": "00e176c8fb4035701c24199bf9225973c1b13c20",
+    "previousReferenceRevision": "b962dfa6dd9a49df96d28412eae3a8f5478b0dfa",
     "pinVerdict": "recaptured",
     "recapturedFields": [
       "referencePinnedRelease",
       "compiledVersionDefault",
+      "buildIdentity",
       "supportedPosixReleasePlatforms",
       "posixHostAliases"
     ],
     "evidence": [
       "OPEN_GROK_VERSION moved from 0.1.220-open-grok.58 at 650c1db7 to 1.0.0-open-grok.81 at historical baseline 538a16df, then advanced to 1.0.0-open-grok.82 in release commit b962dfa6; the marker, build plugin, checked-in generated source, CLI output, and distribution baseline all agree on .82.",
+      "Commit 00e176c8 keeps OPEN_GROK_VERSION at .82 while moving immutable build identity into xai-grok-version::BuildInfo and registering it at xai-grok-pager-bin/src/main.rs:1692-1697 before telemetry, argument parsing, doctor, or version dispatch.",
+      "xai-grok-version/src/lib.rs:15-145 defines local/release identity, permits identical registration, rejects conflicts, retains standalone package fallbacks, and deliberately classifies an uninitialized optimized process as release-shaped so folder trust fails closed.",
       "install.sh:35-53 now accepts Darwin arm64/aarch64, Linux x86_64/amd64, and Linux aarch64/arm64; scripts/build-linux-release.sh:9-26 publishes GNU x86_64 and aarch64 binaries with install.sh and SHA-256 sidecars.",
       "git diff 650c1db7..538a16df -- crates/codegen/xai-grok-version/src/lib.rs => empty; TEST_VERSION_ENV=\"GROK_TEST_VERSION\", compile-time GROK_VERSION fallback, and installed() trimming semantics are unchanged.",
       "xai-grok-config/src/paths.rs added explicit-home helpers and owner-only session directories, but default_grok_home() still resolves <home>/.opengrok and grok_home() still prefers $OPENGROK_HOME.",
