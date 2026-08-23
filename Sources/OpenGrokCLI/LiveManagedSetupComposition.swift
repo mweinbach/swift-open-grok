@@ -244,6 +244,7 @@ public enum LiveManagedSetupComposition {
         streams: CLIStreams,
         services: LiveManagedSetupServices = .production
     ) async throws -> LiveManagedSetupOutcome {
+        try Task.checkCancellation()
         guard options.name == routeName, options.values.isEmpty else {
             throw LiveManagedSetupFailure.invalidArguments
         }
@@ -293,6 +294,7 @@ public enum LiveManagedSetupComposition {
                 environment: environment,
                 transport: transport
             )
+            try Task.checkCancellation()
             if let team, environment["OPENGROK_AUTH"] != nil {
                 operationEnvironment["OPENGROK_AUTH"] = try encodeInlineAuth(team)
             }
@@ -309,6 +311,7 @@ public enum LiveManagedSetupComposition {
             environment: operationEnvironment,
             now: services.now()
         )
+        try Task.checkCancellation()
 
         if options.json {
             let report = LiveManagedSetupReport(
@@ -326,6 +329,7 @@ public enum LiveManagedSetupComposition {
             guard let text = String(data: output, encoding: .utf8) else {
                 throw LiveManagedSetupFailure.invalidResponse
             }
+            try Task.checkCancellation()
             streams.out(text + "\n")
             if !fetched.body.configured {
                 streams.err(nothingConfiguredMessage + "\n")
@@ -333,12 +337,14 @@ public enum LiveManagedSetupComposition {
             return .reported
         }
 
+        try Task.checkCancellation()
         let outcome = try apply(
             fetched,
             home: home,
             environment: operationEnvironment,
             now: services.now()
         )
+        try Task.checkCancellation()
         switch outcome {
         case .installed:
             streams.err("Applied managed configuration.\n")
@@ -516,6 +522,7 @@ public enum LiveManagedSetupComposition {
         await manager.configureRefresher(refresher)
         do {
             let refreshed = try await manager.auth()
+            try Task.checkCancellation()
             guard refreshed.isTeamPrincipal,
                   refreshed.isSessionAuth,
                   normalizeIdentity(refreshed.teamID) == normalizeIdentity(expired.teamID),
@@ -582,6 +589,7 @@ public enum LiveManagedSetupComposition {
         environment: [String: String],
         now: Date
     ) async throws -> LiveManagedFetchedPolicy {
+        try Task.checkCancellation()
         if let key = deploymentKey {
             do {
                 let body = try await request(
@@ -590,18 +598,22 @@ public enum LiveManagedSetupComposition {
                     transport: transport,
                     environment: environment
                 )
+                try Task.checkCancellation()
                 if body.configured || team == nil {
-                    return try verified(
+                    let policy = try verified(
                         body: body,
                         principal: .deploymentKey(key),
                         bindingTeamID: bindingTeamID,
                         now: now
                     )
+                    try Task.checkCancellation()
+                    return policy
                 }
             } catch LiveManagedSetupFailure.rejectedDeploymentKey where team != nil {
                 // A rejected stale deployment key must not starve a valid team.
             }
         }
+        try Task.checkCancellation()
         guard let team else { throw LiveManagedSetupFailure.noPrincipal }
         let body = try await request(
             endpoint: endpoint,
@@ -609,12 +621,15 @@ public enum LiveManagedSetupComposition {
             transport: transport,
             environment: environment
         )
-        return try verified(
+        try Task.checkCancellation()
+        let policy = try verified(
             body: body,
             principal: .team(team),
             bindingTeamID: bindingTeamID,
             now: now
         )
+        try Task.checkCancellation()
+        return policy
     }
 
     private static func request(
@@ -634,14 +649,21 @@ public enum LiveManagedSetupComposition {
         )
         let attempts = 5
         for attempt in 0..<attempts {
+            try Task.checkCancellation()
             let response: HTTPResponse
             do {
                 response = try await transport.send(request)
+                try Task.checkCancellation()
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
+                try Task.checkCancellation()
                 guard attempt + 1 < attempts else { throw LiveManagedSetupFailure.transport }
                 try await retryBackoff(attempt: attempt, environment: environment)
+                try Task.checkCancellation()
                 continue
             }
+            try Task.checkCancellation()
             let status = response.metadata.statusCode
             if status == 401 || status == 403 {
                 throw principal.teamID == nil
@@ -650,6 +672,7 @@ public enum LiveManagedSetupComposition {
             }
             if (500..<600).contains(status), attempt + 1 < attempts {
                 try await retryBackoff(attempt: attempt, environment: environment)
+                try Task.checkCancellation()
                 continue
             }
             guard (200..<300).contains(status) else {
@@ -668,9 +691,11 @@ public enum LiveManagedSetupComposition {
         attempt: Int,
         environment: [String: String]
     ) async throws {
+        try Task.checkCancellation()
         let nanoseconds = boundedRetryBackoffNanoseconds(attempt: attempt, environment: environment)
         guard nanoseconds > 0 else { return }
         try await Task.sleep(nanoseconds: nanoseconds)
+        try Task.checkCancellation()
     }
 
     static func boundedRetryBackoffNanoseconds(
@@ -764,6 +789,7 @@ public enum LiveManagedSetupComposition {
         environment: [String: String],
         now: Date
     ) throws -> LiveManagedSetupOutcome {
+        try Task.checkCancellation()
         let lock: AdvisoryLock
         do {
             lock = try AdvisoryFileLock.acquire(
@@ -777,6 +803,7 @@ public enum LiveManagedSetupComposition {
             throw LiveManagedSetupFailure.disk
         }
         defer { lock.release() }
+        try Task.checkCancellation()
 
         let current = resolveDeploymentKey(
             environment: environment,
@@ -801,7 +828,9 @@ public enum LiveManagedSetupComposition {
         }
         let fingerprint = fetched.principal.keyFingerprint
         do {
+            try Task.checkCancellation()
             try rejectSymbolicManagedArtifacts(in: home)
+            try Task.checkCancellation()
             if managedConfigIdentityChangedAt(
                 home,
                 newPrincipal: principal,
@@ -809,20 +838,24 @@ public enum LiveManagedSetupComposition {
             ) {
                 try removeArtifacts(home: home, includingMarker: false)
             }
+            try Task.checkCancellation()
             try installArtifact(
                 fetched.body.managedConfig,
                 at: home.appendingPathComponent(MANAGED_CONFIG_FILENAME)
             )
+            try Task.checkCancellation()
             try installArtifact(
                 fetched.body.requirements,
                 at: home.appendingPathComponent(REQUIREMENTS_FILENAME)
             )
             if let envelope = fetched.verifiedEnvelope {
+                try Task.checkCancellation()
                 try writeSidecar(home, sidecar: envelope)
             } else {
                 try removeIfPresent(home.appendingPathComponent(SIGNATURE_SIDECAR_FILE))
             }
             if let claim = fetched.verifiedClaimEnvelope {
+                try Task.checkCancellation()
                 try writeManagedIdentitySidecar(home, sidecar: claim)
             } else {
                 try removeIfPresent(home.appendingPathComponent(MANAGED_IDENTITY_SIDECAR_FILE))
@@ -839,11 +872,14 @@ public enum LiveManagedSetupComposition {
             )
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+            try Task.checkCancellation()
             try AtomicFile.write(
                 home.appendingPathComponent(MANAGED_CONFIG_CACHE_FILE),
                 data: encoder.encode(marker),
                 options: .ownerOnly
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw LiveManagedSetupFailure.disk
         }
@@ -869,6 +905,7 @@ public enum LiveManagedSetupComposition {
     }
 
     private static func installArtifact(_ contents: String?, at path: URL) throws {
+        try Task.checkCancellation()
         guard let contents, !contents.isEmpty else {
             try removeIfPresent(path)
             return
@@ -890,6 +927,7 @@ public enum LiveManagedSetupComposition {
     }
 
     private static func removeIfPresent(_ path: URL) throws {
+        try Task.checkCancellation()
         do {
             try FileManager.default.removeItem(at: path)
         } catch {

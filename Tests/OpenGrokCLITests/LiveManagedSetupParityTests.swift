@@ -49,6 +49,50 @@ private final class ManagedSetupRecordingTransport: HTTPTransport, @unchecked Se
     }
 }
 
+private actor ManagedSetupCancellationTransport: HTTPTransport {
+    private let response: HTTPResponse
+    private var capturedRequest: HTTPRequest?
+    private var requestWaiter: CheckedContinuation<Void, Never>?
+    private var responseWaiter: CheckedContinuation<HTTPResponse, Never>?
+
+    init(response: HTTPResponse) {
+        self.response = response
+    }
+
+    func send(_ request: HTTPRequest) async throws -> HTTPResponse {
+        return await withCheckedContinuation { continuation in
+            capturedRequest = request
+            responseWaiter = continuation
+            let waiter = requestWaiter
+            requestWaiter = nil
+            waiter?.resume()
+        }
+    }
+
+    nonisolated func stream(_ request: HTTPRequest) -> AsyncThrowingStream<HTTPStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish()
+        }
+    }
+
+    func waitForRequest() async {
+        guard capturedRequest == nil else { return }
+        await withCheckedContinuation { continuation in
+            requestWaiter = continuation
+        }
+    }
+
+    func releaseResponseAfterCancellation() {
+        let waiter = responseWaiter
+        responseWaiter = nil
+        waiter?.resume(returning: response)
+    }
+
+    var request: HTTPRequest? {
+        capturedRequest
+    }
+}
+
 private struct ManagedSetupFixture {
     let root: URL
     let home: URL
@@ -1044,6 +1088,169 @@ struct LiveManagedSetupParityTests {
         #expect(marker.principal == "team-owned")
         #expect(marker.keyFingerprint == nil)
         #endif
+    }
+
+    @Test("a cancelled managed fetch returning late never installs policy, requirements, or a marker")
+    func cancelledFetchCannotInstallLateAdministratorPolicy() async throws {
+        let fixture = try ManagedSetupFixture()
+        defer { fixture.dispose() }
+        var environment = fixture.environment
+        environment["GROK_DEPLOYMENT_KEY"] = "cancelled-deployment-secret"
+        let taskEnvironment = environment
+        let transport = ManagedSetupCancellationTransport(response: try fixture.response(json: [
+            "deployment_id": "cancelled-deployment",
+            "managed_config": "[features]\ntelemetry = false\n",
+            "requirements": "fail_closed = true\n",
+        ]))
+        let services = LiveManagedSetupServices(makeTransport: { transport })
+        let streams = fixture.streams
+        let task = Task {
+            try await LiveManagedSetupComposition.run(
+                options: CLIUtilityOptions(name: "setup"),
+                environment: taskEnvironment,
+                streams: streams,
+                services: services
+            )
+        }
+
+        await transport.waitForRequest()
+        task.cancel()
+        await transport.releaseResponseAfterCancellation()
+
+        do {
+            let outcome = try await task.value
+            Issue.record("cancelled setup unexpectedly installed policy: \(outcome)")
+        } catch is CancellationError {
+            // Cancellation, not a successful install or a retry, owns the task.
+        } catch {
+            Issue.record("cancelled setup returned an unexpected error: \(error)")
+        }
+
+        let request = await transport.request
+        let remainingFiles = try fixture.stateNames()
+        #expect(request?.url.host == "cli-chat-proxy.grok.com")
+        #expect(remainingFiles.isEmpty)
+        #expect(fixture.stdout.contents.isEmpty)
+        #expect(fixture.stderr.contents.isEmpty)
+    }
+
+    @Test("a late response from a cancelled tenant refresh cannot erase or replace old policy")
+    func cancelledTenantSwitchCannotOverwriteExistingAdministratorPolicy() async throws {
+        let fixture = try ManagedSetupFixture()
+        defer { fixture.dispose() }
+        let oldManaged = "[features]\ntelemetry = false\n"
+        let oldRequirements = "fail_closed = true\n"
+        let managedPath = fixture.state.appendingPathComponent(MANAGED_CONFIG_FILENAME)
+        let requirementsPath = fixture.state.appendingPathComponent(REQUIREMENTS_FILENAME)
+        let markerPath = fixture.state.appendingPathComponent(MANAGED_CONFIG_CACHE_FILE)
+        try oldManaged.write(to: managedPath, atomically: true, encoding: .utf8)
+        try oldRequirements.write(to: requirementsPath, atomically: true, encoding: .utf8)
+        let priorMarker = ManagedConfigCache(
+            syncedAt: UInt64(Date().timeIntervalSince1970),
+            principal: "previous-tenant",
+            hadManagedConfig: true,
+            hadRequirements: true,
+            keyFingerprint: Blake3.hexDigest(Array("prior-deployment-key".utf8)),
+            failClosed: true,
+            rollbackFloor: UInt64(Date().timeIntervalSince1970)
+        )
+        try JSONEncoder().encode(priorMarker).write(to: markerPath)
+        let originalManaged = try Data(contentsOf: managedPath)
+        let originalRequirements = try Data(contentsOf: requirementsPath)
+        let originalMarker = try Data(contentsOf: markerPath)
+        var environment = fixture.environment
+        environment["GROK_DEPLOYMENT_KEY"] = "replacement-deployment-key"
+        let taskEnvironment = environment
+        let transport = ManagedSetupCancellationTransport(response: try fixture.response(json: [
+            "deployment_id": "replacement-tenant",
+            "managed_config": "[features]\ntelemetry = true\n",
+            "requirements": "fail_closed = false\n",
+        ]))
+        let services = LiveManagedSetupServices(makeTransport: { transport })
+        let streams = fixture.streams
+        let task = Task {
+            try await LiveManagedSetupComposition.run(
+                options: CLIUtilityOptions(name: "setup"),
+                environment: taskEnvironment,
+                streams: streams,
+                services: services
+            )
+        }
+
+        await transport.waitForRequest()
+        task.cancel()
+        await transport.releaseResponseAfterCancellation()
+
+        do {
+            let outcome = try await task.value
+            Issue.record("cancelled tenant refresh unexpectedly returned: \(outcome)")
+        } catch is CancellationError {
+            // The original tenant retains its complete fail-closed artifact set.
+        } catch {
+            Issue.record("cancelled tenant refresh returned an unexpected error: \(error)")
+        }
+
+        let currentManaged = try Data(contentsOf: managedPath)
+        let currentRequirements = try Data(contentsOf: requirementsPath)
+        let currentMarker = try Data(contentsOf: markerPath)
+        #expect(currentManaged == originalManaged)
+        #expect(currentRequirements == originalRequirements)
+        #expect(currentMarker == originalMarker)
+        #expect(fixture.stdout.contents.isEmpty)
+        #expect(fixture.stderr.contents.isEmpty)
+    }
+
+    @Test("cancellation during a returning OAuth refresh never persists a new team or policy")
+    func cancelledOAuthRefreshCannotReplaceTeamCredentialsOrPolicy() async throws {
+        let fixture = try ManagedSetupFixture()
+        defer { fixture.dispose() }
+        var expired = fixture.team(expiresAt: Date().addingTimeInterval(-600))
+        expired.refreshToken = "private-cancelled-refresh-token"
+        expired.oidcIssuer = xaiOAuth2Issuer
+        expired.oidcClientID = defaultOAuth2ClientID
+        try fixture.writeAuth(expired)
+        let authPath = fixture.state.appendingPathComponent("auth.json")
+        let originalCredentials = try Data(contentsOf: authPath)
+        let transport = ManagedSetupCancellationTransport(response: try fixture.response(json: [
+            "access_token": "late-refreshed-team-bearer",
+            "refresh_token": "late-refreshed-team-refresh-token",
+            "expires_in": 3_600,
+        ]))
+        let services = LiveManagedSetupServices(makeTransport: { transport })
+        let environment = fixture.environment
+        let streams = fixture.streams
+        let task = Task {
+            try await LiveManagedSetupComposition.run(
+                options: CLIUtilityOptions(name: "setup"),
+                environment: environment,
+                streams: streams,
+                services: services
+            )
+        }
+
+        await transport.waitForRequest()
+        task.cancel()
+        await transport.releaseResponseAfterCancellation()
+
+        do {
+            let outcome = try await task.value
+            Issue.record("cancelled OAuth refresh unexpectedly returned: \(outcome)")
+        } catch is CancellationError {
+            // AuthManager's own pre-write barrier keeps the prior credential.
+        } catch {
+            Issue.record("cancelled OAuth refresh returned an unexpected error: \(error)")
+        }
+
+        let request = await transport.request
+        #expect(request?.url.absoluteString == "https://auth.x.ai/oauth2/token")
+        let currentCredentials = try Data(contentsOf: authPath)
+        #expect(currentCredentials == originalCredentials)
+        #expect(!FileManager.default.fileExists(
+            atPath: fixture.state.appendingPathComponent(MANAGED_CONFIG_FILENAME).path
+        ))
+        #expect(!FileManager.default.fileExists(
+            atPath: fixture.state.appendingPathComponent(MANAGED_CONFIG_CACHE_FILE).path
+        ))
     }
 
     @Test("an existing apply lock returns skipped without overwriting policy")
