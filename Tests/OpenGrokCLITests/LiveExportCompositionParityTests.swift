@@ -675,7 +675,7 @@ struct LiveExportCompositionParityTests {
         #expect(directory.path.utf16.count > 260)
 
         let history = try JSONValue.encode(ConversationItem.user(prompt))
-        let update = SessionUpdateEnvelope(
+        let update = try SessionUpdateEnvelope(
             timestamp: 123,
             method: "session/update",
             params: .object([
