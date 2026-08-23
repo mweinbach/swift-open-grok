@@ -85,23 +85,32 @@ enum LiveWorkflowCapability {
     /// The parent is a ceiling, never a floor. A script asking for `all` inside
     /// a `read_only` session gets `read_only`; a script asking for `read_only`
     /// inside a `read_write` session gets `read_only`, because narrowing is the
-    /// script's to do. An unparseable or non-subset request falls back to the
-    /// parent rather than erroring: the script is data, and a workflow should
-    /// not be able to fail a run by naming a capability it cannot have.
-    static func clamp(requested: String?, parent: ToolCapabilityMode) -> ToolCapabilityMode {
-        guard let requested,
-              let mode = parse(requested),
-              mode.isSubset(of: parent)
-        else { return parent }
-        return mode
+    /// script's to do. A malformed request is rejected rather than silently
+    /// inheriting the parent's broader authority.
+    static func clamp(
+        requested: String?,
+        parent: ToolCapabilityMode
+    ) throws -> ToolCapabilityMode {
+        guard let requested else { return parent }
+        guard let mode = parse(requested) else {
+            throw RhaiHostError.failed(
+                "invalid capability_mode '\(requested)' "
+                    + "(expected read-only, read-write, execute, or all)"
+            )
+        }
+        return mode.isSubset(of: parent) ? mode : parent
     }
 
     static func parse(_ raw: String) -> ToolCapabilityMode? {
         switch raw {
-        case "read_only", "read-only", "readonly": return .readOnly
-        case "read_write", "read-write", "readwrite": return .readWrite
-        case "execute": return .execute
-        case "all": return .all
+        case "read-only", "readonly", "readOnly", "read_only", "ReadOnly":
+            return .readOnly
+        case "read-write", "readwrite", "readWrite", "read_write", "ReadWrite":
+            return .readWrite
+        case "execute", "Execute", "EXECUTE":
+            return .execute
+        case "all", "All", "ALL":
+            return .all
         default: return nil
         }
     }
@@ -121,6 +130,9 @@ struct LiveWorkflowAgentEnvironment: Sendable {
     let systemPrompt: String?
     /// The ceiling for every child's capability mode.
     let parentCapabilityMode: ToolCapabilityMode
+    /// Resolved from the parent's authoritative model metadata. An opaque
+    /// sampler cannot reveal whether it will silently strip an effort field.
+    let supportsReasoningEffort: Bool
     /// Builds the tool surface for one clamped capability mode. Called at most
     /// once per distinct mode per run; the host caches the results.
     let makeInvoker: @Sendable (ToolCapabilityMode) async throws -> any LiveWorkflowToolInvoker
@@ -135,6 +147,7 @@ struct LiveWorkflowAgentEnvironment: Sendable {
         workspaceRoot: URL,
         systemPrompt: String? = nil,
         parentCapabilityMode: ToolCapabilityMode = .readWrite,
+        supportsReasoningEffort: Bool = false,
         maxToolRounds: Int = 16,
         makeInvoker: @escaping @Sendable (ToolCapabilityMode) async throws -> any LiveWorkflowToolInvoker
     ) {
@@ -143,6 +156,7 @@ struct LiveWorkflowAgentEnvironment: Sendable {
         self.workspaceRoot = workspaceRoot
         self.systemPrompt = systemPrompt
         self.parentCapabilityMode = parentCapabilityMode
+        self.supportsReasoningEffort = supportsReasoningEffort
         self.maxToolRounds = maxToolRounds
         self.makeInvoker = makeInvoker
     }
@@ -175,11 +189,18 @@ struct LiveWorkflowChildAgent: Sendable {
         options: RhaiAgentOptions,
         emit: @Sendable @escaping (LiveWorkflowAgentEvent) async -> Void
     ) async throws -> RhaiAgentResult {
+        try checkCancelled()
+        let validated = try validate(options: options)
         let startedAt = Date()
         await emit(.started(agentID: agentID, label: options.label, phase: options.phase))
 
         do {
-            let output = try await turnLoop(agentID: agentID, options: options, emit: emit)
+            let output = try await turnLoop(
+                agentID: agentID,
+                options: options,
+                validated: validated,
+                emit: emit
+            )
             let tokens = output.tokensUsed
             await emit(.finished(agentID: agentID, tokensUsed: tokens))
             return RhaiAgentResult(
@@ -207,18 +228,86 @@ struct LiveWorkflowChildAgent: Sendable {
         let tokensUsed: UInt64
     }
 
-    private func turnLoop(
-        agentID: String,
-        options: RhaiAgentOptions,
-        emit: @Sendable @escaping (LiveWorkflowAgentEvent) async -> Void
-    ) async throws -> Output {
-        let mode = LiveWorkflowCapability.clamp(
+    private struct ValidatedOptions {
+        let capability: ToolCapabilityMode
+        let reasoningEffort: ReasoningEffort?
+    }
+
+    private func validate(options: RhaiAgentOptions) throws -> ValidatedOptions {
+        guard options.prompt.utf8.count <= 1_048_576 else {
+            throw RhaiHostError.failed("agent prompt exceeds 1048576 bytes")
+        }
+        if (options.label?.utf8.count ?? 0) > 256
+            || (options.phase?.utf8.count ?? 0) > 256 {
+            throw RhaiHostError.failed(
+                "agent label and phase must each be at most 256 bytes"
+            )
+        }
+
+        let capability = try LiveWorkflowCapability.clamp(
             requested: options.capabilityMode,
             parent: environment.parentCapabilityMode
         )
+
+        guard !options.isolationWorktree else {
+            throw RhaiHostError.unsupported(
+                "workflow child worktree isolation is not available"
+            )
+        }
+        guard !options.forkContext else {
+            throw RhaiHostError.unsupported(
+                "fork_context is restricted to built-in workflows"
+            )
+        }
+        guard options.resumeFrom == nil else {
+            throw RhaiHostError.unsupported(
+                "workflow child session resume is not available"
+            )
+        }
+        if let agentType = options.agentType, agentType != "general-purpose" {
+            throw RhaiHostError.unsupported(
+                "workflow agent_type '\(agentType)' is not available"
+            )
+        }
+        if let model = options.model, model != environment.model {
+            throw RhaiHostError.unsupported(
+                "workflow model '\(model)' requires an isolated provider sampling route"
+            )
+        }
+
+        let reasoningEffort = try Self.normalizedReasoningEffort(options.reasoningEffort)
+        if reasoningEffort != nil, !environment.supportsReasoningEffort {
+            throw RhaiHostError.unsupported(
+                "reasoning_effort is not supported by the active workflow model"
+            )
+        }
+        return ValidatedOptions(capability: capability, reasoningEffort: reasoningEffort)
+    }
+
+    private static func normalizedReasoningEffort(_ raw: String?) throws -> ReasoningEffort? {
+        guard let raw else { return nil }
+        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized.isEmpty || normalized == "null" || normalized == "undefined" {
+            return nil
+        }
+        guard let effort = parseCanonicalEffortToken(normalized) else {
+            throw RhaiHostError.failed(
+                "invalid reasoning_effort \(String(reflecting: raw)) (expected one of: "
+                    + "none, minimal, low, medium, high, xhigh, max, ultra)"
+            )
+        }
+        return effort
+    }
+
+    private func turnLoop(
+        agentID: String,
+        options: RhaiAgentOptions,
+        validated: ValidatedOptions,
+        emit: @Sendable @escaping (LiveWorkflowAgentEvent) async -> Void
+    ) async throws -> Output {
         let invoker: any LiveWorkflowToolInvoker
         do {
-            invoker = try await environment.makeInvoker(mode)
+            invoker = try await environment.makeInvoker(validated.capability)
         } catch {
             throw RhaiHostError.failed("child agent tool surface unavailable: \(error)")
         }
@@ -244,7 +333,8 @@ struct LiveWorkflowChildAgent: Sendable {
                 prompt: options.prompt,
                 items: items,
                 tools: invoker.tools,
-                jsonSchema: options.outputSchema
+                jsonSchema: options.outputSchema,
+                reasoningEffort: validated.reasoningEffort
             )) { _ in
                 // A child agent's tokens do not stream anywhere: the workflow,
                 // not a pane, is the consumer, and it reads the finished value.
