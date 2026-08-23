@@ -648,6 +648,7 @@ struct LivePagerForkReachabilityTests {
             backend: ForkInertShellBackend(),
             store: store
         )
+        let parentBeforeFork = try await store.load(sessionID: source.sessionID)
 
         let directive = "explore the rate-limit hypothesis"
         try await session.renderer.render(.overlay(.fork(
@@ -664,9 +665,15 @@ struct LivePagerForkReachabilityTests {
         #expect(pending.directive == directive)
         #expect(pending.sessionID == child.sessionID)
         #expect(pending.parentSessionID == source.sessionID)
-        #expect(pending.inheritedItemCount == source.items.count)
-        #expect(child.items == source.items)
-        #expect(try await restartedStore.load(sessionID: source.sessionID) == source)
+        #expect(pending.inheritedItemCount == parentBeforeFork.items.count)
+        #expect(child.items == parentBeforeFork.items)
+        #expect(pending.workingDirectory == child.workingDirectory)
+        #expect(child.currentProvider == parentBeforeFork.currentProvider)
+        #expect(child.currentModelID == parentBeforeFork.currentModelID)
+        #expect(child.everUsedNonXAI == parentBeforeFork.everUsedNonXAI)
+        let parentAfterFork = try await restartedStore.load(sessionID: source.sessionID)
+        #expect(parentAfterFork == parentBeforeFork)
+        #expect(parentAfterFork.pendingFirstPrompt == nil)
         try await session.renderer.restoreTerminal()
         await session.executor.shutdown()
     }
