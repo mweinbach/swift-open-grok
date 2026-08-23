@@ -130,7 +130,7 @@ public enum ACPLeaderCapabilityInjection {
                     setIfAbsent(&meta, "clientIdentifier", .string(clientType))
                 }
             )
-        case "session/new", "session/load":
+        case "session/new", "session/load", "session/resume":
             let isNew = route.method == "session/new"
             return .request(
                 id: id,
@@ -146,11 +146,9 @@ public enum ACPLeaderCapabilityInjection {
                         setIfAbsent(&meta, "modelId", .string(model))
                     }
                     setIfAbsent(&meta, "clientIdentifier", .string(clientType))
-                    setIfAbsent(
-                        &meta,
-                        ACPLeaderCapabilityInjection.clientIDKey,
-                        .number(.uint64(clientID))
-                    )
+                    // Carrier identity is authority, not a client preference:
+                    // accepting a supplied value would redirect private replay.
+                    meta[ACPLeaderCapabilityInjection.clientIDKey] = .number(.uint64(clientID))
                     // Unconditional: these describe the client's actual
                     // abilities, not a preference it may override.
                     meta["codeNavEnabled"] = .bool(capabilities.codeNavEnabled)
@@ -319,6 +317,9 @@ public actor ACPLeaderIPCHost {
         }
         await runtime.setReverseSender { [weak self] message in
             await self?.route(message)
+        }
+        await runtime.setSessionOwnerVerifier { [router] sessionID, clientID in
+            await router.isDriver(clientID: clientID, for: sessionID)
         }
     }
 
@@ -527,10 +528,38 @@ public actor ACPLeaderIPCHost {
             capabilities: handle.capabilities
         )
 
-        // Subscribe the client to any session it names, so notifications for
-        // that session reach it (`server.rs:1847-1861`).
+        if case .response(let requestID, _, _) = injected,
+           await !router.acceptsReverseResponse(requestID, from: String(clientID))
+        {
+            log("leader: dropping reverse response from non-owning client \(clientID)")
+            return
+        }
+
+        // Loading/resuming is the explicit observer-attach boundary. The
+        // claim is provisional until the runtime proves the session exists;
+        // arbitrary mutations must never reserve a future session identifier.
+        var provisionalClaim: AcpSessionId?
         if let sessionID = Self.sessionID(of: injected) {
-            try? await router.claim(sessionID: sessionID, clientID: String(clientID))
+            let route = ACPMethodRoute.normalize(
+                method: injected.method ?? "",
+                params: injected.params ?? .null
+            )
+            if route.method == AgentMethodNames.sessionLoad
+                || route.method == AgentMethodNames.sessionResume {
+                let subscribers = await router.sessionRecipients(sessionID)
+                let role: ACPClientRole = subscribers.isEmpty ? .driver : .subscriber
+                do {
+                    try await router.claim(
+                        sessionID: sessionID,
+                        clientID: String(clientID),
+                        role: role
+                    )
+                    provisionalClaim = sessionID
+                } catch {
+                    log("leader: could not provisionally attach client \(clientID): \(error)")
+                    return
+                }
+            }
         }
 
         let outbound: ACPMessage
@@ -545,7 +574,20 @@ public actor ACPLeaderIPCHost {
             outbound = injected
         }
 
-        let replies = await runtime.handle(outbound)
+        let replies = await ACPLeaderRequestAuthority.$clientID.withValue(String(clientID)) {
+            await runtime.handle(outbound)
+        }
+        if let provisionalClaim,
+           replies.contains(where: { message in
+               if case .response(_, _, _?) = message { return true }
+               return false
+           })
+        {
+            await router.releaseClaim(
+                sessionID: provisionalClaim,
+                clientID: String(clientID)
+            )
+        }
         for reply in replies {
             await route(reply)
         }
@@ -570,14 +612,40 @@ public actor ACPLeaderIPCHost {
     /// subscriptions. Everything else falls to `ACPLeaderRouter`, which already
     /// implements the session-scoped fan-out and the driver-only cases.
     public func route(_ message: ACPMessage) async {
-        if case .response(let id, _, _) = message,
+        if case .response(let id, let result, _) = message,
             let split = ACPLeaderRequestNamespace.split(id)
         {
             guard clients[split.clientID] != nil else {
                 log("leader: dropping response for departed client \(split.clientID)")
                 return
             }
+            if let sessionID = Self.sessionID(in: result) {
+                do {
+                    try await router.claim(
+                        sessionID: sessionID,
+                        clientID: String(split.clientID),
+                        role: .driver
+                    )
+                } catch {
+                    log("leader: could not claim created session for client \(split.clientID): \(error)")
+                    return
+                }
+            }
             await deliver(message, to: split.clientID)
+            return
+        }
+        if let targetClientID = Self.targetClientID(of: message) {
+            guard clients[targetClientID] != nil,
+                  let sessionID = Self.sessionID(of: message),
+                  await router.isSubscribed(
+                    clientID: String(targetClientID),
+                    to: sessionID
+                  )
+            else {
+                log("leader: dropping targeted replay for departed or unauthorized client \(targetClientID)")
+                return
+            }
+            await deliver(message, to: targetClientID)
             return
         }
         if case .notification(let method, let params) = message,
@@ -608,10 +676,38 @@ public actor ACPLeaderIPCHost {
     static func sessionID(of message: ACPMessage) -> AcpSessionId? {
         guard let method = message.method else { return nil }
         let route = ACPMethodRoute.normalize(method: method, params: message.params ?? .null)
-        guard case .object(let object) = route.params,
-            case .string(let value) = object["sessionId"] ?? .null
+        return sessionID(in: route.params)
+    }
+
+    private static func sessionID(in params: JSONValue) -> AcpSessionId? {
+        guard case .object(let object) = params else { return nil }
+        if let value = (
+            object["sessionId"]
+                ?? object["session_id"]
+                ?? object["sourceSessionId"]
+                ?? object["source_session_id"]
+        )?.stringValue {
+            return AcpSessionId(value)
+        }
+        if let nested = object["params"] {
+            return sessionID(in: nested)
+        }
+        return nil
+    }
+
+    private static func sessionID(in result: JSONValue?) -> AcpSessionId? {
+        guard let result else { return nil }
+        return sessionID(in: result)
+    }
+
+    private static func targetClientID(of message: ACPMessage) -> UInt64? {
+        guard case .notification(_, let params) = message,
+              case .object(let object) = params
         else { return nil }
-        return AcpSessionId(value)
+        let direct = object["_meta"]?.objectValue?[ACPLeaderCapabilityInjection.clientIDKey]
+        let nested = object["params"]?.objectValue?["_meta"]?
+            .objectValue?[ACPLeaderCapabilityInjection.clientIDKey]
+        return (direct ?? nested)?.uint64Value
     }
 }
 

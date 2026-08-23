@@ -330,6 +330,10 @@ public enum ACPClientRole: String, Hashable, Sendable, Codable {
     case subscriber
 }
 
+public enum ACPLeaderRequestAuthority {
+    @TaskLocal public static var clientID: String?
+}
+
 public actor ACPLeaderRouter {
     private struct Client {
         var send: @Sendable (ACPMessage) async -> Void
@@ -356,6 +360,7 @@ public actor ACPLeaderRouter {
 
     public func unregister(clientID: String) {
         clients.removeValue(forKey: clientID)
+        interactions = interactions.filter { $0.value != clientID }
         for (sessionID, var route) in sessions {
             route.subscribers.remove(clientID)
             if route.driver == clientID {
@@ -372,7 +377,9 @@ public actor ACPLeaderRouter {
         var route = sessions[sessionID] ?? SessionRoute(driver: nil, subscribers: [])
         switch role {
         case .driver:
-            route.driver = clientID
+            if route.driver == nil || clients[route.driver ?? ""] == nil {
+                route.driver = clientID
+            }
             route.subscribers.insert(clientID)
         case .subscriber:
             route.subscribers.insert(clientID)
@@ -389,9 +396,7 @@ public actor ACPLeaderRouter {
         guard let sessionID = sessionID(in: route.params), let session = sessions[sessionID] else {
             return clients[clientID] == nil ? [] : [clientID]
         }
-        if route.method == ClientMethodNames.sessionUpdate ||
-            route.method == ClientMethodNames.sessionRequestPermission ||
-            route.method == OpenGrokACPExtMethods.askUserQuestion {
+        if route.method == ClientMethodNames.sessionUpdate {
             return Array(session.subscribers).sorted()
         }
         if let driver = session.driver, clients[driver] != nil { return [driver] }
@@ -401,9 +406,7 @@ public actor ACPLeaderRouter {
     public func route(_ message: ACPMessage, from clientID: String) async -> [String] {
         let recipients = recipients(for: message, from: clientID)
         let route = ACPMethodRoute.normalize(method: message.method ?? "", params: message.params ?? .object([:]))
-        if route.method == ClientMethodNames.sessionRequestPermission ||
-            route.method == OpenGrokACPExtMethods.askUserQuestion,
-            let id = message.id,
+        if case .request(let id, _, _) = message,
             let sessionID = sessionID(in: route.params),
             let driver = sessions[sessionID]?.driver {
             interactions[id] = driver
@@ -417,9 +420,49 @@ public actor ACPLeaderRouter {
         Array(sessions[sessionID]?.subscribers ?? []).sorted()
     }
 
+    public func isSubscribed(clientID: String, to sessionID: AcpSessionId) -> Bool {
+        clients[clientID] != nil && sessions[sessionID]?.subscribers.contains(clientID) == true
+    }
+
+    public func isDriver(clientID: String, for sessionID: AcpSessionId) -> Bool {
+        clients[clientID] != nil && sessions[sessionID]?.driver == clientID
+    }
+
+    public func releaseClaim(sessionID: AcpSessionId, clientID: String) {
+        guard var route = sessions[sessionID] else { return }
+        route.subscribers.remove(clientID)
+        clients[clientID]?.sessions.remove(sessionID)
+        if route.driver == clientID {
+            route.driver = route.subscribers.sorted().first
+        }
+        if route.subscribers.isEmpty {
+            sessions.removeValue(forKey: sessionID)
+        } else {
+            sessions[sessionID] = route
+        }
+    }
+
+    public func acceptsReverseResponse(_ requestID: AcpRequestId, from clientID: String) -> Bool {
+        guard interactions[requestID] == clientID, clients[clientID] != nil else {
+            return false
+        }
+        interactions.removeValue(forKey: requestID)
+        return true
+    }
+
     private func sessionID(in params: JSONValue) -> AcpSessionId? {
-        guard case .object(let object) = params,
-              case .string(let value) = object["sessionId"] else { return nil }
-        return AcpSessionId(value)
+        guard case .object(let object) = params else { return nil }
+        if let value = (
+            object["sessionId"]
+                ?? object["session_id"]
+                ?? object["sourceSessionId"]
+                ?? object["source_session_id"]
+        )?.stringValue {
+            return AcpSessionId(value)
+        }
+        if let nested = object["params"] {
+            return sessionID(in: nested)
+        }
+        return nil
     }
 }

@@ -29,6 +29,7 @@ public actor ACPAgentRuntime {
     public typealias SessionOpenedHook = @Sendable (AcpSessionId, AcpMeta?) async throws -> Void
     public typealias SessionClosedHook = @Sendable (AcpSessionId) async -> Void
     public typealias PeerPromptPreparation = @Sendable () async throws -> Void
+    public typealias SessionOwnerVerifier = @Sendable (AcpSessionId, String) async -> Bool
 
     public enum PeerPromptAdmission: Sendable, Equatable {
         case accepted
@@ -67,6 +68,7 @@ public actor ACPAgentRuntime {
     private var notificationSink: NotificationSink?
     private var rosterNotificationSink: NotificationSink?
     private var reverseSender: (@Sendable (ACPMessage) async throws -> Void)?
+    private var sessionOwnerVerifier: SessionOwnerVerifier?
     private var openedLifecycleSessions: Set<AcpSessionId> = []
 
     private struct RosterMetadata: Sendable {
@@ -127,6 +129,10 @@ public actor ACPAgentRuntime {
 
     public func setReverseSender(_ sender: (@Sendable (ACPMessage) async throws -> Void)?) {
         reverseSender = sender
+    }
+
+    public func setSessionOwnerVerifier(_ verifier: SessionOwnerVerifier?) {
+        sessionOwnerVerifier = verifier
     }
 
     public func hasConnectedReverseClient() -> Bool {
@@ -339,6 +345,14 @@ public actor ACPAgentRuntime {
                     await emitProtocolError(error)
                 }
             } else {
+                do {
+                    try requireReady()
+                } catch {
+                    return []
+                }
+                if await !mayControlLeaderSession(from: route.params) {
+                    return []
+                }
                 // Upstream routes every non-core JSON-RPC notification to
                 // `ext_notification`, which matches known names and silently
                 // ignores the rest (acp_agent.rs:4481-4720). The ext-METHOD
@@ -366,6 +380,15 @@ public actor ACPAgentRuntime {
 
     private func dispatch(method: String, params: JSONValue) async throws -> JSONValue {
         let route = ACPMethodRoute.normalize(method: method, params: params)
+        if sessionOwnerVerifier != nil,
+           Self.driverControlledCoreMethods.contains(route.method),
+           await !mayControlLeaderSession(from: route.params)
+        {
+            if let sessionID = Self.sessionID(in: route.params) {
+                throw ACPRuntimeError.sessionNotFound(sessionID)
+            }
+            throw ACPRuntimeError.authenticationRequired
+        }
         switch route.method {
         case AgentMethodNames.initialize:
             return try await initialize(route.params)
@@ -398,8 +421,15 @@ public actor ACPAgentRuntime {
         case ACPLeaderRosterMethods.sessionsList:
             return try await listRoster()
         default:
+            try requireReady()
             guard let extensionRouter else {
                 throw ACPRuntimeError.methodNotFound(route.method)
+            }
+            if await !mayControlLeaderSession(from: route.params) {
+                if let sessionID = Self.sessionID(in: route.params) {
+                    throw ACPRuntimeError.sessionNotFound(sessionID)
+                }
+                throw ACPRuntimeError.authenticationRequired
             }
             return try await extensionRouter.dispatch(method: route.method, params: route.params)
         }
@@ -438,10 +468,15 @@ public actor ACPAgentRuntime {
             // ext notifications go to `ext_notification` dispatch, never the
             // method router, and always acknowledge empty (a notification has
             // no failure channel — acp_agent.rs:4481 returns Ok on every arm).
-            await extensionNotifications?.dispatch(
-                method: args.request.method,
-                params: args.request.params
-            )
+            do {
+                try requireReady()
+                if await mayControlLeaderSession(from: args.request.params) {
+                    await extensionNotifications?.dispatch(
+                        method: args.request.method,
+                        params: args.request.params
+                    )
+                }
+            } catch {}
             _ = args.respond(.success(EmptyAcpResponse()))
         case .askUserQuestion(let args): await handleTyped(args)
         }
@@ -459,6 +494,19 @@ public actor ACPAgentRuntime {
         AgentMethodNames.sessionResume,
         AgentMethodNames.sessionFork,
         AgentMethodNames.sessionList,
+        AgentMethodNames.sessionClose,
+        AgentMethodNames.sessionPrompt,
+        AgentMethodNames.sessionCancel,
+        AgentMethodNames.sessionSetMode,
+        AgentMethodNames.sessionSetModeCamel,
+        AgentMethodNames.sessionSetModel,
+        AgentMethodNames.sessionSetModelCamel,
+        AgentMethodNames.sessionSetConfigOption,
+    ]
+
+    private static let driverControlledCoreMethods: Set<String> = [
+        AgentMethodNames.logout,
+        AgentMethodNames.sessionFork,
         AgentMethodNames.sessionClose,
         AgentMethodNames.sessionPrompt,
         AgentMethodNames.sessionCancel,
@@ -552,6 +600,14 @@ public actor ACPAgentRuntime {
         guard var session = try await store.read(request.sessionId) else {
             throw ACPRuntimeError.sessionNotFound(request.sessionId)
         }
+        if sessionOwnerVerifier != nil,
+           openedLifecycleSessions.contains(request.sessionId),
+           await !ownsSession(request.sessionId)
+        {
+            guard !session.closed else { throw ACPRuntimeError.sessionClosed(request.sessionId) }
+            await replay(session, leaderClientID: request.meta?[ACPLeaderCapabilityInjection.clientIDKey])
+            return try encode(LoadSessionResponse(modes: configuration.modes, models: configuration.models))
+        }
         session.cwd = try await validateWorkspace(request.cwd)
         session.additionalDirectories = request.additionalDirectories
         session.mcpServers = request.mcpServers
@@ -569,7 +625,7 @@ public actor ACPAgentRuntime {
             throw error
         }
         updateRosterMetadata(sessionId: session.sessionId, meta: request.meta)
-        await replay(session)
+        await replay(session, leaderClientID: request.meta?[ACPLeaderCapabilityInjection.clientIDKey])
         await publishRosterUpsert(sessionId: session.sessionId)
         return try encode(LoadSessionResponse(modes: configuration.modes, models: configuration.models))
     }
@@ -579,6 +635,14 @@ public actor ACPAgentRuntime {
         let request = try decode(ResumeSessionRequest.self, from: params, method: AgentMethodNames.sessionResume)
         guard var session = try await store.read(request.sessionId) else {
             throw ACPRuntimeError.sessionNotFound(request.sessionId)
+        }
+        if sessionOwnerVerifier != nil,
+           openedLifecycleSessions.contains(request.sessionId),
+           await !ownsSession(request.sessionId)
+        {
+            guard !session.closed else { throw ACPRuntimeError.sessionClosed(request.sessionId) }
+            await replay(session, leaderClientID: request.meta?[ACPLeaderCapabilityInjection.clientIDKey])
+            return try encode(ResumeSessionResponse(modes: configuration.modes, models: configuration.models))
         }
         if let cwd = request.cwd {
             session.cwd = try await validateWorkspace(cwd)
@@ -603,7 +667,7 @@ public actor ACPAgentRuntime {
             throw error
         }
         updateRosterMetadata(sessionId: session.sessionId, meta: request.meta)
-        await replay(session)
+        await replay(session, leaderClientID: request.meta?[ACPLeaderCapabilityInjection.clientIDKey])
         await publishRosterUpsert(sessionId: session.sessionId)
         return try encode(ResumeSessionResponse(modes: configuration.modes, models: configuration.models))
     }
@@ -683,9 +747,8 @@ public actor ACPAgentRuntime {
     }
 
     private func openSessionLifecycle(sessionId: AcpSessionId, meta: AcpMeta?) async throws {
-        guard let onSessionOpened else { return }
         do {
-            try await onSessionOpened(sessionId, meta)
+            try await onSessionOpened?(sessionId, meta)
             guard state != .closed else {
                 throw ACPRuntimeError.transport("ACP client disconnected while opening its session")
             }
@@ -858,6 +921,85 @@ public actor ACPAgentRuntime {
         return .accepted
     }
 
+    /// Admit an authenticated connected user's idle interjection as an actual
+    /// user prompt; peer-message provenance must never be reused for consent.
+    public func submitUserInterjection(
+        sessionId: AcpSessionId,
+        promptID: String,
+        text: String
+    ) async throws -> PeerPromptAdmission {
+        try requireReady()
+        guard !promptID.hasPrefix("peer-message-") else {
+            throw ACPRuntimeError.invalidParams("user interjections cannot use peer-message provenance")
+        }
+        guard await ownsSession(sessionId),
+              let session = try await store.read(sessionId),
+              !session.closed,
+              state != .closed,
+              openedLifecycleSessions.contains(sessionId)
+        else {
+            return .unknownSession
+        }
+        guard activePrompts[sessionId] == nil,
+              !startingPrompts.contains(sessionId)
+        else {
+            return .busy
+        }
+
+        let request = PromptRequest(
+            sessionId: sessionId,
+            prompt: [.text(text)],
+            messageId: promptID,
+            meta: ["promptId": .string(promptID)]
+        )
+        let generation = UUID()
+        let driver = promptDriver
+        let runtime = self
+        let task = Task<PromptRunOutcome, Never> {
+            do {
+                for block in request.prompt {
+                    await runtime.emit(
+                        SessionNotification(
+                            sessionId: sessionId,
+                            update: .userMessageChunk(ContentChunk(content: block))
+                        ),
+                        disposition: .durable
+                    )
+                    try Task.checkCancellation()
+                }
+                await runtime.publishRosterUpsert(sessionId: sessionId, activity: .working)
+                let response = try await driver.run(
+                    context: ACPPromptContext(session: session, request: request),
+                    emit: { update, disposition in
+                        await runtime.emit(update, disposition: disposition)
+                    }
+                )
+                return PromptRunOutcome(response: response, failure: nil)
+            } catch is CancellationError {
+                return PromptRunOutcome(
+                    response: PromptResponse(stopReason: .cancelled, userMessageId: promptID),
+                    failure: nil
+                )
+            } catch {
+                return PromptRunOutcome(
+                    response: PromptResponse(stopReason: .refusal, userMessageId: promptID),
+                    failure: runtime.protocolError(for: error)
+                )
+            }
+        }
+        activePrompts[sessionId] = task
+        peerPromptGenerations[sessionId] = generation
+        Task { [weak runtime] in
+            let outcome = await task.value
+            await runtime?.finishPeerPrompt(
+                request: request,
+                generation: generation,
+                outcome: outcome
+            )
+        }
+        return .accepted
+    }
+
     private func finishPeerPrompt(
         request: PromptRequest,
         generation: UUID,
@@ -954,6 +1096,60 @@ public actor ACPAgentRuntime {
         return snapshot != nil
     }
 
+    public func ownsSession(_ sessionId: AcpSessionId) async -> Bool {
+        do {
+            try requireReady()
+        } catch {
+            return false
+        }
+        guard state != .closed, openedLifecycleSessions.contains(sessionId) else {
+            return false
+        }
+        if let sessionOwnerVerifier {
+            guard let clientID = ACPLeaderRequestAuthority.clientID,
+                  await sessionOwnerVerifier(sessionId, clientID)
+            else {
+                return false
+            }
+        }
+        do {
+            guard let session = try await store.read(sessionId) else { return false }
+            return !session.closed
+        } catch {
+            return false
+        }
+    }
+
+    private func mayControlLeaderSession(from params: JSONValue) async -> Bool {
+        guard let sessionOwnerVerifier else { return true }
+        guard let clientID = ACPLeaderRequestAuthority.clientID else { return false }
+        if let sessionID = Self.sessionID(in: params) {
+            return await ownsSession(sessionID)
+        }
+        for sessionID in openedLifecycleSessions {
+            if await sessionOwnerVerifier(sessionID, clientID) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func sessionID(in params: JSONValue) -> AcpSessionId? {
+        guard case .object(let object) = params else { return nil }
+        if let raw = (
+            object["sessionId"]
+            ?? object["session_id"]
+            ?? object["sourceSessionId"]
+            ?? object["source_session_id"]
+        )?.stringValue {
+            return AcpSessionId(raw)
+        }
+        if let nested = object["params"] {
+            return sessionID(in: nested)
+        }
+        return nil
+    }
+
     private func cancel(_ params: JSONValue) async throws -> JSONValue {
         try requireReady()
         let request = try decode(CancelNotification.self, from: params, method: AgentMethodNames.sessionCancel)
@@ -1041,11 +1237,14 @@ public actor ACPAgentRuntime {
         }
     }
 
-    private func replay(_ session: ACPSessionSnapshot) async {
+    private func replay(_ session: ACPSessionSnapshot, leaderClientID: JSONValue? = nil) async {
         for original in session.durableUpdates {
             var notification = original
             var meta = notification.meta ?? [:]
             meta["isReplay"] = .bool(true)
+            if let leaderClientID, leaderClientID.uint64Value != nil {
+                meta[ACPLeaderCapabilityInjection.clientIDKey] = leaderClientID
+            }
             notification.meta = meta
             await emit(notification, disposition: .live)
         }

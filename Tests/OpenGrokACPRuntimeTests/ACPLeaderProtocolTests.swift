@@ -552,6 +552,37 @@ struct ACPLeaderCapabilityInjectionTests {
         #expect(meta[ACPLeaderCapabilityInjection.clientIDKey] == .number(.uint64(7)))
     }
 
+    @Test("session/resume carries the authenticated replay owner without replacing its model")
+    func sessionResumeInjection() {
+        let injected = meta(
+            inject(
+                method: "session/resume",
+                capabilities: ACPLeaderClientCapabilities(yoloMode: true, defaultModel: "grok-4")
+            )
+        )
+        #expect(injected["yoloMode"] == nil)
+        #expect(injected["modelId"] == nil)
+        #expect(injected[ACPLeaderCapabilityInjection.clientIDKey] == .number(.uint64(7)))
+    }
+
+    @Test("a client cannot forge another carrier's private replay identity")
+    func replayIdentityAlwaysBelongsToAuthenticatedCarrier() {
+        for method in ["session/new", "session/load", "session/resume"] {
+            let injected = meta(
+                inject(
+                    method: method,
+                    params: .object([
+                        "_meta": .object([
+                            ACPLeaderCapabilityInjection.clientIDKey: .number(.uint64(99)),
+                        ]),
+                    ]),
+                    capabilities: ACPLeaderClientCapabilities()
+                )
+            )
+            #expect(injected[ACPLeaderCapabilityInjection.clientIDKey] == .number(.uint64(7)))
+        }
+    }
+
     @Test("initialize gets only the client identifier")
     func initializeInjection() {
         let meta = meta(

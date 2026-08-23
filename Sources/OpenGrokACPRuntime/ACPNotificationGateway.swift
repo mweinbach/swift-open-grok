@@ -232,6 +232,43 @@ public actor ACPNotificationGateway {
         return await runtime.sessionExists(sessionId)
     }
 
+    public func ownsSession(_ sessionId: AcpSessionId) async -> Bool {
+        guard let runtime,
+              await runtime.ownsSession(sessionId),
+              self.runtime === runtime
+        else {
+            return false
+        }
+        return true
+    }
+
+    public func submitUserInterjection(
+        sessionId: AcpSessionId,
+        promptID: String,
+        text: String
+    ) async throws -> ACPAgentRuntime.PeerPromptAdmission {
+        guard let runtime, await isCurrentConnectedRuntime(runtime) else {
+            throw ACPRuntimeError.transport("the owning ACP client has disconnected")
+        }
+        return try await runtime.submitUserInterjection(
+            sessionId: sessionId,
+            promptID: promptID,
+            text: text
+        )
+    }
+
+    public func submitUserInterjection(
+        sessionId: AcpSessionId,
+        text: String,
+        interjectionID: String?
+    ) async throws -> Bool {
+        try await submitUserInterjection(
+            sessionId: sessionId,
+            promptID: interjectionID ?? "interjection-\(UUID().uuidString)",
+            text: text
+        ) == .accepted
+    }
+
     /// Fire-and-forget one extension notification to the connected client —
     /// the port of `GatewaySender::forward_fire_and_forget`. Dropped when no
     /// runtime is attached, which is upstream's behavior for a gateway whose

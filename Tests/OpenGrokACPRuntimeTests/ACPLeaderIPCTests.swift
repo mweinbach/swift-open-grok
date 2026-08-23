@@ -395,10 +395,9 @@ struct ACPLeaderIPCRoutingTests {
         #expect(secondReply.id == .number(1))
     }
 
-    /// The shared-agent guarantee: a session created by one client is
-    /// addressable by another. Without it, leader mode is just several agents
-    /// behind one socket.
-    @Test("a session created by one client is usable by another", .timeLimit(.minutes(1)))
+    /// Observers may explicitly attach and replay a shared session, but its
+    /// original driver alone retains prompt and tool-authorization authority.
+    @Test("observers may load a shared session but cannot drive its owner's turn", .timeLimit(.minutes(1)))
     func sessionsAreShared() async throws {
         let host = makeHost()
         let (first, servedFirst) = attach(to: host)
@@ -426,9 +425,34 @@ struct ACPLeaderIPCRoutingTests {
         }
         let session = try sessionID(from: created)
 
+        try await second.sendACP(.request(
+            id: .number(19),
+            method: AgentMethodNames.sessionLoad,
+            params: .object([
+                "sessionId": .string(session),
+                "cwd": .string(FileManager.default.currentDirectoryPath),
+                "mcpServers": .array([]),
+            ])
+        ))
+        let attached = try await second.nextACP { message in
+            if case .response(.number(19), _, _) = message { return true }
+            return false
+        }
+        if case .response(_, _, let error) = attached { #expect(error == nil) }
+
         try await second.sendACP(leaderPrompt(id: 20, sessionId: session))
-        let done = try await second.nextACP { message in
+        let rejected = try await second.nextACP { message in
             if case .response(.number(20), _, _) = message { return true }
+            return false
+        }
+        if case .response(_, let result, let error) = rejected {
+            #expect(result == nil)
+            #expect(error != nil)
+        }
+
+        try await first.sendACP(leaderPrompt(id: 21, sessionId: session))
+        let done = try await first.nextACP { message in
+            if case .response(.number(21), _, _) = message { return true }
             return false
         }
         if case .response(_, let result, let error) = done {
