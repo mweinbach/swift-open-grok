@@ -377,6 +377,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// stacking side-calls.
     var recapTask: Task<Void, Never>?
     var recapLaunchInProgress = false
+    /// The focus-loss-owned recap poll. It wakes first at the configured away
+    /// threshold, then mirrors upstream's 20-second idle eligibility poll.
+    var awayRecapPollTask: Task<Void, Never>?
+    var awayRecapPollGeneration: UInt64 = 0
     /// Bumped when a new turn starts or the session is swapped, so a recap
     /// that finishes late is discarded instead of painting into a
     /// conversation it no longer describes — upstream's `recap_epoch`
@@ -1637,6 +1641,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // A swapped conversation invalidates an in-flight recap the same
             // way a new prompt does — it no longer describes this session.
             recapEpoch &+= 1
+            cancelAwayRecapPregeneration()
             let preserveDashboard = preserveDashboardOnNextSessionSwitch
             preserveDashboardOnNextSessionSwitch = false
             registerSessionTab(sessionID)
@@ -1653,8 +1658,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             if preserveDashboard {
                 restoreDashboardAfterSessionSwitch()
             }
+            if !terminalNotifications.focused {
+                scheduleAwayRecapPregeneration()
+            }
         case .sessionResumed(let sessionID):
             recapEpoch &+= 1
+            cancelAwayRecapPregeneration()
             let preserveDashboard = preserveDashboardOnNextSessionSwitch
             preserveDashboardOnNextSessionSwitch = false
             registerSessionTab(sessionID)
@@ -1662,6 +1671,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             await synchronizeRendererWorkingDirectory(sessionID: sessionID)
             if preserveDashboard {
                 restoreDashboardAfterSessionSwitch()
+            }
+            if !terminalNotifications.focused {
+                scheduleAwayRecapPregeneration()
             }
         case .notice(let message):
             appendMessage(PagerMessage(role: .system, text: message))
@@ -2142,6 +2154,12 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     func restoreTerminal() async throws {
         guard !restored else { return }
         restored = true
+        cancelAwayRecapPregeneration()
+        recapEpoch &+= 1
+        if let recapTask {
+            recapTask.cancel()
+            await recapTask.value
+        }
         // A restore mid-gutter-drag must not leave the latch armed for a
         // later session on the same renderer instance.
         clearScrollbarDragLatch()
@@ -2726,6 +2744,90 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
 
     // MARK: - /recap
 
+    private static let awayRecapPollIntervalNanoseconds: UInt64 = 20_000_000_000
+
+    func cancelAwayRecapPregeneration() {
+        awayRecapPollGeneration &+= 1
+        awayRecapPollTask?.cancel()
+        awayRecapPollTask = nil
+    }
+
+    func scheduleAwayRecapPregeneration(delayNanoseconds: UInt64? = nil) {
+        guard !restored,
+              !terminalNotifications.focused,
+              terminalNotifications.sessionStarted,
+              terminalNotifications.configuration.sessionRecap,
+              !sessionID.isEmpty,
+              modelSwitch != nil,
+              conversationHistory != nil,
+              LiveRecap.enabled(
+                workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true),
+                openGrokHome: openGrokHome,
+                environment: environment
+              )
+        else { return }
+
+        let delay: UInt64
+        if let delayNanoseconds {
+            delay = delayNanoseconds
+        } else {
+            let (threshold, overflow) = terminalNotifications.configuration
+                .sessionRecapThresholdSeconds.multipliedReportingOverflow(by: 1_000_000_000)
+            guard !overflow, let lostAt = terminalNotifications.focusLostAtNanoseconds else {
+                return
+            }
+            let now = DispatchTime.now().uptimeNanoseconds
+            let elapsed = now >= lostAt ? now - lostAt : 0
+            delay = threshold > elapsed ? threshold - elapsed : 0
+        }
+
+        let generation = awayRecapPollGeneration
+        let expectedSessionID = sessionID
+        awayRecapPollTask = Task { [weak self] in
+            do {
+                if delay > 0 { try await Task.sleep(nanoseconds: delay) }
+                try Task.checkCancellation()
+            } catch {
+                return
+            }
+            await self?.pollAwayRecapPregeneration(
+                generation: generation,
+                expectedSessionID: expectedSessionID
+            )
+        }
+    }
+
+    private func pollAwayRecapPregeneration(
+        generation: UInt64,
+        expectedSessionID: String
+    ) async {
+        guard generation == awayRecapPollGeneration,
+              !restored,
+              !terminalNotifications.focused,
+              terminalNotifications.sessionStarted,
+              sessionID == expectedSessionID
+        else { return }
+
+        if terminalNotifications.recapDue() {
+            await startRecap(auto: true)
+        }
+
+        guard generation == awayRecapPollGeneration,
+              !restored,
+              !terminalNotifications.focused,
+              terminalNotifications.sessionStarted,
+              sessionID == expectedSessionID,
+              !terminalNotifications.recapShownThisAway
+        else {
+            if generation == awayRecapPollGeneration { awayRecapPollTask = nil }
+            return
+        }
+        awayRecapPollTask = nil
+        scheduleAwayRecapPregeneration(
+            delayNanoseconds: Self.awayRecapPollIntervalNanoseconds
+        )
+    }
+
     /// Kick off a manual or return-from-away session-recap side-call
     /// (`handle_recap`, acp_session_impl/recap.rs:250-507). One read-only
     /// snapshot of the live conversation, ONE tool-free model call on the
@@ -2912,6 +3014,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         result: Result<String, any Error>
     ) {
         recapTask = nil
+        guard !restored else {
+            conversation.removeBlock(id: blockID)
+            if activeRecapBlockID == blockID { activeRecapBlockID = nil }
+            return
+        }
         // A prompt accepted (or a session swapped) while generating: keep the
         // late recap out of a conversation it no longer describes; the manual
         // path still clears its feedback (recap.rs:430-455).
@@ -2939,6 +3046,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                 summary = cleaned
                 saveRecapWatermark(mainTurnCount)
                 terminalNotifications.markRecapShown()
+                if auto, !terminalNotifications.focused {
+                    cancelAwayRecapPregeneration()
+                }
             }
         case .failure:
             // A failed side-call must never break the session: the failure
@@ -4236,6 +4346,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         case .focusGained:
             let recapDue = terminalNotifications.configuration.sessionRecap
                 && terminalNotifications.recapDue()
+            cancelAwayRecapPregeneration()
             terminalNotifications.focusGained()
             updateTerminalNotificationPresentation()
             if recapDue {
@@ -4243,8 +4354,10 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             }
             return .consumed
         case .focusLost:
+            cancelAwayRecapPregeneration()
             terminalNotifications.focusLost()
             updateTerminalNotificationPresentation()
+            scheduleAwayRecapPregeneration()
             return .consumed
         case .mouse(let mouse):
             guard mouseReportingEnabled else { return .notHandled }
