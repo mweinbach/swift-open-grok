@@ -15,6 +15,33 @@ public func isAltGr(_ modifiers: KeyModifiers) -> Bool {
     #endif
 }
 
+func resolveMovement(_ event: KeyEvent) -> Movement? {
+    let modifiers = event.modifiers
+    switch event.key {
+    case .left where modifiers.contains(.superKey) || modifiers.contains(.meta):
+        return .visualRowStart
+    case .right where modifiers.contains(.superKey) || modifiers.contains(.meta):
+        return .visualRowEnd
+    case .home:
+        return .logicalLineStart
+    case .end:
+        return .logicalLineEnd
+    case .up:
+        return .visualRowUp
+    case .down:
+        return .visualRowDown
+    case let .char(character) where character == "p" && modifiers == [.control]:
+        return .visualRowUp
+    case let .char(character) where character == "n" && modifiers == [.control]:
+        return .visualRowDown
+    default:
+        guard let command = classifyKeyEvent(event), let edge = command.selectionCollapseEdge else {
+            return nil
+        }
+        return .command(command, edge)
+    }
+}
+
 /// Classify a key event into a semantic edit command, or `nil` when the host
 /// adapter owns the binding (Home/End visual, Enter, undo, etc.).
 public func classifyKeyEvent(_ event: KeyEvent) -> EditCommand? {

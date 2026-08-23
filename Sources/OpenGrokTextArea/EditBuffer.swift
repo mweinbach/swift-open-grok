@@ -33,7 +33,48 @@ public enum EditCommandCategory: Sendable, Equatable {
     case insert, navigation, delete, kill
 }
 
+enum HorizontalEdge: Sendable, Equatable {
+    case start
+    case end
+}
+
+enum Movement: Sendable, Equatable {
+    case command(EditCommand, HorizontalEdge)
+    case visualRowUp
+    case visualRowDown
+    case visualRowStart
+    case visualRowEnd
+    case logicalLineStart
+    case logicalLineEnd
+
+    var collapseEdge: HorizontalEdge {
+        switch self {
+        case let .command(_, edge): edge
+        case .visualRowUp, .visualRowStart, .logicalLineStart: .start
+        case .visualRowDown, .visualRowEnd, .logicalLineEnd: .end
+        }
+    }
+
+    var stopsAtCollapseEdge: Bool {
+        switch self {
+        case .command(.moveGraphemeLeft, _), .command(.moveGraphemeRight, _): true
+        default: false
+        }
+    }
+}
+
 extension EditCommand {
+    var selectionCollapseEdge: HorizontalEdge? {
+        switch self {
+        case .moveGraphemeLeft, .moveWordLeft, .moveLogicalLineStart:
+            .start
+        case .moveGraphemeRight, .moveWordRight, .moveLogicalLineEnd:
+            .end
+        default:
+            nil
+        }
+    }
+
     public var category: EditCommandCategory {
         switch self {
         case .insert: return .insert

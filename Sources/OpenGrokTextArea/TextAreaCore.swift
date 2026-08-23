@@ -290,7 +290,29 @@ public final class TextArea {
     // MARK: Selection
 
     public var selectionRange: Range<Int>? {
-        selection.map(\.range)
+        guard let selection else { return nil }
+        var start = min(max(0, min(selection.anchor, selection.head)), buffer.count)
+        var end = min(max(0, max(selection.anchor, selection.head)), buffer.count)
+        guard start < end else { return nil }
+
+        start = buffer.text.floorGraphemeBoundary(byte: start)
+        end = buffer.text.ceilGraphemeBoundary(byte: end)
+
+        var expanded: Bool
+        repeat {
+            expanded = false
+            for element in elements where start < element.range.upperBound && end > element.range.lowerBound {
+                let expandedStart = min(start, element.range.lowerBound)
+                let expandedEnd = max(end, element.range.upperBound)
+                if expandedStart != start || expandedEnd != end {
+                    start = expandedStart
+                    end = expandedEnd
+                    expanded = true
+                }
+            }
+        } while expanded
+
+        return start < end ? start..<end : nil
     }
 
     public func selectedText() -> String? {
@@ -312,6 +334,47 @@ public final class TextArea {
 
     public func setSelection(anchor: Int, head: Int) {
         selection = Selection(anchor: anchor, head: head)
+    }
+
+    public func insertStrReplacingSelection(_ text: String) {
+        guard selectionRange != nil else {
+            clearSelection()
+            insertStr(text)
+            return
+        }
+
+        beginUndoGroup()
+        if deleteSelection() {
+            insertStr(text)
+        } else {
+            clearSelection()
+            insertStr(text)
+        }
+        endUndoGroup()
+    }
+
+    private func collapseSelection(to position: Int) {
+        setCursor(position)
+        clearSelection()
+    }
+
+    private func extendSelection(_ movement: Movement) {
+        let anchor: Int
+        if let selection {
+            if cursor != selection.head {
+                setCursor(selection.head)
+            }
+            anchor = selection.anchor
+        } else {
+            anchor = cursor
+        }
+
+        applyMovement(movement)
+        if cursor == anchor {
+            clearSelection()
+        } else {
+            setSelection(anchor: anchor, head: cursor)
+        }
     }
 
     // MARK: Clipboard
@@ -336,44 +399,77 @@ public final class TextArea {
     // MARK: Input
 
     public func input(_ event: KeyEvent) {
-        if selection != nil {
-            if let cmd = classifyKeyEvent(event), case .insert(let ch) = cmd {
-                beginUndoGroup()
-                if !deleteSelection() { clearSelection() }
-                insertStr(String(ch))
-                endUndoGroup()
+        if event.modifiers.contains(.shift) && !isReservedSuperVerticalSelection(event) {
+            let unshifted = keyEventWithoutSelectionShift(event)
+            if let movement = resolveMovement(unshifted) {
+                extendSelection(movement)
                 return
             }
+        }
+
+        if selection != nil {
+            let classified = classifyKeyEvent(event)
+            if case let .insert(character)? = classified {
+                insertStrReplacingSelection(String(character))
+                return
+            }
+
+            if let range = selectionRange, let movement = resolveMovement(event) {
+                let edge = movement.collapseEdge == .start ? range.lowerBound : range.upperBound
+                let preferredColumn = preferredColStorage
+                collapseSelection(to: edge)
+                if movement == .visualRowUp || movement == .visualRowDown {
+                    preferredColStorage = preferredColumn
+                }
+                if !movement.stopsAtCollapseEdge {
+                    applyMovement(movement)
+                }
+                return
+            }
+
+            let category = classified?.category
             switch event.key {
             case .enter:
-                beginUndoGroup()
-                if !deleteSelection() { clearSelection() }
-                insertStr("\n")
-                endUndoGroup()
+                insertStrReplacingSelection("\n")
                 return
             // Ctrl+J is readline newline (`textarea.rs:1918-1935`). Host-owned
             // Ctrl+M (multiline) never reaches this intercept.
             case .char(let ch) where ch == "j" && event.modifiers == [.control]:
-                beginUndoGroup()
-                if !deleteSelection() { clearSelection() }
-                insertStr("\n")
-                endUndoGroup()
+                insertStrReplacingSelection("\n")
                 return
-            case .backspace, .delete:
+            case _ where category == .delete || category == .kill:
+                if category == .kill, let selected = selectedText() {
+                    killBuffer = selected
+                }
                 if deleteSelection() { return }
                 clearSelection()
-            // Ctrl+H is backward-delete (`textarea.rs:1941-1959`). Host-owned
-            // Ctrl+D (EOF) / Ctrl+X (shortcuts) never reach this intercept.
-            case .char(let ch) where ch == "h" && event.modifiers == [.control]:
-                if deleteSelection() { return }
-                clearSelection()
-            case .char(let ch) where ch == "x" && event.modifiers == [.control]:
+            case .char(let ch) where ch == "x" && (
+                event.modifiers == [.control]
+                    || event.modifiers.contains(.superKey)
+                    || event.modifiers.contains(.meta)
+            ):
                 if let t = selectedText() { setClipboardText(t) }
                 if deleteSelection() { return }
                 clearSelection()
+            case .char(let ch) where ch == "c" && (
+                event.modifiers.contains(.superKey) || event.modifiers.contains(.meta)
+            ):
+                if let text = selectedText() {
+                    setClipboardText(text)
+                } else {
+                    clearSelection()
+                }
+                return
+            case .char(let ch) where (ch == "y" || ch == "v") && event.modifiers == [.control]:
+                break
             default:
                 clearSelection()
             }
+        }
+
+        if let movement = resolveMovement(event) {
+            applyMovement(movement)
+            return
         }
 
         if let command = classifyKeyEvent(event) {
@@ -401,26 +497,62 @@ public final class TextArea {
         case .char(let ch) where ch == "r" && mods == [.control]:
             redo()
         case .char(let ch) where ch == "v" && mods == [.control]:
-            if let t = clipboardProvider.get() { insertStr(t) }
-        case .left where mods.contains(.superKey) || mods.contains(.meta):
-            moveCursorToBeginningOfLine(moveUpAtBOL: false)
-        case .right where mods.contains(.superKey) || mods.contains(.meta):
-            moveCursorToEndOfLine(moveDownAtEOL: false)
-        case .up:
-            moveCursorUp()
-        case .down:
-            moveCursorDown()
-        case .char(let ch) where ch == "p" && mods == [.control]:
-            moveCursorUp()
-        case .char(let ch) where ch == "n" && mods == [.control]:
-            moveCursorDown()
-        case .home:
-            moveCursorToBeginningOfLine(moveUpAtBOL: false)
-        case .end:
-            moveCursorToEndOfLine(moveDownAtEOL: false)
+            if let text = clipboardProvider.get() { insertStrReplacingSelection(text) }
         default:
             break
         }
+    }
+
+    private func applyMovement(_ movement: Movement) {
+        switch movement {
+        case let .command(command, _):
+            applyEditCommand(command, nil)
+        case .visualRowUp:
+            moveCursorUp()
+        case .visualRowDown:
+            moveCursorDown()
+        case .visualRowStart:
+            moveCursorToVisualRowEdge(.start)
+        case .visualRowEnd:
+            moveCursorToVisualRowEdge(.end)
+        case .logicalLineStart:
+            setCursor(beginningOfCurrentLine())
+        case .logicalLineEnd:
+            setCursor(endOfCurrentLine())
+        }
+    }
+
+    private func moveCursorToVisualRowEdge(_ edge: HorizontalEdge) {
+        ensureWrapCache(width: wrapCache?.width ?? 80)
+        guard let cache = wrapCache, let row = wrappedLineIndex(cache.lines, cursor) else {
+            setCursor(edge == .start ? beginningOfCurrentLine() : endOfCurrentLine())
+            return
+        }
+        setCursor(edge == .start ? cache.lines[row].lowerBound : cache.lines[row].upperBound)
+    }
+
+    private func isReservedSuperVerticalSelection(_ event: KeyEvent) -> Bool {
+        guard event.modifiers.contains(.superKey) || event.modifiers.contains(.meta) else {
+            return false
+        }
+        return event.key == .up || event.key == .down
+    }
+
+    private func keyEventWithoutSelectionShift(_ event: KeyEvent) -> KeyEvent {
+        let normalizedKey: KeyCode
+        if case let .char(character) = event.key,
+           character.isASCII,
+           character.isUppercase,
+           let lowered = String(character).lowercased().first {
+            normalizedKey = .char(lowered)
+        } else {
+            normalizedKey = event.key
+        }
+        return KeyEvent(
+            key: normalizedKey,
+            modifiers: event.modifiers.subtracting(.shift),
+            character: event.character
+        )
     }
 
     private func applyClassifiedCommand(_ command: EditCommand) {
@@ -489,7 +621,15 @@ public final class TextArea {
     public func yank() {
         guard !killBuffer.isEmpty else { return }
         let text = killBuffer
+        let replacingSelection = selectionRange != nil
+        if replacingSelection {
+            beginUndoGroup()
+            if !deleteSelection() { clearSelection() }
+        }
         applyEditReplacement(cursor..<cursor, text, .insert)
+        if replacingSelection {
+            endUndoGroup()
+        }
         if let last = text.last { undoState.lastInsertWS = last.isWhitespace }
     }
 
