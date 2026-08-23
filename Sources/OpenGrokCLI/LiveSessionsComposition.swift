@@ -545,7 +545,8 @@ public enum LiveSessionsComposition {
         environment: [String: String],
         streams: CLIStreams,
         foreignScanner: (any ForeignSessionScanning)? = nil,
-        foreignSources: EnabledForeignSources = .none
+        foreignSources: EnabledForeignSources = .none,
+        sessionSearchGate: SessionSearchGate = .shared
     ) throws {
         try run(
             options: options,
@@ -553,7 +554,8 @@ public enum LiveSessionsComposition {
             streams: streams,
             cwd: try resolveWorkingDirectory(options.common.cwd),
             foreignScanner: foreignScanner,
-            foreignSources: foreignSources
+            foreignSources: foreignSources,
+            sessionSearchGate: sessionSearchGate
         )
     }
 
@@ -563,7 +565,8 @@ public enum LiveSessionsComposition {
         streams: CLIStreams,
         cwd: URL,
         foreignScanner: (any ForeignSessionScanning)? = nil,
-        foreignSources: EnabledForeignSources = .none
+        foreignSources: EnabledForeignSources = .none,
+        sessionSearchGate: SessionSearchGate = .shared
     ) throws {
         let home = OpenGrokHomeResolver.resolve(environment: environment)
         let catalog = LiveSessionCatalog(openGrokHome: home)
@@ -579,7 +582,14 @@ public enum LiveSessionsComposition {
                 foreignSources: foreignSources
             )
         case .search:
-            try runSearch(options: options, catalog: catalog, streams: streams)
+            try runSearch(
+                options: options,
+                catalog: catalog,
+                streams: streams,
+                environment: environment,
+                workingDirectory: cwd,
+                gate: sessionSearchGate
+            )
         case .show:
             try runShow(options: options, catalog: catalog, streams: streams)
         case .delete:
@@ -686,7 +696,10 @@ public enum LiveSessionsComposition {
     private static func runSearch(
         options: CLISessionOptions,
         catalog: LiveSessionCatalog,
-        streams: CLIStreams
+        streams: CLIStreams,
+        environment: [String: String],
+        workingDirectory: URL,
+        gate: SessionSearchGate
     ) throws {
         guard let query = options.query?.trimmingCharacters(in: .whitespacesAndNewlines),
               !query.isEmpty
@@ -695,18 +708,32 @@ public enum LiveSessionsComposition {
                 "sessions search requires a query: open-grok sessions search <query>"
             )
         }
-        let isEnabled = SessionSearchGate.shared.isIndexEnabled()
+        let security = LiveSecurityContext.resolve(
+            workspaceRoot: workingDirectory,
+            environment: environment,
+            isInteractive: false
+        )
+        let policy = LiveSessionSearchPolicy(
+            environment: environment,
+            document: security.document,
+            requirements: security.requirements,
+            gate: gate
+        )
+        let isEnabled = policy.apply()
         let hits: [LiveSessionSearchHit]
         if isEnabled {
-            hits = LiveSessionSearch.rank(
-                documents: try catalog.documents(),
+            hits = try LiveSessionSearchIndex.search(
+                openGrokHome: catalog.sessionsDirectory.deletingLastPathComponent(),
+                environment: environment,
                 query: query,
-                limit: options.limit
-            )
+                workingDirectory: nil,
+                limit: options.limit,
+                gate: gate
+            ).hits
         } else {
             hits = []
         }
-        if let by = SessionSearchGate.shared.sessionSearchTurnedOffBy() {
+        if let by = policy.disabledReason {
             streams.err("warning: local session search is off (\(by)); local sessions were not searched.\n")
         }
         if options.json {

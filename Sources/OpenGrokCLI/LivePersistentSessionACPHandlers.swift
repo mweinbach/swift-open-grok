@@ -1,6 +1,7 @@
 import Foundation
 import OpenGrokACP
 import OpenGrokACPRuntime
+import OpenGrokConfig
 import OpenGrokSessionPersistence
 import OpenGrokShellSessionSupport
 import OpenGrokShared
@@ -12,7 +13,6 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
     private static let maximumJournalRecords = 100_000
     private static let maximumUpdatePage = 10_000
     private static let maximumUpdateChunk = 1_000
-    private static let maximumSearchDocuments = 10_000
     private static let maximumSearchPage = 1_000
     private static let maximumSearchOffset = 100_000
 
@@ -27,10 +27,22 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
 
     let openGrokHome: URL
     let gateway: ACPNotificationGateway?
+    let environment: [String: String]
+    let searchGate: SessionSearchGate
+    let enabledAtLaunch: Bool
 
-    init(openGrokHome: URL, gateway: ACPNotificationGateway? = nil) {
+    init(
+        openGrokHome: URL,
+        gateway: ACPNotificationGateway? = nil,
+        environment: [String: String]? = nil,
+        searchGate: SessionSearchGate = .shared,
+        enabledAtLaunch: Bool = true
+    ) {
         self.openGrokHome = openGrokHome.standardizedFileURL
         self.gateway = gateway
+        self.environment = environment ?? ["OPENGROK_HOME": openGrokHome.path]
+        self.searchGate = searchGate
+        self.enabledAtLaunch = enabledAtLaunch
     }
 
     func handle(method: String, params: JSONValue) async throws -> JSONValue {
@@ -414,46 +426,46 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
         guard request.offset <= UInt64(Self.maximumSearchOffset) else {
             throw invalidParams("invalid params: offset exceeds the bounded search range")
         }
+        guard enabledAtLaunch,
+              LiveSessionSearchPolicy(environment: environment, gate: searchGate).apply()
+        else {
+            return .object(["result": .object([
+                "results": .array([]),
+                "nextOffset": .null,
+                "totalEstimate": .number(.uint64(0)),
+                "bootstrapping": .bool(false),
+            ])])
+        }
         let offset = Int(request.offset)
         let limit = Int(min(request.limit, UInt64(Self.maximumSearchPage)))
-        let entries = try loadEntries().filter { entry in
-            guard let workspace else { return true }
-            return matchesWorkspace(entry.listing.workingDirectory, workspace)
-        }
         let root = openGrokHome.appendingPathComponent("sessions", isDirectory: true)
             .resolvingSymlinksInPath().standardizedFileURL
-        let documents = entries.prefix(Self.maximumSearchDocuments).compactMap {
-            secureSearchDocument(for: $0, root: root)
-        }
         let needle = request.query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let idShaped = isSessionIDQuery(needle)
-        let matchingIDs: [LiveSessionSearchHit]
-        if idShaped {
-            matchingIDs = documents.filter {
-                $0.sessionID.localizedCaseInsensitiveContains(needle)
-            }.sorted {
-                if $0.updatedAt == $1.updatedAt { return $0.sessionID < $1.sessionID }
-                return $0.updatedAt > $1.updatedAt
-            }.map {
-                LiveSessionSearchHit(
-                    sessionID: $0.sessionID,
-                    title: $0.title,
-                    workingDirectory: $0.workingDirectory,
-                    updatedAt: $0.updatedAt,
-                    score: 1,
-                    snippet: ""
-                )
+        let indexPage = try LiveSessionSearchIndex.search(
+            openGrokHome: openGrokHome,
+            environment: environment,
+            query: needle,
+            workingDirectory: workspace,
+            limit: limit,
+            offset: offset,
+            includeContent: request.includeContent,
+            gate: searchGate,
+            sources: {
+                try loadEntries().map { entry in
+                    LiveSessionSearchIndexSource(
+                        sessionID: entry.listing.sessionID,
+                        workingDirectory: entry.listing.workingDirectory,
+                        updatedAt: entry.listing.lastActivityAt,
+                        load: { secureSearchDocument(for: entry, root: root) }
+                    )
+                }
             }
-        } else {
-            matchingIDs = []
-        }
-        let useIDResults = !matchingIDs.isEmpty || (idShaped && UUID(uuidString: needle) != nil)
-        let ranked = useIDResults
-            ? matchingIDs
-            : LiveSessionSearch.rank(documents: documents, query: needle, limit: documents.count)
-        let page = offset < ranked.count ? Array(ranked.dropFirst(offset).prefix(limit)) : []
-        let documentsByID = Dictionary(uniqueKeysWithValues: documents.map { ($0.sessionID, $0) })
-        let rows = page.map { hit -> JSONValue in
+        )
+        let useIDResults = isSessionIDQuery(needle)
+            && indexPage.hits.contains {
+                $0.sessionID.localizedCaseInsensitiveContains(needle)
+            }
+        let rows = indexPage.hits.map { hit -> JSONValue in
             var row: [String: JSONValue] = [
                 "sessionId": .string(hit.sessionID),
                 "cwd": .string(hit.workingDirectory),
@@ -464,7 +476,7 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
                     useIDResults
                         ? [.string("session_id")]
                         : searchMatchedFields(
-                            document: documentsByID[hit.sessionID],
+                            document: indexPage.documentsByID[hit.sessionID],
                             query: needle
                         ).map(JSONValue.string)
                 ),
@@ -474,12 +486,11 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
             }
             return .object(row)
         }
-        let nextOffset = offset + page.count < ranked.count ? offset + page.count : nil
         return .object(["result": .object([
             "results": .array(rows),
-            "nextOffset": nextOffset.map { .number(.uint64(UInt64($0))) } ?? .null,
-            "totalEstimate": .number(.uint64(UInt64(ranked.count))),
-            "bootstrapping": .bool(false),
+            "nextOffset": indexPage.nextOffset.map { .number(.uint64(UInt64($0))) } ?? .null,
+            "totalEstimate": .number(.uint64(UInt64(indexPage.total))),
+            "bootstrapping": .bool(indexPage.bootstrapping),
         ])])
     }
 

@@ -12,6 +12,78 @@ public enum SessionSearchGateState: UInt8, Sendable, Equatable {
     case closed = 2
 }
 
+/// Resolve the actual launch's disk and deployment authority; ambient process
+/// variables belong to another tenant when multiple sessions share a leader.
+public func resolveSessionSearchSetting(
+    environment: [String: String],
+    document: TOMLValue? = nil,
+    requirements: [TOMLValue]? = nil,
+    remote: Bool? = nil
+) -> Resolved<Bool> {
+    let layers: ConfigLayers?
+    do {
+        layers = try ConfigLayers.load(environment: environment)
+    } catch {
+        layers = nil
+    }
+
+    let suppliedRequirements = requirements?.reversed()
+        .compactMap { sessionSearchFeature($0) }
+        .first
+    let diskRequirements = layers.flatMap { loaded in
+        [loaded.mdmRequirements, loaded.systemRequirements, loaded.userRequirements]
+            .compactMap { $0 }
+            .compactMap { sessionSearchFeature($0) }
+            .first
+    } ?? loadMergedRequirements(environment: environment).flatMap { sessionSearchFeature($0) }
+    if let pinned = diskRequirements ?? suppliedRequirements {
+        return Resolved(value: pinned, source: .requirement)
+    }
+
+    let managed: TOMLValue?
+    let systemManaged: TOMLValue?
+    if let layers {
+        managed = layers.managed
+        systemManaged = layers.systemManaged
+    } else {
+        managed = try? loadManagedConfig(environment: environment)
+        systemManaged = try? loadSystemManagedConfig(environment: environment)
+    }
+    if sessionSearchFeature(managed) == false {
+        return Resolved(value: false, source: .managedConfig)
+    }
+    if sessionSearchFeature(systemManaged) == false {
+        return Resolved(value: false, source: .systemManagedConfig)
+    }
+
+    if let value = GrokEnvGates.sessionSearch(environment: environment) {
+        return Resolved(value: value, source: .env)
+    }
+    if let value = sessionSearchFeature(document) {
+        return Resolved(value: value, source: .config)
+    }
+    if let value = layers.flatMap({ sessionSearchFeature($0.user) }) {
+        return Resolved(value: value, source: .userConfig)
+    }
+    if let value = sessionSearchFeature(managed) {
+        return Resolved(value: value, source: .managedConfig)
+    }
+    if let value = sessionSearchFeature(systemManaged) {
+        return Resolved(value: value, source: .systemManagedConfig)
+    }
+    if let remote {
+        return Resolved(value: remote, source: .remote)
+    }
+    return Resolved(value: true, source: .default)
+}
+
+private func sessionSearchFeature(_ document: TOMLValue?) -> Bool? {
+    guard case let .boolean(value)? = document?[path: ["features", "session_search"]] else {
+        return nil
+    }
+    return value
+}
+
 /// One latch for the process, so the first workspace to turn search off turns it
 /// off for every workspace hosted beside it.
 public final class SessionSearchGate: @unchecked Sendable {
@@ -63,26 +135,23 @@ public final class SessionSearchGate: @unchecked Sendable {
         return closedBy
     }
 
-    public func isIndexEnabled() -> Bool {
+    public func isIndexEnabled(environment: [String: String]) -> Bool {
+        isIndexEnabled(
+            environment: environment,
+            resolved: resolveSessionSearchSetting(environment: environment)
+        )
+    }
+
+    public func isIndexEnabled(
+        environment: [String: String],
+        resolved: Resolved<Bool>
+    ) -> Bool {
+        // Apply on every access: a newly arrived requirements deny or remote
+        // update may close an already-open process gate, but can never reopen it.
+        applyGate(resolved)
         lock.lock()
         defer { lock.unlock() }
-        switch state {
-        case .closed:
-            return false
-        case .open:
-            return true
-        case .unapplied:
-            let env = GrokEnvGates.sessionSearch(environment: ProcessInfo.processInfo.environment)
-            let setting = Resolved<Bool>(value: env ?? true, source: env != nil ? .env : .default)
-            if !setting.value {
-                closedBy = setting.source
-                state = .closed
-                return false
-            } else {
-                state = .open
-                return true
-            }
-        }
+        return state != .closed
     }
 
     public func sessionSearchTurnedOffBy() -> String? {
