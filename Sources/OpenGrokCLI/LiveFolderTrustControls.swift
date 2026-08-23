@@ -96,11 +96,81 @@ struct LiveFolderTrustScope: Hashable, Sendable {
     }
 }
 
+enum LiveFolderTrustStartupCheckpoint: Sendable {
+    case beforeProjectMCP
+}
+
+final class LiveFolderTrustStartupReservation: @unchecked Sendable {
+    let id = UUID()
+    let scope: LiveFolderTrustScope
+    private let lock = NSLock()
+    private var pending = true
+    private var invalidated = false
+
+    init(scope: LiveFolderTrustScope) {
+        self.scope = scope
+    }
+
+    var isPending: Bool {
+        lock.withLock { pending }
+    }
+
+    var wasInvalidated: Bool {
+        lock.withLock { invalidated }
+    }
+
+    func invalidate() {
+        lock.withLock {
+            if pending { invalidated = true }
+        }
+    }
+
+    func consume() {
+        lock.withLock { pending = false }
+    }
+}
+
+enum LiveFolderTrustStartupAdmission: Sendable {
+    case admitted
+    case changed(LiveSecurityContext)
+    case blocked
+}
+
+final class LiveFolderTrustStartupMCPConfiguration: @unchecked Sendable {
+    private let lock = NSLock()
+    private var currentDeclarations: MCPConfigLoadResult
+    private var currentDisabledTools: [String: Set<String>]
+
+    init(document: TOMLValue) {
+        currentDeclarations = MCPConfigLoader.load(from: document)
+        currentDisabledTools = allDisabledMCPTools(in: document)
+    }
+
+    var declarations: MCPConfigLoadResult {
+        lock.withLock { currentDeclarations }
+    }
+
+    func disabledTools(for server: String) -> Set<String> {
+        lock.withLock { currentDisabledTools[server] ?? [] }
+    }
+
+    func replace(document: TOMLValue) {
+        let declarations = MCPConfigLoader.load(from: document)
+        let disabledTools = allDisabledMCPTools(in: document)
+        lock.withLock {
+            currentDeclarations = declarations
+            currentDisabledTools = disabledTools
+        }
+    }
+}
+
 final class LiveFolderTrustExecutorBinding: @unchecked Sendable {
     let id = UUID()
     let scope: LiveFolderTrustScope
     private let lock = NSLock()
     private var closed = false
+    private var startingUp = true
+    private var connectionsStarted = false
     private let sessionID: String
     private let workingDirectory: URL
     private let environment: [String: String]
@@ -110,6 +180,7 @@ final class LiveFolderTrustExecutorBinding: @unchecked Sendable {
     private let hookPresentationStore: LiveHookPresentationStore
     private let connections: MCPSessionConnections
     private let toolset: FinalizedToolset
+    private let mcpConfiguration: LiveFolderTrustStartupMCPConfiguration
 
     init(
         sessionID: String,
@@ -120,7 +191,8 @@ final class LiveFolderTrustExecutorBinding: @unchecked Sendable {
         permissionPipeline: PermissionPipeline?,
         hookPresentationStore: LiveHookPresentationStore,
         connections: MCPSessionConnections,
-        toolset: FinalizedToolset
+        toolset: FinalizedToolset,
+        mcpConfiguration: LiveFolderTrustStartupMCPConfiguration
     ) {
         let identity = LiveWorkspaceTrustIdentity.resolve(
             workingDirectory: workingDirectory,
@@ -136,10 +208,23 @@ final class LiveFolderTrustExecutorBinding: @unchecked Sendable {
         self.hookPresentationStore = hookPresentationStore
         self.connections = connections
         self.toolset = toolset
+        self.mcpConfiguration = mcpConfiguration
     }
 
     var isActive: Bool {
         lock.withLock { !closed }
+    }
+
+    private var canDeferStartupConnections: Bool {
+        lock.withLock { startingUp && !connectionsStarted && !closed }
+    }
+
+    func finishStartup() {
+        lock.withLock { startingUp = false }
+    }
+
+    func beginStartupConnections() {
+        lock.withLock { connectionsStarted = true }
     }
 
     func close() {
@@ -168,6 +253,7 @@ final class LiveFolderTrustExecutorBinding: @unchecked Sendable {
             )
     }
 
+    @discardableResult
     func reload(trusted: Bool) async -> Int {
         guard isActive else { return 0 }
         let previousDeclarations = runtime.begin(trusted: trusted)
@@ -183,6 +269,7 @@ final class LiveFolderTrustExecutorBinding: @unchecked Sendable {
             runtime.failClosed()
             return 0
         }
+        mcpConfiguration.replace(document: security.document)
 
         let loadedHooks = LiveHooksComposition.load(
             sessionId: sessionID,
@@ -204,9 +291,12 @@ final class LiveFolderTrustExecutorBinding: @unchecked Sendable {
             await permissionPipeline.permissions.replaceConfig(security.permissions.config)
         }
 
-        let disabledServers = disabledMCPServers(in: security.document)
-        let declarations = MCPConfigLoader.load(from: security.document).enabledServers
-            .filter { !disabledServers.contains($0.name) }
+        if canDeferStartupConnections {
+            runtime.finish(trusted: trusted, declarations: declarationsFor(security))
+            return loadedHooks.result.registry.count
+        }
+
+        let declarations = declarationsFor(security)
         let declarationsByName = Dictionary(uniqueKeysWithValues: declarations.map { ($0.name, $0) })
         for name in await connections.names() {
             if let previous = previousDeclarations[name],
@@ -267,6 +357,12 @@ final class LiveFolderTrustExecutorBinding: @unchecked Sendable {
         runtime.finish(trusted: trusted, declarations: declarations)
         return loadedHooks.result.registry.count
     }
+
+    private func declarationsFor(_ security: LiveSecurityContext) -> [MCPServerDeclaration] {
+        let disabled = disabledMCPServers(in: security.document)
+        return MCPConfigLoader.load(from: security.document).enabledServers
+            .filter { !disabled.contains($0.name) }
+    }
 }
 
 actor LiveFolderTrustExecutorRegistry {
@@ -276,8 +372,98 @@ actor LiveFolderTrustExecutorRegistry {
         weak var value: LiveFolderTrustExecutorBinding?
     }
 
+    private struct WeakStartup {
+        weak var value: LiveFolderTrustStartupReservation?
+    }
+
     private var registrations: [LiveFolderTrustScope: [WeakBinding]] = [:]
+    private var startups: [LiveFolderTrustScope: [WeakStartup]] = [:]
     private var blocked: Set<LiveFolderTrustScope> = []
+    private var decisions: [LiveFolderTrustScope: Bool] = [:]
+
+    func reserveStartup(_ reservation: LiveFolderTrustStartupReservation) {
+        var current = startups[reservation.scope, default: []].filter { $0.value?.isPending == true }
+        current.append(WeakStartup(value: reservation))
+        startups[reservation.scope] = current
+        if blocked.contains(reservation.scope) || decisions[reservation.scope] == false {
+            reservation.invalidate()
+        }
+    }
+
+    func cancelStartup(_ reservation: LiveFolderTrustStartupReservation) {
+        reservation.consume()
+        let remaining = startups[reservation.scope, default: []].filter {
+            guard let value = $0.value else { return false }
+            return value.id != reservation.id && value.isPending
+        }
+        if remaining.isEmpty {
+            startups.removeValue(forKey: reservation.scope)
+        } else {
+            startups[reservation.scope] = remaining
+        }
+    }
+
+    func admitStartup(
+        _ binding: LiveFolderTrustExecutorBinding,
+        reservation: LiveFolderTrustStartupReservation,
+        proposed: LiveSecurityContext,
+        workingDirectory: URL,
+        environment: [String: String],
+        permissionOptions: CLIPermissionOptions
+    ) -> LiveFolderTrustStartupAdmission {
+        guard reservation.isPending,
+              binding.scope == reservation.scope,
+              !blocked.contains(binding.scope)
+        else {
+            return .blocked
+        }
+
+        var options = permissionOptions
+        options.trustFolder = false
+        let authoritative = LiveSecurityContext.resolve(
+            workspaceRoot: workingDirectory,
+            environment: environment,
+            isInteractive: false,
+            cli: options
+        )
+        guard reconcileStartupDecision(
+            scope: binding.scope,
+            authoritative: authoritative,
+            environment: environment
+        ) else {
+            return .blocked
+        }
+        guard proposed.projectTrusted == authoritative.projectTrusted else {
+            return .changed(authoritative)
+        }
+
+        register(binding)
+        cancelStartup(reservation)
+        return .admitted
+    }
+
+    func authoritativeStartupSecurity(
+        for binding: LiveFolderTrustExecutorBinding,
+        workingDirectory: URL,
+        environment: [String: String],
+        permissionOptions: CLIPermissionOptions
+    ) -> LiveSecurityContext? {
+        guard binding.isActive, !blocked.contains(binding.scope) else { return nil }
+        var options = permissionOptions
+        options.trustFolder = false
+        let security = LiveSecurityContext.resolve(
+            workspaceRoot: workingDirectory,
+            environment: environment,
+            isInteractive: false,
+            cli: options
+        )
+        guard reconcileStartupDecision(
+            scope: binding.scope,
+            authoritative: security,
+            environment: environment
+        ) else { return nil }
+        return security
+    }
 
     func register(_ binding: LiveFolderTrustExecutorBinding) {
         var current = registrations[binding.scope, default: []].filter { $0.value?.isActive == true }
@@ -296,7 +482,9 @@ actor LiveFolderTrustExecutorRegistry {
         }
         if survivors.isEmpty {
             registrations.removeValue(forKey: binding.scope)
-            blocked.remove(binding.scope)
+            if startups[binding.scope, default: []].allSatisfy({ $0.value?.isPending != true }) {
+                blocked.remove(binding.scope)
+            }
         } else {
             registrations[binding.scope] = survivors
         }
@@ -304,6 +492,10 @@ actor LiveFolderTrustExecutorRegistry {
 
     func block(_ scope: LiveFolderTrustScope) {
         blocked.insert(scope)
+        decisions[scope] = false
+        for reservation in startups[scope, default: []] {
+            reservation.value?.invalidate()
+        }
         for binding in liveBindings(for: scope) {
             binding.failClosed()
         }
@@ -325,6 +517,7 @@ actor LiveFolderTrustExecutorRegistry {
         while true {
             let pending = liveBindings(for: scope).filter { !processed.contains($0.id) }
             guard !pending.isEmpty else {
+                decisions[scope] = trusted
                 blocked.remove(scope)
                 return initiatingHookCount
             }
@@ -350,6 +543,21 @@ actor LiveFolderTrustExecutorRegistry {
         }
         registrations[scope] = live.map { WeakBinding(value: $0) }
         return live
+    }
+
+    private func reconcileStartupDecision(
+        scope: LiveFolderTrustScope,
+        authoritative: LiveSecurityContext,
+        environment: [String: String]
+    ) -> Bool {
+        guard decisions[scope] == false, authoritative.projectTrusted else { return true }
+        guard PersistentFolderTrustStore(environment: environment)
+            .isTrusted(URL(fileURLWithPath: scope.workspace))
+        else {
+            return false
+        }
+        decisions[scope] = true
+        return true
     }
 }
 

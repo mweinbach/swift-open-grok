@@ -408,10 +408,27 @@ struct LiveToolExecutor: Sendable {
         schedulerHost: LiveSchedulerHost? = nil,
         // The monitor runtime, same defaulting rule: only the interactive
         // TUI foundation has an event-delivery seam, so only it passes one.
-        monitorHost: LiveMonitorHost? = nil
+        monitorHost: LiveMonitorHost? = nil,
+        startupTrustCheckpoint: (@Sendable (LiveFolderTrustStartupCheckpoint) async -> Void)? = nil
     ) async throws {
         self.subagentHost = subagentHost
         self.sessionEnvironment = environment
+        let standardizedWorkingDirectory = workingDirectory.standardizedFileURL
+        let trustIdentity = LiveWorkspaceTrustIdentity.resolve(
+            workingDirectory: standardizedWorkingDirectory,
+            environment: environment
+        )
+        let startupReservation = LiveFolderTrustStartupReservation(
+            scope: LiveFolderTrustScope(identity: trustIdentity, environment: environment)
+        )
+        await LiveFolderTrustExecutorRegistry.shared.reserveStartup(startupReservation)
+        defer {
+            if startupReservation.isPending {
+                Task {
+                    await LiveFolderTrustExecutorRegistry.shared.cancelStartup(startupReservation)
+                }
+            }
+        }
         let composition = OpenGrokShellToolRuntimeComposition(
             processBackend: processBackend,
             runtime: LiveRunTerminalToolRuntime(subagents: subagentHost)
@@ -420,10 +437,9 @@ struct LiveToolExecutor: Sendable {
             sessionID: sessionID,
             workingDirectory: workingDirectory
         )
-        let standardizedWorkingDirectory = workingDirectory.standardizedFileURL
         // Resolve folder trust before inspecting any repository-owned hook. A
         // hooks-only clone is executable configuration even without config.toml.
-        let security = securityContext ?? LiveSecurityContext.resolve(
+        var security = securityContext ?? LiveSecurityContext.resolve(
             workspaceRoot: standardizedWorkingDirectory,
             environment: environment,
             isInteractive: fileAccessPolicy.isInteractive,
@@ -695,19 +711,92 @@ struct LiveToolExecutor: Sendable {
         )
         toolset.resources.extras.insert(EnabledNativeToolNames(nativeNames))
         let mcpConnections = MCPSessionConnections()
-        let mcpDeclarations = MCPConfigLoader.load(from: security.document)
-        let mcpDisabledTools = allDisabledMCPTools(in: security.document)
+        let mcpConfiguration = LiveFolderTrustStartupMCPConfiguration(document: security.document)
+        let folderTrustRuntime = LiveFolderTrustRuntimeState(
+            trusted: security.projectTrusted,
+            declarations: mcpConfiguration.declarations.enabledServers,
+            languageSession: nil
+        )
+        let folderTrustBinding = LiveFolderTrustExecutorBinding(
+            sessionID: sessionID,
+            workingDirectory: standardizedWorkingDirectory,
+            environment: environment,
+            launchPermissionOptions: permissionOptions,
+            runtime: folderTrustRuntime,
+            permissionPipeline: fileToolResources.permissionPipeline,
+            hookPresentationStore: hookPresentationStore,
+            connections: mcpConnections,
+            toolset: toolset,
+            mcpConfiguration: mcpConfiguration
+        )
+
+        var admittedStartup = false
+        var blockedStartup = false
+        for _ in 0..<3 {
+            let admission = await LiveFolderTrustExecutorRegistry.shared.admitStartup(
+                folderTrustBinding,
+                reservation: startupReservation,
+                proposed: security,
+                workingDirectory: standardizedWorkingDirectory,
+                environment: environment,
+                permissionOptions: permissionOptions
+            )
+            switch admission {
+            case .admitted:
+                admittedStartup = true
+            case .changed(let authoritative):
+                security = authoritative
+                await folderTrustBinding.reload(trusted: authoritative.projectTrusted)
+            case .blocked:
+                blockedStartup = true
+            }
+            if admittedStartup || blockedStartup { break }
+        }
+        guard admittedStartup else {
+            folderTrustRuntime.failClosed()
+            await mcpConnections.shutdown()
+            await composition.shutdown()
+            throw CLIApplicationError.failed(
+                "folder trust changed while the session was starting; project access is blocked"
+            )
+        }
+
         await mcpConnections.startLifecycle(
             sessionID: sessionID,
             toolset: toolset,
-            declarations: { mcpDeclarations },
+            declarations: { mcpConfiguration.declarations },
             environment: environment,
-            disabledTools: { mcpDisabledTools[$0] ?? [] }
+            disabledTools: { mcpConfiguration.disabledTools(for: $0) }
         )
-        // `security.document` already excludes the project tier when the folder
-        // is untrusted, so a hostile repo's `.opengrok/config.toml` servers are
-        // simply not present here — they never reach `makeTransport`, which is
-        // what spawns the process.
+        if let startupTrustCheckpoint {
+            await startupTrustCheckpoint(.beforeProjectMCP)
+        }
+        guard let launchSecurity = await LiveFolderTrustExecutorRegistry.shared
+            .authoritativeStartupSecurity(
+                for: folderTrustBinding,
+                workingDirectory: standardizedWorkingDirectory,
+                environment: environment,
+                permissionOptions: permissionOptions
+            )
+        else {
+            folderTrustRuntime.failClosed()
+            await LiveFolderTrustExecutorRegistry.shared.unregister(folderTrustBinding)
+            await mcpConnections.shutdown()
+            await composition.shutdown()
+            throw CLIApplicationError.failed(
+                "folder trust was revoked while the session was starting; project access is blocked"
+            )
+        }
+        if security.projectTrusted != launchSecurity.projectTrusted
+            || folderTrustRuntime.isTrusted != launchSecurity.projectTrusted
+        {
+            security = launchSecurity
+            await folderTrustBinding.reload(trusted: launchSecurity.projectTrusted)
+        } else {
+            security = launchSecurity
+            mcpConfiguration.replace(document: launchSecurity.document)
+        }
+        folderTrustBinding.beginStartupConnections()
         let mcpServerConnections = await LiveMCPComposition.connectConfiguredServers(
             document: security.document,
             toolset: toolset,
@@ -715,6 +804,32 @@ struct LiveToolExecutor: Sendable {
             environment: environment,
             managedMCPPolicy: security.managedMCPPolicy
         )
+        guard let languageSecurity = await LiveFolderTrustExecutorRegistry.shared
+            .authoritativeStartupSecurity(
+                for: folderTrustBinding,
+                workingDirectory: standardizedWorkingDirectory,
+                environment: environment,
+                permissionOptions: permissionOptions
+            )
+        else {
+            folderTrustRuntime.failClosed()
+            await LiveFolderTrustExecutorRegistry.shared.unregister(folderTrustBinding)
+            await folderTrustRuntime.currentLanguageSession?.shutdown()
+            await mcpConnections.shutdown()
+            await composition.shutdown()
+            throw CLIApplicationError.failed(
+                "folder trust was revoked while language services were starting; project access is blocked"
+            )
+        }
+        if security.projectTrusted != languageSecurity.projectTrusted
+            || folderTrustRuntime.isTrusted != languageSecurity.projectTrusted
+        {
+            security = languageSecurity
+            await folderTrustBinding.reload(trusted: languageSecurity.projectTrusted)
+        } else {
+            security = languageSecurity
+            mcpConfiguration.replace(document: languageSecurity.document)
+        }
         // LSP `pull_diagnostics` — after MCP so both share one search index
         // refresh, and before `toolDefinitions()` so the model list includes it.
         let lspPullSession = LiveLspComposition.registerTools(
@@ -724,6 +839,14 @@ struct LiveToolExecutor: Sendable {
             environment: environment,
             projectTrusted: security.projectTrusted
         )
+        let previousLanguageSession = folderTrustRuntime.replaceLanguageSession(lspPullSession)
+        folderTrustRuntime.finish(
+            trusted: security.projectTrusted,
+            declarations: mcpConfiguration.declarations.enabledServers
+        )
+        if let previousLanguageSession {
+            await previousLanguageSession.shutdown()
+        }
         mcpSearchIndex.refresh(from: toolset)
         let fileToolDefinitions = fileToolBridge.toolDefinitions()
         let allowedFileToolDefinitions = fileToolDefinitions.filter {
@@ -865,23 +988,8 @@ struct LiveToolExecutor: Sendable {
         self.fileToolBridge = fileToolBridge
         self.mcpConnections = mcpConnections
         self.mcpServerConnections = mcpServerConnections
-        let folderTrustRuntime = LiveFolderTrustRuntimeState(
-            trusted: security.projectTrusted,
-            declarations: mcpDeclarations.enabledServers,
-            languageSession: lspPullSession
-        )
         self.folderTrustRuntime = folderTrustRuntime
-        self.folderTrustBinding = LiveFolderTrustExecutorBinding(
-            sessionID: sessionID,
-            workingDirectory: standardizedWorkingDirectory,
-            environment: environment,
-            launchPermissionOptions: permissionOptions,
-            runtime: folderTrustRuntime,
-            permissionPipeline: fileToolResources.permissionPipeline,
-            hookPresentationStore: hookPresentationStore,
-            connections: mcpConnections,
-            toolset: toolset
-        )
+        self.folderTrustBinding = folderTrustBinding
         self.registryToolNames = Set(allowedFileToolDefinitions.map(\.name))
         self.initiallyAdvertisedMCPToolNames = Set(
             allowedFileToolDefinitions.compactMap { definition in
@@ -963,7 +1071,7 @@ struct LiveToolExecutor: Sendable {
             ))
         }
         self.tools = advertisedTools
-        await LiveFolderTrustExecutorRegistry.shared.register(folderTrustBinding)
+        folderTrustBinding.finishStartup()
     }
 
     /// Re-snapshot only the mutable MCP surface. Built-ins and their launch
