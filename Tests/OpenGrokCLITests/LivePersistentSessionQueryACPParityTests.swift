@@ -414,6 +414,15 @@ struct LivePersistentSessionQueryACPParityTests {
             tag: "agent_message_chunk",
             text: "platform-owned conversation"
         )
+        let (canonicalUpdates, canonicalError) = try await fixture.call(
+            "x.ai/session/updates",
+            params: .object(fixture.updatesParams("case-sensitive-workspace"))
+        )
+        #expect(canonicalError == nil)
+        let persistedUpdates = try #require(canonicalUpdates?["updates"]?.arrayValue)
+        #expect(persistedUpdates.map {
+            $0["params"]?["update"]?["sessionUpdate"]?.stringValue
+        } == ["user_message_chunk", "agent_message_chunk"])
 
         let alternateCasing = fixture.firstWorkspace.path.uppercased()
         #expect(alternateCasing != fixture.firstWorkspace.path)
@@ -440,7 +449,8 @@ struct LivePersistentSessionQueryACPParityTests {
         #expect(searchError == nil)
 
         if resolvesToSameWorkspace {
-            #expect(updates?["totalCount"]?.uint64Value == 1)
+            #expect(updates?["totalCount"]?.uint64Value == UInt64(persistedUpdates.count))
+            #expect(updates?["updates"] == canonicalUpdates?["updates"])
             #expect(search?["result"]?["results"]?[0]?["sessionId"]?.stringValue
                 == "case-sensitive-workspace")
         } else {
