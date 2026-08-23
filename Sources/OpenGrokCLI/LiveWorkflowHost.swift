@@ -4,8 +4,9 @@
 //
 // The engine decides *when* to ask for an agent, how many slots to reserve
 // first, and how to journal the answer. This actor decides what an agent
-// actually is: a headless child session against the parent's provider, with the
-// parent's tool policy as a ceiling and the parent's workspace as its only root.
+// actually is: a genuine root-owned child session, with independently resolved
+// provider credentials, the parent's sandbox/tool policy as its ceiling, and
+// a real isolated checkout whenever the workflow requests one.
 //
 // Budget arithmetic lives here rather than in the engine on purpose. The engine
 // distinguishes a quota refusal at *reservation* time (terminal and
@@ -116,7 +117,7 @@ actor LiveWorkflowHost: RhaiWorkflowHost {
             tokensUsed = tokensUsed.saturatingAdd(result.tokensUsed)
             await board.agentFinished(
                 agentID: agentID,
-                state: .succeeded,
+                state: result.cancelled ? .cancelled : result.success ? .succeeded : .failed,
                 tokensUsed: result.tokensUsed
             )
             return result
@@ -281,6 +282,8 @@ actor LiveWorkflowHost: RhaiWorkflowHost {
             systemPrompt: environment.systemPrompt,
             parentCapabilityMode: environment.parentCapabilityMode,
             supportsReasoningEffort: environment.supportsReasoningEffort,
+            subagentBridge: environment.subagentBridge,
+            requiresSubagentBridge: environment.requiresSubagentBridge,
             maxToolRounds: environment.maxToolRounds,
             makeInvoker: { [self] mode in try await invoker(for: mode) }
         )

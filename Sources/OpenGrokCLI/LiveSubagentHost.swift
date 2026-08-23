@@ -679,8 +679,21 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     func spawn(
         args: JSONValue,
         toolCallID: String,
-        persona requestedPersona: String? = nil
+        persona requestedPersona: String? = nil,
+        workflow: LiveWorkflowSubagentInvocation? = nil
     ) async -> Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError> {
+        if let workflow {
+            guard workflow.parentSessionID == context.sessionID,
+                  isSafeSubagentChildID(workflow.runID)
+            else {
+                return .failure(.invalidCall("workflow child parent or run ownership is invalid"))
+            }
+            if workflow.forkContext, workflow.sourceProvenance != .trustedBuiltIn {
+                return .failure(.invalidCall(
+                    "fork_context is restricted to built-in workflows"
+                ))
+            }
+        }
         guard case .object(var object) = args else {
             return .failure(.invalidCall("\(Self.advertisedToolName) requires an object argument"))
         }
@@ -694,6 +707,9 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             input = try JSONDecoder().decode(TaskToolInput.self, from: JSONEncoder().encode(object))
         } catch {
             return .failure(.invalidCall("\(Self.advertisedToolName) arguments are invalid: \(error)"))
+        }
+        if workflow != nil, input.runInBackground {
+            return .failure(.invalidCall("workflow children cannot run in the background"))
         }
 
         // cwd: sanitize; validate it names a real directory only for a fresh
@@ -841,6 +857,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         // final child-CWD selection so resume inherits the source path
         // (handle_request.rs:327-351 → select_override_cwd at :737).
         var resumeItems: [ConversationItem]? = nil
+        var forkItems: [ConversationItem]? = nil
         var resumeSource: Bookkeeping? = nil
         if let resumeID {
             let activeIDs = await coordinator.listActive(parentSessionID: context.sessionID)
@@ -910,6 +927,20 @@ actor LiveSubagentHost: LiveSubagentQuerying {
 
         let childModel = runtime.model ?? context.parentModel
         let antigravityModel = LiveAntigravityComposition.stripModelPrefix(childModel)
+        if workflow?.forkContext == true, resumeID == nil {
+            guard antigravityModel == nil else {
+                return .failure(.invalidCall(
+                    "fork_context is unavailable for external workflow child runners"
+                ))
+            }
+            do {
+                forkItems = try await workflowParentConversationItems()
+            } catch {
+                return .failure(.invalidCall(
+                    "workflow parent conversation cannot be safely forked: \(error)"
+                ))
+            }
+        }
         var antigravityRoster: [String] = []
         // Upstream assigns `Uuid::now_v7()`. The port has no v7 helper; a v4
         // UUID costs the time-ordered id sort (cosmetic only — completion
@@ -1053,6 +1084,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         let childDefinition = strippedDefinition
         let childRuntime = runtime
         let inheritedItems = resumeItems
+        let inheritedForkItems = forkItems
         let childAntigravityRoster = antigravityRoster
         let inheritedAntigravityConversationID = resumeSource?.antigravityConversationID
 
@@ -1076,17 +1108,19 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         let request = OpenGrokChildRequest(
             id: childID,
             parentSessionID: context.sessionID,
-            parentPromptID: LiveSubagentParentPromptContext.promptID,
+            parentPromptID: workflow == nil ? LiveSubagentParentPromptContext.promptID : nil,
             subagentType: input.subagentType,
             description: input.description,
             childCWD: childCWD.path,
             worktreePath: childWorktree?.path,
-            owner: antigravityModel == nil ? .task : .antigravity,
-            runInBackground: input.runInBackground,
+            workflowRunID: workflow?.runID,
+            owner: workflow != nil ? .workflow : antigravityModel == nil ? .task : .antigravity,
+            runInBackground: workflow == nil && input.runInBackground,
+            awaitToCompletion: workflow != nil,
             capabilityMode: runtime.capabilityMode?.rawValue,
             reasoningEffort: runtime.reasoningEffort,
             resumeFrom: resumeID,
-            surfaceCompletion: true
+            surfaceCompletion: workflow == nil
         )
         if antigravityModel == nil {
             // Install before the coordinator hop: credential rotation can
@@ -1130,7 +1164,8 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                             runtime: childRuntime,
                             model: childModel,
                             cwd: childCWD,
-                            resumeItems: inheritedItems
+                            resumeItems: inheritedItems,
+                            forkItems: inheritedForkItems
                         )
                     }
                     do {
@@ -1187,7 +1222,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             return .failure(.failed("subagent \(childID) could not be registered: \(error)"))
         }
 
-        if input.runInBackground {
+        if input.runInBackground, workflow == nil {
             let text = formatSubagentStartedBackground(
                 subagentId: childID,
                 subagentType: input.subagentType,
@@ -1264,6 +1299,59 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         let stats = bookkeeping[childID]
         message += "\n\nThe subagent's session was preserved (\(stats?.terminalToolCalls ?? 0) tool calls, \(stats?.terminalTurns ?? 0) turns). To retry or continue it, call this tool again with resume_from: \"\(childID)\"."
         return .failure(.invalidCall(message))
+    }
+
+    /// A built-in workflow may inherit actual parent conversation context,
+    /// but backend reasoning, executable tool payloads, project/system
+    /// injections, images and provider metadata must never cross routes.
+    private func workflowParentConversationItems() async throws -> [ConversationItem] {
+        guard let parentProvider = context.parentProvider else {
+            throw CLIApplicationError.failed("the parent provider is unknown")
+        }
+        guard let record = try await context.conversationStore.loadIfPresent(
+            sessionID: context.sessionID
+        ) else {
+            throw CLIApplicationError.failed("the parent conversation is unavailable")
+        }
+        guard record.sessionID == context.sessionID,
+              record.currentProvider == parentProvider,
+              URL(fileURLWithPath: record.workingDirectory, isDirectory: true)
+                .standardizedFileURL.path == context.workingDirectory.standardizedFileURL.path
+        else {
+            throw CLIApplicationError.failed("parent conversation ownership could not be verified")
+        }
+
+        var copied: [ConversationItem] = []
+        var copiedBytes = 0
+        for item in record.items.reversed() {
+            let clean: ConversationItem
+            let text: String
+            switch item {
+            case .user(let user):
+                guard user.syntheticReason == nil else { continue }
+                let parts = user.content.compactMap { part -> String? in
+                    guard case .text(let value) = part else { return nil }
+                    return value
+                }
+                text = parts.joined(separator: "\n")
+                guard !text.isEmpty else { continue }
+                clean = .user(text)
+            case .assistant(let assistant):
+                text = assistant.content
+                guard !text.isEmpty else { continue }
+                clean = .assistant(AssistantItem(content: text))
+            case .system, .toolResult, .customToolOutput, .backendToolCall, .reasoning:
+                continue
+            }
+            let bytes = text.utf8.count
+            guard bytes <= 1_048_576,
+                  copied.count < 128,
+                  copiedBytes <= 1_048_576 - bytes
+            else { break }
+            copied.append(clean)
+            copiedBytes += bytes
+        }
+        return Array(copied.reversed())
     }
 
     static func validationMessage(_ error: ResolutionError) -> String {
@@ -1358,7 +1446,8 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         runtime: EffectiveRuntimeConfig,
         model: String,
         cwd: URL,
-        resumeItems: [ConversationItem]?
+        resumeItems: [ConversationItem]?,
+        forkItems: [ConversationItem]? = nil
     ) async -> OpenGrokChildResult {
         let startedAt = Date()
         if shellChildProviderBindings[childID] == nil {
@@ -1485,6 +1574,9 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             ) {
                 items.append(.user(agentsBody))
             }
+            if let forkItems {
+                items.append(contentsOf: forkItems)
+            }
         }
         items.append(.user(prompt))
         bookkeeping[childID]?.liveItems = items
@@ -1507,8 +1599,11 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         let history = LiveConversationHistory(record: record, store: context.conversationStore)
         let logicalTurnID = "\(childID)-\(bookkeeping[childID]?.turns ?? 0)"
         let activeChildren = await coordinator.listActive(parentSessionID: context.sessionID)
-        let parentPromptID = activeChildren.first { $0.request.id == childID }?.request.parentPromptID
-            ?? LiveSubagentParentPromptContext.promptID
+        let activeChild = activeChildren.first { $0.request.id == childID }
+        let workflowOwned = activeChild?.request.owner == .workflow
+        let parentPromptID: String? = workflowOwned
+            ? nil
+            : activeChild?.request.parentPromptID ?? LiveSubagentParentPromptContext.promptID
         await history.beginUsagePrompt(logicalTurnID)
 
         var stopHookContinuations = 0
@@ -1660,7 +1755,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             bookkeeping[childID]?.model = model
         }
         let childUsage = await history.usageSnapshot
-        if let parentUsageHistory {
+        if !workflowOwned, let parentUsageHistory {
             let byModel = childUsage?.models.map {
                 (model: $0.modelID, totals: $0.totals.usageTotals)
             } ?? []
@@ -1675,7 +1770,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                     promptID: parentPromptID
                 )
             }
-        } else if let parentPromptID {
+        } else if !workflowOwned, let parentPromptID {
             await coordinator.markUsageNotApplied(
                 parentSessionID: context.sessionID,
                 promptID: parentPromptID

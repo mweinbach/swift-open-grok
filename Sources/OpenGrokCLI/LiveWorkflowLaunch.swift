@@ -34,6 +34,40 @@ enum LiveWorkflowLaunch {
         let fileAccessPolicy: FileToolAccessPolicy
         let makeProcessBackend: @Sendable () -> any ShellProcessBackend
         let environment: [String: String]
+        let subagentHost: LiveSubagentHost?
+        let sourceProvenance: LiveWorkflowSourceProvenance
+
+        init(
+            sampler: OpenGrokLiveSampler,
+            model: String,
+            supportsReasoningEffort: Bool,
+            workspaceRoot: URL,
+            sessionID: String,
+            openGrokHome: URL,
+            telemetryBootstrapContext: LiveTelemetryBootstrapContext,
+            systemPrompt: String?,
+            toolPolicy: LiveAgentToolPolicy?,
+            fileAccessPolicy: FileToolAccessPolicy,
+            makeProcessBackend: @escaping @Sendable () -> any ShellProcessBackend,
+            environment: [String: String],
+            subagentHost: LiveSubagentHost? = nil,
+            sourceProvenance: LiveWorkflowSourceProvenance = .untrusted
+        ) {
+            self.sampler = sampler
+            self.model = model
+            self.supportsReasoningEffort = supportsReasoningEffort
+            self.workspaceRoot = workspaceRoot
+            self.sessionID = sessionID
+            self.openGrokHome = openGrokHome
+            self.telemetryBootstrapContext = telemetryBootstrapContext
+            self.systemPrompt = systemPrompt
+            self.toolPolicy = toolPolicy
+            self.fileAccessPolicy = fileAccessPolicy
+            self.makeProcessBackend = makeProcessBackend
+            self.environment = environment
+            self.subagentHost = subagentHost
+            self.sourceProvenance = sourceProvenance
+        }
     }
 
     /// The parent session's capability ceiling. A workflow child can narrow it
@@ -110,6 +144,14 @@ enum LiveWorkflowLaunch {
                     systemPrompt: session.systemPrompt,
                     parentCapabilityMode: parentCapabilityMode(for: session.toolPolicy),
                     supportsReasoningEffort: session.supportsReasoningEffort,
+                    subagentBridge: session.subagentHost.map {
+                        LiveWorkflowSubagentBridge(
+                            host: $0,
+                            parentSessionID: session.sessionID,
+                            sourceProvenance: session.sourceProvenance
+                        )
+                    },
+                    requiresSubagentBridge: true,
                     makeInvoker: { mode in
                         let executor = try await LiveToolExecutor(
                             processBackend: session.makeProcessBackend(),
@@ -145,9 +187,44 @@ enum LiveWorkflowLaunch {
                 )
             },
             finish: { context in
+                if let subagentHost = session.subagentHost {
+                    await cancelAndDrainWorkflowChildren(
+                        host: subagentHost,
+                        runID: context.runID
+                    )
+                }
                 await teardown.shutdown(runID: context.runID)
             }
         )
+    }
+
+    private static func cancelAndDrainWorkflowChildren(
+        host: LiveSubagentHost,
+        runID: String
+    ) async {
+        // Registry cancellation marks its own task cancelled before this
+        // finalizer runs. Cleanup still needs an uncancelled execution context
+        // to await the real children before their shared resources disappear.
+        let cleanup = Task.detached {
+            let cancelled = await host.coordinator.cancel(.workflowRun(runID))
+            guard cancelled > 0 else { return }
+            let deadline = Date().addingTimeInterval(20)
+            let children = await host.coordinator.listActive(workflowRunID: runID)
+            for child in children {
+                let milliseconds = UInt64(max(0, deadline.timeIntervalSinceNow) * 1_000)
+                guard milliseconds > 0 else { break }
+                do {
+                    let result = try await host.coordinator.awaitResult(
+                        child.request.id,
+                        timeoutMS: milliseconds
+                    )
+                    guard result.id == child.request.id else { break }
+                } catch {
+                    break
+                }
+            }
+        }
+        await cleanup.value
     }
 
     /// The parent's policy with its capability mode replaced by the clamped

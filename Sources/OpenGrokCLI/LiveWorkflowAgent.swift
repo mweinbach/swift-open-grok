@@ -3,20 +3,11 @@
 // The child-agent side of the workflow seam: what actually happens when a
 // workflow script calls `agent(prompt, opts)`.
 //
-// A child agent is a real headless session against the configured provider —
-// the same sampler, the same tool executor, the same turn loop shape as the
-// interactive session in `LiveShellSamplingDriver` — with three things removed
-// and two added.
-//
-// Removed: no conversation persistence (a child's transcript is not a resumable
-// user session; the durable record of what it did is the workflow journal), no
-// Code Mode (it is a session-wide decision the parent already made, and a
-// child inheriting a half-built cell runtime would be able to `wait` on cells
-// it never created), and no pager surface.
-//
-// Added: schema-forced output when the script asked for one, and a capability
-// clamp that makes it structurally impossible for a child to hold a tool the
-// parent session does not.
+// Production children are real durable subagent sessions owned by the root
+// `LiveSubagentHost`, with isolated provider credentials, authoritative
+// workspace/sandbox policy, worktree isolation, and resumable transcripts.
+// The sampler-only runner below remains as a focused harness for older
+// call sites which do not claim production subagent authority.
 
 import Foundation
 import OpenGrokHooks
@@ -98,7 +89,11 @@ enum LiveWorkflowCapability {
                     + "(expected read-only, read-write, execute, or all)"
             )
         }
-        return mode.isSubset(of: parent) ? mode : parent
+        if mode.isSubset(of: parent) { return mode }
+        if parent.isSubset(of: mode) { return parent }
+        // Execute and read/write are incomparable: their only common
+        // authority is read-only, never either side's exclusive capability.
+        return .readOnly
     }
 
     static func parse(_ raw: String) -> ToolCapabilityMode? {
@@ -133,6 +128,11 @@ struct LiveWorkflowAgentEnvironment: Sendable {
     /// Resolved from the parent's authoritative model metadata. An opaque
     /// sampler cannot reveal whether it will silently strip an effort field.
     let supportsReasoningEffort: Bool
+    /// Production workflows execute through the parent's actual subagent host.
+    /// A missing host is an authority failure, never permission to substitute
+    /// the legacy sampler-only runner.
+    let subagentBridge: LiveWorkflowSubagentBridge?
+    let requiresSubagentBridge: Bool
     /// Builds the tool surface for one clamped capability mode. Called at most
     /// once per distinct mode per run; the host caches the results.
     let makeInvoker: @Sendable (ToolCapabilityMode) async throws -> any LiveWorkflowToolInvoker
@@ -148,6 +148,8 @@ struct LiveWorkflowAgentEnvironment: Sendable {
         systemPrompt: String? = nil,
         parentCapabilityMode: ToolCapabilityMode = .readWrite,
         supportsReasoningEffort: Bool = false,
+        subagentBridge: LiveWorkflowSubagentBridge? = nil,
+        requiresSubagentBridge: Bool = false,
         maxToolRounds: Int = 16,
         makeInvoker: @escaping @Sendable (ToolCapabilityMode) async throws -> any LiveWorkflowToolInvoker
     ) {
@@ -157,6 +159,8 @@ struct LiveWorkflowAgentEnvironment: Sendable {
         self.systemPrompt = systemPrompt
         self.parentCapabilityMode = parentCapabilityMode
         self.supportsReasoningEffort = supportsReasoningEffort
+        self.subagentBridge = subagentBridge
+        self.requiresSubagentBridge = requiresSubagentBridge
         self.maxToolRounds = maxToolRounds
         self.makeInvoker = makeInvoker
     }
@@ -190,6 +194,19 @@ struct LiveWorkflowChildAgent: Sendable {
         emit: @Sendable @escaping (LiveWorkflowAgentEvent) async -> Void
     ) async throws -> RhaiAgentResult {
         try checkCancelled()
+        if let bridge = environment.subagentBridge {
+            return try await bridge.run(
+                runID: runID,
+                agentID: agentID,
+                options: options,
+                environment: environment,
+                cancellation: cancellation,
+                emit: emit
+            )
+        }
+        guard !environment.requiresSubagentBridge else {
+            throw RhaiHostError.failed("workflow child subagent host is unavailable")
+        }
         let validated = try validate(options: options)
         let startedAt = Date()
         await emit(.started(agentID: agentID, label: options.label, phase: options.phase))
@@ -284,7 +301,7 @@ struct LiveWorkflowChildAgent: Sendable {
         return ValidatedOptions(capability: capability, reasoningEffort: reasoningEffort)
     }
 
-    private static func normalizedReasoningEffort(_ raw: String?) throws -> ReasoningEffort? {
+    static func normalizedReasoningEffort(_ raw: String?) throws -> ReasoningEffort? {
         guard let raw else { return nil }
         let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if normalized.isEmpty || normalized == "null" || normalized == "undefined" {
