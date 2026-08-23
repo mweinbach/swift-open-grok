@@ -104,6 +104,7 @@ private struct ACPPeerLiveFixture {
         let environment = [
             "HOME": home.path,
             "OPENGROK_HOME": home.path,
+            "GROK_SANDBOX": "off",
             "XAI_API_KEY": "acp-peer-test-key",
         ]
         let parsed = try CLICommandParser.parseOrThrow([

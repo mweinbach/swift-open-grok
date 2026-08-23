@@ -39,6 +39,7 @@ private struct LiveLspProjectTrustFixture {
         environment = [
             "HOME": ownerHome.path,
             "OPENGROK_HOME": openGrokHome.path,
+            "GROK_SANDBOX": "off",
             "GROK_FOLDER_TRUST": "1",
             "GROK_LSP_TOOLS": "1",
             "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",

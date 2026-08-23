@@ -95,6 +95,7 @@ private struct InteractiveCredentialRotationFixture {
         var environment = [
             "HOME": home.path,
             "OPENGROK_HOME": home.path,
+            "GROK_SANDBOX": "off",
         ]
         for (key, value) in extraEnvironment { environment[key] = value }
         self.environment = environment

@@ -61,6 +61,7 @@ private struct SubagentFixture {
         var env = [
             "HOME": home.path,
             "OPENGROK_HOME": home.path,
+            "GROK_SANDBOX": "off",
             "XDG_STATE_HOME": home.appendingPathComponent("state").path,
             "XAI_API_KEY": "test-xai-key",
         ]
@@ -365,6 +366,7 @@ struct LiveSubagentAdvertisementTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XDG_STATE_HOME": root.appendingPathComponent("state").path,
                 "XAI_API_KEY": "test-key",
             ],
@@ -408,6 +410,7 @@ struct LiveSubagentAdvertisementTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XDG_STATE_HOME": root.appendingPathComponent("state").path,
                 "XAI_API_KEY": "test-key",
             ],

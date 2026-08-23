@@ -84,6 +84,7 @@ private func makeTelemetryFoundation(
         environment: [
             "HOME": home.path,
             "OPENGROK_HOME": home.path,
+            "GROK_SANDBOX": "off",
             "XAI_API_KEY": "test-key",
             "GROK_DISABLE_API_KEY_AUTH": "1",
             "GROK_EXTERNAL_OTEL": "1",

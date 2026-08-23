@@ -85,6 +85,7 @@ struct LiveSessionBusParityTests {
             environment: [
                 "HOME": fixture.home.path,
                 "OPENGROK_HOME": fixture.home.path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "session-bus-test-key",
             ],
             streams: CLIStreams(out: { _ in }, err: { _ in }),

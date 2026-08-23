@@ -61,6 +61,7 @@ struct LiveLaunchAutoUpdateReachabilityTests {
         var environment: [String: String] = [
             "HOME": home.path,
             "OPENGROK_HOME": home.path,
+            "GROK_SANDBOX": "off",
             "XDG_STATE_HOME": home.appendingPathComponent("state").path,
             "GROK_TEST_VERSION": "0.1.0",
             "OPENGROK_TEST_LAUNCH_UPDATE": "1",

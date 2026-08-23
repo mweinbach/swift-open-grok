@@ -76,6 +76,7 @@ private struct LiveSessionFoundationTurnFixture {
         environment = [
             "HOME": disk.home.path,
             "OPENGROK_HOME": disk.home.path,
+            "GROK_SANDBOX": "off",
             "XDG_STATE_HOME": disk.home.appendingPathComponent("state").path,
             "XAI_API_KEY": "test-xai-key",
         ]

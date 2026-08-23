@@ -27,6 +27,7 @@ private struct CodeModeProgressWorkspace {
         environment = [
             "HOME": home.path,
             "OPENGROK_HOME": openGrokHome.path,
+            "GROK_SANDBOX": "off",
             "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",
         ]
     }

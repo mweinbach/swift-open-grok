@@ -417,6 +417,7 @@ struct NativeMessagesOutputParityTests {
         let environment = [
             "HOME": home.path,
             "OPENGROK_HOME": home.path,
+            "GROK_SANDBOX": "off",
             "XDG_STATE_HOME": home.appendingPathComponent("state").path,
             "XAI_API_KEY": "native-test-key",
         ]

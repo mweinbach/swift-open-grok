@@ -169,6 +169,7 @@ private struct LivePlanModeSecurityFixture {
         let environment = [
             "HOME": home.path,
             "OPENGROK_HOME": grokHome.path,
+            "GROK_SANDBOX": "off",
             "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",
         ]
         plan = root.appendingPathComponent(".opengrok/plan.md")

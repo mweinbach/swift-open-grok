@@ -133,6 +133,7 @@ private struct ForkTasksWorkspace {
         environment = [
             "HOME": home.path,
             "OPENGROK_HOME": grokHome.path,
+            "GROK_SANDBOX": "off",
         ]
     }
 

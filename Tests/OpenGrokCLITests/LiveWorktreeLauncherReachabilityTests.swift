@@ -70,6 +70,7 @@ struct LiveWorktreeLauncherReachabilityTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": home.path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,

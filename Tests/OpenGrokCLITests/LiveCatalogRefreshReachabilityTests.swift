@@ -53,6 +53,7 @@ struct LiveCatalogRefreshReachabilityTests {
             environment: [
                 "HOME": home.path,
                 "OPENGROK_HOME": home.path,
+                "GROK_SANDBOX": "off",
                 "XDG_STATE_HOME": home.appendingPathComponent("state").path,
                 "META_API_KEY": "meta-test-key",
                 "OPENGROK_META_API_BASE_URL": server.url,

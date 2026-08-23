@@ -51,6 +51,7 @@ private struct WorkflowSourceAuthorityFixture {
         environment = [
             "HOME": home.path,
             "OPENGROK_HOME": home.path,
+            "GROK_SANDBOX": "off",
             "XDG_STATE_HOME": home.appendingPathComponent("xdg-state").path,
             "XAI_API_KEY": "workflow-authority-test-credential",
             "GROK_FOLDER_TRUST": "1",

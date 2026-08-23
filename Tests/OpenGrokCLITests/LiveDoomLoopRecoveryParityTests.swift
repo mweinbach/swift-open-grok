@@ -45,6 +45,7 @@ private final class LiveDoomLoopFixture: @unchecked Sendable {
         var values = [
             "HOME": home.path,
             "OPENGROK_HOME": home.path,
+            "GROK_SANDBOX": "off",
             "XAI_API_KEY": "private-doom-loop-test-credential",
         ]
         for (key, value) in environmentOverrides {

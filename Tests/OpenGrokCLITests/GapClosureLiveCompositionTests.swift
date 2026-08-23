@@ -89,6 +89,7 @@ struct GapClosureLiveCompositionTests {
             let environment = [
                 "HOME": home.path,
                 "OPENGROK_HOME": home.path,
+                "GROK_SANDBOX": "off",
                 credentialName: "provider-test-key",
             ]
             let command = try CLICommandParser.parseOrThrow([
@@ -138,6 +139,7 @@ struct GapClosureLiveCompositionTests {
         let environment = [
             "HOME": home.path,
             "OPENGROK_HOME": home.path,
+            "GROK_SANDBOX": "off",
             OpenRouterModels.apiKeyEnv: "router-test-key",
         ]
         let (streams, _, _) = CLIStreams.buffered()

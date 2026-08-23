@@ -115,6 +115,7 @@ private struct QuestionWorkspace {
         environment = [
             "HOME": home.path,
             "OPENGROK_HOME": grokHome.path,
+            "GROK_SANDBOX": "off",
         ]
     }
 
@@ -343,6 +344,7 @@ struct LiveAskUserQuestionReachabilityTests {
                     environment: [
                         "HOME": workspace.root.path,
                         "OPENGROK_HOME": workspace.root.appendingPathComponent("state").path,
+                        "GROK_SANDBOX": "off",
                         "XAI_API_KEY": "test-key",
                     ],
                     streams: streams,

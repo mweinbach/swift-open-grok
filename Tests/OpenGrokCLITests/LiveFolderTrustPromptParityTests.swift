@@ -169,6 +169,7 @@ private struct FolderTrustPromptFixture {
         environment = [
             "HOME": home.path,
             "OPENGROK_HOME": ownerState.path,
+            "GROK_SANDBOX": "off",
             "XAI_API_KEY": "folder-trust-prompt-test-credential",
             "GROK_FOLDER_TRUST": "1",
             "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",

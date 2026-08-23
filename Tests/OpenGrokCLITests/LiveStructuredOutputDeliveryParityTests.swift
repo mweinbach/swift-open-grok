@@ -66,6 +66,7 @@ struct LiveStructuredOutputDeliveryParityTests {
             environment: [
                 "HOME": home.path,
                 "OPENGROK_HOME": home.path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "schema-delivery-private-credential",
             ],
             streams: captured.streams,

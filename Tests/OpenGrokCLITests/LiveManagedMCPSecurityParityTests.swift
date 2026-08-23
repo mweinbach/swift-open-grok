@@ -25,6 +25,7 @@ private struct ManagedMCPSecurityFixture {
         [
             "HOME": home.path,
             "OPENGROK_HOME": state.path,
+            "GROK_SANDBOX": "off",
             "GROK_FOLDER_TRUST": "1",
             "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",
         ]

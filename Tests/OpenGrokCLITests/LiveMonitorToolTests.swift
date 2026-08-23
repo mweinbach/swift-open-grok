@@ -377,7 +377,11 @@ struct LiveMonitorAdvertisementTests {
         defer { try? FileManager.default.removeItem(at: workspace) }
         let home = workspace.appendingPathComponent("home", isDirectory: true)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
-        let environment = ["HOME": home.path, "OPENGROK_HOME": home.path]
+        let environment = [
+            "HOME": home.path,
+            "OPENGROK_HOME": home.path,
+            "GROK_SANDBOX": "off",
+        ]
 
         let without = try await LiveToolExecutor(
             processBackend: InertMonitorShellBackend(),

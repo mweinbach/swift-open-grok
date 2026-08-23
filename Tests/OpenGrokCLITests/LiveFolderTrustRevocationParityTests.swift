@@ -40,6 +40,7 @@ private struct LiveFolderTrustRevocationFixture {
         environment = [
             "HOME": home.path,
             "OPENGROK_HOME": state.path,
+            "GROK_SANDBOX": "off",
             "GROK_FOLDER_TRUST": "1",
             "GROK_LSP_TOOLS": "1",
             "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",

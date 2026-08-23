@@ -55,6 +55,7 @@ private struct SchedulerFireFixture {
         environment = [
             "HOME": home.path,
             "OPENGROK_HOME": home.path,
+            "GROK_SANDBOX": "off",
             "XDG_STATE_HOME": home.appendingPathComponent("state").path,
             "XAI_API_KEY": "test-xai-key",
         ]

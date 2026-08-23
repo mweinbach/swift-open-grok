@@ -128,6 +128,7 @@ private struct SessionCollaborationExecutorFixture {
         environment = [
             "HOME": home.path,
             "OPENGROK_HOME": openGrokHome.path,
+            "GROK_SANDBOX": "off",
             "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",
         ]
         processBackend = LocalShellProcessBackend(inheritedEnvironment: environment)
