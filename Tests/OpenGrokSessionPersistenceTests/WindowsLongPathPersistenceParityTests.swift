@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokConfig
 import OpenGrokSamplingTypes
 import OpenGrokShared
 import OpenGrokShellSessionSupport
@@ -94,6 +95,148 @@ struct WindowsLongPathPersistenceParityTests {
     }
 
     #if os(Windows)
+    @Test("durable session creation hardens the state, sessions, workspace, and session chain")
+    func durableDirectoryCreationProtectsEveryAncestor() throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let state = root.appendingPathComponent("state", isDirectory: true)
+        let sessions = state.appendingPathComponent("sessions", isDirectory: true)
+        let workspace = sessions.appendingPathComponent("workspace", isDirectory: true)
+        let session = workspace.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: session, withIntermediateDirectories: true)
+        #expect(state.path.withCString { og_path_is_private_to_current_user($0, 1) } != 1)
+
+        try RelocationFS.createDirectoryDurable(session, stateRoot: state)
+
+        for directory in [state, sessions, workspace, session] {
+            let extended = try RelocationFS.windowsExtendedLengthPath(directory.standardizedFileURL.path)
+            #expect(extended.withCString { og_path_is_private_to_current_user($0, 1) } == 1)
+        }
+        let history = session.appendingPathComponent("chat_history.jsonl")
+        try RelocationFS.writeAtomicDurable(
+            path: history,
+            data: Data("private\n".utf8),
+            stateRoot: state
+        )
+        try expectOwnerPrivateWindowsFile(history)
+    }
+
+    @Test("a directly constructed session store hardens its explicit preexisting home before persistence")
+    func directSessionStoreHardensBroadExistingAncestors() throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stateRoot = root.appendingPathComponent("unregistered-state", isDirectory: true)
+        let workspace = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+
+        let sessionID = UUID().uuidString
+        let store = SessionDocumentStore(grokHome: stateRoot)
+        let session = try store.sessionDirectory(sessionID: sessionID, cwd: workspace.path)
+        try FileManager.default.createDirectory(at: session, withIntermediateDirectories: true)
+        #expect(stateRoot.path.withCString { og_path_is_private_to_current_user($0, 1) } != 1)
+
+        let history = try JSONValue.encode(ConversationItem.user("owner-private session history"))
+        try store.save(PersistedSessionState(
+            summary: SessionSummary(
+                sessionID: SessionID(sessionID),
+                cwd: workspace.path,
+                currentModelID: "grok-code-fast-1"
+            ),
+            chatHistory: [history]
+        ))
+
+        for directory in [
+            stateRoot,
+            stateRoot.appendingPathComponent("sessions"),
+            session.deletingLastPathComponent(),
+            session,
+        ] {
+            let extended = try RelocationFS.windowsExtendedLengthPath(directory.standardizedFileURL.path)
+            #expect(extended.withCString { og_path_is_private_to_current_user($0, 1) } == 1)
+        }
+        for filename in ["chat_history.jsonl", "updates.jsonl", "state.json", "summary.json"] {
+            try expectOwnerPrivateWindowsFile(session.appendingPathComponent(filename))
+        }
+    }
+
+    @Test("a directly constructed relocation journal protects its explicit home before opening the lease")
+    func directRelocationJournalHardensExistingAncestorsBeforeLease() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stateRoot = root.appendingPathComponent("unregistered-journal-state", isDirectory: true)
+        let relocations = stateRoot.appendingPathComponent("relocations", isDirectory: true)
+        try FileManager.default.createDirectory(at: relocations, withIntermediateDirectories: true)
+        #expect(stateRoot.path.withCString { og_path_is_private_to_current_user($0, 1) } != 1)
+
+        let sessionID = UUID().uuidString
+        let journal = RelocationJournal(grokHome: stateRoot)
+        try await journal.acquireLease(sessionID: sessionID)
+
+        for directory in [stateRoot, relocations] {
+            let extended = try RelocationFS.windowsExtendedLengthPath(directory.standardizedFileURL.path)
+            #expect(extended.withCString { og_path_is_private_to_current_user($0, 1) } == 1)
+        }
+        try expectOwnerPrivateWindowsFile(
+            RelocationFS.lockPath(grokHome: stateRoot, sessionID: sessionID)
+        )
+        await journal.releaseLease(sessionID: sessionID)
+    }
+
+    @Test("an explicit state root cannot authorize directory creation outside its boundary")
+    func explicitStateRootRejectsUnrelatedDirectories() throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stateRoot = root.appendingPathComponent("state", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        #expect(outside.path.withCString { og_path_is_private_to_current_user($0, 1) } != 1)
+
+        #expect(throws: (any Error).self) {
+            try RelocationFS.createDirectoryDurable(
+                outside.appendingPathComponent("session"),
+                stateRoot: stateRoot
+            )
+        }
+
+        #expect(FileManager.default.fileExists(
+            atPath: outside.appendingPathComponent("session").path
+        ) == false)
+        #expect(outside.path.withCString { og_path_is_private_to_current_user($0, 1) } != 1)
+    }
+
+    @Test("durable session creation refuses a reparse-point workspace before writing through it")
+    func durableDirectoryRejectsReparsePoint() throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessions = root.appendingPathComponent("state/sessions")
+        let outside = root.appendingPathComponent("outside")
+        for directory in [sessions, outside] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        let redirected = sessions.appendingPathComponent("workspace")
+        try FileManager.default.createSymbolicLink(at: redirected, withDestinationURL: outside)
+
+        #expect(throws: (any Error).self) {
+            try RelocationFS.createDirectoryDurable(redirected.appendingPathComponent("session"))
+        }
+        #expect(FileManager.default.fileExists(
+            atPath: outside.appendingPathComponent("session").path
+        ) == false)
+    }
+
+    @Test("validation refuses inherited broad session files until their owner ACL is secured")
+    func validationRejectsBroadSessionDocuments() throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let broad = root.appendingPathComponent("broad.json")
+        try Data("{}".utf8).write(to: broad)
+        #expect(broad.path.withCString { og_path_is_private_to_current_user($0, 0) } != 1)
+
+        #expect(throws: RelocationError.self) {
+            try RelocationFS.requireRegularFile(broad)
+        }
+    }
+
     @Test("drive and UNC session paths use idempotent canonical verbatim namespaces")
     func verbatimWindowsPathNamespaces() throws {
         #expect(

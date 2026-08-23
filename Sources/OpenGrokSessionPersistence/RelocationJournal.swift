@@ -36,6 +36,12 @@ public actor RelocationJournal {
         try RelocationFS.validateComponent(field: "session id", value: sessionID)
         let lockURL = RelocationFS.lockPath(grokHome: grokHome, sessionID: sessionID)
         do {
+            #if os(Windows)
+            try RelocationFS.createDirectoryDurable(
+                lockURL.deletingLastPathComponent(),
+                stateRoot: grokHome
+            )
+            #endif
             let lock = try AdvisoryFileLock.acquire(
                 at: lockURL,
                 options: AdvisoryLockOptions(nonBlocking: true, create: true, mode: 0o600)
@@ -103,7 +109,12 @@ public actor RelocationJournal {
             throw RelocationError.json(path: path.path, message: error.localizedDescription)
         }
 
-        try RelocationFS.writeAtomicDurable(path: path, data: data, permissions: 0o600)
+        try RelocationFS.writeAtomicDurable(
+            path: path,
+            data: data,
+            permissions: 0o600,
+            stateRoot: grokHome
+        )
     }
 
     private func removeJournalFile(sessionID: String) throws {
@@ -217,7 +228,7 @@ public actor RelocationJournal {
 
         // Copy source directory to staging
         do {
-            try RelocationFS.copyDirectory(source: sourceDir, target: stagingDir)
+            try RelocationFS.copyDirectory(source: sourceDir, target: stagingDir, stateRoot: grokHome)
         } catch {
             _ = try? FileManager.default.removeItem(at: stagingDir)
             throw error
@@ -245,7 +256,11 @@ public actor RelocationJournal {
                     }
 
                     let updatedData = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
-                    try RelocationFS.writeAtomicDurable(path: summaryPath, data: updatedData)
+                    try RelocationFS.writeAtomicDurable(
+                        path: summaryPath,
+                        data: updatedData,
+                        stateRoot: grokHome
+                    )
                 }
             } catch {
                 _ = try? FileManager.default.removeItem(at: stagingDir)
@@ -255,7 +270,11 @@ public actor RelocationJournal {
 
         // Atomically publish staging directory to target
         do {
-            try RelocationFS.publishNoReplace(source: stagingDir, target: targetDir)
+            try RelocationFS.publishNoReplace(
+                source: stagingDir,
+                target: targetDir,
+                stateRoot: grokHome
+            )
         } catch {
             _ = try? FileManager.default.removeItem(at: stagingDir)
             throw error

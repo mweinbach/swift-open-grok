@@ -130,7 +130,7 @@ public enum RelocationFS: Sendable {
 
     // MARK: - Durable Creation and Removal
 
-    public static func createDirectoryDurable(_ url: URL) throws {
+    public static func createDirectoryDurable(_ url: URL, stateRoot: URL? = nil) throws {
         let existingType = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.type]
             as? FileAttributeType
         let alreadyExisted = existingType == .typeDirectory
@@ -142,7 +142,18 @@ public enum RelocationFS: Sendable {
         )
         _ = chmod(url.path, S_IRWXU)
         #else
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        if let stateRoot {
+            try OpenGrokConfig.createDirAllOwnerOnly(url, stateRoot: stateRoot)
+        } else {
+            try OpenGrokConfig.createDirAllOwnerOnly(url)
+        }
+        let nativePath = try windowsExtendedLengthPath(url.standardizedFileURL.path)
+        guard nativePath.withCString({ og_directory_secure_current_user($0) }) == 0 else {
+            throw windowsNativeFileError(operation: "protect session directory DACL", path: url)
+        }
+        guard nativePath.withCString({ og_path_is_private_to_current_user($0, 1) }) == 1 else {
+            throw windowsNativeFileError(operation: "verify owner-private session directory", path: url)
+        }
         #endif
         // Only a newly published directory needs a durable parent entry. Still
         // create and restrict existing directories above; skipping that work
@@ -174,6 +185,12 @@ public enum RelocationFS: Sendable {
         if let type = attrs?[.type] as? FileAttributeType, type == .typeSymbolicLink {
             throw RelocationError.inconsistent("expected real directory, got symlink at \(url.path)")
         }
+        #if os(Windows)
+        let nativePath = try windowsExtendedLengthPath(url.standardizedFileURL.path)
+        guard nativePath.withCString({ og_path_is_private_to_current_user($0, 1) }) == 1 else {
+            throw RelocationError.inconsistent("expected owner-private directory at \(url.path)")
+        }
+        #endif
     }
 
     public static func requireRegularFile(_ url: URL) throws {
@@ -185,13 +202,24 @@ public enum RelocationFS: Sendable {
         if let type = attrs?[.type] as? FileAttributeType, type == .typeSymbolicLink {
             throw RelocationError.inconsistent("expected regular file, got symlink at \(url.path)")
         }
+        #if os(Windows)
+        let nativePath = try windowsExtendedLengthPath(url.standardizedFileURL.path)
+        guard nativePath.withCString({ og_path_is_private_to_current_user($0, 0) }) == 1 else {
+            throw RelocationError.inconsistent("expected owner-private regular file at \(url.path)")
+        }
+        #endif
     }
 
     // MARK: - Atomic Durable File Writing
 
-    public static func writeAtomicDurable(path: URL, data: Data, permissions: UInt16? = nil) throws {
+    public static func writeAtomicDurable(
+        path: URL,
+        data: Data,
+        permissions: UInt16? = nil,
+        stateRoot: URL? = nil
+    ) throws {
         let parent = path.deletingLastPathComponent()
-        try createDirectoryDurable(parent)
+        try createDirectoryDurable(parent, stateRoot: stateRoot)
 
         let tempURL = parent.appendingPathComponent(".\(path.lastPathComponent).\(UUID().uuidString).tmp")
         do {
@@ -417,7 +445,12 @@ public enum RelocationFS: Sendable {
 
     // MARK: - Atomic Publication (No-Replace)
 
-    public static func publishNoReplace(source: URL, target: URL) throws {
+    public static func publishNoReplace(source: URL, target: URL, stateRoot: URL? = nil) throws {
+        #if os(Windows)
+        if let stateRoot {
+            try createDirectoryDurable(target.deletingLastPathComponent(), stateRoot: stateRoot)
+        }
+        #endif
         guard FileManager.default.fileExists(atPath: source.path) else {
             throw RelocationError.inconsistent("source directory missing for publication: \(source.path)")
         }
@@ -457,7 +490,7 @@ public enum RelocationFS: Sendable {
 
     // MARK: - Directory Copy
 
-    public static func copyDirectory(source: URL, target: URL) throws {
+    public static func copyDirectory(source: URL, target: URL, stateRoot: URL? = nil) throws {
         try requireDirectory(source)
 
         let sourceStandard = source.standardizedFileURL.path
@@ -470,12 +503,12 @@ public enum RelocationFS: Sendable {
             throw RelocationError.collision(path: target.path)
         }
 
-        try createDirectoryDurable(target)
-        try copyDirectoryContents(source: source, target: target)
+        try createDirectoryDurable(target, stateRoot: stateRoot)
+        try copyDirectoryContents(source: source, target: target, stateRoot: stateRoot)
         try? syncDirectory(target)
     }
 
-    private static func copyDirectoryContents(source: URL, target: URL) throws {
+    private static func copyDirectoryContents(source: URL, target: URL, stateRoot: URL?) throws {
         let contents = try FileManager.default.contentsOfDirectory(
             at: source,
             includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey],
@@ -492,8 +525,8 @@ public enum RelocationFS: Sendable {
             }
 
             if fileType == FileAttributeType.typeDirectory {
-                try createDirectoryDurable(destItem)
-                try copyDirectoryContents(source: item, target: destItem)
+                try createDirectoryDurable(destItem, stateRoot: stateRoot)
+                try copyDirectoryContents(source: item, target: destItem, stateRoot: stateRoot)
                 #if !os(Windows)
                 if let perms = attrs[FileAttributeKey.posixPermissions] as? NSNumber {
                     _ = chmod(destItem.path, mode_t(perms.uint32Value))

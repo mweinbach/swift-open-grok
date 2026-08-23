@@ -51,7 +51,7 @@ public struct SessionDocumentStore: Sendable {
             state.summary.cwd,
             environment: ["OPENGROK_HOME": grokHome.path]
         )
-        try RelocationFS.createDirectoryDurable(directory)
+        try RelocationFS.createDirectoryDurable(directory, stateRoot: grokHome)
 
         let summaryURL = directory.appendingPathComponent(Self.summaryFileName)
         let summaryLock = try AdvisoryFileLock.acquire(
@@ -99,11 +99,13 @@ public struct SessionDocumentStore: Sendable {
         let auxiliaryURL = directory.appendingPathComponent(Self.auxiliaryStateFileName)
         try RelocationFS.writeAtomicDurable(
             path: auxiliaryURL,
-            data: makeEncoder(prettyPrinted: false).encode(state)
+            data: makeEncoder(prettyPrinted: false).encode(state),
+            stateRoot: grokHome
         )
         try RelocationFS.writeAtomicDurable(
             path: summaryURL,
-            data: encodeSummary(state.summary)
+            data: encodeSummary(state.summary),
+            stateRoot: grokHome
         )
     }
 
@@ -270,7 +272,8 @@ public struct SessionDocumentStore: Sendable {
             .appendingPathComponent("\(checkpoint.checkpointID).json")
         try RelocationFS.writeAtomicDurable(
             path: checkpointURL,
-            data: makeEncoder(prettyPrinted: true).encode(checkpoint)
+            data: makeEncoder(prettyPrinted: true).encode(checkpoint),
+            stateRoot: grokHome
         )
         return checkpointURL
     }
@@ -468,6 +471,9 @@ public struct SessionDocumentStore: Sendable {
         in directory: URL,
         update: (inout SessionSummary) -> Void
     ) throws {
+        #if os(Windows)
+        try RelocationFS.createDirectoryDurable(directory, stateRoot: grokHome)
+        #endif
         let lock = try AdvisoryFileLock.acquire(
             at: directory.appendingPathComponent("\(Self.summaryFileName).lock")
         )
@@ -475,7 +481,7 @@ public struct SessionDocumentStore: Sendable {
         let url = directory.appendingPathComponent(Self.summaryFileName)
         var summary = try readSummary(at: url)
         update(&summary)
-        try RelocationFS.writeAtomicDurable(path: url, data: encodeSummary(summary))
+        try RelocationFS.writeAtomicDurable(path: url, data: encodeSummary(summary), stateRoot: grokHome)
     }
 
     private func readCanonicalSession(
@@ -543,6 +549,9 @@ public struct SessionDocumentStore: Sendable {
     // MARK: - Durable, corruption-tolerant JSONL
 
     private func withJSONLLock<T>(at path: URL, perform body: () throws -> T) throws -> T {
+        #if os(Windows)
+        try RelocationFS.createDirectoryDurable(path.deletingLastPathComponent(), stateRoot: grokHome)
+        #endif
         let lock = try AdvisoryFileLock.acquire(
             at: path.deletingLastPathComponent().appendingPathComponent(
                 "\(path.lastPathComponent).lock"
@@ -559,11 +568,11 @@ public struct SessionDocumentStore: Sendable {
             bytes.append(try encoder.encode(value))
             bytes.append(0x0A)
         }
-        try RelocationFS.writeAtomicDurable(path: path, data: bytes)
+        try RelocationFS.writeAtomicDurable(path: path, data: bytes, stateRoot: grokHome)
     }
 
     private func appendJSONLine<T: Encodable>(_ value: T, to path: URL) throws {
-        try RelocationFS.createDirectoryDurable(path.deletingLastPathComponent())
+        try RelocationFS.createDirectoryDurable(path.deletingLastPathComponent(), stateRoot: grokHome)
         try withJSONLLock(at: path) {
             if !FileManager.default.fileExists(atPath: path.path) {
                 guard FileManager.default.createFile(
@@ -671,7 +680,11 @@ public struct SessionDocumentStore: Sendable {
                 "\(path.lastPathComponent).corrupt"
             )
             if !FileManager.default.fileExists(atPath: backup.path) {
-                try RelocationFS.writeAtomicDurable(path: backup, data: history.originalBytes)
+                try RelocationFS.writeAtomicDurable(
+                    path: backup,
+                    data: history.originalBytes,
+                    stateRoot: grokHome
+                )
             }
             try writeJSONLines(history.values, to: path)
         }
@@ -724,7 +737,7 @@ public struct SessionDocumentStore: Sendable {
             "compaction_checkpoints",
             isDirectory: true
         )
-        try RelocationFS.createDirectoryDurable(destinationDirectory)
+        try RelocationFS.createDirectoryDurable(destinationDirectory, stateRoot: grokHome)
         let entries = try FileManager.default.contentsOfDirectory(
             at: sourceDirectory,
             includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
@@ -735,7 +748,8 @@ public struct SessionDocumentStore: Sendable {
             guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
             try RelocationFS.writeAtomicDurable(
                 path: destinationDirectory.appendingPathComponent(entry.lastPathComponent),
-                data: Data(contentsOf: entry)
+                data: Data(contentsOf: entry),
+                stateRoot: grokHome
             )
         }
     }

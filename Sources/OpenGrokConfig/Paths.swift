@@ -26,6 +26,11 @@ import Foundation
 import OpenGrokPaths
 import OpenGrokConfigTypes
 
+#if os(Windows)
+import COpenGrokSockets
+import WinSDK
+#endif
+
 // MARK: - Public path resolvers
 
 /// The default user Open Grok directory (`~/.opengrok`, canonicalized) used
@@ -59,7 +64,17 @@ public func grokHome(
     } else {
         resolved = defaultGrokHome(environment: environment)
     }
+    #if os(Windows)
+    do {
+        try createDirAllOwnerOnly(resolved, stateRoot: resolved)
+        WindowsOwnerStateDirectoryRegistry.shared.register(resolved)
+    } catch {
+        // The nonthrowing resolver retains its established API; callers that
+        // create session state take the throwing owner-private path below.
+    }
+    #else
     try? FileManager.default.createDirectory(at: resolved, withIntermediateDirectories: true)
+    #endif
     return resolved
 }
 
@@ -192,12 +207,15 @@ public func decodeCwdFromDirname(_ dir: URL) -> String? {
     return s.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-/// Best-effort chmod 0700 on Unix, no-op elsewhere: session dirs hold chat
-/// history, and creators re-run on every touch so the mode self-heals.
+/// Best-effort chmod 0700 on Unix or a protected owner SID DACL on Windows:
+/// session dirs hold chat history, and creators re-run on every touch so the
+/// owner-private boundary self-heals.
 /// Failures are ignored: on chmod-hostile filesystems (FAT, some network mounts)
 /// healing pre-existing loose dirs can never succeed.
 public func setDirOwnerOnly(_ dir: URL) {
-    #if !os(Windows)
+    #if os(Windows)
+    try? secureExistingWindowsOwnerDirectory(dir)
+    #else
     _ = chmod(dir.path, S_IRWXU)
     #endif
 }
@@ -206,17 +224,183 @@ public func setDirOwnerOnly(_ dir: URL) {
 /// plus a self-heal chmod for a pre-existing `dir`. Prefer this over bare
 /// `createDirectory` for anything under `sessions/`.
 public func createDirAllOwnerOnly(_ dir: URL) throws {
-    #if !os(Windows)
+    #if os(Windows)
+    let stateRoot = WindowsOwnerStateDirectoryRegistry.shared.root(containing: dir)
+    try createWindowsOwnerOnlyDirectoryChain(dir, stateRoot: stateRoot)
+    #else
     try FileManager.default.createDirectory(
         at: dir,
         withIntermediateDirectories: true,
         attributes: [.posixPermissions: 0o700]
     )
-    #else
-    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    #endif
     setDirOwnerOnly(dir)
+    #endif
 }
+
+#if os(Windows)
+private final class WindowsOwnerStateDirectoryRegistry: @unchecked Sendable {
+    static let shared = WindowsOwnerStateDirectoryRegistry()
+
+    private let lock = NSLock()
+    private var roots: [URL] = []
+
+    func register(_ root: URL) {
+        let normalized = root.standardizedFileURL
+        lock.withLock {
+            if !roots.contains(where: { $0.path.caseInsensitiveCompare(normalized.path) == .orderedSame }) {
+                roots.append(normalized)
+            }
+        }
+    }
+
+    func root(containing directory: URL) -> URL? {
+        let path = directory.standardizedFileURL.path.lowercased()
+        return lock.withLock {
+            roots
+                .filter { root in
+                    let prefix = root.path.lowercased()
+                    return path == prefix || path.hasPrefix(prefix + "\\") || path.hasPrefix(prefix + "/")
+                }
+                .max { $0.path.count < $1.path.count }
+        }
+    }
+}
+
+public func createDirAllOwnerOnly(_ directory: URL, stateRoot: URL) throws {
+    try createWindowsOwnerOnlyDirectoryChain(directory, stateRoot: stateRoot)
+    WindowsOwnerStateDirectoryRegistry.shared.register(stateRoot)
+}
+
+private enum WindowsOwnerDirectoryKind: Equatable {
+    case missing
+    case directory
+}
+
+private func windowsOwnerDirectoryError(
+    _ directory: URL,
+    operation: String,
+    detail: String? = nil
+) -> NSError {
+    let nativeDetail = String(cString: og_socket_last_error_message())
+    let explanation = detail ?? (nativeDetail.isEmpty ? "Windows error \(og_socket_last_error_code())" : nativeDetail)
+    return NSError(
+        domain: NSCocoaErrorDomain,
+        code: NSFileWriteNoPermissionError,
+        userInfo: [
+            NSFilePathErrorKey: directory.path,
+            NSLocalizedDescriptionKey: "\(operation): \(explanation)",
+        ]
+    )
+}
+
+private func windowsOwnerDirectoryNativePath(_ directory: URL) throws -> String {
+    let path = directory.standardizedFileURL.path.replacingOccurrences(of: "/", with: "\\")
+    guard !path.isEmpty, !path.unicodeScalars.contains("\0") else {
+        throw windowsOwnerDirectoryError(directory, operation: "validate session directory", detail: "invalid path")
+    }
+    if path.hasPrefix("\\\\?\\") {
+        return path
+    }
+    if path.hasPrefix("\\\\.\\") {
+        throw windowsOwnerDirectoryError(directory, operation: "validate session directory", detail: "device paths are not allowed")
+    }
+    if path.hasPrefix("\\\\") {
+        return "\\\\?\\UNC\\" + String(path.dropFirst(2))
+    }
+    let bytes = Array(path.utf8)
+    guard bytes.count >= 3,
+          ((65...90).contains(bytes[0]) || (97...122).contains(bytes[0])),
+          bytes[1] == 58,
+          bytes[2] == 92
+    else {
+        throw windowsOwnerDirectoryError(directory, operation: "validate session directory", detail: "path is not absolute")
+    }
+    return "\\\\?\\" + path
+}
+
+private func inspectWindowsOwnerDirectory(_ directory: URL) throws -> WindowsOwnerDirectoryKind {
+    let path = try windowsOwnerDirectoryNativePath(directory)
+    let attributes = path.withCString(encodedAs: UTF16.self) { GetFileAttributesW($0) }
+    if attributes == DWORD(INVALID_FILE_ATTRIBUTES) {
+        let code = GetLastError()
+        if code == DWORD(ERROR_FILE_NOT_FOUND) || code == DWORD(ERROR_PATH_NOT_FOUND) {
+            return .missing
+        }
+        throw windowsOwnerDirectoryError(
+            directory,
+            operation: "inspect session directory",
+            detail: "Windows error \(code)"
+        )
+    }
+    guard attributes & DWORD(FILE_ATTRIBUTE_REPARSE_POINT) == 0 else {
+        throw windowsOwnerDirectoryError(directory, operation: "inspect session directory", detail: "reparse points are not allowed")
+    }
+    guard attributes & DWORD(FILE_ATTRIBUTE_DIRECTORY) != 0 else {
+        throw windowsOwnerDirectoryError(directory, operation: "inspect session directory", detail: "path is not a directory")
+    }
+    return .directory
+}
+
+private func secureExistingWindowsOwnerDirectory(_ directory: URL) throws {
+    guard try inspectWindowsOwnerDirectory(directory) == .directory else {
+        throw windowsOwnerDirectoryError(directory, operation: "secure session directory", detail: "directory does not exist")
+    }
+    let path = try windowsOwnerDirectoryNativePath(directory)
+    guard path.withCString({ og_directory_secure_current_user($0) }) == 0 else {
+        throw windowsOwnerDirectoryError(directory, operation: "secure session directory")
+    }
+    guard path.withCString({ og_path_is_private_to_current_user($0, 1) }) == 1 else {
+        throw windowsOwnerDirectoryError(directory, operation: "verify owner-private session directory")
+    }
+}
+
+private func createWindowsOwnerOnlyDirectoryChain(_ directory: URL, stateRoot: URL?) throws {
+    var ancestry = [directory.standardizedFileURL]
+    while let current = ancestry.last {
+        let parent = current.deletingLastPathComponent()
+        guard parent.path != current.path else { break }
+        ancestry.append(parent)
+    }
+    ancestry.reverse()
+
+    var firstMissing: Int?
+    for (index, component) in ancestry.enumerated() {
+        if try inspectWindowsOwnerDirectory(component) == .missing {
+            firstMissing = firstMissing ?? index
+        }
+    }
+
+    let stateAnchor: Int?
+    if let stateRoot {
+        let expected = stateRoot.standardizedFileURL.path
+        guard let index = ancestry.firstIndex(where: {
+            $0.path.caseInsensitiveCompare(expected) == .orderedSame
+        }) else {
+            throw windowsOwnerDirectoryError(
+                directory,
+                operation: "validate session directory",
+                detail: "directory is outside its explicit application-state root"
+            )
+        }
+        stateAnchor = index
+    } else {
+        stateAnchor = nil
+    }
+    let secureFrom = stateAnchor ?? firstMissing ?? ancestry.count - 1
+
+    for (index, component) in ancestry.enumerated() {
+        if try inspectWindowsOwnerDirectory(component) == .missing {
+            try FileManager.default.createDirectory(
+                at: component,
+                withIntermediateDirectories: false
+            )
+        }
+        if index >= secureFrom {
+            try secureExistingWindowsOwnerDirectory(component)
+        }
+    }
+}
+#endif
 
 /// Build the CWD-level session directory path:
 /// `grokHome()/sessions/{encodeCwdDirname(cwd)}`.
@@ -250,7 +434,11 @@ public func ensureSessionsCwdDir(
         .appendingPathComponent(encodedName)
     // 0700 dir + root shield everything beneath (children with looser modes,
     // cwd-path dirnames, the session search index).
+    #if os(Windows)
+    try createDirAllOwnerOnly(dir, stateRoot: home)
+    #else
     try createDirAllOwnerOnly(dir)
+    #endif
     setDirOwnerOnly(home.appendingPathComponent("sessions"))
     // Hash-based encoding is in use when the dirname differs from the plain
     // URL-encoded form. Write a `.cwd` file so decode can recover the original
