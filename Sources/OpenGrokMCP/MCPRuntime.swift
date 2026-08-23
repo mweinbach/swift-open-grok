@@ -336,6 +336,7 @@ public actor MCPClient {
     private var clientState: MCPClientState = .disconnected
     private var initializeResult: MCPInitializeResult?
     private var pending: [JsonRpcId: Task<MCPWireMessage?, Error>] = [:]
+    private var listedToolIcons: [String: [MCPIcon]] = [:]
 
     public init(
         transport: any MCPTransport,
@@ -348,6 +349,22 @@ public actor MCPClient {
     public func state() -> MCPClientState { clientState }
 
     public func serverInfo() -> MCPImplementation? { initializeResult?.serverInfo }
+
+    public func serverIcons() -> [MCPIcon] {
+        guard clientState == .initialized else { return [] }
+        return initializeResult?.serverInfo.icons ?? []
+    }
+
+    public func toolIcons(named name: String) -> [MCPIcon] { listedToolIcons[name] ?? [] }
+
+    public func toolIconsSnapshot() -> [String: [MCPIcon]] { listedToolIcons }
+
+    public func replaceToolIcons(_ icons: [String: [MCPIcon]]) {
+        listedToolIcons = icons.reduce(into: [:]) { result, entry in
+            guard !entry.value.isEmpty else { return }
+            result[entry.key] = Array(entry.value.prefix(MCPIconLimits.maximumIconsPerEntity))
+        }
+    }
 
     public func serverCapabilities() -> MCPCapabilities? { initializeResult?.capabilities }
 
@@ -511,6 +528,7 @@ public actor MCPClient {
         await transport.close()
         pending.values.forEach { $0.cancel() }
         pending.removeAll()
+        listedToolIcons.removeAll()
     }
 
     private func requestTyped<Params: Encodable & Sendable, Response: Decodable & Sendable>(

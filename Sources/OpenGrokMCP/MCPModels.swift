@@ -25,10 +25,35 @@ public struct MCPProtocolVersion: RawRepresentable, Codable, Sendable, Hashable,
 public struct MCPImplementation: Codable, Sendable, Hashable, Equatable {
     public var name: String
     public var version: String
+    public var icons: [MCPIcon]
 
-    public init(name: String, version: String) {
+    public init(name: String, version: String, icons: [MCPIcon] = []) {
         self.name = name
         self.version = version
+        self.icons = Array(icons.prefix(MCPIconLimits.maximumIconsPerEntity))
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name
+        case version
+        case icons
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        version = try container.decode(String.self, forKey: .version)
+        let rawIcons = try container.decodeIfPresent([JSONValue].self, forKey: .icons) ?? []
+        icons = MCPIcon.sanitize(rawIcons)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(name, forKey: .name)
+        try container.encode(version, forKey: .version)
+        if !icons.isEmpty {
+            try container.encode(icons, forKey: .icons)
+        }
     }
 }
 
@@ -325,6 +350,7 @@ public struct MCPTool: Codable, Sendable, Hashable, Equatable {
     public var outputSchema: JSONValue?
     public var annotations: JSONValue?
     public var meta: JSONValue?
+    public var icons: [MCPIcon]
 
     public init(
         name: String,
@@ -333,7 +359,8 @@ public struct MCPTool: Codable, Sendable, Hashable, Equatable {
         inputSchema: JSONValue = .object(["type": .string("object")]),
         outputSchema: JSONValue? = nil,
         annotations: JSONValue? = nil,
-        meta: JSONValue? = nil
+        meta: JSONValue? = nil,
+        icons: [MCPIcon] = []
     ) {
         self.name = name
         self.title = title
@@ -342,6 +369,7 @@ public struct MCPTool: Codable, Sendable, Hashable, Equatable {
         self.outputSchema = outputSchema
         self.annotations = annotations
         self.meta = meta
+        self.icons = Array(icons.prefix(MCPIconLimits.maximumIconsPerEntity))
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -352,6 +380,7 @@ public struct MCPTool: Codable, Sendable, Hashable, Equatable {
         case outputSchema
         case annotations
         case meta = "_meta"
+        case icons
     }
 
     public init(from decoder: Decoder) throws {
@@ -363,6 +392,22 @@ public struct MCPTool: Codable, Sendable, Hashable, Equatable {
         outputSchema = try container.decodeIfPresent(JSONValue.self, forKey: .outputSchema)
         annotations = try container.decodeIfPresent(JSONValue.self, forKey: .annotations)
         meta = try container.decodeIfPresent(JSONValue.self, forKey: .meta)
+        let rawIcons = try container.decodeIfPresent([JSONValue].self, forKey: .icons) ?? []
+        icons = MCPIcon.sanitize(rawIcons)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(name, forKey: .name)
+        try container.encodeIfPresent(title, forKey: .title)
+        try container.encodeIfPresent(description, forKey: .description)
+        try container.encode(inputSchema, forKey: .inputSchema)
+        try container.encodeIfPresent(outputSchema, forKey: .outputSchema)
+        try container.encodeIfPresent(annotations, forKey: .annotations)
+        try container.encodeIfPresent(meta, forKey: .meta)
+        if !icons.isEmpty {
+            try container.encode(icons, forKey: .icons)
+        }
     }
 
     public func asToolDescription() throws -> ToolDescription {

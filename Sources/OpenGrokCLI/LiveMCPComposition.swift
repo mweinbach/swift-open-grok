@@ -69,10 +69,14 @@ public struct MCPClientTransportAdapter: McpTransport {
 
     public func listTools() async throws -> [McpToolDefinition] {
         var allTools: [McpToolDefinition] = []
+        var icons: [String: [MCPIcon]] = [:]
         var cursor: String?
         var visitedCursors = Set<String>()
         repeat {
             let page = try await client.listTools(MCPListToolsParams(cursor: cursor))
+            for tool in page.tools where !tool.icons.isEmpty {
+                icons[tool.name] = tool.icons
+            }
             allTools.append(contentsOf: page.tools.map { tool in
                 McpToolDefinition(
                     name: tool.name,
@@ -85,6 +89,7 @@ public struct MCPClientTransportAdapter: McpTransport {
                 throw MCPError.invalidRequest("MCP tools/list repeated pagination cursor '\(cursor)'")
             }
         } while cursor != nil
+        await client.replaceToolIcons(icons)
         return allTools
     }
 
@@ -151,10 +156,14 @@ public struct MCPClientToolProvider: MCPToolProviding {
 
     public func listBridgedTools() async throws -> [MCPBridgedTool] {
         var bridged: [MCPBridgedTool] = []
+        var icons: [String: [MCPIcon]] = [:]
         var cursor: String?
         var visitedCursors = Set<String>()
         repeat {
             let page = try await client.listTools(MCPListToolsParams(cursor: cursor))
+            for tool in page.tools where !tool.icons.isEmpty {
+                icons[tool.name] = tool.icons
+            }
             bridged.append(contentsOf: page.tools.map { tool in
                 MCPBridgedTool(
                     name: tool.name,
@@ -168,6 +177,7 @@ public struct MCPClientToolProvider: MCPToolProviding {
                 throw MCPError.invalidRequest("MCP tools/list repeated pagination cursor '\(cursor)'")
             }
         } while cursor != nil
+        await client.replaceToolIcons(icons)
         return bridged
     }
 

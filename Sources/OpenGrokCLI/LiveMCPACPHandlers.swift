@@ -546,7 +546,11 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
                 transport: declaration.config.transport
             )
             guard managedMCPPolicy.isServerAllowed(identity) else { continue }
-            servers.append(await serverEntry(declaration, annotate: annotate))
+            servers.append(await serverEntry(
+                declaration,
+                annotate: annotate,
+                sessionID: sessionID
+            ))
         }
         return envelope(.object(["servers": .array(servers)]))
     }
@@ -557,7 +561,8 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
     /// (mcp.rs:79-176).
     private func serverEntry(
         _ declaration: MCPServerDeclaration,
-        annotate: Bool
+        annotate: Bool,
+        sessionID: String?
     ) async -> JSONValue {
         var entry: [String: JSONValue] = [
             "name": .string(declaration.name),
@@ -600,9 +605,19 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         if let outcome = await state.outcome(for: declaration.name) {
             if outcome.isConnected {
                 session["status"] = .string("ready")
+                if let client = await catalogClient(
+                    named: declaration.name,
+                    sessionID: sessionID
+                ) {
+                    let icons = await client.serverIcons()
+                    if !icons.isEmpty {
+                        entry["icons"] = .array(icons.map(Self.iconValue))
+                    }
+                }
                 let tools = await connectedToolEntries(
                     serverName: declaration.name,
-                    qualifiedNames: outcome.toolNames
+                    qualifiedNames: outcome.toolNames,
+                    sessionID: sessionID
                 )
                 if !tools.isEmpty {
                     session["tools"] = .array(tools)
@@ -627,7 +642,8 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
     /// offered — and stable alphabetical order (mcp.rs:711-713).
     private func connectedToolEntries(
         serverName: String,
-        qualifiedNames: [String]
+        qualifiedNames: [String],
+        sessionID: String?
     ) async -> [JSONValue] {
         let toolset = state.toolset
         let descriptions = Dictionary(
@@ -635,6 +651,8 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
             uniquingKeysWith: { first, _ in first }
         )
         let prefix = mcpToolNamePrefix(serverName)
+        let client = await catalogClient(named: serverName, sessionID: sessionID)
+        let icons = await client?.toolIconsSnapshot() ?? [:]
         return qualifiedNames.sorted().map { qualified in
             let unqualified = qualified.hasPrefix(prefix)
                 ? String(qualified.dropFirst(prefix.count))
@@ -646,8 +664,34 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
             if let description = descriptions[qualified], !description.isEmpty {
                 tool["description"] = .string(description)
             }
+            if let toolIcons = icons[unqualified], !toolIcons.isEmpty {
+                tool["icons"] = .array(toolIcons.map(Self.iconValue))
+            }
             return .object(tool)
         }
+    }
+
+    private func catalogClient(named server: String, sessionID: String?) async -> MCPClient? {
+        if let sessionID,
+           let scoped = await state.sdkClient(named: server, sessionID: sessionID)
+        {
+            return scoped
+        }
+        return await state.connections.client(named: server)
+    }
+
+    private static func iconValue(_ icon: MCPIcon) -> JSONValue {
+        var value: [String: JSONValue] = ["src": .string(icon.src)]
+        if let mimeType = icon.mimeType {
+            value["mimeType"] = .string(mimeType)
+        }
+        if let sizes = icon.sizes {
+            value["sizes"] = .array(sizes.map(JSONValue.string))
+        }
+        if let theme = icon.theme {
+            value["theme"] = .string(theme.rawValue)
+        }
+        return .object(value)
     }
 
     // MARK: x.ai/mcp/call
