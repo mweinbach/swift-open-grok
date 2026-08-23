@@ -1271,6 +1271,8 @@ actor LiveConversationHistory {
 
     var usageSnapshot: LiveSessionUsageSnapshot? { record.usageSnapshot }
 
+    var pendingFirstPrompt: LivePendingForkDirective? { record.pendingFirstPrompt }
+
     func snapshot() -> LiveConversationRecord { record }
 
     /// Switch the in-memory spine only after the replacement record is
@@ -1880,6 +1882,27 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             ),
             agentMessage: request.isAgentMessage
         )
+        if let pending = await conversationHistory.pendingFirstPrompt {
+            guard pending.sessionID == context.sessionID,
+                  request.text == pending.directive,
+                  let lastItem = items.last,
+                  case .user(let user) = lastItem,
+                  user.syntheticReason == nil,
+                  lastItem.textContent() == pending.directive
+            else {
+                throw CLIApplicationError.failed(
+                    "pending fork directive must run as its child's genuine first user turn"
+                )
+            }
+            // A newly constructed system prompt or memory splice may insert
+            // before the inherited transcript. Acknowledge the exact copied
+            // prefix and genuine child user turn first, so durable one-shot
+            // consumption remains atomic without blessing an altered prefix.
+            try await conversationHistory.commit(
+                sessionID: context.sessionID,
+                items: items
+            )
+        }
         let combinedSystemPrompt = [systemPrompt, skillsListing]
             .compactMap { value in
                 guard let value, !value.isEmpty else { return nil }

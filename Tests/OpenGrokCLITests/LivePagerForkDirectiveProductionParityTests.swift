@@ -187,7 +187,11 @@ struct LivePagerForkDirectiveProductionParityTests {
         let seeded = try await fixture.seed(directive: directive)
 
         let firstInput = ForkDirectiveProductionInput()
-        let first = try await fixture.launch(sessionID: seeded.child.sessionID, input: firstInput)
+        let first = try await fixture.launch(
+            sessionID: seeded.child.sessionID,
+            input: firstInput,
+            extraArguments: ["--system-prompt", "trusted framework instructions"]
+        )
         try await fixture.wait(first, input: firstInput)
 
         let firstObservations = await fixture.capture.all
@@ -197,6 +201,10 @@ struct LivePagerForkDirectiveProductionParityTests {
         #expect(observation.request.prompt == directive)
         #expect(observation.pendingAlreadyCleared)
         #expect(observation.persistedUserCount == 1)
+        #expect(observation.request.items.contains { item in
+            guard case .system = item else { return false }
+            return item.textContent().contains("trusted framework instructions")
+        })
         #expect(observation.request.items.contains { item in
             guard case .user(let user) = item else { return false }
             return user.syntheticReason == nil && item.textContent() == directive
