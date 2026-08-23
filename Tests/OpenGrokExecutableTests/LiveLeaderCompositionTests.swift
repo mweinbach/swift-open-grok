@@ -515,6 +515,7 @@ struct LiveLeaderInteractiveDashboardTests {
             environment: [
                 "HOME": home.path,
                 "OPENGROK_HOME": home.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "TERM": "xterm-256color",
             ],
             streams: streams,
@@ -559,6 +560,7 @@ struct LiveLeaderCompositionLiveTests {
         let context = makeLeaderContext(
             environment: [
                 "OPENGROK_HOME": home.path,
+                "GROK_SANDBOX": "off",
                 "GROK_TEST_VERSION": "11.2.3-test",
                 // No credentials, so the relay parks and the test exercises the
                 // IPC half without reaching the network.
@@ -764,6 +766,7 @@ struct LiveLeaderCompositionLiveTests {
 
         let environment = [
             "OPENGROK_HOME": home.path,
+            "GROK_SANDBOX": "off",
             "GROK_WS_URL": "wss://staging.invalid/ws",
         ]
         let first = try await LiveLeaderComposition.session(
@@ -1081,6 +1084,7 @@ struct LiveLeaderCompositionWindowsTests {
         defer { try? FileManager.default.removeItem(at: home) }
         let environment = [
             "OPENGROK_HOME": home.path,
+            "GROK_SANDBOX": "off",
             "GROK_WS_URL": "wss://staging.invalid/ws",
         ]
         let services = LiveACPServices(makePromptDriver: { _ in

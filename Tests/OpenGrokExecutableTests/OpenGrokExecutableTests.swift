@@ -66,6 +66,7 @@ struct OpenGrokExecutableTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -111,6 +112,7 @@ struct OpenGrokExecutableTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -168,6 +170,7 @@ struct OpenGrokExecutableTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -204,6 +207,7 @@ struct OpenGrokExecutableTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key",
                 "GROK_XAI_API_BASE_URL": "http://127.0.0.1:9999/v1"
             ],
@@ -238,6 +242,7 @@ struct OpenGrokExecutableTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -269,7 +274,11 @@ struct OpenGrokExecutableTests {
         let (streams, out, err) = CLIStreams.buffered()
         let code = await CLIRunner.run(
             ["headless", "--prompt", "hello", "--provider", "codex"],
-            environment: ["XAI_API_KEY": "test-key", "OPENGROK_HOME": home.path],
+            environment: [
+                "XAI_API_KEY": "test-key",
+                "OPENGROK_HOME": home.path,
+                "GROK_SANDBOX": "off",
+            ],
             streams: streams,
             application: application
         )

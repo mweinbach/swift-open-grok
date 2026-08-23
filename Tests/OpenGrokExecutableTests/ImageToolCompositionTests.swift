@@ -128,6 +128,7 @@ private func runImageToolSession(
     var environment = [
         "HOME": root.path,
         "OPENGROK_HOME": root.appendingPathComponent("state").path,
+        "GROK_SANDBOX": "off",
         "XAI_API_KEY": "test-xai-key",
         "GROK_XAI_API_BASE_URL": "https://images.mock.invalid/v1",
     ]

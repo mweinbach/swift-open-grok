@@ -50,6 +50,7 @@ struct LiveWebToolLaunchReachabilityTests {
         let environment = [
             "HOME": home.path,
             "OPENGROK_HOME": root.appendingPathComponent("state").path,
+            "GROK_SANDBOX": "off",
             "XAI_API_KEY": "test-xai-key",
         ]
 

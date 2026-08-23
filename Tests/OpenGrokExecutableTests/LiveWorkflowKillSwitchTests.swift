@@ -39,6 +39,7 @@ struct LiveWorkflowKillSwitchTests {
             environment: [
                 "HOME": home.path,
                 "OPENGROK_HOME": home.path,
+                "GROK_SANDBOX": "off",
                 "GROK_WORKFLOWS": "0",
             ],
             streams: streams,
@@ -78,6 +79,7 @@ struct LiveWorkflowKillSwitchTests {
             environment: [
                 "HOME": home.path,
                 "OPENGROK_HOME": home.path,
+                "GROK_SANDBOX": "off",
                 "GROK_WORKFLOWS": "0",
             ],
             streams: streams,

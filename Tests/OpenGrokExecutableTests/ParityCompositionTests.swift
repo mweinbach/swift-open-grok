@@ -199,6 +199,7 @@ struct Wave11NewSessionCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -1013,6 +1014,7 @@ struct ParityCompositionTests {
             var environment = providerCase.environment
             environment["HOME"] = root.path
             environment["OPENGROK_HOME"] = root.appendingPathComponent("state").path
+            environment["GROK_SANDBOX"] = "off"
 
             let code = await CLIRunner.run(
                 providerCase.arguments,
@@ -1068,6 +1070,7 @@ struct ParityCompositionTests {
         let environment = [
             "HOME": root.path,
             "OPENGROK_HOME": state.path,
+            "GROK_SANDBOX": "off",
             "XAI_API_KEY": "xai-key",
             "FIREWORKS_API_KEY": "fireworks-key"
         ]
@@ -1168,6 +1171,7 @@ struct ParityCompositionTests {
         let environment = [
             "HOME": root.path,
             "OPENGROK_HOME": state.path,
+            "GROK_SANDBOX": "off",
             "XAI_API_KEY": "test-key"
         ]
 
@@ -1227,6 +1231,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -1309,6 +1314,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -1372,6 +1378,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -1405,6 +1412,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -1453,6 +1461,7 @@ struct ParityCompositionTests {
                 environment: [
                     "HOME": root.path,
                     "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                    "GROK_SANDBOX": "off",
                     "XAI_API_KEY": "test-key"
                 ],
                 streams: streams,
@@ -1558,6 +1567,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -1605,6 +1615,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -1698,6 +1709,7 @@ struct ParityCompositionTests {
         var environment = [
             "HOME": root.path,
             "OPENGROK_HOME": root.appendingPathComponent("state").path,
+            "GROK_SANDBOX": "off",
             "XAI_API_KEY": "test-key"
         ]
         if allowWrites {
@@ -1783,6 +1795,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -1882,6 +1895,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key",
                 "OPENGROK_ALLOW_WRITES": "1"
             ],
@@ -1944,6 +1958,7 @@ struct ParityCompositionTests {
         var environment = [
             "HOME": root.path,
             "OPENGROK_HOME": state.path,
+            "GROK_SANDBOX": "off",
             "XAI_API_KEY": "test-key"
         ]
         environment.merge(environmentOverrides) { _, override in override }
@@ -2141,6 +2156,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": parent.path,
                 "OPENGROK_HOME": parent.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -2174,6 +2190,7 @@ struct ParityCompositionTests {
         let environment = [
             "HOME": root.path,
             "OPENGROK_HOME": state.path,
+            "GROK_SANDBOX": "off",
             "XAI_API_KEY": "test-key"
         ]
 
@@ -2232,6 +2249,7 @@ struct ParityCompositionTests {
         let environment = [
             "HOME": root.path,
             "OPENGROK_HOME": state.path,
+            "GROK_SANDBOX": "off",
             "XAI_API_KEY": "ambient-xai-key",
             "OPENAI_API_KEY": "codex-key"
         ]
@@ -2322,6 +2340,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": state.path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "xai-key"
             ],
             streams: streams,
@@ -2388,6 +2407,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": state.path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "xai-key"
             ],
             streams: streams,
@@ -2452,6 +2472,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": state.path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "xai-key"
             ],
             streams: streams,
@@ -2492,6 +2513,7 @@ struct ParityCompositionTests {
         let environment = [
             "HOME": root.path,
             "OPENGROK_HOME": state.path,
+            "GROK_SANDBOX": "off",
             "XAI_API_KEY": "test-key"
         ]
 
@@ -2559,6 +2581,7 @@ struct ParityCompositionTests {
         let environment = [
             "HOME": root.path,
             "OPENGROK_HOME": state.path,
+            "GROK_SANDBOX": "off",
             "XAI_API_KEY": "test-key"
         ]
 
@@ -2623,6 +2646,7 @@ struct ParityCompositionTests {
         let environment = [
             "HOME": root.path,
             "OPENGROK_HOME": state.path,
+            "GROK_SANDBOX": "off",
             "XAI_API_KEY": "test-key",
             "FIREWORKS_API_KEY": "fireworks-key"
         ]
@@ -2780,6 +2804,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": state.path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "xai-key"
             ],
             streams: streams,
@@ -2853,6 +2878,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -2937,6 +2963,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -3018,6 +3045,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -3052,6 +3080,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -3089,6 +3118,7 @@ struct ParityCompositionTests {
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                "GROK_SANDBOX": "off",
                 "XAI_API_KEY": "test-key"
             ],
             streams: streams,
@@ -3150,6 +3180,7 @@ struct ParityCompositionTests {
                 environment: [
                     "HOME": root.path,
                     "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                    "GROK_SANDBOX": "off",
                     "XAI_API_KEY": "test-key"
                 ],
                 streams: streams,
@@ -3277,6 +3308,7 @@ struct ParityCompositionTests {
                 environment: [
                     "HOME": root.path,
                     "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                    "GROK_SANDBOX": "off",
                     "XAI_API_KEY": "test-key"
                 ],
                 streams: streams,
@@ -3395,6 +3427,7 @@ struct ParityCompositionTests {
                 environment: [
                     "HOME": root.path,
                     "OPENGROK_HOME": root.appendingPathComponent("state").path,
+                    "GROK_SANDBOX": "off",
                     "XAI_API_KEY": "test-key"
                 ],
                 streams: streams,

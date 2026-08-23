@@ -131,6 +131,7 @@ private struct LiveWorkspace {
         environment = [
             "HOME": home.path,
             "OPENGROK_HOME": grokHome.path,
+            "GROK_SANDBOX": "off",
         ]
         if memoryEnabled {
             environment["OPENGROK_MEMORY"] = "1"

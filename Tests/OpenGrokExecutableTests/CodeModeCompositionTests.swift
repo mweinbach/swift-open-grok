@@ -247,6 +247,7 @@ private enum CodeModeFixtures {
         var environment = [
             "HOME": root.path,
             "OPENGROK_HOME": root.appendingPathComponent("state").path,
+            "GROK_SANDBOX": "off",
             "XAI_API_KEY": "test-key"
         ]
         for (key, value) in extra { environment[key] = value }
