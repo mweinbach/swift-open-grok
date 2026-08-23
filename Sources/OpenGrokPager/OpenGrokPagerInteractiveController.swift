@@ -4687,6 +4687,15 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         editor.reset()
         if clearQueue { await promptQueue.removeAll() }
         try await emit(.sessionResumed(sessionID: resumedID))
+        if let directive = try await runtime.claimPendingFirstPrompt(sessionID: resumedID) {
+            do {
+                try await enqueue(directive, insertion: .front, promptKind: .standard)
+            } catch {
+                await runtime.releasePendingFirstPromptClaim(sessionID: resumedID)
+                throw error
+            }
+            await signalMailbox?.send(.control(.cronEnqueued))
+        }
         return true
     }
 

@@ -2486,8 +2486,30 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             hidden: hidden
                         )
                     }
+
+                    let openingPrompt: String
+                    if foundation.conversationRecord.pendingFirstPrompt != nil {
+                        guard prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                            throw CLIApplicationError.failed(
+                                "cannot provide another prompt before the fork directive runs"
+                            )
+                        }
+                        guard let directive = try await foundation.conversationStore
+                            .claimPendingFirstPrompt(
+                                sessionID: sessionID,
+                                workingDirectory: cwd
+                            )
+                        else {
+                            throw CLIApplicationError.failed(
+                                "the pending fork directive is no longer available"
+                            )
+                        }
+                        openingPrompt = directive
+                    } else {
+                        openingPrompt = prompt
+                    }
                     let request = OpenGrokPagerRequest(
-                        prompt: prompt,
+                        prompt: openingPrompt,
                         mode: pagerMode,
                         sessionID: sessionID,
                         metadata: ["mode": options.mode.rawValue]
@@ -2495,7 +2517,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     let task = Task {
                         do {
                             let result: OpenGrokPagerInteractiveResult
-                            if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            if openingPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                                 result = try await controller.run(request)
                             } else {
                                 let initialSession = try await runtime.makeSession(for: request)
@@ -2507,6 +2529,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             await interactiveInput.close()
                             return result
                         } catch {
+                            await foundation.conversationStore.releasePendingFirstPromptClaim(
+                                sessionID: sessionID
+                            )
                             await interactiveInput.close()
                             throw error
                         }
@@ -2518,6 +2543,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             } onCancel: {
                                 task.cancel()
                             }
+                            await runtime.releaseActivePendingFirstPromptClaim()
+                            await foundation.conversationStore.releasePendingFirstPromptClaim(
+                                sessionID: sessionID
+                            )
                             // B2-S2: an accepted /minimal · /fullscreen switch
                             // execs HERE — after the controller loop ended and
                             // its teardown restored the terminal, upstream's
@@ -2571,6 +2600,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             stack.sessionBusObserver?.cancel()
                             await foundation.sessionBus.stop()
                             _ = await shell.shutdown(timeout: ShellDuration(timeInterval: 1))
+                            await runtime.releaseActivePendingFirstPromptClaim()
+                            await foundation.conversationStore.releasePendingFirstPromptClaim(
+                                sessionID: sessionID
+                            )
                             await Self.persistSessionMemoryIfNeeded(
                                 toolExecutor: toolExecutor,
                                 history: stack.conversationHistory,

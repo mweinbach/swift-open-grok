@@ -357,6 +357,37 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
         return sessionID
     }
 
+    func claimPendingFirstPrompt(sessionID: String) async throws -> String? {
+        guard activeShellSessionID?.rawValue == sessionID else {
+            throw CLIApplicationError.failed(
+                "cannot claim a fork directive for an inactive session: \(sessionID)"
+            )
+        }
+        let record = await conversationHistory.snapshot()
+        guard record.sessionID == sessionID else {
+            throw CLIApplicationError.failed(
+                "cannot claim a fork directive for a different active conversation"
+            )
+        }
+        try await validateWorkspaceAuthority(
+            sessionID: sessionID,
+            workingDirectory: activeWorkingDirectory
+        )
+        return try await conversationStore.claimPendingFirstPrompt(
+            sessionID: sessionID,
+            workingDirectory: activeWorkingDirectory
+        )
+    }
+
+    func releasePendingFirstPromptClaim(sessionID: String) async {
+        await conversationStore.releasePendingFirstPromptClaim(sessionID: sessionID)
+    }
+
+    func releaseActivePendingFirstPromptClaim() async {
+        guard let sessionID = activeShellSessionID?.rawValue else { return }
+        await conversationStore.releasePendingFirstPromptClaim(sessionID: sessionID)
+    }
+
     func renameRetainedSession(sessionID: String, title: String) async throws -> Bool {
         let activeSessionID = await conversationHistory.sessionID
         if sessionID == activeSessionID {

@@ -80,6 +80,13 @@ public protocol OpenGrokPagerRuntimeAdapter: Sendable {
     /// `slash/commands/resume.rs:21-23`, resolved by the picker's selection).
     /// Returns the resumed session's id.
     func resumeSession(sessionID: String) async throws -> String
+
+    /// Reserve a durable fork directive only after its session has passed the
+    /// runtime's ordinary workspace and trust checks.
+    func claimPendingFirstPrompt(sessionID: String) async throws -> String?
+
+    /// Preserve an unsubmitted directive when enqueueing or shutdown fails.
+    func releasePendingFirstPromptClaim(sessionID: String) async
 }
 
 public extension OpenGrokPagerRuntimeAdapter {
@@ -102,6 +109,15 @@ public extension OpenGrokPagerRuntimeAdapter {
     func resumeSession(sessionID: String) async throws -> String {
         _ = sessionID
         throw OpenGrokPagerError.sessionResumeUnsupported
+    }
+
+    func claimPendingFirstPrompt(sessionID: String) async throws -> String? {
+        _ = sessionID
+        return nil
+    }
+
+    func releasePendingFirstPromptClaim(sessionID: String) async {
+        _ = sessionID
     }
 }
 
