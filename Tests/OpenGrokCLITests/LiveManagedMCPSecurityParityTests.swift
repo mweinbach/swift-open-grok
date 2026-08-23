@@ -303,6 +303,85 @@ struct LiveManagedMCPSecurityParityTests {
         await permitted.shutdown()
     }
 
+    @Test("a protected policy removed during startup still blocks MCP before process creation")
+    func removedAdministratorPolicyFailsClosedBeforeActualProcessSpawn() async throws {
+        let fixture = try ManagedMCPSecurityFixture()
+        defer { fixture.dispose() }
+        let marker = fixture.root.appendingPathComponent("removed-policy-mcp-process")
+        let server = try fixture.markerServer(named: "process", marker: marker)
+        try fixture.writeUser(server.document)
+        let encodedCommand = String(decoding: try JSONEncoder().encode(server.command), as: UTF8.self)
+        try fixture.writePolicy("{\"deniedMcpServers\":[{\"command\":\(encodedCommand)}]}")
+        let security = LiveSecurityContext.resolve(
+            workspaceRoot: fixture.workspace,
+            environment: fixture.environment,
+            isInteractive: false,
+            managedSettingsPath: fixture.adminPolicy
+        )
+        let policyPath = fixture.adminPolicy
+
+        let executor = try await LiveToolExecutor(
+            processBackend: LocalShellProcessBackend(inheritedEnvironment: fixture.environment),
+            sessionID: "managed-policy-removed-before-process",
+            workingDirectory: fixture.workspace,
+            toolPolicy: nil,
+            telemetryBootstrapContext: .empty,
+            environment: fixture.environment,
+            securityContext: security,
+            startupTrustCheckpoint: { _ in
+                try? FileManager.default.removeItem(at: policyPath)
+            }
+        )
+
+        #expect(!FileManager.default.fileExists(atPath: policyPath.path))
+        #expect(executor.mcpServerConnections.count == 1)
+        #expect(executor.mcpServerConnections[0].failure?
+            .contains("invalid managed MCP server policy") == true)
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+        #expect(executor.mcpToolset.clientNames.allSatisfy { !$0.hasPrefix("process__") })
+        await executor.shutdown()
+    }
+
+    @Test("folder-trust reload cannot discard the administrator policy and spawn a denied MCP")
+    func trustReloadPreservesProtectedManagedMCPPolicyBeforeSpawn() async throws {
+        let fixture = try ManagedMCPSecurityFixture()
+        defer { fixture.dispose() }
+        let marker = fixture.root.appendingPathComponent("reloaded-managed-mcp-process")
+        let server = try fixture.markerServer(named: "process", marker: marker)
+        try fixture.writeUser(server.document)
+        let encodedCommand = String(decoding: try JSONEncoder().encode(server.command), as: UTF8.self)
+        try fixture.writePolicy("{\"deniedMcpServers\":[{\"command\":\(encodedCommand)}]}")
+        let security = LiveSecurityContext.resolve(
+            workspaceRoot: fixture.workspace,
+            environment: fixture.environment,
+            isInteractive: false,
+            managedSettingsPath: fixture.adminPolicy
+        )
+        let sessionID = "managed-policy-survives-trust-reload"
+        let executor = try await LiveToolExecutor(
+            processBackend: LocalShellProcessBackend(inheritedEnvironment: fixture.environment),
+            sessionID: sessionID,
+            workingDirectory: fixture.workspace,
+            toolPolicy: nil,
+            telemetryBootstrapContext: .empty,
+            environment: fixture.environment,
+            securityContext: security
+        )
+
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+        let reloadedHooks = await executor.reloadFolderTrust(
+            trusted: security.projectTrusted,
+            sessionID: sessionID,
+            workspaceRoot: fixture.workspace,
+            environment: fixture.environment
+        )
+
+        #expect(reloadedHooks == 0)
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+        #expect(executor.mcpToolset.clientNames.allSatisfy { !$0.hasPrefix("process__") })
+        await executor.shutdown()
+    }
+
     @Test("protected deny rules outrank malicious trusted-project and user allow keys")
     func managedAuthorityCannotBeOverriddenByProject() throws {
         let fixture = try ManagedMCPSecurityFixture()

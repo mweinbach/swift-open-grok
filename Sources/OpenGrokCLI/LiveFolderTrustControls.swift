@@ -171,6 +171,8 @@ final class LiveFolderTrustExecutorBinding: @unchecked Sendable {
     private var closed = false
     private var startingUp = true
     private var connectionsStarted = false
+    private var managedSettingsSourceBound = false
+    private var managedSettingsSourcePath: URL?
     private let sessionID: String
     private let workingDirectory: URL
     private let environment: [String: String]
@@ -213,6 +215,22 @@ final class LiveFolderTrustExecutorBinding: @unchecked Sendable {
 
     var isActive: Bool {
         lock.withLock { !closed }
+    }
+
+    var administratorManagedSettingsPath: URL? {
+        lock.withLock { managedSettingsSourcePath }
+    }
+
+    func bindAdministratorManagedSettingsPath(_ path: URL?) -> Bool {
+        lock.withLock {
+            guard !closed else { return false }
+            if managedSettingsSourceBound {
+                return managedSettingsSourcePath == path
+            }
+            managedSettingsSourcePath = path
+            managedSettingsSourceBound = true
+            return true
+        }
     }
 
     private var canDeferStartupConnections: Bool {
@@ -263,7 +281,8 @@ final class LiveFolderTrustExecutorBinding: @unchecked Sendable {
             workspaceRoot: workingDirectory,
             environment: environment,
             isInteractive: false,
-            cli: options
+            cli: options,
+            managedSettingsPath: administratorManagedSettingsPath
         )
         guard security.projectTrusted == trusted, isActive else {
             runtime.failClosed()
@@ -417,6 +436,11 @@ actor LiveFolderTrustExecutorRegistry {
         else {
             return .blocked
         }
+        guard binding.bindAdministratorManagedSettingsPath(
+            proposed.managedMCPPolicy.sourcePath
+        ) else {
+            return .blocked
+        }
 
         var options = permissionOptions
         options.trustFolder = false
@@ -424,7 +448,8 @@ actor LiveFolderTrustExecutorRegistry {
             workspaceRoot: workingDirectory,
             environment: environment,
             isInteractive: false,
-            cli: options
+            cli: options,
+            managedSettingsPath: binding.administratorManagedSettingsPath
         )
         guard reconcileStartupDecision(
             scope: binding.scope,
@@ -455,7 +480,8 @@ actor LiveFolderTrustExecutorRegistry {
             workspaceRoot: workingDirectory,
             environment: environment,
             isInteractive: false,
-            cli: options
+            cli: options,
+            managedSettingsPath: binding.administratorManagedSettingsPath
         )
         guard reconcileStartupDecision(
             scope: binding.scope,
