@@ -5,6 +5,10 @@ import Testing
 
 #if os(Windows)
 import COpenGrokSockets
+import OpenGrokConfig
+import OpenGrokFileUtils
+import OpenGrokSessionPersistence
+import OpenGrokShellSessionSupport
 #endif
 
 private struct SessionEventLogFixture {
@@ -15,7 +19,11 @@ private struct SessionEventLogFixture {
             "opengrok-event-log-\(UUID().uuidString)",
             isDirectory: true
         )
+        #if os(Windows)
+        try OpenGrokConfig.createDirAllOwnerOnly(directory, stateRoot: directory)
+        #else
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        #endif
     }
 
     func cleanup() {
@@ -288,4 +296,106 @@ struct SessionEventLogParityTests {
         #expect(wire.contains(#""duration_ms":18446744073709551615"#))
         #expect(wire.contains(#""conversation_message_count":0"#))
     }
+
+    #if os(Windows)
+    @Test("canonical sessions beyond MAX_PATH durably record the real turn and tool lifecycle")
+    func extendedLengthCanonicalSessionRecordsTurnAndToolEvents() async throws {
+        let fixture = try SessionEventLogFixture()
+        defer { fixture.cleanup() }
+        let stateRoot = fixture.directory.appendingPathComponent(
+            String(repeating: "s", count: 120),
+            isDirectory: true
+        )
+        let workspace = fixture.directory.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+
+        let sessionID = UUID().uuidString
+        let documents = SessionDocumentStore(grokHome: stateRoot)
+        let session = try documents.sessionDirectory(sessionID: sessionID, cwd: workspace.path)
+        #expect(session.path.utf16.count > 260)
+        try documents.save(PersistedSessionState(
+            summary: SessionSummary(
+                sessionID: SessionID(sessionID),
+                cwd: workspace.path,
+                currentModelID: "grok-code-fast-1"
+            )
+        ))
+        let directoryMetadata = try #require(WindowsSecurePath.metadata(at: session))
+        #expect(directoryMetadata.isDirectory)
+        #expect(!directoryMetadata.isReparsePoint)
+
+        let tracker = SessionEventTracker(
+            log: try SessionEventLog(
+                sessionDirectory: session,
+                clock: { Date(timeIntervalSince1970: 0) }
+            )
+        )
+        #expect(await tracker.beginTurn(
+            sessionID: sessionID,
+            modelID: "grok-code-fast-1",
+            yoloMode: false,
+            conversationMessageCount: 0
+        ))
+        #expect(await tracker.beginSamplerRound())
+        #expect(await tracker.noteToken(phase: .streamingText))
+        #expect(await tracker.toolStarted(name: "read_file", callID: "long-tool-1"))
+        #expect(await tracker.toolCompleted(callID: "long-tool-1", outcome: .success))
+        #expect(await tracker.endTurn(outcome: .completed))
+
+        let eventFile = session.appendingPathComponent("events.jsonl")
+        #expect(eventFile.path.utf16.count > 260)
+        let nativeFile = try WindowsSecurePath.extendedLengthPath(eventFile.path)
+        #expect(nativeFile.withCString { og_file_is_owner_only($0) } == 1)
+        #expect(nativeFile.withCString { og_path_is_private_to_current_user($0, 0) } == 1)
+        let bytes = try PathSecurity.readNoFollow(
+            eventFile,
+            maximumBytes: SessionEventLog.maximumRecordBytes,
+            requireOwnerOnly: true
+        )
+        let values = try bytes.split(separator: 0x0A).map { line in
+            try JSONDecoder().decode([String: JSONValue].self, from: Data(line))
+        }
+        #expect(values.compactMap { $0["type"]?.stringValue } == [
+            "turn_started",
+            "loop_started",
+            "phase_changed",
+            "first_token",
+            "phase_changed",
+            "phase_changed",
+            "tool_started",
+            "tool_completed",
+            "turn_ended",
+        ])
+        #expect(values.first?["session_id"] == .string(sessionID))
+        #expect(values.first?["ts"] == .string("1970-01-01T00:00:00.000Z"))
+        #expect(values.first { $0["type"] == .string("tool_completed") }?["tool_call_id"]
+            == .string("long-tool-1"))
+        #expect(values.last?["outcome"] == .string("completed"))
+    }
+
+    @Test("event writers reject a session directory with an inherited broad Windows DACL")
+    func broadSessionDirectoryFailsClosed() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "opengrok-event-log-broad-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let nativeDirectory = try WindowsSecurePath.extendedLengthPath(directory.path)
+        let ownerPrivate = nativeDirectory.withCString {
+            og_path_is_private_to_current_user($0, 1)
+        }
+        guard ownerPrivate == 0 else {
+            Issue.record("negative Windows session fixture unexpectedly has an owner-only DACL")
+            return
+        }
+
+        #expect(throws: SessionEventLogError.self) {
+            try SessionEventLog(sessionDirectory: directory)
+        }
+        #expect(try WindowsSecurePath.metadata(
+            at: directory.appendingPathComponent("events.jsonl")
+        ) == nil)
+    }
+    #endif
 }

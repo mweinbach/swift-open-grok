@@ -3,6 +3,7 @@ import OpenGrokShared
 
 #if os(Windows)
 import COpenGrokSockets
+import OpenGrokFileUtils
 #elseif canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
@@ -319,15 +320,34 @@ public final class SessionEventLog: @unchecked Sendable {
         onFirstFailure: @escaping @Sendable (SessionEventLogError) -> Void = { _ in }
     ) throws {
         let directory = sessionDirectory.standardizedFileURL
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
-              isDirectory.boolValue
+        #if os(Windows)
+        let directoryMetadata: WindowsSecurePath.Metadata?
+        do {
+            directoryMetadata = try WindowsSecurePath.metadata(at: directory)
+        } catch {
+            throw SessionEventLogError.invalidDirectory(directory.path)
+        }
+        guard let directoryMetadata, directoryMetadata.isDirectory,
+              !directoryMetadata.isReparsePoint
         else { throw SessionEventLogError.invalidDirectory(directory.path) }
 
+        let nativeDirectory: String
+        let nativePath: String
         let path = directory.appendingPathComponent(Self.fileName)
-        #if os(Windows)
+        do {
+            nativeDirectory = try WindowsSecurePath.extendedLengthPath(directory.path)
+            nativePath = try WindowsSecurePath.extendedLengthPath(path.path)
+        } catch {
+            throw SessionEventLogError.unsafeFile(path.path)
+        }
+        guard nativeDirectory.withCString({
+            og_path_is_private_to_current_user($0, 1)
+        }) == 1 else {
+            throw SessionEventLogError.unsafeFile(directory.path)
+        }
+
         var opened: OGSocketHandle = -1
-        let result = path.path.withCString {
+        let result = nativePath.withCString {
             og_file_open_owner_only_append($0, &opened)
         }
         guard result == 0 else {
@@ -335,6 +355,12 @@ public final class SessionEventLog: @unchecked Sendable {
             throw SessionEventLogError.openFailed(detail)
         }
         #else
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else { throw SessionEventLogError.invalidDirectory(directory.path) }
+
+        let path = directory.appendingPathComponent(Self.fileName)
         let opened = path.path.withCString {
             open($0, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW, mode_t(0o600))
         }
@@ -410,6 +436,10 @@ public final class SessionEventLog: @unchecked Sendable {
             og_file_handle_write_all(descriptor, buffer.baseAddress, buffer.count)
         }
         guard count == Int64(data.count) else {
+            let detail = String(cString: og_socket_last_error_message())
+            throw SessionEventLogError.writeFailed(detail)
+        }
+        guard og_file_handle_flush(descriptor) == 0 else {
             let detail = String(cString: og_socket_last_error_message())
             throw SessionEventLogError.writeFailed(detail)
         }
