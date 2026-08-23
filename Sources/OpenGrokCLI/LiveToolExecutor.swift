@@ -310,6 +310,7 @@ struct LiveToolExecutor: Sendable {
     /// The current verdict, shared by slash revocation, discovery and the UI.
     var projectTrusted: Bool { folderTrustRuntime.isTrusted }
     private let folderTrustRuntime: LiveFolderTrustRuntimeState
+    private let folderTrustBinding: LiveFolderTrustExecutorBinding
     let hookPresentationStore: LiveHookPresentationStore
     /// The exact store backing the advertised `todo_write` handler. The
     /// renderer reads this actor through the executor so a successful tool
@@ -864,10 +865,22 @@ struct LiveToolExecutor: Sendable {
         self.fileToolBridge = fileToolBridge
         self.mcpConnections = mcpConnections
         self.mcpServerConnections = mcpServerConnections
-        self.folderTrustRuntime = LiveFolderTrustRuntimeState(
+        let folderTrustRuntime = LiveFolderTrustRuntimeState(
             trusted: security.projectTrusted,
             declarations: mcpDeclarations.enabledServers,
             languageSession: lspPullSession
+        )
+        self.folderTrustRuntime = folderTrustRuntime
+        self.folderTrustBinding = LiveFolderTrustExecutorBinding(
+            sessionID: sessionID,
+            workingDirectory: standardizedWorkingDirectory,
+            environment: environment,
+            launchPermissionOptions: permissionOptions,
+            runtime: folderTrustRuntime,
+            permissionPipeline: fileToolResources.permissionPipeline,
+            hookPresentationStore: hookPresentationStore,
+            connections: mcpConnections,
+            toolset: toolset
         )
         self.registryToolNames = Set(allowedFileToolDefinitions.map(\.name))
         self.initiallyAdvertisedMCPToolNames = Set(
@@ -950,6 +963,7 @@ struct LiveToolExecutor: Sendable {
             ))
         }
         self.tools = advertisedTools
+        await LiveFolderTrustExecutorRegistry.shared.register(folderTrustBinding)
     }
 
     /// Re-snapshot only the mutable MCP surface. Built-ins and their launch
@@ -996,95 +1010,27 @@ struct LiveToolExecutor: Sendable {
         folderTrustRuntime.failClosed()
     }
 
+    var folderTrustRegistrationID: UUID { folderTrustBinding.id }
+
+    func belongsToFolderTrustScope(_ scope: LiveFolderTrustScope) -> Bool {
+        folderTrustBinding.scope == scope
+    }
+
     func reloadFolderTrust(
         trusted: Bool,
         sessionID: String,
         workspaceRoot: URL,
         environment: [String: String]
     ) async -> Int {
-        let previousDeclarations = folderTrustRuntime.begin(trusted: trusted)
-        var options = launchPermissionOptions
-        options.trustFolder = false
-        let security = LiveSecurityContext.resolve(
+        guard folderTrustBinding.matches(
+            sessionID: sessionID,
             workspaceRoot: workspaceRoot,
-            environment: environment,
-            isInteractive: false,
-            cli: options
-        )
-        guard security.projectTrusted == trusted else {
+            environment: environment
+        ) else {
             folderTrustRuntime.failClosed()
             return 0
         }
-
-        let loadedHooks = LiveHooksComposition.load(
-            sessionId: sessionID,
-            workspaceRoot: workspaceRoot,
-            environment: environment,
-            projectTrusted: trusted
-        )
-        loadedHooks.gate?.setRunObserver { [hookPresentationStore] event, id, records in
-            Task {
-                await hookPresentationStore.record(event: event, id: id, records: records)
-            }
-        }
-        if let permissionPipeline {
-            let runner: any PreToolUseHookRunner = loadedHooks.gate
-                .map { $0 as any PreToolUseHookRunner }
-                ?? FailOpenPreToolUseHookRunner()
-            await permissionPipeline.replaceLiveFolderTrustHooks(runner)
-            await permissionPipeline.permissions.replaceConfig(security.permissions.config)
-        }
-
-        let disabledServers = disabledMCPServers(in: security.document)
-        let declarations = MCPConfigLoader.load(from: security.document).enabledServers
-            .filter { !disabledServers.contains($0.name) }
-        let declarationsByName = Dictionary(uniqueKeysWithValues: declarations.map { ($0.name, $0) })
-        for name in await mcpConnections.names() {
-            if let previous = previousDeclarations[name],
-               let current = declarationsByName[name],
-               previous == current {
-                continue
-            }
-            await mcpConnections.markServerShuttingDown(name)
-            MCPToolBridge.unregister(server: name, from: mcpToolset)
-            if let client = await mcpConnections.release(named: name) {
-                try? await client.shutdown()
-                await client.close()
-            }
-        }
-
-        if let previousLanguageSession = folderTrustRuntime.replaceLanguageSession(nil) {
-            await previousLanguageSession.shutdown()
-        }
-        mcpToolset.unregister(prefix: LiveLspComposition.toolName)
-        let languageSession = LiveLspComposition.registerTools(
-            toolset: mcpToolset,
-            workingDirectory: workspaceRoot,
-            document: security.document,
-            environment: environment,
-            projectTrusted: trusted
-        )
-        _ = folderTrustRuntime.replaceLanguageSession(languageSession)
-
-        let disabledTools = allDisabledMCPTools(in: security.document)
-        for declaration in declarations {
-            guard await mcpConnections.client(named: declaration.name) == nil else { continue }
-            await mcpConnections.markServerAvailable(declaration.name)
-            let outcome = await LiveMCPComposition.connect(
-                declaration: declaration,
-                toolset: mcpToolset,
-                connections: mcpConnections,
-                environment: environment,
-                disabledToolNames: disabledTools[declaration.name] ?? [],
-                managedMCPPolicy: security.managedMCPPolicy
-            )
-            if outcome.failure != nil {
-                MCPToolBridge.unregister(server: declaration.name, from: mcpToolset)
-            }
-        }
-        LiveMCPToolSearchIndex.refreshIfPresent(in: mcpToolset)
-        folderTrustRuntime.finish(trusted: trusted, declarations: declarations)
-        return loadedHooks.result.registry.count
+        return await folderTrustBinding.reload(trusted: trusted)
     }
 
     func runStop(
@@ -1092,7 +1038,8 @@ struct LiveToolExecutor: Sendable {
         promptID: String?,
         payload: [String: HookJSONValue]
     ) async -> StopDispatchResult {
-        guard let permissionPipeline,
+        guard !folderTrustRuntime.isChanging,
+              let permissionPipeline,
               let hookPermissionGate = await permissionPipeline.liveFolderTrustHookGate()
         else { return StopDispatchResult() }
         return await hookPermissionGate.runStop(
@@ -1122,7 +1069,7 @@ struct LiveToolExecutor: Sendable {
         promptID: String? = nil,
         payload: [String: HookJSONValue] = [:]
     ) {
-        guard let permissionPipeline else { return }
+        guard !folderTrustRuntime.isChanging, let permissionPipeline else { return }
         Task {
             guard let hookPermissionGate = await permissionPipeline.liveFolderTrustHookGate()
             else { return }
@@ -1942,6 +1889,7 @@ struct LiveToolExecutor: Sendable {
     }
 
     func shutdown() async {
+        await LiveFolderTrustExecutorRegistry.shared.unregister(folderTrustBinding)
         // SessionEnd fires before the session's process-bearing resources
         // come down, matching upstream (run_loop.rs:471-490 channel-closed and
         // :2216-2235 shutdown paths both fire BEFORE memory auto-save). The

@@ -246,18 +246,22 @@ struct LiveSecurityContext: Sendable {
         let base = layers?.effectiveConfigBase() ?? .table(TOMLTable())
 
         let featureEnabled = folderTrustEnabled(document: base, environment: environment)
-        let canonicalWorkspaceRoot = workspaceRoot.standardizedFileURL.resolvingSymlinksInPath()
+        let effectiveWorkspaceRoot = workspaceRoot.standardizedFileURL.resolvingSymlinksInPath()
+        let workspaceTrustIdentity = LiveWorkspaceTrustIdentity.resolve(
+            workingDirectory: effectiveWorkspaceRoot,
+            environment: environment
+        )
         let keyRecordable = !isUnsafeTrustRoot(
-            canonicalWorkspaceRoot.path,
+            workspaceTrustIdentity.path,
             home: environment["HOME"]
         )
         var store = PersistentFolderTrustStore(environment: environment)
         var explicitTrustPersisted = false
         if cli.trustFolder, keyRecordable {
             do {
-                try store.record(canonicalWorkspaceRoot, trusted: true)
+                try store.record(workspaceTrustIdentity, trusted: true)
                 explicitTrustPersisted = PersistentFolderTrustStore(environment: environment)
-                    .isTrusted(canonicalWorkspaceRoot)
+                    .isTrusted(workspaceTrustIdentity)
             } catch {
                 explicitTrustPersisted = false
             }
@@ -265,8 +269,8 @@ struct LiveSecurityContext: Sendable {
         let outcome = decideFolderTrust(
             featureEnabled: featureEnabled,
             inputs: FolderTrustDecideInputs(
-                storeTrusted: store.isTrusted(canonicalWorkspaceRoot),
-                repoConfigsPresent: repoConfigsPresent(at: canonicalWorkspaceRoot),
+                storeTrusted: store.isTrusted(workspaceTrustIdentity),
+                repoConfigsPresent: repoConfigsPresent(at: effectiveWorkspaceRoot),
                 isInteractive: isInteractive,
                 keyRecordable: keyRecordable
             )
