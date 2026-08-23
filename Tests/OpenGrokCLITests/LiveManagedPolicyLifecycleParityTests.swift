@@ -661,6 +661,29 @@ struct LiveManagedPolicyLifecycleParityTests {
         #expect(fixture.exists(MANAGED_CONFIG_CACHE_FILE))
     }
 
+    #if !os(Windows)
+    @Test("dangling managed marker symlinks are unreadable policy, never evidence of logout")
+    func danglingMarkerSymlinkPreventsOrphanCleanup() throws {
+        let fixture = try ManagedPolicyLifecycleFixture()
+        defer { fixture.dispose() }
+        try fixture.writeManagedArtifacts()
+        let marker = fixture.home.appendingPathComponent(MANAGED_CONFIG_CACHE_FILE)
+        try FileManager.default.removeItem(at: marker)
+        try FileManager.default.createSymbolicLink(
+            at: marker,
+            withDestinationURL: fixture.root.appendingPathComponent("missing-managed-marker")
+        )
+
+        LiveManagedPolicyLifecycle.clearOrphan(environment: fixture.environment)
+
+        let symbolicDestination = try FileManager.default.destinationOfSymbolicLink(
+            atPath: marker.path
+        )
+        #expect(fixture.exists(MANAGED_CONFIG_FILENAME))
+        #expect(symbolicDestination.hasSuffix("missing-managed-marker"))
+    }
+    #endif
+
     @Test("orphan cleanup skips active owner-private cross-process advisory locks")
     func contestedManagedLockPreventsCleanup() throws {
         let fixture = try ManagedPolicyLifecycleFixture()
@@ -789,7 +812,7 @@ struct LiveManagedPolicyLifecycleParityTests {
 
         #expect(output.contents.contains("Signed in to xAI with an API key."))
         #expect(errors.contents.isEmpty)
-        #expect(transport.recordedRequests.count == 1)
+        #expect(transport.recordedRequests.count == 5)
     }
 
     @Test("CLI xAI logout clears unowned policy while preserving user configuration")

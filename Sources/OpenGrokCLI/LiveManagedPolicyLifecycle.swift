@@ -569,7 +569,13 @@ public enum LiveManagedPolicyLifecycle {
     private static func failClosedPolicyArmed(home: URL) -> Bool {
         for name in markerNames {
             let path = home.appendingPathComponent(name)
-            guard FileManager.default.fileExists(atPath: path.path) else { continue }
+            guard FileManager.default.fileExists(atPath: path.path)
+                || (try? FileManager.default.destinationOfSymbolicLink(
+                    atPath: path.path
+                )) != nil
+            else {
+                continue
+            }
             guard (try? FileManager.default.destinationOfSymbolicLink(atPath: path.path)) == nil,
                   let data = try? Data(contentsOf: path),
                   let cache = try? JSONDecoder().decode(ManagedConfigCache.self, from: data)
