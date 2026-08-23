@@ -129,7 +129,11 @@ enum LiveStartupAuthenticationReadiness {
         let namedAuthReady: Bool
         if let name = selectedEntry?.authProvider {
             guard let definition = configuredCatalog.providerDefinitions.authProvider(named: name),
-                  definition.isUsable else {
+                  trustedAuthExecutable(
+                      definition,
+                      workingDirectory: options.common.cwd,
+                      environment: environment
+                  ) else {
                 return false
             }
             namedAuthReady = true
@@ -178,10 +182,19 @@ enum LiveStartupAuthenticationReadiness {
         let apiKeyAllowed = !config.apiKeyAuthDisabled(environment: environment)
         let manager = AuthManager(grokHome: home, config: config, environment: environment)
         let account = await manager.currentOrExpired()
+        let currentAccount = await manager.current()
+        let refreshableAccount = account.map { auth in
+            auth.refreshToken?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                && makeXAIOIDCTokenRefresher(auth: auth, config: config) != nil
+        } ?? false
         let endpointTrusted = trustedBuiltInSessionEndpoint(provider: .xai, baseURL: baseURL)
         let explicitUsable = apiKeyAllowed && explicitAPIKey != nil
         let deploymentUsable = endpointTrusted && deploymentKeyFromEnvironment(environment) != nil
-        let accountUsable = endpointTrusted && account != nil
+        let accountUsable = endpointTrusted && (
+            currentAccount != nil
+                || (apiKeyAllowed && account?.authMode == .apiKey)
+                || refreshableAccount
+        )
         guard namedAuthReady || explicitUsable || deploymentUsable || accountUsable else {
             return false
         }
@@ -193,5 +206,50 @@ enum LiveStartupAuthenticationReadiness {
             return false
         }
         return true
+    }
+
+    private static func trustedAuthExecutable(
+        _ configuration: AuthProviderConfig,
+        workingDirectory: String?,
+        environment: [String: String]
+    ) -> Bool {
+        guard configuration.isUsable else { return false }
+        let command = configuration.command.trimmingCharacters(in: .whitespacesAndNewlines)
+        let executable: String
+        if configuration.args != nil {
+            executable = command
+        } else {
+            guard let first = command.split(maxSplits: 1, whereSeparator: \.isWhitespace).first else {
+                return false
+            }
+            executable = String(first)
+        }
+
+        let resolved: String
+        if executable.hasPrefix("/") {
+            resolved = executable
+        } else {
+            guard !executable.contains("/"),
+                  !executable.contains("\\"),
+                  let path = resolveExecutablePath(executable, environment: environment),
+                  path.hasPrefix("/") else {
+                return false
+            }
+            resolved = path
+        }
+
+        let executableURL = URL(fileURLWithPath: resolved).standardizedFileURL
+            .resolvingSymlinksInPath()
+        guard FileManager.default.isExecutableFile(atPath: executableURL.path),
+              (try? executableURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+            return false
+        }
+
+        let projectURL = URL(
+            fileURLWithPath: workingDirectory ?? FileManager.default.currentDirectoryPath,
+            isDirectory: true
+        ).standardizedFileURL.resolvingSymlinksInPath()
+        return executableURL.path != projectURL.path
+            && !executableURL.path.hasPrefix(projectURL.path + "/")
     }
 }

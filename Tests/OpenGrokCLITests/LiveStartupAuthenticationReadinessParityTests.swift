@@ -111,6 +111,37 @@ struct LiveStartupAuthenticationReadinessParityTests {
         ]))
     }
 
+    @Test("expired xAI sessions authenticate only when a legitimate refresh is possible")
+    func expiredXAISessionsRequireUsableRefreshCapability() async throws {
+        let fixture = try StartupAuthenticationFixture()
+        defer { fixture.dispose() }
+        let config = GrokComConfig.default(environment: fixture.environment)
+        let authFile = fixture.home.appendingPathComponent("auth.json")
+        var expired = GrokAuth(
+            key: "hard-expired-private-token",
+            authMode: .oidc,
+            userID: "expired-owner",
+            teamBlockedReasons: ["BLOCKED_REASON_NO_LOGS"],
+            expiresAt: Date().addingTimeInterval(-3_600),
+            oidcIssuer: xaiOAuth2Issuer,
+            oidcClientID: defaultOAuth2ClientID
+        )
+        var permitted = RemoteSettings()
+        permitted.zdrAccessEnabled = true
+
+        try writeAuthJSON(at: authFile, store: [config.authScope: expired])
+        #expect(await fixture.ready(remote: permitted) == false)
+
+        expired.refreshToken = "   "
+        try writeAuthJSON(at: authFile, store: [config.authScope: expired])
+        #expect(await fixture.ready(remote: permitted) == false)
+
+        expired.refreshToken = "legitimate-team-refresh-token"
+        try writeAuthJSON(at: authFile, store: [config.authScope: expired])
+        #expect(await fixture.ready(remote: permitted))
+        #expect(await fixture.ready() == false)
+    }
+
     @Test("every provider reads its actual environment keys and CLI aliases")
     func providerEnvironmentCredentialsAreIsolated() async throws {
         let fixture = try StartupAuthenticationFixture()
@@ -312,6 +343,64 @@ struct LiveStartupAuthenticationReadinessParityTests {
 
         #expect(await fixture.ready(model: "owner-auth"))
         #expect(FileManager.default.fileExists(atPath: marker.path) == false)
+    }
+
+    @Test("named auth refuses nonexistent, non-executable, and project-controlled binaries")
+    func namedAuthenticationRequiresTrustedExecutable() async throws {
+        let fixture = try StartupAuthenticationFixture()
+        defer { fixture.dispose() }
+        let ownerBinary = fixture.root.appendingPathComponent("owner-auth-command")
+        let projectBinary = fixture.project.appendingPathComponent("project-auth-command")
+        try "#!/bin/sh\nexit 0\n".write(to: ownerBinary, atomically: true, encoding: .utf8)
+        try "#!/bin/sh\nexit 0\n".write(to: projectBinary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: ownerBinary.path
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: projectBinary.path
+        )
+
+        for command in [
+            fixture.root.appendingPathComponent("does-not-exist").path,
+            ownerBinary.path,
+            projectBinary.path,
+        ] {
+            try fixture.configureOwner("""
+            [auth_provider.owner_command]
+            command = "\(command)"
+            args = []
+
+            [model.owner-auth]
+            model = "private-routing-slug"
+            provider = "fireworks"
+            base_url = "https://api.fireworks.ai/inference/v1"
+            auth_provider = "owner_command"
+            """)
+            #expect(await fixture.ready(model: "owner-auth") == false)
+        }
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: ownerBinary.path
+        )
+        try fixture.configureOwner("""
+        [auth_provider.owner_command]
+        command = "owner-auth-command"
+
+        [model.owner-auth]
+        model = "private-routing-slug"
+        provider = "fireworks"
+        base_url = "https://api.fireworks.ai/inference/v1"
+        auth_provider = "owner_command"
+        """)
+        #expect(await fixture.ready(model: "owner-auth", extra: [
+            "PATH": fixture.root.path,
+        ]))
+        #expect(await fixture.ready(model: "owner-auth", extra: [
+            "PATH": fixture.project.path,
+        ]) == false)
     }
 
     @Test("xAI access and ZDR gates never contaminate third-party providers")
