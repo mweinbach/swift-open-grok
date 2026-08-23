@@ -2889,7 +2889,7 @@ struct ParityCompositionTests {
     }
 
     @Test("live interactive composition redraws after terminal resize")
-    func liveInteractiveResizeComposition() async {
+    func liveInteractiveResizeComposition() async throws {
         let terminal = ParityTerminalFixture(
             tty: true,
             size: OpenGrokLiveTerminalSize(width: 60, height: 12)
@@ -2914,6 +2914,11 @@ struct ParityCompositionTests {
         }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
+        let isolatedCwd = root.appendingPathComponent("cwd", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: isolatedCwd,
+            withIntermediateDirectories: true
+        )
         let dependencies = OpenGrokLiveCompositionDependencies(
             makeSampler: { _ in sampler.makeSampler() },
             terminal: terminal.terminal,
@@ -2928,7 +2933,7 @@ struct ParityCompositionTests {
         let (streams, out, err) = CLIStreams.buffered()
 
         let code = await CLIRunner.run(
-            ["interactive"],
+            ["interactive", "--cwd", isolatedCwd.path],
             environment: [
                 "HOME": root.path,
                 "OPENGROK_HOME": root.appendingPathComponent("state").path,
