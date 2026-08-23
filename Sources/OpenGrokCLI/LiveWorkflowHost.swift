@@ -23,7 +23,8 @@ actor LiveWorkflowHost: RhaiWorkflowHost {
     private let context: RhaiWorkflowRunContext
     private let environment: LiveWorkflowAgentEnvironment
     private let scratchRoot: URL
-    private let gitDiff: @Sendable (String, URL) async -> String
+    private let templates: LiveWorkflowTemplates
+    private let gitDiff: @Sendable (String, URL) async throws -> String
     private let concurrency: Int
 
     /// Slots handed out but not yet returned, plus slots already spent. Both
@@ -38,6 +39,7 @@ actor LiveWorkflowHost: RhaiWorkflowHost {
     /// connects MCP servers and loads hooks, so it is done at most four times
     /// per run rather than once per agent.
     private var invokers: [ToolCapabilityMode: any LiveWorkflowToolInvoker] = [:]
+    private var pendingInvokers: [ToolCapabilityMode: Task<any LiveWorkflowToolInvoker, Error>] = [:]
 
     nonisolated let maxConcurrentAgents: Int
 
@@ -46,11 +48,13 @@ actor LiveWorkflowHost: RhaiWorkflowHost {
         environment: LiveWorkflowAgentEnvironment,
         scratchRoot: URL,
         maxConcurrentAgents: Int = 8,
-        gitDiff: @escaping @Sendable (String, URL) async -> String = LiveWorkflowHost.runGitDiff
+        templates: LiveWorkflowTemplates = .empty,
+        gitDiff: @escaping @Sendable (String, URL) async throws -> String = LiveWorkflowGitDiff.run
     ) {
         self.context = context
         self.environment = environment
         self.scratchRoot = scratchRoot
+        self.templates = templates
         self.concurrency = max(1, maxConcurrentAgents)
         self.maxConcurrentAgents = max(1, maxConcurrentAgents)
         self.gitDiff = gitDiff
@@ -225,78 +229,22 @@ actor LiveWorkflowHost: RhaiWorkflowHost {
 
     // MARK: - Scratch files
 
-    /// Scratch files are the workflow's own storage, not the workspace's: a
-    /// script writing a report must not be able to drop it into the user's
-    /// repository. They live under the run's own directory, and the name is
-    /// reduced to a single path component so `../` cannot escape it.
     func writeScratchFile(name: String, content: String) throws -> String {
-        let url = try scratchURL(for: name)
-        do {
-            try FileManager.default.createDirectory(
-                at: scratchRoot,
-                withIntermediateDirectories: true
-            )
-            try Data(content.utf8).write(to: url, options: .atomic)
-        } catch {
-            throw RhaiHostError.failed("cannot write scratch file \(name): \(error)")
-        }
-        return url.path
+        try LiveWorkflowScratchSecurity.write(name: name, content: content, root: scratchRoot)
     }
 
     func readScratchFile(name: String) throws -> String {
-        let url = try scratchURL(for: name)
-        do {
-            return try String(contentsOf: url, encoding: .utf8)
-        } catch {
-            throw RhaiHostError.failed("cannot read scratch file \(name): \(error)")
-        }
-    }
-
-    private func scratchURL(for name: String) throws -> URL {
-        let component = (name as NSString).lastPathComponent
-        guard !component.isEmpty, component != ".", component != ".." else {
-            throw RhaiHostError.failed("invalid scratch file name: \(name)")
-        }
-        return scratchRoot.appendingPathComponent(component)
+        try LiveWorkflowScratchSecurity.read(name: name, root: scratchRoot)
     }
 
     // MARK: - Other host calls
 
     func renderTemplate(name: String, variables: JSONValue) throws -> String {
-        // Upstream resolves named prompt templates from the shell's registry,
-        // which this composition does not have. Reporting it as unsupported
-        // rather than returning a stub is deliberate: `unsupported` is
-        // catchable, so a script can fall back, whereas a stub would silently
-        // send an agent a meaningless prompt.
-        throw RhaiHostError.unsupported("render_template is not available in this session: \(name)")
+        try templates.render(name: name, variables: variables)
     }
 
-    func gitDiffSince(commit: String) async -> String {
-        await gitDiff(commit, environment.workspaceRoot)
-    }
-
-    static let runGitDiff: @Sendable (String, URL) async -> String = { commit, root in
-        await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = ["git", "diff", "\(commit)...HEAD"]
-            process.currentDirectoryURL = root
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
-            let box = LiveWorkflowContinuationBox(continuation)
-            // Never `waitUntilExit` — it blocks a cooperative thread and has
-            // deadlocked this codebase before (PORT_STATUS, wave 4).
-            process.terminationHandler = { _ in
-                let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
-                box.resume(String(data: data, encoding: .utf8) ?? "")
-            }
-            do {
-                try process.run()
-            } catch {
-                box.resume("")
-            }
-        }
+    func gitDiffSince(commit: String) async throws -> String {
+        try await gitDiff(commit, environment.workspaceRoot)
     }
 
     // MARK: - Tool surfaces
@@ -304,7 +252,17 @@ actor LiveWorkflowHost: RhaiWorkflowHost {
     /// Hand out (and cache) the tool surface for one clamped capability mode.
     func invoker(for mode: ToolCapabilityMode) async throws -> any LiveWorkflowToolInvoker {
         if let cached = invokers[mode] { return cached }
-        let built = try await environment.makeInvoker(mode)
+        if let pending = pendingInvokers[mode] {
+            return try await pending.value
+        }
+
+        let factory = environment.makeInvoker
+        let pending = Task<any LiveWorkflowToolInvoker, Error> {
+            try await factory(mode)
+        }
+        pendingInvokers[mode] = pending
+        defer { pendingInvokers[mode] = nil }
+        let built = try await pending.value
         invokers[mode] = built
         return built
     }
@@ -322,28 +280,10 @@ actor LiveWorkflowHost: RhaiWorkflowHost {
             workspaceRoot: environment.workspaceRoot,
             systemPrompt: environment.systemPrompt,
             parentCapabilityMode: environment.parentCapabilityMode,
+            supportsReasoningEffort: environment.supportsReasoningEffort,
             maxToolRounds: environment.maxToolRounds,
             makeInvoker: { [self] mode in try await invoker(for: mode) }
         )
-    }
-}
-
-/// `terminationHandler` can fire once, but the compiler cannot see that, so the
-/// continuation needs a resume-once guard to stay `Sendable`.
-private final class LiveWorkflowContinuationBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<String, Never>?
-
-    init(_ continuation: CheckedContinuation<String, Never>) {
-        self.continuation = continuation
-    }
-
-    func resume(_ value: String) {
-        lock.lock()
-        let pending = continuation
-        continuation = nil
-        lock.unlock()
-        pending?.resume(returning: value)
     }
 }
 
