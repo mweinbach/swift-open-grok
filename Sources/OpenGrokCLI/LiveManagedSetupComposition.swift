@@ -151,6 +151,7 @@ private struct LiveManagedFetchedPolicy: Sendable {
 
 private enum LiveManagedSetupFailure: Error, Sendable {
     case noPrincipal
+    case invalidCredentials
     case remoteFetchDisabled
     case untrustedEndpoint
     case rejectedDeploymentKey
@@ -173,6 +174,8 @@ private enum LiveManagedSetupFailure: Error, Sendable {
                 To install managed configuration, sign in with a team using `open-grok login`,
                 or set GROK_DEPLOYMENT_KEY and run `open-grok setup`.
                 """
+        case .invalidCredentials:
+            return "The configured managed account credentials could not be read safely."
         case .remoteFetchDisabled:
             return "Managed configuration fetch is disabled by deployment policy."
         case .untrustedEndpoint:
@@ -247,25 +250,63 @@ public enum LiveManagedSetupComposition {
         guard let home = userGrokHome(environment: environment) else {
             throw LiveManagedSetupFailure.noPrincipal
         }
-        let document = (try? ConfigLayers.load(environment: environment))?
-            .effectiveConfigBase() ?? .table(TOMLTable())
+        let document = trustedConfigDocument(environment: environment)
         let deploymentKey = resolveDeploymentKey(environment: environment, document: document)
-        let team = activeTeamPrincipal(home: home, environment: environment, now: services.now())
-        let bindingTeamID = signedInTeamIDForPolicyBinding(home: home)
-        guard deploymentKey != nil || team != nil else {
+        let credentials: [GrokAuth]
+        do {
+            credentials = try managedAuthCredentials(home: home, environment: environment)
+        } catch {
+            guard deploymentKey != nil else { throw error }
+            // Deployment credentials own policy independently. A broken
+            // optional team source cannot disable that administrator path.
+            credentials = []
+        }
+        let signedInTeam = eligibleTeamPrincipal(
+            credentials: credentials,
+            environment: environment,
+            now: services.now(),
+            includingExpired: true
+        )
+        var team = eligibleTeamPrincipal(
+            credentials: credentials,
+            environment: environment,
+            now: services.now(),
+            includingExpired: false
+        )
+        let bindingTeamID = signedInTeamIDForPolicyBinding(
+            home: home,
+            environment: environment
+        )
+        guard deploymentKey != nil || signedInTeam != nil else {
             throw LiveManagedSetupFailure.noPrincipal
         }
         guard resolveTrustedRemoteFetchEnabled(environment: environment) else {
             throw LiveManagedSetupFailure.remoteFetchDisabled
         }
         let endpoint = try trustedManagedEndpoint(environment: environment, document: document)
+        let transport = services.makeTransport()
+        var operationEnvironment = environment
+        if team == nil, let signedInTeam {
+            team = await refreshTeamPrincipal(
+                signedInTeam,
+                home: home,
+                environment: environment,
+                transport: transport
+            )
+            if let team, environment["OPENGROK_AUTH"] != nil {
+                operationEnvironment["OPENGROK_AUTH"] = try encodeInlineAuth(team)
+            }
+        }
+        guard deploymentKey != nil || team != nil else {
+            throw LiveManagedSetupFailure.noPrincipal
+        }
         let fetched = try await fetch(
             endpoint: endpoint,
             deploymentKey: deploymentKey,
             team: team,
             bindingTeamID: bindingTeamID,
-            transport: services.makeTransport(),
-            environment: environment,
+            transport: transport,
+            environment: operationEnvironment,
             now: services.now()
         )
 
@@ -292,7 +333,12 @@ public enum LiveManagedSetupComposition {
             return .reported
         }
 
-        let outcome = try apply(fetched, home: home, environment: environment, now: services.now())
+        let outcome = try apply(
+            fetched,
+            home: home,
+            environment: operationEnvironment,
+            now: services.now()
+        )
         switch outcome {
         case .installed:
             streams.err("Applied managed configuration.\n")
@@ -308,6 +354,73 @@ public enum LiveManagedSetupComposition {
 
     private static let nothingConfiguredMessage =
         "Your team doesn't have a managed configuration yet. A team admin can set one up at console.x.ai."
+
+    /// A malformed user-owned config cannot erase independently readable
+    /// administrator requirements, managed policy, or deployment identity.
+    static func trustedConfigDocument(environment: [String: String]) -> TOMLValue {
+        do {
+            return try ConfigLayers.load(environment: environment).effectiveConfigBase()
+        } catch {
+            var trusted = (try? loadSystemManagedConfig(environment: environment))
+                ?? .table(TOMLTable())
+            if let managed = try? loadManagedConfig(environment: environment) {
+                deepMergeTOML(&trusted, overrides: managed)
+            }
+            if let requirements = loadMergedRequirements(environment: environment) {
+                deepMergeTOML(&trusted, overrides: requirements)
+            }
+            return trusted
+        }
+    }
+
+    /// Match AuthManager's source selection without treating a malformed
+    /// highest-priority override as permission to fall back to another user.
+    static func managedAuthCredentials(
+        home: URL,
+        environment: [String: String]
+    ) throws -> [GrokAuth] {
+        if let inline = environment["OPENGROK_AUTH"] {
+            do {
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .custom { decoder in
+                    let container = try decoder.singleValueContainer()
+                    if let text = try? container.decode(String.self) {
+                        let fractional = ISO8601DateFormatter()
+                        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                        let standard = ISO8601DateFormatter()
+                        standard.formatOptions = [.withInternetDateTime]
+                        if let date = fractional.date(from: text) ?? standard.date(from: text) {
+                            return date
+                        }
+                    }
+                    if let timestamp = try? container.decode(Double.self) {
+                        return Date(timeIntervalSince1970: timestamp)
+                    }
+                    throw DecodingError.dataCorruptedError(
+                        in: container,
+                        debugDescription: "invalid account timestamp"
+                    )
+                }
+                return [try decoder.decode(GrokAuth.self, from: Data(inline.utf8))]
+            } catch {
+                throw LiveManagedSetupFailure.invalidCredentials
+            }
+        }
+
+        if let override = environment["OPENGROK_AUTH_PATH"], !override.isEmpty {
+            do {
+                return Array(try readAuthJSON(at: URL(fileURLWithPath: override)).values)
+            } catch {
+                throw LiveManagedSetupFailure.invalidCredentials
+            }
+        }
+        do {
+            let path = home.appendingPathComponent(OpenGrokAuthPaths.authFileName)
+            return Array(try readAuthJSONOrEmpty(at: path).values)
+        } catch {
+            throw LiveManagedSetupFailure.invalidCredentials
+        }
+    }
 
     private static func resolveDeploymentKey(
         environment: [String: String],
@@ -325,24 +438,106 @@ public enum LiveManagedSetupComposition {
         environment: [String: String],
         now: Date
     ) -> GrokAuth? {
-        guard let credentials = try? readAuthJSONOrEmpty(at: home.appendingPathComponent("auth.json")) else {
+        guard let credentials = try? managedAuthCredentials(home: home, environment: environment) else {
             return nil
         }
-        return credentials.values.first {
+        return eligibleTeamPrincipal(
+            credentials: credentials,
+            environment: environment,
+            now: now,
+            includingExpired: false
+        )
+    }
+
+    private static func eligibleTeamPrincipal(
+        credentials: [GrokAuth],
+        environment: [String: String],
+        now: Date,
+        includingExpired: Bool
+    ) -> GrokAuth? {
+        credentials.first {
             $0.isTeamPrincipal
                 && $0.isSessionAuth
                 && normalizeIdentity($0.teamID) != nil
                 && !$0.key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                && !isExpired($0, now: now, environment: environment)
+                && (includingExpired || !isExpired($0, now: now, environment: environment))
         }
     }
 
-    static func signedInTeamIDForPolicyBinding(home: URL) -> String? {
-        guard let credentials = try? readAuthJSONOrEmpty(at: home.appendingPathComponent("auth.json")) else {
+    static func signedInTeamIDForPolicyBinding(
+        home: URL,
+        environment: [String: String] = [:]
+    ) -> String? {
+        if let credentials = try? managedAuthCredentials(home: home, environment: environment) {
+            return credentials.first { $0.isTeamPrincipal }
+                .flatMap { normalizeIdentity($0.teamID) }
+        }
+
+        // AuthManager falls through malformed inline JSON to its selected
+        // path. A deployment key may still serve policy, but that must never
+        // erase the real disk tenant's cryptographic envelope binding.
+        var fallback = environment
+        fallback.removeValue(forKey: "OPENGROK_AUTH")
+        if let credentials = try? managedAuthCredentials(home: home, environment: fallback) {
+            return credentials.first { $0.isTeamPrincipal }
+                .flatMap { normalizeIdentity($0.teamID) }
+        }
+        guard fallback.removeValue(forKey: "OPENGROK_AUTH_PATH") != nil,
+              let credentials = try? managedAuthCredentials(home: home, environment: fallback)
+        else {
             return nil
         }
-        return credentials.values.first { $0.isTeamPrincipal }
+        return credentials.first { $0.isTeamPrincipal }
             .flatMap { normalizeIdentity($0.teamID) }
+    }
+
+    private static func refreshTeamPrincipal(
+        _ expired: GrokAuth,
+        home: URL,
+        environment: [String: String],
+        transport: any HTTPTransport
+    ) async -> GrokAuth? {
+        guard expired.refreshToken?.trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty == false
+        else {
+            return nil
+        }
+        let config = GrokComConfig.default(environment: environment)
+        guard let refresher = makeXAIOIDCTokenRefresher(
+            auth: expired,
+            config: config,
+            transport: transport
+        ) else {
+            return nil
+        }
+
+        let manager = AuthManager(grokHome: home, config: config, environment: environment)
+        await manager.hotSwap(expired)
+        await manager.configureRefresher(refresher)
+        do {
+            let refreshed = try await manager.auth()
+            guard refreshed.isTeamPrincipal,
+                  refreshed.isSessionAuth,
+                  normalizeIdentity(refreshed.teamID) == normalizeIdentity(expired.teamID),
+                  !refreshed.key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !isExpired(refreshed, environment: environment)
+            else {
+                return nil
+            }
+            return refreshed
+        } catch {
+            return nil
+        }
+    }
+
+    private static func encodeInlineAuth(_ auth: GrokAuth) throws -> String {
+        do {
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            return String(decoding: try encoder.encode(auth), as: UTF8.self)
+        } catch {
+            throw LiveManagedSetupFailure.invalidCredentials
+        }
     }
 
     private static func trustedManagedEndpoint(
@@ -585,8 +780,7 @@ public enum LiveManagedSetupComposition {
 
         let current = resolveDeploymentKey(
             environment: environment,
-            document: (try? ConfigLayers.load(environment: environment))?
-                .effectiveConfigBase() ?? .table(TOMLTable())
+            document: trustedConfigDocument(environment: environment)
         )
         switch fetched.principal {
         case .deploymentKey(let token):

@@ -87,6 +87,12 @@ private struct ManagedSetupFixture {
         )
     }
 
+    func inlineAuth(_ auth: GrokAuth) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return String(decoding: try encoder.encode(auth), as: UTF8.self)
+    }
+
     func team(
         key: String = "team-oauth-secret",
         id: String = "team-owned",
@@ -283,6 +289,139 @@ struct LiveManagedSetupParityTests {
         #expect(expiredTransport.capturedRequests.isEmpty)
     }
 
+    @Test("inline team credentials outrank an explicit path and the home auth store")
+    func inlineManagedTeamIsAuthoritativeForSetup() async throws {
+        let fixture = try ManagedSetupFixture()
+        defer { fixture.dispose() }
+        try fixture.writeAuth(fixture.team(key: "must-not-send-home-token", id: "home-team"))
+        let path = fixture.root.appendingPathComponent("different-team-auth.json")
+        try writeAuthJSON(at: path, store: [
+            "path-team": fixture.team(key: "must-not-send-path-token", id: "path-team"),
+        ])
+        var environment = fixture.environment
+        environment["OPENGROK_AUTH_PATH"] = path.path
+        environment["OPENGROK_AUTH"] = try fixture.inlineAuth(
+            fixture.team(key: "inline-team-token", id: "inline-team")
+        )
+        let transport = ManagedSetupRecordingTransport([
+            try fixture.response(json: ["team_id": "inline-team"]),
+        ])
+
+        let outcome = try await fixture.run(transport: transport, environment: environment)
+
+        #expect(outcome == .installed)
+        #expect(transport.capturedRequests.count == 1)
+        #expect(transport.capturedRequests.first?.headers["Authorization"] == "Bearer inline-team-token")
+        #expect(LiveManagedSetupComposition.signedInTeamIDForPolicyBinding(
+            home: fixture.state,
+            environment: environment
+        ) == "inline-team")
+    }
+
+    @Test("an explicit team auth path outranks a different home credential")
+    func explicitManagedAuthPathIsAuthoritativeForSetup() async throws {
+        let fixture = try ManagedSetupFixture()
+        defer { fixture.dispose() }
+        try fixture.writeAuth(fixture.team(key: "must-not-send-home-token", id: "home-team"))
+        let path = fixture.root.appendingPathComponent("active-team-auth.json")
+        try writeAuthJSON(at: path, store: [
+            "active-team": fixture.team(key: "path-team-token", id: "path-team"),
+        ])
+        var environment = fixture.environment
+        environment["OPENGROK_AUTH_PATH"] = path.path
+        let transport = ManagedSetupRecordingTransport([
+            try fixture.response(json: ["team_id": "path-team"]),
+        ])
+
+        let outcome = try await fixture.run(transport: transport, environment: environment)
+
+        #expect(outcome == .installed)
+        #expect(transport.capturedRequests.first?.headers["Authorization"] == "Bearer path-team-token")
+        #expect(LiveManagedSetupComposition.signedInTeamIDForPolicyBinding(
+            home: fixture.state,
+            environment: environment
+        ) == "path-team")
+    }
+
+    @Test("personal inline credentials never borrow a managed account from disk")
+    func personalInlineOverrideNeverBorrowsDiskTeam() async throws {
+        let fixture = try ManagedSetupFixture()
+        defer { fixture.dispose() }
+        try fixture.writeAuth(fixture.team())
+        var environment = fixture.environment
+        environment["OPENGROK_AUTH"] = try fixture.inlineAuth(
+            GrokAuth(key: "personal-inline-key", authMode: .apiKey)
+        )
+        let transport = ManagedSetupRecordingTransport()
+
+        let message = await fixture.sessionFailure(transport: transport, environment: environment)
+
+        #expect(message.contains("No deployment key"))
+        #expect(transport.capturedRequests.isEmpty)
+    }
+
+    @Test("malformed inline and unreadable explicit auth overrides fail without fallback")
+    func malformedAuthOverridesCannotBorrowAnotherPrincipal() async throws {
+        let fixture = try ManagedSetupFixture()
+        defer { fixture.dispose() }
+        try fixture.writeAuth(fixture.team())
+        var inline = fixture.environment
+        inline["OPENGROK_AUTH"] = "{invalid-managed-identity"
+        let inlineTransport = ManagedSetupRecordingTransport()
+
+        let inlineMessage = await fixture.sessionFailure(
+            transport: inlineTransport,
+            environment: inline
+        )
+
+        #expect(inlineMessage.contains("credentials could not be read safely"))
+        #expect(inlineTransport.capturedRequests.isEmpty)
+
+        var path = fixture.environment
+        path["OPENGROK_AUTH_PATH"] = fixture.root.appendingPathComponent("absent-auth.json").path
+        let pathTransport = ManagedSetupRecordingTransport()
+        let pathMessage = await fixture.sessionFailure(transport: pathTransport, environment: path)
+
+        #expect(pathMessage.contains("credentials could not be read safely"))
+        #expect(pathTransport.capturedRequests.isEmpty)
+    }
+
+    @Test("an administrator deployment key remains independent of broken team auth sources")
+    func deploymentKeySurvivesBrokenOptionalTeamCredentials() async throws {
+        for source in ["missing-path", "malformed-home", "malformed-inline"] {
+            let fixture = try ManagedSetupFixture()
+            defer { fixture.dispose() }
+            var environment = fixture.environment
+            environment["GROK_DEPLOYMENT_KEY"] = "independent-administrator-key"
+            switch source {
+            case "missing-path":
+                environment["OPENGROK_AUTH_PATH"] = fixture.root
+                    .appendingPathComponent("missing-team.json").path
+            case "malformed-home":
+                try "{broken-auth-store".write(
+                    to: fixture.state.appendingPathComponent("auth.json"),
+                    atomically: true,
+                    encoding: .utf8
+                )
+            case "malformed-inline":
+                environment["OPENGROK_AUTH"] = "{broken-inline-team"
+            default:
+                Issue.record("unknown auth-source fixture")
+                continue
+            }
+            let transport = ManagedSetupRecordingTransport([
+                try fixture.response(json: ["deployment_id": "administrator-deployment"]),
+            ])
+
+            let outcome = try await fixture.run(transport: transport, environment: environment)
+
+            #expect(outcome == .installed)
+            #expect(transport.capturedRequests.count == 1)
+            #expect(transport.capturedRequests.first?.headers["Authorization"]
+                == "Bearer independent-administrator-key")
+        }
+    }
+
     @Test("signed policy tenant binding survives an expired team access token")
     func expiredTeamIdentityRemainsAuthoritativeForPolicyBinding() throws {
         let fixture = try ManagedSetupFixture()
@@ -449,6 +588,40 @@ struct LiveManagedSetupParityTests {
         #expect(transport.capturedRequests.first?.headers["Authorization"] == "Bearer owner-config-secret")
     }
 
+    @Test("malformed owner config cannot hide a trusted managed-tier deployment key")
+    func corruptOwnerConfigPreservesManagedDeploymentAuthority() async throws {
+        let fixture = try ManagedSetupFixture()
+        defer { fixture.dispose() }
+        let managed = "[endpoints]\ndeployment_key = \"trusted-managed-deployment\"\n"
+        try managed.write(
+            to: fixture.state.appendingPathComponent(MANAGED_CONFIG_FILENAME),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "[intentionally malformed user config".write(
+            to: fixture.state.appendingPathComponent("config.toml"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let transport = ManagedSetupRecordingTransport([
+            try fixture.response(json: [
+                "deployment_id": "trusted-deployment",
+                "managed_config": managed,
+                "requirements": "fail_closed = true\n",
+            ]),
+        ])
+
+        let outcome = try await fixture.run(transport: transport)
+
+        #expect(outcome == .installed)
+        #expect(transport.capturedRequests.first?.headers["Authorization"]
+            == "Bearer trusted-managed-deployment")
+        let markerData = try Data(contentsOf: fixture.state.appendingPathComponent(MANAGED_CONFIG_CACHE_FILE))
+        let marker = try JSONDecoder().decode(ManagedConfigCache.self, from: markerData)
+        #expect(marker.principal == "trusted-deployment")
+        #expect(marker.failClosed)
+    }
+
     @Test("eligible team OAuth fetches its own policy without accepting a personal API key")
     func authenticatedTeamPrincipalInstallsPolicy() async throws {
         let fixture = try ManagedSetupFixture()
@@ -492,6 +665,69 @@ struct LiveManagedSetupParityTests {
             "Bearer rejected-deployment-secret",
             "Bearer team-oauth-secret",
         ])
+    }
+
+    @Test("an expired team refreshes before a rejected deployment falls back to that team")
+    func rejectedDeploymentFallsBackToRefreshedTeam() async throws {
+        let fixture = try ManagedSetupFixture()
+        defer { fixture.dispose() }
+        var expired = fixture.team(
+            key: "expired-team-secret",
+            expiresAt: Date().addingTimeInterval(-600)
+        )
+        expired.refreshToken = "team-refresh-secret"
+        expired.oidcIssuer = xaiOAuth2Issuer
+        expired.oidcClientID = defaultOAuth2ClientID
+        try fixture.writeAuth(expired)
+        var environment = fixture.environment
+        environment["GROK_DEPLOYMENT_KEY"] = "rejected-deployment-secret"
+        let transport = ManagedSetupRecordingTransport([
+            try fixture.response(json: [
+                "access_token": "refreshed-team-secret",
+                "expires_in": 3_600,
+            ]),
+            try fixture.response(status: 401, json: [:]),
+            try fixture.response(json: ["team_id": "team-owned"]),
+        ])
+
+        let outcome = try await fixture.run(transport: transport, environment: environment)
+
+        #expect(outcome == .installed)
+        let requests = transport.capturedRequests
+        #expect(requests.count == 3)
+        #expect(requests.first?.url.absoluteString == "https://auth.x.ai/oauth2/token")
+        #expect(requests.dropFirst().compactMap { $0.headers["Authorization"] } == [
+            "Bearer rejected-deployment-secret",
+            "Bearer refreshed-team-secret",
+        ])
+        let markerData = try Data(contentsOf: fixture.state.appendingPathComponent(MANAGED_CONFIG_CACHE_FILE))
+        let marker = try JSONDecoder().decode(ManagedConfigCache.self, from: markerData)
+        #expect(marker.principal == "team-owned")
+        #expect(marker.keyFingerprint == nil)
+    }
+
+    @Test("a failed optional team refresh cannot disable a valid deployment key")
+    func failedTeamRefreshStillUsesIndependentDeploymentKey() async throws {
+        let fixture = try ManagedSetupFixture()
+        defer { fixture.dispose() }
+        var expired = fixture.team(expiresAt: Date().addingTimeInterval(-600))
+        expired.refreshToken = "rejected-team-refresh"
+        expired.oidcIssuer = xaiOAuth2Issuer
+        expired.oidcClientID = defaultOAuth2ClientID
+        try fixture.writeAuth(expired)
+        var environment = fixture.environment
+        environment["GROK_DEPLOYMENT_KEY"] = "valid-deployment-secret"
+        let transport = ManagedSetupRecordingTransport([
+            try fixture.response(status: 400, json: ["error": "invalid_grant"]),
+            try fixture.response(json: ["deployment_id": "valid-deployment"]),
+        ])
+
+        let outcome = try await fixture.run(transport: transport, environment: environment)
+
+        #expect(outcome == .installed)
+        #expect(transport.capturedRequests.count == 2)
+        #expect(transport.capturedRequests.last?.headers["Authorization"]
+            == "Bearer valid-deployment-secret")
     }
 
     @Test("a deployment principal with no served row falls back to configured team policy")
@@ -666,6 +902,85 @@ struct LiveManagedSetupParityTests {
         #expect(transport.capturedRequests.first?.headers["Authorization"] == "Bearer deployment-secret")
         #expect(!FileManager.default.fileExists(atPath: fixture.state.appendingPathComponent(MANAGED_CONFIG_FILENAME).path))
         #expect(!FileManager.default.fileExists(atPath: fixture.state.appendingPathComponent(MANAGED_CONFIG_CACHE_FILE).path))
+        #endif
+    }
+
+    @Test("deployment-signed policy binds to the inline team instead of a different disk tenant")
+    func deploymentEnvelopeUsesInlineTenantAuthority() async throws {
+        #if canImport(CryptoKit)
+        let fixture = try ManagedSetupFixture()
+        defer { fixture.dispose() }
+        try fixture.writeAuth(fixture.team(id: "disk-team"))
+        let signingKey = Curve25519.Signing.PrivateKey()
+        setEmbeddedKeys([("trusted-setup-admin", Array(signingKey.publicKey.rawRepresentation))])
+        defer { clearEmbeddedKeysOverride() }
+        var environment = fixture.environment
+        environment["GROK_DEPLOYMENT_KEY"] = "deployment-secret"
+        environment["OPENGROK_AUTH"] = try fixture.inlineAuth(
+            fixture.team(key: "inline-team-secret", id: "inline-team")
+        )
+        let transport = ManagedSetupRecordingTransport([
+            try fixture.signedResponse(
+                key: signingKey,
+                deploymentID: "deployment-owned",
+                signedTeamID: "disk-team",
+                managedConfig: "[features]\ntelemetry = true\n"
+            ),
+        ])
+
+        let message = await fixture.sessionFailure(transport: transport, environment: environment)
+
+        #expect(message.contains("signature could not be verified"))
+        #expect(transport.capturedRequests.count == 1)
+        #expect(transport.capturedRequests.first?.headers["Authorization"] == "Bearer deployment-secret")
+        #expect(!FileManager.default.fileExists(
+            atPath: fixture.state.appendingPathComponent(MANAGED_CONFIG_FILENAME).path
+        ))
+        #endif
+    }
+
+    @Test("broken optional auth overrides cannot erase a deployment's signed disk-team binding")
+    func brokenOptionalAuthSourcesCannotEraseSignedDiskTenant() async throws {
+        #if canImport(CryptoKit)
+        let signingKey = Curve25519.Signing.PrivateKey()
+        setEmbeddedKeys([("trusted-setup-admin", Array(signingKey.publicKey.rawRepresentation))])
+        defer { clearEmbeddedKeysOverride() }
+
+        for source in ["malformed-inline", "unreadable-path", "malformed-inline-unreadable-path"] {
+            let fixture = try ManagedSetupFixture()
+            defer { fixture.dispose() }
+            try fixture.writeAuth(fixture.team(id: "genuine-disk-team"))
+            var environment = fixture.environment
+            environment["GROK_DEPLOYMENT_KEY"] = "deployment-secret"
+            if source.contains("malformed-inline") {
+                environment["OPENGROK_AUTH"] = "{broken-selected-credential"
+            }
+            if source.contains("unreadable-path") {
+                environment["OPENGROK_AUTH_PATH"] = fixture.root
+                    .appendingPathComponent("missing-selected-team.json").path
+            }
+            let transport = ManagedSetupRecordingTransport([
+                try fixture.signedResponse(
+                    key: signingKey,
+                    deploymentID: "deployment-owned",
+                    signedTeamID: "attacker-team",
+                    managedConfig: "[features]\ntelemetry = true\n"
+                ),
+            ])
+
+            let message = await fixture.sessionFailure(transport: transport, environment: environment)
+
+            #expect(LiveManagedSetupComposition.signedInTeamIDForPolicyBinding(
+                home: fixture.state,
+                environment: environment
+            ) == "genuine-disk-team")
+            #expect(message.contains("signature could not be verified"))
+            #expect(transport.capturedRequests.count == 1)
+            #expect(transport.capturedRequests.first?.headers["Authorization"] == "Bearer deployment-secret")
+            #expect(!FileManager.default.fileExists(
+                atPath: fixture.state.appendingPathComponent(MANAGED_CONFIG_FILENAME).path
+            ))
+        }
         #endif
     }
 

@@ -104,9 +104,10 @@ public enum LiveManagedPolicyGate {
         if let value = envBool("GROK_MANAGED_CONFIG", environment: environment) {
             return value
         }
-        guard let document = try? ConfigLayers.load(environment: environment)
-            .effectiveConfigBase(),
-              case let .boolean(value)? = document[path: ["features", "managed_config"]]
+        let document = LiveManagedSetupComposition.trustedConfigDocument(
+            environment: environment
+        )
+        guard case let .boolean(value)? = document[path: ["features", "managed_config"]]
         else {
             return true
         }
@@ -117,9 +118,10 @@ public enum LiveManagedPolicyGate {
         home: URL,
         environment: [String: String]
     ) -> ManagedPrincipalSnapshot {
-        let document = (try? ConfigLayers.load(environment: environment))?
-            .effectiveConfigBase()
-        let configuredKey = document?[path: ["endpoints", "deployment_key"]]?.stringValue
+        let document = LiveManagedSetupComposition.trustedConfigDocument(
+            environment: environment
+        )
+        let configuredKey = document[path: ["endpoints", "deployment_key"]]?.stringValue
         if let deploymentKey = deploymentKeyFromEnvironment(environment)
             ?? normalizeIdentity(configuredKey)
         {
@@ -129,17 +131,27 @@ public enum LiveManagedPolicyGate {
             )
         }
 
-        let authPath = home.appendingPathComponent("auth.json")
-        let store: AuthStore
+        let credentials: [GrokAuth]
         do {
-            store = try readAuthJSONOrEmpty(at: authPath)
+            credentials = try LiveManagedSetupComposition.managedAuthCredentials(
+                home: home,
+                environment: environment
+            )
         } catch {
-            // An unreadable auth store is not evidence of logout. Preserve the
-            // gate so deleting/corrupting auth.json cannot disarm live policy.
+            // An unreadable selected source is not evidence of logout. Inline
+            // and path overrides cannot fall through to an unrelated account.
+            if let fallbackTeam = LiveManagedSetupComposition
+                .signedInTeamIDForPolicyBinding(home: home, environment: environment)
+            {
+                return ManagedPrincipalSnapshot(
+                    identity: .team(fallbackTeam),
+                    isManagedPrincipalPresent: true
+                )
+            }
             return ManagedPrincipalSnapshot(identity: .none, isManagedPrincipalPresent: true)
         }
 
-        for auth in store.values where auth.isTeamPrincipal {
+        for auth in credentials where auth.isTeamPrincipal {
             if let teamID = normalizeIdentity(auth.teamID) {
                 // Expiry is intentionally ignored: a backdated or temporarily
                 // stale OAuth token must not bypass enterprise enforcement.

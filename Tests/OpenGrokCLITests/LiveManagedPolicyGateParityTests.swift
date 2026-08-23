@@ -1,11 +1,16 @@
 import Foundation
 import OpenGrokAuth
+import OpenGrokCLIChatProxyTypes
 import OpenGrokConfig
 import OpenGrokFileUtils
 import OpenGrokHTTP
 import OpenGrokSamplingTypes
 import Testing
 @testable import OpenGrokCLI
+
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
 
 private final class ManagedPolicyGateRecorder: @unchecked Sendable {
     private let lock = NSLock()
@@ -98,6 +103,48 @@ private struct ManagedPolicyGateFixture {
         )
     }
 
+    func inlineAuth(_ auth: GrokAuth) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return String(decoding: try encoder.encode(auth), as: UTF8.self)
+    }
+
+    #if canImport(CryptoKit)
+    func signedPolicyResponse(
+        signingKey: Curve25519.Signing.PrivateKey,
+        teamID: String = "team-owned",
+        managed: String = "[permission]\nmode = \"default\"\n"
+    ) throws -> HTTPResponse {
+        let keyID = "managed-gate-refresh-signing-key"
+        let payload = SignedPayload(
+            typ: managedPolicyTyp,
+            version: signedPayloadVersion,
+            deploymentId: nil,
+            teamId: teamID,
+            managedConfig: managed,
+            requirements: "fail_closed = true\n",
+            failClosed: true,
+            expiresAt: UInt64(Date().addingTimeInterval(3_600).timeIntervalSince1970),
+            keyId: keyID
+        )
+        let encoded = try JSONEncoder().encode(payload)
+        let signature = try signingKey.signature(for: encoded)
+        return HTTPResponse(
+            metadata: HTTPResponseMetadata(statusCode: 200),
+            body: try JSONSerialization.data(withJSONObject: [
+                "team_id": teamID,
+                "managed_config": managed,
+                "requirements": "fail_closed = true\n",
+                "signatures": [[
+                    "signed_payload": String(decoding: encoded, as: UTF8.self),
+                    "signature": signature.base64EncodedString(),
+                    "key_id": keyID,
+                ]],
+            ])
+        )
+    }
+    #endif
+
     func writeMarker(
         principal: String? = "team-owned",
         fingerprint: String? = nil,
@@ -147,6 +194,39 @@ private struct ManagedPolicyGateFixture {
         } catch {
             Issue.record("expected a typed managed-policy refusal, got \(error)")
         }
+    }
+
+    func requireLauncherRefusal(
+        environment: [String: String],
+        recorder: ManagedPolicyGateRecorder = ManagedPolicyGateRecorder()
+    ) async throws {
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in
+                recorder.record("sampler")
+                return OpenGrokLiveSampler { _, _ in
+                    OpenGrokLiveSamplingResponse(output: "must not run")
+                }
+            }
+        )
+        let command = try CLICommandParser.parseOrThrow([
+            "headless", "--prompt", "blocked", "--cwd", workspace.path,
+            "--model", "grok-4.5",
+        ])
+        let context = CLIApplicationContext(
+            environment: environment,
+            streams: CLIStreams(out: { _ in }, err: { _ in }),
+            control: .never
+        )
+        do {
+            let session = try await OpenGrokLiveApplicationLauncher(dependencies: dependencies)
+                .launcher.start(command, context)
+            await session.shutdown()
+            Issue.record("the actual launcher admitted compromised administrator policy")
+        } catch let error as CLIApplicationError {
+            #expect(error == .failed(LiveManagedPolicyGate.missingPolicyMessage))
+        }
+        #expect(recorder.recorded.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: home.appendingPathComponent("sessions").path))
     }
 }
 
@@ -209,6 +289,81 @@ struct LiveManagedPolicyGateParityTests {
         #expect(LiveManagedPolicyGate.servingIdentity(environment: fixture.environment) == .none)
     }
 
+    @Test("an inline managed team cannot bypass the actual fail-closed session launcher")
+    func inlineTeamOverrideIsEnforcedByActualLauncher() async throws {
+        let fixture = try ManagedPolicyGateFixture()
+        defer { fixture.dispose() }
+        try fixture.writeMarker()
+        try fixture.write("[features]\nremote_fetch = false\n", filename: "config.toml")
+        var environment = fixture.environment
+        environment["OPENGROK_AUTH"] = try fixture.inlineAuth(fixture.team())
+
+        #expect(LiveManagedPolicyGate.servingIdentity(environment: environment) == .team("team-owned"))
+        try await fixture.requireLauncherRefusal(environment: environment)
+    }
+
+    @Test("an explicit managed auth path cannot bypass the actual fail-closed session launcher")
+    func overriddenTeamAuthPathIsEnforcedByActualLauncher() async throws {
+        let fixture = try ManagedPolicyGateFixture()
+        defer { fixture.dispose() }
+        try fixture.writeAuth(GrokAuth(key: "home-personal-key", authMode: .apiKey))
+        try fixture.writeMarker()
+        try fixture.write("[features]\nremote_fetch = false\n", filename: "config.toml")
+        let override = fixture.root.appendingPathComponent("managed-override.json")
+        try writeAuthJSON(at: override, store: ["override-team": fixture.team()])
+        var environment = fixture.environment
+        environment["OPENGROK_AUTH_PATH"] = override.path
+
+        #expect(LiveManagedPolicyGate.servingIdentity(environment: environment) == .team("team-owned"))
+        try await fixture.requireLauncherRefusal(environment: environment)
+    }
+
+    @Test("a valid personal inline identity outranks managed disk and path credentials")
+    func personalInlineOverrideDoesNotInheritDiskTeam() async throws {
+        let fixture = try ManagedPolicyGateFixture()
+        defer { fixture.dispose() }
+        try fixture.writeAuth(fixture.team())
+        try fixture.writeMarker()
+        let override = fixture.root.appendingPathComponent("override-team.json")
+        try writeAuthJSON(at: override, store: ["path-team": fixture.team()])
+        var environment = fixture.environment
+        environment["OPENGROK_AUTH_PATH"] = override.path
+        environment["OPENGROK_AUTH"] = try fixture.inlineAuth(
+            GrokAuth(key: "inline-personal-key", authMode: .apiKey)
+        )
+        let recorder = ManagedPolicyGateRecorder()
+
+        try await LiveManagedPolicyGate.enforce(
+            environment: environment,
+            services: fixture.noHealing(recorder: recorder)
+        )
+
+        #expect(LiveManagedPolicyGate.servingIdentity(environment: environment) == .none)
+        #expect(recorder.recorded.isEmpty)
+    }
+
+    @Test("malformed inline and missing path overrides cannot downgrade enforced policy")
+    func malformedAuthOverridesFailClosed() async throws {
+        let fixture = try ManagedPolicyGateFixture()
+        defer { fixture.dispose() }
+        try fixture.writeAuth(GrokAuth(key: "disk-personal-key", authMode: .apiKey))
+        try fixture.writeMarker()
+        var inline = fixture.environment
+        inline["OPENGROK_AUTH"] = "{broken-enterprise-override"
+        await fixture.requireRefusal(environment: inline)
+
+        var missingPath = fixture.environment
+        missingPath["OPENGROK_AUTH_PATH"] = fixture.root
+            .appendingPathComponent("missing-enterprise-auth.json").path
+        await fixture.requireRefusal(environment: missingPath)
+
+        try fixture.writeAuth(fixture.team())
+        #expect(LiveManagedPolicyGate.servingIdentity(environment: inline) == .team("team-owned"))
+        #expect(LiveManagedPolicyGate.servingIdentity(environment: missingPath) == .team("team-owned"))
+        await fixture.requireRefusal(environment: inline)
+        await fixture.requireRefusal(environment: missingPath)
+    }
+
     @Test("deployment identity uses a full BLAKE3 fingerprint and outranks team OAuth")
     func deploymentIdentityOutranksTeam() throws {
         let fixture = try ManagedPolicyGateFixture()
@@ -236,6 +391,76 @@ struct LiveManagedPolicyGateParityTests {
             LiveManagedPolicyGate.servingIdentity(environment: fixture.environment)
                 == .deploymentKey(fingerprint: Blake3.hexDigest(Array("owner-config-key".utf8)))
         )
+    }
+
+    @Test("malformed owner config cannot erase a managed deployment or bypass actual launch")
+    func malformedOwnerConfigCannotEraseManagedDeploymentAuthority() async throws {
+        let fixture = try ManagedPolicyGateFixture()
+        defer { fixture.dispose() }
+        let deploymentKey = "administrator-only-deployment-key"
+        try fixture.write("[malformed owner config", filename: "config.toml")
+        try fixture.write(
+            "[endpoints]\ndeployment_key = \"\(deploymentKey)\"\n"
+                + "[features]\nremote_fetch = false\n",
+            filename: MANAGED_CONFIG_FILENAME
+        )
+        try fixture.writeMarker(
+            principal: "administrator-deployment",
+            fingerprint: Blake3.hexDigest(Array(deploymentKey.utf8)),
+            requirements: true
+        )
+
+        #expect(
+            LiveManagedPolicyGate.servingIdentity(environment: fixture.environment)
+                == .deploymentKey(fingerprint: Blake3.hexDigest(Array(deploymentKey.utf8)))
+        )
+        try await fixture.requireLauncherRefusal(environment: fixture.environment)
+    }
+
+    @Test("a deployment-authenticated real launch survives missing or malformed team auth")
+    func actualDeploymentLauncherIgnoresBrokenOptionalTeamSources() async throws {
+        for source in ["missing-path", "malformed-home"] {
+            let fixture = try ManagedPolicyGateFixture()
+            defer { fixture.dispose() }
+            let deploymentKey = "live-administrator-deployment-key"
+            try fixture.write("[features]\nremote_fetch = false\n", filename: MANAGED_CONFIG_FILENAME)
+            try fixture.writeMarker(
+                principal: "administrator-deployment",
+                fingerprint: Blake3.hexDigest(Array(deploymentKey.utf8))
+            )
+            var environment = fixture.environment
+            environment["GROK_DEPLOYMENT_KEY"] = deploymentKey
+            if source == "missing-path" {
+                environment["OPENGROK_AUTH_PATH"] = fixture.root
+                    .appendingPathComponent("absent-team.json").path
+            } else {
+                try fixture.write("{malformed-team-store", filename: "auth.json")
+            }
+            let recorder = ManagedPolicyGateRecorder()
+            let dependencies = OpenGrokLiveCompositionDependencies(
+                makeSampler: { configuration in
+                    recorder.record(configuration.apiKey)
+                    return OpenGrokLiveSampler { _, _ in
+                        OpenGrokLiveSamplingResponse(output: "deployment launch admitted")
+                    }
+                }
+            )
+            let command = try CLICommandParser.parseOrThrow([
+                "headless", "--prompt", "allowed", "--cwd", fixture.workspace.path,
+                "--model", "grok-4.5",
+            ])
+            let context = CLIApplicationContext(
+                environment: environment,
+                streams: CLIStreams(out: { _ in }, err: { _ in }),
+                control: .never
+            )
+
+            let session = try await OpenGrokLiveApplicationLauncher(dependencies: dependencies)
+                .launcher.start(command, context)
+
+            #expect(recorder.recorded == [deploymentKey])
+            await session.shutdown()
+        }
     }
 
     @Test("an unreadable auth store never bypasses a fail-closed missing artifact")
@@ -411,6 +636,158 @@ struct LiveManagedPolicyGateParityTests {
         ))
         #expect(FileManager.default.fileExists(
             atPath: fixture.home.appendingPathComponent(REQUIREMENTS_FILENAME).path
+        ))
+    }
+
+    @Test("an expired team token is really refreshed before signed policy install and live launch")
+    func expiredTeamRefreshInstallsSignedPolicyAndLaunches() async throws {
+        #if canImport(CryptoKit)
+        let fixture = try ManagedPolicyGateFixture()
+        defer { fixture.dispose() }
+        var expired = fixture.team(expiresAt: Date().addingTimeInterval(-600))
+        expired.key = "expired-team-bearer"
+        expired.refreshToken = "private-team-refresh-token"
+        expired.oidcIssuer = xaiOAuth2Issuer
+        expired.oidcClientID = defaultOAuth2ClientID
+        try fixture.writeAuth(expired)
+        try fixture.writeMarker()
+        let signingKey = Curve25519.Signing.PrivateKey()
+        setEmbeddedKeys([(
+            "managed-gate-refresh-signing-key",
+            Array(signingKey.publicKey.rawRepresentation),
+        )])
+        defer { clearEmbeddedKeysOverride() }
+        let refreshedBearer = "fresh-team-bearer"
+        let refreshResponse = HTTPResponse(
+            metadata: HTTPResponseMetadata(statusCode: 200),
+            body: try JSONSerialization.data(withJSONObject: [
+                "access_token": refreshedBearer,
+                "refresh_token": "rotated-private-team-refresh-token",
+                "expires_in": 3_600,
+            ])
+        )
+        let transport = ManagedPolicyGateTransport(responses: [
+            refreshResponse,
+            try fixture.signedPolicyResponse(signingKey: signingKey),
+        ])
+        let services = LiveManagedPolicyGateServices.using(
+            setupServices: LiveManagedSetupServices(makeTransport: { transport })
+        )
+
+        try await LiveManagedPolicyGate.enforce(environment: fixture.environment, services: services)
+
+        let requests = transport.capturedRequests
+        #expect(requests.count == 2)
+        let refresh = try #require(requests.first)
+        let policy = try #require(requests.last)
+        #expect(refresh.url.absoluteString == "https://auth.x.ai/oauth2/token")
+        #expect(refresh.method == .post)
+        #expect(policy.url.absoluteString == "https://cli-chat-proxy.grok.com/v1/deployment/config")
+        #expect(policy.headers["Authorization"] == "Bearer \(refreshedBearer)")
+        #expect(policy.headers["Authorization"] != "Bearer expired-team-bearer")
+        #expect(FileManager.default.fileExists(
+            atPath: fixture.home.appendingPathComponent(SIGNATURE_SIDECAR_FILE).path
+        ))
+        let persisted = try readAuthJSON(at: fixture.home.appendingPathComponent("auth.json"))
+        #expect(persisted.values.contains { $0.key == refreshedBearer && $0.teamID == "team-owned" })
+
+        let command = try CLICommandParser.parseOrThrow([
+            "headless", "--prompt", "allowed", "--cwd", fixture.workspace.path,
+            "--model", "grok-4.5",
+        ])
+        guard case let .launch(options) = command else {
+            Issue.record("fixture command did not parse as a launch")
+            return
+        }
+        let recorder = ManagedPolicyGateRecorder()
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { configuration in
+                recorder.record(configuration.apiKey)
+                return OpenGrokLiveSampler { _, _ in
+                    OpenGrokLiveSamplingResponse(output: "signed policy admitted launch")
+                }
+            }
+        )
+        let foundation = try await OpenGrokLiveApplicationLauncher.makeSessionFoundation(
+            options: options,
+            context: CLIApplicationContext(
+                environment: fixture.environment,
+                streams: CLIStreams(out: { _ in }, err: { _ in }),
+                control: .never
+            ),
+            dependencies: dependencies
+        )
+
+        #expect(recorder.recorded == [refreshedBearer])
+        #expect(foundation.samplingConfiguration.apiKey == refreshedBearer)
+        await foundation.toolExecutor.shutdown()
+        #endif
+    }
+
+    @Test("an expired inline team refresh uses the fresh bearer without changing its tenant")
+    func expiredInlineTeamRefreshesWithinSameStartupBudget() async throws {
+        let fixture = try ManagedPolicyGateFixture()
+        defer { fixture.dispose() }
+        var expired = fixture.team(expiresAt: Date().addingTimeInterval(-600))
+        expired.refreshToken = "inline-team-refresh"
+        expired.oidcIssuer = xaiOAuth2Issuer
+        expired.oidcClientID = defaultOAuth2ClientID
+        try fixture.writeMarker()
+        var environment = fixture.environment
+        environment["OPENGROK_AUTH"] = try fixture.inlineAuth(expired)
+        let refreshResponse = HTTPResponse(
+            metadata: HTTPResponseMetadata(statusCode: 200),
+            body: try JSONSerialization.data(withJSONObject: [
+                "access_token": "fresh-inline-team-bearer",
+                "expires_in": 3_600,
+            ])
+        )
+        let policyResponse = HTTPResponse(
+            metadata: HTTPResponseMetadata(statusCode: 200),
+            body: try JSONSerialization.data(withJSONObject: [
+                "team_id": "team-owned",
+                "managed_config": "[features]\nmanaged = true\n",
+                "requirements": "fail_closed = true\n",
+            ])
+        )
+        let transport = ManagedPolicyGateTransport(responses: [refreshResponse, policyResponse])
+        let services = LiveManagedPolicyGateServices.using(
+            setupServices: LiveManagedSetupServices(makeTransport: { transport })
+        )
+
+        try await LiveManagedPolicyGate.enforce(environment: environment, services: services)
+
+        #expect(transport.capturedRequests.count == 2)
+        #expect(transport.capturedRequests.last?.headers["Authorization"]
+            == "Bearer fresh-inline-team-bearer")
+        #expect(LiveManagedPolicyGate.servingIdentity(environment: environment) == .team("team-owned"))
+    }
+
+    @Test("a rejected managed-team refresh never fetches policy or opens a compromised session")
+    func failedTeamRefreshRemainsFailClosed() async throws {
+        let fixture = try ManagedPolicyGateFixture()
+        defer { fixture.dispose() }
+        var expired = fixture.team(expiresAt: Date().addingTimeInterval(-600))
+        expired.refreshToken = "rejected-private-refresh-token"
+        expired.oidcIssuer = xaiOAuth2Issuer
+        expired.oidcClientID = defaultOAuth2ClientID
+        try fixture.writeAuth(expired)
+        try fixture.writeMarker()
+        let rejected = HTTPResponse(
+            metadata: HTTPResponseMetadata(statusCode: 400),
+            body: try JSONSerialization.data(withJSONObject: ["error": "invalid_grant"])
+        )
+        let transport = ManagedPolicyGateTransport(responses: [rejected])
+        let services = LiveManagedPolicyGateServices.using(
+            setupServices: LiveManagedSetupServices(makeTransport: { transport })
+        )
+
+        await fixture.requireRefusal(services: services)
+
+        #expect(transport.capturedRequests.count == 1)
+        #expect(transport.capturedRequests.first?.url.absoluteString == "https://auth.x.ai/oauth2/token")
+        #expect(!FileManager.default.fileExists(
+            atPath: fixture.home.appendingPathComponent(MANAGED_CONFIG_FILENAME).path
         ))
     }
 
