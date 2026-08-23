@@ -57,10 +57,20 @@ private final class LeaderStreamRecorder: @unchecked Sendable {
 }
 
 private final class LeaderInteractiveTerminalFixture: PagerTerminalSink, @unchecked Sendable {
+    private enum EscapeState {
+        case text
+        case escape
+        case csi
+        case osc
+    }
+
     let capabilities = PagerTerminalCapabilities.standard
 
     private let lock = NSLock()
     private var storage = Data()
+    private var paintedStorage = Data()
+    private var cachedPaintedText: String?
+    private var escapeState = EscapeState.text
 
     var terminal: OpenGrokLiveTerminal {
         let fixture = self
@@ -72,29 +82,13 @@ private final class LeaderInteractiveTerminalFixture: PagerTerminalSink, @unchec
     }
 
     var paintedText: String {
-        var result = ""
-        var iterator = output[...]
-        while let escape = iterator.firstIndex(of: "\u{1B}") {
-            result += iterator[iterator.startIndex..<escape]
-            var cursor = iterator.index(after: escape)
-            guard cursor < iterator.endIndex else { break }
-            if iterator[cursor] == "[" || iterator[cursor] == "]" {
-                let isOSC = iterator[cursor] == "]"
-                cursor = iterator.index(after: cursor)
-                while cursor < iterator.endIndex {
-                    let scalar = iterator[cursor].unicodeScalars.first!.value
-                    let isFinal = isOSC
-                        ? (scalar == 0x07 || iterator[cursor] == "\\")
-                        : (scalar >= 0x40 && scalar <= 0x7E)
-                    cursor = iterator.index(after: cursor)
-                    if isFinal { break }
-                }
-            } else {
-                cursor = iterator.index(after: cursor)
-            }
-            iterator = iterator[cursor...]
+        lock.lock()
+        defer { lock.unlock() }
+        if let cachedPaintedText {
+            return cachedPaintedText
         }
-        result += iterator
+        let result = String(decoding: paintedStorage, as: UTF8.self)
+        cachedPaintedText = result
         return result
     }
 
@@ -121,8 +115,41 @@ private final class LeaderInteractiveTerminalFixture: PagerTerminalSink, @unchec
 
     private func append(_ data: Data) {
         lock.lock()
+        defer { lock.unlock() }
         storage.append(data)
-        lock.unlock()
+
+        var appendedVisibleBytes = false
+        for byte in data {
+            switch escapeState {
+            case .text:
+                if byte == 0x1B {
+                    escapeState = .escape
+                } else {
+                    paintedStorage.append(byte)
+                    appendedVisibleBytes = true
+                }
+            case .escape:
+                switch byte {
+                case 0x5B:
+                    escapeState = .csi
+                case 0x5D:
+                    escapeState = .osc
+                default:
+                    escapeState = .text
+                }
+            case .csi:
+                if (0x40...0x7E).contains(byte) {
+                    escapeState = .text
+                }
+            case .osc:
+                if byte == 0x07 || byte == 0x5C {
+                    escapeState = .text
+                }
+            }
+        }
+        if appendedVisibleBytes {
+            cachedPaintedText = nil
+        }
     }
 }
 

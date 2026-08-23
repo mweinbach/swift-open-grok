@@ -411,14 +411,64 @@ struct LiveRecapHelperTests {
 
 private final class RecapCapturingSink: PagerTerminalSink, CustomReflectable,
     @unchecked Sendable {
+    private enum EscapeState {
+        case text
+        case escape
+        case csi
+        case osc
+        case oscEscape
+    }
+
     private let lock = NSLock()
     private var bytes: [UInt8] = []
+    private var visibleBytes: [UInt8] = []
+    private var cachedStrippedText: String?
+    private var cachedCompactText: String?
+    private var escapeState = EscapeState.text
 
     var capabilities: PagerTerminalCapabilities { .standard }
 
     func write(bytes newBytes: [UInt8]) throws {
         lock.lock(); defer { lock.unlock() }
         bytes.append(contentsOf: newBytes)
+        var appendedVisibleBytes = false
+        for byte in newBytes {
+            switch escapeState {
+            case .text:
+                if byte == 0x1B {
+                    escapeState = .escape
+                } else {
+                    visibleBytes.append(byte)
+                    appendedVisibleBytes = true
+                }
+            case .escape:
+                switch byte {
+                case UInt8(ascii: "["): escapeState = .csi
+                case UInt8(ascii: "]"): escapeState = .osc
+                default: escapeState = .text
+                }
+            case .csi:
+                if (0x40...0x7E).contains(byte) {
+                    escapeState = .text
+                }
+            case .osc:
+                if byte == 0x07 {
+                    escapeState = .text
+                } else if byte == 0x1B {
+                    escapeState = .oscEscape
+                }
+            case .oscEscape:
+                if byte == UInt8(ascii: "\\") || byte == 0x07 {
+                    escapeState = .text
+                } else if byte != 0x1B {
+                    escapeState = .osc
+                }
+            }
+        }
+        if appendedVisibleBytes {
+            cachedStrippedText = nil
+            cachedCompactText = nil
+        }
     }
 
     func flush() throws {}
@@ -432,40 +482,24 @@ private final class RecapCapturingSink: PagerTerminalSink, CustomReflectable,
 
     var strippedText: String {
         lock.lock(); defer { lock.unlock() }
-        var plain: [UInt8] = []
-        plain.reserveCapacity(bytes.count / 4)
-        var index = 0
-        while index < bytes.count {
-            guard bytes[index] == 0x1B else {
-                plain.append(bytes[index])
-                index += 1
-                continue
-            }
-            index += 1
-            guard index < bytes.count else { break }
-            switch bytes[index] {
-            case UInt8(ascii: "["):
-                index += 1
-                while index < bytes.count, !(0x40...0x7E).contains(bytes[index]) {
-                    index += 1
-                }
-                index += 1
-            case UInt8(ascii: "]"):
-                index += 1
-                while index < bytes.count {
-                    if bytes[index] == 0x07 { index += 1; break }
-                    if bytes[index] == 0x1B, index + 1 < bytes.count,
-                       bytes[index + 1] == UInt8(ascii: "\\") {
-                        index += 2
-                        break
-                    }
-                    index += 1
-                }
-            default:
-                index += 1
-            }
+        if let cachedStrippedText {
+            return cachedStrippedText
         }
-        return String(decoding: plain, as: UTF8.self)
+        let text = String(decoding: visibleBytes, as: UTF8.self)
+        cachedStrippedText = text
+        return text
+    }
+
+    var compactText: String {
+        lock.lock(); defer { lock.unlock() }
+        if let cachedCompactText {
+            return cachedCompactText
+        }
+        let text = cachedStrippedText ?? String(decoding: visibleBytes, as: UTF8.self)
+        cachedStrippedText = text
+        let compact = text.filter { !$0.isWhitespace }
+        cachedCompactText = compact
+        return compact
     }
 }
 
@@ -597,7 +631,7 @@ private struct RecapRendererFixture {
     }
 
     func paintedCompact() -> String {
-        sink.strippedText.filter { !$0.isWhitespace }
+        sink.compactText
     }
 
     func waitForPaint(of marker: String, timeout: TimeInterval = 10) async -> Bool {
@@ -903,10 +937,10 @@ struct LiveRecapLiveSeamTests {
         try await renderer.render(.overlay(.recap))
 
         let deadline = Date().addingTimeInterval(5)
-        var painted = sink.strippedText.filter { !$0.isWhitespace }
+        var painted = sink.compactText
         while Date() < deadline, !painted.contains("Noactivesession") {
             try? await Task.sleep(nanoseconds: 10_000_000)
-            painted = sink.strippedText.filter { !$0.isWhitespace }
+            painted = sink.compactText
         }
         #expect(painted.contains("Noactivesession"))
         try await renderer.restoreTerminal()
@@ -950,10 +984,10 @@ struct LiveRecapLiveSeamTests {
         try await renderer.render(.overlay(.recap))
 
         let deadline = Date().addingTimeInterval(5)
-        var painted = sink.strippedText.filter { !$0.isWhitespace }
+        var painted = sink.compactText
         while Date() < deadline, !painted.contains("Sessionrecapisnotenabled") {
             try? await Task.sleep(nanoseconds: 10_000_000)
-            painted = sink.strippedText.filter { !$0.isWhitespace }
+            painted = sink.compactText
         }
         #expect(painted.contains("Sessionrecapisnotenabled"))
         #expect(fixture.inferenceBodies().isEmpty)
