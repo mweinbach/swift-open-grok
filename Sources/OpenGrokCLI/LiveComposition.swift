@@ -2112,7 +2112,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         },
                         workflowsEnabled: workflowsEnabled,
                         folderTrustCommandsEnabled: true,
-                        mouseReportingToggleEnabled: uiConfiguration.mouseReportingToggleEnabled
+                        mouseReportingToggleEnabled: uiConfiguration.mouseReportingToggleEnabled,
+                        promptSelectAllEnabled: await renderer.terminalNotifications
+                            .terminalContext.brand == .ghostty
                     )
                     await controller.setFolderTrustHandler { trusted in
                         await renderer.setFolderTrustFromSlash(trusted: trusted)
@@ -2818,7 +2820,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     runtime: runtime,
                     renderer: renderer,
                     output: SilentLiveInteractiveOutput(),
-                    mouseReportingToggleEnabled: uiConfiguration.mouseReportingToggleEnabled
+                    mouseReportingToggleEnabled: uiConfiguration.mouseReportingToggleEnabled,
+                    promptSelectAllEnabled: await renderer.terminalNotifications
+                        .terminalContext.brand == .ghostty
                 )
                 // Leader composition: same one-shot `[animation].fps` wire as
                 // the local fullScreen/inline path (before `run`).

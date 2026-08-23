@@ -264,7 +264,7 @@ struct PagerComposerReadlineTests {
         #expect(await harness.lastPrompt?.selectedText == nil)
     }
 
-    @Test("host-owned Ctrl+M/D/X are unchanged with a mouse selection")
+    @Test("host-owned Ctrl+M/D remain unchanged with a mouse selection")
     func hostOwnedChordsUnchangedWithSelection() async throws {
         let multiline = try await ReadlineHarness.run(
             [
@@ -279,19 +279,6 @@ struct PagerComposerReadlineTests {
         #expect(await multiline.lastPrompt?.text == "hello")
         #expect(await multiline.lastPrompt?.selectedText == "hello")
 
-        let shortcuts = try await ReadlineHarness.run(
-            [
-                .paste("hello"),
-                .mouse(MouseEvent(kind: .down, x: 0, y: 0, button: .left)),
-                .mouse(MouseEvent(kind: .drag, x: 5, y: 0, button: .left)),
-                .mouse(MouseEvent(kind: .up, x: 5, y: 0, button: .left)),
-                ctrl("x"),
-            ],
-            routeMouse: true
-        )
-        #expect(await shortcuts.lastPrompt?.text == "hello")
-        #expect(await shortcuts.overlayRequests.contains(.shortcutsHelp))
-
         let eof = try await ReadlineHarness.run(
             [
                 .paste("hello"),
@@ -304,6 +291,271 @@ struct PagerComposerReadlineTests {
         )
         #expect(await eof.lastPrompt?.text == "hello")
         #expect(eof.submittedPrompts.isEmpty)
+    }
+
+    @Test("prompt Shift arrows select Unicode graphemes and plain arrows collapse the range")
+    func keyboardGraphemeSelectionAndCollapse() async throws {
+        let flag = "🇺🇸"
+        let events: [InputEvent] = [
+            .paste("a" + flag + "b"),
+            .key(KeyEvent(key: .home)),
+            .key(KeyEvent(key: .right, modifiers: [.shift])),
+            .key(KeyEvent(key: .right, modifiers: [.shift])),
+        ]
+
+        let selected = try await ReadlineHarness.run(events)
+        let selectedPrompt = await selected.lastPrompt
+        #expect(selectedPrompt?.selectedText == "a" + flag)
+        #expect(selectedPrompt?.selectionUTF8 == 0..<(1 + flag.utf8.count))
+        #expect(selectedPrompt?.cursorOffset == 2)
+        #expect(await selected.scrollbackCommands.isEmpty)
+
+        let collapsed = try await ReadlineHarness.run(
+            events + [.key(KeyEvent(key: .left))]
+        )
+        let collapsedPrompt = await collapsed.lastPrompt
+        #expect(collapsedPrompt?.text == "a" + flag + "b")
+        #expect(collapsedPrompt?.selectionUTF8 == nil)
+        #expect(collapsedPrompt?.cursorOffset == 0)
+    }
+
+    @Test("Alt and Control Shift arrows select words through the real composer")
+    func keyboardWordSelection() async throws {
+        for modifier: KeyModifiers in [.alt, .control] {
+            let harness = try await ReadlineHarness.run([
+                .paste("alpha beta"),
+                .key(KeyEvent(key: .home)),
+                .key(KeyEvent(key: .right, modifiers: [.shift, modifier])),
+            ])
+
+            let prompt = await harness.lastPrompt
+            #expect(prompt?.selectedText == "alpha")
+            #expect(prompt?.selectionUTF8 == 0..<5)
+            #expect(await harness.viewportCommands.isEmpty)
+        }
+    }
+
+    @Test("Command and Meta Shift arrows use the painted composer wrap width")
+    func keyboardSelectionUsesLiveWrappedRowGeometry() async throws {
+        for modifier: KeyModifiers in [.superKey, .meta] {
+            let harness = try await ReadlineHarness.run(
+                [
+                    .paste("abcdefghijk"),
+                    .key(KeyEvent(key: .home)),
+                    .key(KeyEvent(key: .right, modifiers: [.shift, modifier])),
+                ],
+                contentWidth: 5
+            )
+
+            let prompt = await harness.lastPrompt
+            #expect(prompt?.selectedText == "abcde")
+            #expect(prompt?.cursorOffset == 5)
+        }
+
+        let logicalLine = try await ReadlineHarness.run(
+            [
+                .paste("abcdefghijk"),
+                .key(KeyEvent(key: .home)),
+                .key(KeyEvent(key: .end, modifiers: [.shift])),
+            ],
+            contentWidth: 5
+        )
+        #expect(await logicalLine.lastPrompt?.selectedText == "abcdefghijk")
+    }
+
+    @Test("Shift vertical selection does not open history or navigate slash completions")
+    func shiftVerticalSelectionBypassesHistoryAndDropdown() async throws {
+        let selected = try await ReadlineHarness.run([
+            .paste("one\ntwo\nthree"),
+            .key(KeyEvent(key: .up, modifiers: [.shift])),
+        ])
+        let selectedPrompt = await selected.lastPrompt
+        #expect(selectedPrompt?.text == "one\ntwo\nthree")
+        #expect(selectedPrompt?.selectedText == "\nthree")
+
+        let dropdown = try await ReadlineHarness.run([
+            .paste("/q"),
+            .key(KeyEvent(key: .down, modifiers: [.shift])),
+        ])
+        let dropdownPrompt = await dropdown.lastPrompt
+        #expect(dropdownPrompt?.text == "/q")
+        #expect(dropdownPrompt?.selectedCompletion == 0)
+
+        let session = ReadlineSession(sessionID: "selected-history")
+        await session.emit(.completed(.init(sessionID: "selected-history")))
+        let history = try await ReadlineHarness.run(
+            [
+                .paste("alpha"),
+                .key(KeyEvent(key: .enter)),
+                .key(KeyEvent(key: .up, modifiers: [.shift])),
+            ],
+            sessions: [session]
+        )
+        #expect(history.submittedPrompts == ["alpha"])
+        #expect(await history.lastPrompt?.text == "")
+
+        let reserved = try await ReadlineHarness.run([
+            .paste("one\ntwo"),
+            .key(KeyEvent(key: .up, modifiers: [.shift, .superKey])),
+        ])
+        #expect(await reserved.lastPrompt?.selectionUTF8 == nil)
+    }
+
+    @Test("scrollback-focused Shift arrows retain previous and next turn navigation")
+    func shiftArrowsRetainScrollbackBindings() async throws {
+        let harness = try await ReadlineHarness.run([
+            .paste("draft"),
+            .key(KeyEvent(key: .tab)),
+            .key(KeyEvent(key: .left, modifiers: [.shift])),
+            .key(KeyEvent(key: .right, modifiers: [.shift])),
+        ])
+
+        #expect(await harness.focusChanges == [.scrollback])
+        #expect(await harness.scrollbackCommands == [.previousTurn, .nextTurn])
+        #expect(await harness.lastPrompt?.text == "draft")
+        #expect(await harness.lastPrompt?.selectionUTF8 == nil)
+    }
+
+    @Test("Command and Meta copy preserve selection and cut reaches the renderer clipboard")
+    func keyboardClipboardCopyAndCutUseLiveRenderer() async throws {
+        for modifier: KeyModifiers in [.superKey, .meta] {
+            let selecting: [InputEvent] = [
+                .paste("alpha beta"),
+                .key(KeyEvent(key: .home)),
+                .key(KeyEvent(key: .right, modifiers: [.shift, .alt])),
+            ]
+            let copied = try await ReadlineHarness.run(
+                selecting + [
+                    .key(KeyEvent(key: .char("c"), modifiers: modifier, character: "c")),
+                ]
+            )
+            #expect(await copied.clipboard == ["alpha"])
+            #expect(await copied.lastPrompt?.selectedText == "alpha")
+            #expect(await copied.lastPrompt?.text == "alpha beta")
+
+            let cut = try await ReadlineHarness.run(
+                selecting + [
+                    .key(KeyEvent(key: .char("c"), modifiers: modifier, character: "c")),
+                    .key(KeyEvent(key: .char("x"), modifiers: modifier, character: "x")),
+                ]
+            )
+            #expect(await cut.clipboard == ["alpha", "alpha"])
+            #expect(await cut.lastPrompt?.text == " beta")
+            #expect(await cut.lastPrompt?.selectionUTF8 == nil)
+            #expect(await cut.overlayRequests.isEmpty)
+        }
+    }
+
+    @Test("Ctrl+X cuts a selection but remains the shortcuts binding without one")
+    func ctrlXRespectsComposerSelectionAndGlobalShortcut() async throws {
+        let cut = try await ReadlineHarness.run([
+            .paste("alpha beta"),
+            .key(KeyEvent(key: .home)),
+            .key(KeyEvent(key: .right, modifiers: [.shift, .alt])),
+            ctrl("x"),
+        ])
+        #expect(await cut.lastPrompt?.text == " beta")
+        #expect(await cut.clipboard == ["alpha"])
+        #expect(!(await cut.overlayRequests).contains(.shortcutsHelp))
+
+        let shortcuts = try await ReadlineHarness.run([
+            .paste("alpha beta"),
+            ctrl("x"),
+        ])
+        #expect(await shortcuts.lastPrompt?.text == "alpha beta")
+        #expect(await shortcuts.overlayRequests.contains(.shortcutsHelp))
+        #expect(await shortcuts.clipboard.isEmpty)
+    }
+
+    @Test("Ghostty-only Command+A selects the full Unicode prompt while Ctrl+A remains readline")
+    func selectAllIsGatedToGhostty() async throws {
+        let text = "a🇺🇸b"
+        let commandA = InputEvent.key(
+            KeyEvent(key: .char("a"), modifiers: [.superKey], character: "a")
+        )
+        let enabled = try await ReadlineHarness.run(
+            [.paste(text), .key(KeyEvent(key: .home)), commandA],
+            promptSelectAllEnabled: true
+        )
+        let enabledPrompt = await enabled.lastPrompt
+        #expect(enabledPrompt?.text == text)
+        #expect(enabledPrompt?.selectedText == text)
+        #expect(enabledPrompt?.selectionUTF8 == 0..<text.utf8.count)
+        #expect(enabledPrompt?.cursorOffset == text.count)
+
+        let disabled = try await ReadlineHarness.run(
+            [.paste(text), .key(KeyEvent(key: .home)), commandA],
+            promptSelectAllEnabled: false
+        )
+        let disabledPrompt = await disabled.lastPrompt
+        #expect(disabledPrompt?.text == text)
+        #expect(disabledPrompt?.selectionUTF8 == nil)
+        #expect(disabledPrompt?.cursorOffset == 0)
+
+        let meta = try await ReadlineHarness.run(
+            [
+                .paste(text),
+                .key(KeyEvent(key: .char("a"), modifiers: [.meta], character: "a")),
+            ],
+            promptSelectAllEnabled: true
+        )
+        #expect(await meta.lastPrompt?.selectionUTF8 == nil)
+
+        let readline = try await ReadlineHarness.run(
+            [.paste(text), ctrl("a")],
+            promptSelectAllEnabled: true
+        )
+        #expect(await readline.lastPrompt?.cursorOffset == 0)
+        #expect(await readline.lastPrompt?.selectionUTF8 == nil)
+    }
+
+    @Test("bracketed paste replaces keyboard selection in a single undo operation")
+    func bracketedPasteReplacesSelectionAtomically() async throws {
+        let harness = try await ReadlineHarness.run([
+            .paste("alpha beta"),
+            .key(KeyEvent(key: .home)),
+            .key(KeyEvent(key: .right, modifiers: [.shift, .alt])),
+            .paste("🌍"),
+            ctrl("z"),
+        ])
+
+        #expect(await harness.promptTexts.contains("🌍 beta"))
+        #expect(await harness.lastPrompt?.text == "alpha beta")
+        #expect(await harness.viewportCommands.isEmpty)
+    }
+
+    @Test("modal-consumed Command+C never forwards composer selection to the clipboard")
+    func consumedModalInputCannotLeakPromptClipboard() async throws {
+        let harness = try await ReadlineHarness.run(
+            [
+                .paste("private"),
+                .key(KeyEvent(key: .home)),
+                .key(KeyEvent(key: .right, modifiers: [.shift])),
+                .key(KeyEvent(key: .char("c"), modifiers: [.superKey], character: "c")),
+            ],
+            consumeCommandCopy: true
+        )
+
+        #expect(await harness.clipboard.isEmpty)
+        #expect(await harness.lastPrompt?.selectedText == "p")
+    }
+
+    @Test("renderer clipboard failures propagate instead of silently claiming a copy")
+    func rendererClipboardFailurePropagates() async throws {
+        do {
+            let result = try await ReadlineHarness.run(
+                [
+                    .paste("alpha"),
+                    .key(KeyEvent(key: .home)),
+                    .key(KeyEvent(key: .right, modifiers: [.shift])),
+                    .key(KeyEvent(key: .char("c"), modifiers: [.superKey], character: "c")),
+                ],
+                copyShouldFail: true
+            )
+            Issue.record("copy unexpectedly succeeded: \(result.submittedPrompts)")
+        } catch {
+            #expect(error is ReadlineClipboardFailure)
+        }
     }
 }
 
@@ -335,6 +587,14 @@ private struct ReadlineHarness {
         get async { await renderer.viewportCommands }
     }
 
+    var scrollbackCommands: [OpenGrokPagerScrollbackCommand] {
+        get async { await renderer.scrollbackCommands }
+    }
+
+    var clipboard: [String] {
+        get async { await renderer.clipboard }
+    }
+
     var globals: [OpenGrokPagerGlobalCommand] {
         get async { await renderer.globals }
     }
@@ -350,14 +610,24 @@ private struct ReadlineHarness {
     static func run(
         _ events: [InputEvent],
         sessions: [ReadlineSession] = [],
-        routeMouse: Bool = false
+        routeMouse: Bool = false,
+        promptSelectAllEnabled: Bool = false,
+        contentWidth: Int = 40,
+        consumeCommandCopy: Bool = false,
+        copyShouldFail: Bool = false
     ) async throws -> ReadlineHarness {
-        let renderer = ReadlineRecordingRenderer(routeMouse: routeMouse)
+        let renderer = ReadlineRecordingRenderer(
+            routeMouse: routeMouse,
+            contentWidth: contentWidth,
+            consumeCommandCopy: consumeCommandCopy,
+            copyShouldFail: copyShouldFail
+        )
         let controller = OpenGrokPagerInteractiveController(
             input: closedReadlineStream(events),
             runtime: ReadlineRuntime(sessions: sessions),
             renderer: renderer,
-            output: SilentReadlineOutput()
+            output: SilentReadlineOutput(),
+            promptSelectAllEnabled: promptSelectAllEnabled
         )
         let result = try await controller.run(.init(prompt: "", mode: .inline))
         return ReadlineHarness(renderer: renderer, submittedPrompts: result.submittedPrompts)
@@ -366,11 +636,22 @@ private struct ReadlineHarness {
 
 private actor ReadlineRecordingRenderer: OpenGrokPagerInteractiveRenderAdapter {
     private let routeMouse: Bool
-    private let content = TextAreaRect(x: 0, y: 0, width: 40, height: 3)
+    private let content: TextAreaRect
+    private let consumeCommandCopy: Bool
+    private let copyShouldFail: Bool
     private(set) var events: [OpenGrokPagerInteractiveEvent] = []
+    private(set) var clipboard: [String] = []
 
-    init(routeMouse: Bool) {
+    init(
+        routeMouse: Bool,
+        contentWidth: Int,
+        consumeCommandCopy: Bool,
+        copyShouldFail: Bool
+    ) {
         self.routeMouse = routeMouse
+        self.content = TextAreaRect(x: 0, y: 0, width: contentWidth, height: 3)
+        self.consumeCommandCopy = consumeCommandCopy
+        self.copyShouldFail = copyShouldFail
     }
 
     func begin() {}
@@ -378,8 +659,21 @@ private actor ReadlineRecordingRenderer: OpenGrokPagerInteractiveRenderAdapter {
     func render(_ event: OpenGrokPagerInteractiveEvent) { events.append(event) }
 
     func handleInput(_ event: InputEvent) -> OpenGrokPagerInputRouting {
+        if consumeCommandCopy,
+           case .key(let key) = event,
+           case .char("c") = key.key,
+           key.modifiers.contains(.superKey) || key.modifiers.contains(.meta) {
+            return .consumed
+        }
         guard routeMouse, case .mouse(let mouse) = event else { return .notHandled }
         return .composerMouse(OpenGrokPagerComposerMouse(event: mouse, content: content))
+    }
+
+    func lastComposerContentRect() -> TextAreaRect? { content }
+
+    func copyToClipboard(_ text: String) throws {
+        if copyShouldFail { throw ReadlineClipboardFailure() }
+        clipboard.append(text)
     }
 
     var promptStates: [OpenGrokPagerInteractivePromptState] {
@@ -392,6 +686,13 @@ private actor ReadlineRecordingRenderer: OpenGrokPagerInteractiveRenderAdapter {
     var viewportCommands: [OpenGrokPagerViewportCommand] {
         events.compactMap {
             if case .viewport(let command) = $0 { return command }
+            return nil
+        }
+    }
+
+    var scrollbackCommands: [OpenGrokPagerScrollbackCommand] {
+        events.compactMap {
+            if case .scrollback(let command) = $0 { return command }
             return nil
         }
     }
@@ -417,6 +718,8 @@ private actor ReadlineRecordingRenderer: OpenGrokPagerInteractiveRenderAdapter {
         }
     }
 }
+
+private struct ReadlineClipboardFailure: Error {}
 
 private struct SilentReadlineOutput: OpenGrokPagerInteractiveOutputAdapter {
     func forward(_ event: OpenGrokPagerInteractiveEvent) async throws { _ = event }

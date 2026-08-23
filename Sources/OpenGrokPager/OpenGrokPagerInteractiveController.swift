@@ -182,6 +182,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         /// The only text / cursor / selection / undo buffer. UTF-8 internally;
         /// Character offsets exist only at `state()` / `placeCursor(at:)`.
         private let area: TextArea
+        private let promptSelectAllEnabled: Bool
         /// Open slash-command dropdown. When non-empty, `↑`/`↓` move the
         /// selection instead of recalling history, matching the reference's
         /// dropdown intercept ahead of the history step.
@@ -201,7 +202,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         var pastedImages: [PastedImage] = []
         var imageCounter = 0
 
-        init(text: String) {
+        init(text: String, promptSelectAllEnabled: Bool = false) {
             let area = TextArea()
             // Default tabWidth is 4 and would expand pasted tabs; Stage 1
             // keyboard paste must keep the bytes the user handed us.
@@ -211,6 +212,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             area.showScrollbar = false
             area.keepSelectionAfterMouseUp = true
             self.area = area
+            self.promptSelectAllEnabled = promptSelectAllEnabled
             loadBuffer(text)
         }
 
@@ -320,6 +322,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             area.takeClipboard()
         }
 
+        func updateWrapWidth(_ width: Int) {
+            area.ensureWrapCache(width: width)
+        }
+
         /// Close the dropdown, latching it shut until the text changes.
         /// Returns whether there was anything to close, so the Esc handler
         /// can fall through to the cancel/clear ladder when there was not.
@@ -334,6 +340,20 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         private func apply(_ event: KeyEvent) -> PromptAction {
             if let control = controlAction(for: event) {
                 return control
+            }
+            if promptSelectAllEnabled,
+               case .char("a") = event.key,
+               event.modifiers == .superKey {
+                let count = area.text.utf8.count
+                guard count > 0 else { return .ignored }
+                area.setSelection(anchor: 0, head: count)
+                area.setCursor(count)
+                return .changed
+            }
+            if event.modifiers == .control,
+               case .char("x") = event.key,
+               area.selectionRange != nil {
+                return routeEditorKey(event)
             }
             if let global = Self.globalAction(for: event) {
                 return .global(global)
@@ -362,6 +382,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             case .backTab:
                 return .global(.cyclePermissionMode)
             case .up:
+                if event.modifiers.contains(.shift) { return routeEditorKey(event) }
                 if !completions.isEmpty { return .completionMove(-1) }
                 // `Up` recalls history only on an empty composer
                 // (`app/agent_view/prompt.rs:465-486`). A nonempty draft
@@ -370,6 +391,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 if isEmpty || isBrowsingHistory { return .historyPrevious }
                 return routeEditorKey(event)
             case .down:
+                if event.modifiers.contains(.shift) { return routeEditorKey(event) }
                 if !completions.isEmpty { return .completionMove(1) }
                 // Down never opens history (`prompt.rs`: "Down never opens
                 // the panel"); once browsing it steps toward the newest.
@@ -567,17 +589,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
 
         private func insert(_ value: String) {
             guard !value.isEmpty else { return }
-            // Host-owned mutations (bracketed paste, Enter-as-newline) do not
-            // go through `TextArea.input`, which is what replaces a selection
-            // before inserting. Mirror that here so paste/newline still
-            // overwrite a highlighted range.
-            if let range = area.selectionRange, !range.isEmpty {
-                let deleted = area.deleteSelection()
-                if !deleted {
-                    area.clearSelection()
-                }
-            }
-            area.insertStr(value)
+            area.insertStrReplacingSelection(value)
             // New text lifts the Esc dismissal: typing after closing the
             // dropdown is a fresh query.
             completionsDismissed = false
@@ -817,6 +829,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private let runtime: any OpenGrokPagerRuntimeAdapter
     private let renderer: any OpenGrokPagerInteractiveRenderAdapter
     private let output: any OpenGrokPagerInteractiveOutputAdapter
+    private let promptSelectAllEnabled: Bool
 
     private var lifecycle: OpenGrokPagerInteractiveLifecycle = .idle
     private var editor = PromptEditor(text: "")
@@ -1012,12 +1025,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         bashCommandHandler: BashCommandHandler? = nil,
         workflowsEnabled: Bool = true,
         folderTrustCommandsEnabled: Bool = false,
-        mouseReportingToggleEnabled: Bool = false
+        mouseReportingToggleEnabled: Bool = false,
+        promptSelectAllEnabled: Bool = false
     ) {
         self.input = input
         self.runtime = runtime
         self.renderer = renderer
         self.output = output
+        self.promptSelectAllEnabled = promptSelectAllEnabled
         self.mouseReportingToggleEnabled = mouseReportingToggleEnabled
         let definitions = customCommands.map { registration in
             PagerCommandDefinition(
@@ -1070,7 +1085,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         bashCommandHandler: BashCommandHandler? = nil,
         workflowsEnabled: Bool = true,
         folderTrustCommandsEnabled: Bool = false,
-        mouseReportingToggleEnabled: Bool = false
+        mouseReportingToggleEnabled: Bool = false,
+        promptSelectAllEnabled: Bool = false
     ) {
         self.init(
             input: Self.makeThrowingStream(from: input),
@@ -1084,7 +1100,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             bashCommandHandler: bashCommandHandler,
             workflowsEnabled: workflowsEnabled,
             folderTrustCommandsEnabled: folderTrustCommandsEnabled,
-            mouseReportingToggleEnabled: mouseReportingToggleEnabled
+            mouseReportingToggleEnabled: mouseReportingToggleEnabled,
+            promptSelectAllEnabled: promptSelectAllEnabled
         )
     }
 
@@ -1542,7 +1559,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             try await renderer.begin()
             rendererBegan = true
             try await transition(to: .starting)
-            editor = PromptEditor(text: request.prompt)
+            editor = PromptEditor(
+                text: request.prompt,
+                promptSelectAllEnabled: promptSelectAllEnabled
+            )
             // A fresh editor starts in single-line mode; anything seeded by
             // `setInputModes` has to survive the rebuild or `/multiline` would
             // silently reset itself at the top of every run.
@@ -1710,7 +1730,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             await inputPumpGate.resume()
                             continue
                         }
+                        await synchronizePromptEditorWrapGeometry(for: event)
                         let action = applyEditorEvent(event)
+                        try await copyPromptClipboardIfNeeded()
                         switch action {
                         case .changed, .historyPrevious, .historyNext,
                              .completionMove, .completionAccept,
@@ -2059,7 +2081,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             // The composer stays live while a turn runs — that
                             // is the whole point of the send→queue flip in the
                             // shortcuts bar.
-                            switch applyEditorEvent(event) {
+                            await synchronizePromptEditorWrapGeometry(for: event)
+                            let action = applyEditorEvent(event)
+                            try await copyPromptClipboardIfNeeded()
+                            switch action {
                             case .submit:
                                 let prompt = editor.text
                                 if prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -2987,6 +3012,27 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             break
         }
         return action
+    }
+
+    private func synchronizePromptEditorWrapGeometry(for event: InputEvent) async {
+        guard case .key(let key) = event else { return }
+        switch key.key {
+        case .up, .down:
+            break
+        case .left, .right:
+            guard key.modifiers.contains(.superKey) || key.modifiers.contains(.meta)
+            else { return }
+        default:
+            return
+        }
+        guard let content = await renderer.lastComposerContentRect(), content.width > 0
+        else { return }
+        editor.updateWrapWidth(content.width)
+    }
+
+    private func copyPromptClipboardIfNeeded() async throws {
+        guard let copied = editor.takeClipboard(), !copied.isEmpty else { return }
+        try await renderer.copyToClipboard(copied)
     }
 
     /// Replace the draft with the highlighted row's insert text, recording
