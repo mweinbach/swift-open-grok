@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokFastWorktree
 import OpenGrokPager
 import OpenGrokSamplingTypes
 import OpenGrokShell
@@ -147,6 +148,75 @@ private struct ResumedWorkspaceAuthorityFixture {
         _ = await stack.shell.shutdown()
         await foundation.toolExecutor.shutdown()
         try? FileManager.default.removeItem(at: root)
+    }
+
+    func initializeRepository(at directory: URL) throws {
+        let hooks = directory.appendingPathComponent("isolated-hooks", isDirectory: true)
+        try FileManager.default.createDirectory(at: hooks, withIntermediateDirectories: true)
+        for arguments in [
+            ["init"],
+            ["config", "user.name", "Workspace Authority"],
+            ["config", "user.email", "workspace-authority@example.test"],
+            ["config", "commit.gpgsign", "false"],
+            ["config", "core.hooksPath", hooks.path],
+        ] {
+            let result = try runGit(arguments, cwd: directory)
+            guard result.exitCode == 0 else {
+                throw CLIApplicationError.failed(
+                    "could not initialize repository \(directory.path): \(result.stderr)"
+                )
+            }
+        }
+
+        try "committed source\n".write(
+            to: directory.appendingPathComponent("tracked.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "isolated-hooks/\nignored-source.txt\n".write(
+            to: directory.appendingPathComponent(".gitignore"),
+            atomically: true,
+            encoding: .utf8
+        )
+        for arguments in [
+            ["add", "tracked.txt", ".gitignore"],
+            ["commit", "-m", "Initialize workspace authority fixture"],
+        ] {
+            let result = try runGit(arguments, cwd: directory)
+            guard result.exitCode == 0 else {
+                throw CLIApplicationError.failed(
+                    "could not commit repository \(directory.path): \(result.stderr)"
+                )
+            }
+        }
+
+        try "dirty source\n".write(
+            to: directory.appendingPathComponent("tracked.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "untracked source\n".write(
+            to: directory.appendingPathComponent("untracked-source.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "ignored source\n".write(
+            to: directory.appendingPathComponent("ignored-source.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+    }
+
+    func resumeInWorktreeOptions(sessionID: String, cwd: URL) throws -> CLIExecutionOptions {
+        let command = try CLICommandParser.parseOrThrow([
+            "headless", "--prompt", "resume in isolated worktree",
+            "--resume", sessionID, "--cwd", cwd.path, "--worktree",
+            "--model", "grok-4.5", "--always-approve",
+        ])
+        guard case .launch(let options) = command else {
+            throw CLIApplicationError.failed("worktree-resume fixture did not parse")
+        }
+        return options
     }
 }
 
@@ -401,5 +471,163 @@ struct LiveResumedWorkspaceAuthorityParityTests {
             sessionID: child.sessionID
         )
         #expect(persistedChild == child)
+    }
+
+    @Test("resume plus worktree rejects a source from another git repository before all mutation")
+    func foreignWorktreeResumeFailsBeforeCreationOrProviderConstruction() async throws {
+        let fixture = try await ResumedWorkspaceAuthorityFixture()
+        defer { Task { await fixture.shutdown() } }
+        try fixture.initializeRepository(at: fixture.parent)
+        try fixture.initializeRepository(at: fixture.child)
+        let source = try await fixture.saveSession(
+            id: "foreign-worktree-source",
+            workingDirectory: fixture.child
+        )
+        let parentBefore = await fixture.stack.conversationHistory.snapshot()
+        let registry = WorktreeRegistry(openGrokHome: fixture.home)
+        let registryBefore = try registry.records()
+        let poolExistedBefore = FileManager.default.fileExists(atPath: registry.poolRoot.path)
+        let constructions = WorkspaceAuthorityProviderCounter()
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in
+                constructions.recordConstruction()
+                return OpenGrokLiveSampler { _, _ in
+                    OpenGrokLiveSamplingResponse(output: "must not initialize")
+                }
+            }
+        )
+
+        do {
+            _ = try await OpenGrokLiveApplicationLauncher.makeSessionFoundation(
+                options: fixture.resumeInWorktreeOptions(
+                    sessionID: source.sessionID,
+                    cwd: fixture.parent
+                ),
+                context: fixture.context,
+                dependencies: dependencies
+            )
+            Issue.record("an unrelated repository unexpectedly adopted the source session")
+        } catch {
+            #expect(String(describing: error).contains("repository"))
+        }
+
+        let sourceAfter = try await fixture.foundation.conversationStore.load(
+            sessionID: source.sessionID
+        )
+        let registryAfter = try registry.records()
+        #expect(sourceAfter == source)
+        #expect(await fixture.stack.conversationHistory.snapshot() == parentBefore)
+        #expect(registryAfter == registryBefore)
+        #expect(FileManager.default.fileExists(atPath: registry.poolRoot.path) == poolExistedBefore)
+        #expect(constructions.count == 0)
+    }
+
+    @Test("same-repository resume plus worktree forks a new session and preserves the dirty source")
+    func sameRepositoryWorktreeResumeForksWithoutMutatingSource() async throws {
+        let fixture = try await ResumedWorkspaceAuthorityFixture()
+        defer { Task { await fixture.shutdown() } }
+        try fixture.initializeRepository(at: fixture.parent)
+        let source = try await fixture.saveSession(
+            id: "same-repository-worktree-source",
+            workingDirectory: fixture.parent
+        )
+        let sourceIdentity = try discoverGitRepo(at: fixture.parent)
+        let resumed = try await OpenGrokLiveApplicationLauncher.makeSessionFoundation(
+            options: fixture.resumeInWorktreeOptions(
+                sessionID: source.sessionID,
+                cwd: fixture.parent
+            ),
+            context: fixture.context,
+            dependencies: fixture.dependencies
+        )
+        defer { Task { await resumed.toolExecutor.shutdown() } }
+
+        let sourceAfter = try await fixture.foundation.conversationStore.load(
+            sessionID: source.sessionID
+        )
+        let forked = try await fixture.foundation.conversationStore.load(
+            sessionID: resumed.sessionID
+        )
+        let forkIdentity = try discoverGitRepo(at: resumed.cwd)
+        let records = try WorktreeRegistry(openGrokHome: fixture.home).records()
+        let copiedTracked = try String(
+            contentsOf: resumed.cwd.appendingPathComponent("tracked.txt"),
+            encoding: .utf8
+        )
+        let copiedUntracked = try String(
+            contentsOf: resumed.cwd.appendingPathComponent("untracked-source.txt"),
+            encoding: .utf8
+        )
+
+        #expect(resumed.sessionID != source.sessionID)
+        #expect(sourceAfter == source)
+        #expect(forked.parentSessionID == source.sessionID)
+        #expect(forked.sessionKind == "worktree")
+        #expect(forked.items == source.items)
+        #expect(LiveToolExecutor.workspaceRootsMatch(
+            URL(fileURLWithPath: forked.workingDirectory),
+            resumed.cwd
+        ))
+        #expect(!LiveToolExecutor.workspaceRootsMatch(resumed.cwd, fixture.parent))
+        #expect(LiveToolExecutor.workspaceRootsMatch(
+            sourceIdentity.commonDir,
+            forkIdentity.commonDir
+        ))
+        #expect(records.count == 1)
+        #expect(records.first?.sessionID == resumed.sessionID)
+        #expect(copiedTracked == "dirty source\n")
+        #expect(copiedUntracked == "untracked source\n")
+        #expect(!FileManager.default.fileExists(
+            atPath: resumed.cwd.appendingPathComponent("ignored-source.txt").path
+        ))
+    }
+
+    @Test("a failed resume transcript fork reclaims its materialized worktree and registry row")
+    func failedWorktreeResumeForkRollsBackCreation() async throws {
+        let fixture = try await ResumedWorkspaceAuthorityFixture()
+        defer { Task { await fixture.shutdown() } }
+        try fixture.initializeRepository(at: fixture.parent)
+        var legacy = try await fixture.saveSession(
+            id: "legacy-worktree-source",
+            workingDirectory: fixture.parent
+        )
+        legacy.everUsedNonXAI = nil
+        try await fixture.foundation.conversationStore.save(legacy)
+        let sourceBefore = try await fixture.foundation.conversationStore.load(
+            sessionID: legacy.sessionID
+        )
+        let registry = WorktreeRegistry(openGrokHome: fixture.home)
+        let registryBefore = try registry.records()
+
+        do {
+            _ = try await OpenGrokLiveApplicationLauncher.makeSessionFoundation(
+                options: fixture.resumeInWorktreeOptions(
+                    sessionID: legacy.sessionID,
+                    cwd: fixture.parent
+                ),
+                context: fixture.context,
+                dependencies: fixture.dependencies
+            )
+            Issue.record("legacy source unexpectedly forked without its export boundary")
+        } catch {
+            #expect(String(describing: error).contains("export-boundary"))
+        }
+
+        let sourceAfter = try await fixture.foundation.conversationStore.load(
+            sessionID: legacy.sessionID
+        )
+        let registryAfter = try registry.records()
+        let poolEntries: [URL]
+        if FileManager.default.fileExists(atPath: registry.poolRoot.path) {
+            poolEntries = try FileManager.default.contentsOfDirectory(
+                at: registry.poolRoot,
+                includingPropertiesForKeys: nil
+            )
+        } else {
+            poolEntries = []
+        }
+        #expect(sourceAfter == sourceBefore)
+        #expect(registryAfter == registryBefore)
+        #expect(poolEntries.isEmpty)
     }
 }

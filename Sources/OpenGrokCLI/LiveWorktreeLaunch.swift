@@ -32,15 +32,21 @@ enum LiveWorktreeLaunch {
         let destination = registry.poolRoot
             .appendingPathComponent("\(repositoryName)-\(worktreeID)", isDirectory: true)
         let ref = options.worktreeRef ?? "HEAD"
+        let resumeSource = options.sessionToResume?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Resume forks preserve the source checkout by default. An explicit
+        // ref remains a clean checkout, matching upstream's copy-mode override.
+        let preservesSourceCheckout = resumeSource?.isEmpty == false
+            && options.worktreeRef == nil
         let report: WorktreeReport
         do {
             report = try WorktreeBuilder(
                 source: sourceDirectory,
                 dest: destination,
                 gitRef: ref,
-                workingTree: .cleanTracked,
+                workingTree: preservesSourceCheckout ? .preserveWorkingTree : .cleanTracked,
                 ignoredFiles: .skip,
-                creationMode: .gitCheckout,
+                creationMode: preservesSourceCheckout ? .linked : .gitCheckout,
                 allowedPoolRoot: registry.poolRoot
             ).create(isCancelled: isCancelled)
         } catch let error as FastWorktreeError {
@@ -87,6 +93,64 @@ enum LiveWorktreeLaunch {
             try preparation.registry.updateSession(id: preparation.recordID, sessionID: sessionID)
         } catch {
             throw CLIApplicationError.failed("could not persist worktree session: \(error)")
+        }
+    }
+
+    /// A session may be resumed from another checkout of its repository, but
+    /// never from an unrelated repository that happens to know its session ID.
+    static func validateResumeSource(
+        invocationDirectory: URL,
+        sourceDirectory: URL
+    ) throws {
+        let invocation: GitRepoIdentity
+        let source: GitRepoIdentity
+        do {
+            invocation = try discoverGitRepo(at: invocationDirectory)
+            source = try discoverGitRepo(at: sourceDirectory)
+        } catch {
+            throw CLIApplicationError.failed(
+                "cannot resume a session in a worktree: the invoking workspace and "
+                    + "source session must belong to the same git repository (\(error))"
+            )
+        }
+
+        guard invocation.toplevel != nil,
+              source.toplevel != nil,
+              LiveToolExecutor.workspaceRootsMatch(invocation.commonDir, source.commonDir)
+        else {
+            throw CLIApplicationError.failed(
+                "cannot resume a session from workspace \(sourceDirectory.path) in "
+                    + "the unrelated git repository \(invocationDirectory.path)"
+            )
+        }
+    }
+
+    /// A failed transcript fork must not strand a usable checkout or a
+    /// registry row claiming that checkout belongs to a real session.
+    static func discard(_ preparation: LiveWorktreePreparation) throws {
+        guard let record = try preparation.registry.records().first(where: {
+            $0.id == preparation.recordID
+        }) else {
+            throw CLIApplicationError.failed(
+                "could not clean up worktree: registry record \(preparation.recordID) is missing"
+            )
+        }
+
+        do {
+            let report = try removeWorktreeAt(
+                dest: record.url,
+                primaryCheckout: record.sourceURL,
+                force: true
+            )
+            guard report.removed, report.issues.isEmpty else {
+                throw CLIApplicationError.failed(
+                    "could not remove failed worktree \(record.path): "
+                        + report.issues.joined(separator: "; ")
+                )
+            }
+            try preparation.registry.remove(id: preparation.recordID)
+        } catch {
+            throw CLIApplicationError.failed("could not clean up failed worktree: \(error)")
         }
     }
 
