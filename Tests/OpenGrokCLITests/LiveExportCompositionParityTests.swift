@@ -1,10 +1,14 @@
 import Foundation
+import OpenGrokFileUtils
 import OpenGrokSamplingTypes
 import OpenGrokSessionPersistence
 import OpenGrokShared
 import OpenGrokShellSessionSupport
 import OpenGrokWebMediaTools
 import Testing
+#if os(Windows)
+import COpenGrokSockets
+#endif
 
 @testable import OpenGrokCLI
 
@@ -76,8 +80,13 @@ private struct LiveExportFixture {
         rewindTo: UInt64? = nil,
         hostTurn: Bool = false,
         owner: String? = nil,
+        ownerValue: JSONValue? = nil,
+        omitOwner: Bool = false,
         title: String? = nil,
         input: [String: JSONValue]? = nil,
+        rawInput: JSONValue? = nil,
+        rawOutput: JSONValue? = nil,
+        kind: String? = nil,
         toolCallID: String? = nil,
         hiddenTransport: Bool = false
     ) throws {
@@ -91,12 +100,18 @@ private struct LiveExportFixture {
         if !updateMetadata.isEmpty { update["_meta"] = .object(updateMetadata) }
         if let rewindTo { update["target_prompt_index"] = .number(.uint64(rewindTo)) }
         if let title { update["title"] = .string(title) }
-        if let input { update["rawInput"] = .object(input) }
+        if let rawInput {
+            update["rawInput"] = rawInput
+        } else if let input {
+            update["rawInput"] = .object(input)
+        }
+        if let rawOutput { update["rawOutput"] = rawOutput }
+        if let kind { update["kind"] = .string(kind) }
         if let toolCallID { update["toolCallId"] = .string(toolCallID) }
-        var params: [String: JSONValue] = [
-            "sessionId": .string(owner ?? id),
-            "update": .object(update),
-        ]
+        var params: [String: JSONValue] = ["update": .object(update)]
+        if !omitOwner {
+            params["sessionId"] = ownerValue ?? .string(owner ?? id)
+        }
         if hiddenTransport {
             params["_meta"] = .object(["open-grok/codeModeTransport": .bool(true)])
         }
@@ -345,6 +360,332 @@ struct LiveExportCompositionParityTests {
         #expect(errors.contents.isEmpty)
     }
 
+    @Test("summary-only exact transport identities are redacted from real stdout, file, and clipboard exports")
+    func durableTransportIdentityProtectsEveryDestination() async throws {
+        let fixture = try LiveExportFixture.make()
+        defer { fixture.clean() }
+        try await fixture.seed(
+            "summary-provenance",
+            items: [.user("Visible conversation")],
+            hiddenTransportIDs: ["durable-exec", "durable-wait"]
+        )
+        try fixture.append(
+            to: "summary-provenance", tag: "tool_call", title: "exec",
+            input: ["command": .string("SUMMARY_ONLY_SECRET_JAVASCRIPT")],
+            kind: "other", toolCallID: "durable-exec"
+        )
+        try fixture.append(
+            to: "summary-provenance", tag: "tool_call_update",
+            rawOutput: .object(["text": .string("SUMMARY_ONLY_SECRET_RESULT")]),
+            toolCallID: "durable-exec"
+        )
+        try fixture.append(
+            to: "summary-provenance", tag: "tool_call", title: "wait",
+            input: ["cell_id": .string("SUMMARY_ONLY_SECRET_CELL")],
+            kind: "other", toolCallID: "durable-wait"
+        )
+        try fixture.append(
+            to: "summary-provenance", tag: "tool_call", title: "read_file",
+            input: ["path": .string("visible.swift")], kind: "read", toolCallID: "nested-read"
+        )
+        try fixture.append(
+            to: "summary-provenance", tag: "tool_call", title: "exec",
+            input: ["command": .string("VISIBLE_PLUGIN_COMMAND")],
+            kind: "other", toolCallID: "plugin-exec"
+        )
+        try fixture.append(
+            to: "summary-provenance", tag: "tool_call", title: "wait",
+            input: ["job": .string("visible-plugin-job")],
+            kind: "other", toolCallID: "plugin-wait"
+        )
+
+        let (stdoutStreams, stdout, _) = CLIStreams.buffered()
+        try await fixture.launch(["export", "summary-provenance"], streams: stdoutStreams)
+
+        let destination = fixture.root.appendingPathComponent("sanitized.md")
+        let (fileStreams, _, _) = CLIStreams.buffered()
+        try await fixture.launch(
+            ["export", "summary-provenance", destination.path],
+            streams: fileStreams
+        )
+        let fileContents = try String(contentsOf: destination, encoding: .utf8)
+
+        let clipboard = ExportClipboardCapture()
+        let services = LiveExportServices { text, _ in await clipboard.append(text) }
+        let (clipboardStreams, _, _) = CLIStreams.buffered()
+        try await fixture.runInjected(
+            ["export", "summary-provenance", "--clipboard"],
+            streams: clipboardStreams,
+            services: services
+        )
+        let copied = try #require(await clipboard.snapshot().first)
+
+        for transcript in [stdout.contents, fileContents, copied] {
+            #expect(transcript.contains("Visible conversation"))
+            #expect(transcript.contains("Read: visible.swift"))
+            #expect(transcript.contains("Execute: VISIBLE_PLUGIN_COMMAND"))
+            #expect(transcript.components(separatedBy: "- Tool: wait").count == 2)
+            #expect(!transcript.contains("SUMMARY_ONLY_SECRET"))
+        }
+    }
+
+    @Test("unmarked legacy string-input exec and its exact cell-linked wait are hidden without suppressing plugins")
+    func legacyTransportShapeAndPairedWaitStayPrivate() async throws {
+        let fixture = try LiveExportFixture.make()
+        defer { fixture.clean() }
+        try await fixture.seed("legacy-transport", items: [.user("Legacy visible prompt")])
+        try fixture.append(
+            to: "legacy-transport", tag: "tool_call", title: "exec",
+            rawInput: .string("tools.exec_command({cmd: 'LEGACY_SECRET_JS'})"),
+            kind: "other", toolCallID: "legacy-exec"
+        )
+        try fixture.append(
+            to: "legacy-transport", tag: "tool_call_update",
+            rawOutput: .object([
+                "cell_id": .string("linked-legacy-cell"),
+                "text": .string("LEGACY_SECRET_OUTPUT"),
+            ]),
+            toolCallID: "legacy-exec"
+        )
+        try fixture.append(
+            to: "legacy-transport", tag: "tool_call", title: "wait",
+            rawInput: .object(["cell_id": .string("linked-legacy-cell")]),
+            rawOutput: .object(["text": .string("LEGACY_WAIT_SECRET")]),
+            kind: "other", toolCallID: "legacy-wait"
+        )
+        try fixture.append(
+            to: "legacy-transport", tag: "tool_call", title: "exec",
+            input: ["command": .string("SAFE_PLUGIN_EXEC")],
+            kind: "other", toolCallID: "plugin-exec"
+        )
+        try fixture.append(
+            to: "legacy-transport", tag: "tool_call", title: "wait",
+            rawInput: .object(["cell_id": .string("unrelated-plugin-cell")]),
+            kind: "other", toolCallID: "plugin-wait"
+        )
+        let (streams, output, errors) = CLIStreams.buffered()
+
+        try await fixture.launch(["export", "legacy-transport"], streams: streams)
+
+        #expect(output.contents.contains("Execute: SAFE_PLUGIN_EXEC"))
+        #expect(output.contents.components(separatedBy: "- Tool: wait").count == 2)
+        #expect(!output.contents.contains("- Execute: exec"))
+        #expect(!output.contents.contains("LEGACY_SECRET"))
+        #expect(!output.contents.contains("LEGACY_WAIT_SECRET"))
+        #expect(errors.contents.isEmpty)
+    }
+
+    @Test("a string-input external exec is preserved when its kind is not Code Mode's reserved other kind")
+    func externalStringInputExecIsNotClassifiedByTitleAlone() async throws {
+        let fixture = try LiveExportFixture.make()
+        defer { fixture.clean() }
+        try await fixture.seed("external-exec", items: [.user("Keep the external tool")])
+        try fixture.append(
+            to: "external-exec", tag: "tool_call", title: "exec",
+            rawInput: .string("an ordinary extension's string argument"),
+            kind: "execute", toolCallID: "external-string-exec"
+        )
+        let (streams, output, errors) = CLIStreams.buffered()
+
+        try await fixture.launch(["export", "external-exec"], streams: streams)
+
+        #expect(output.contents.contains("## Tools\n\n- Execute: exec"))
+        #expect(errors.contents.isEmpty)
+    }
+
+    @Test("a marked terminal update redacts its unmarked secret-bearing base across the full replay")
+    func mixedMarkedAndUnmarkedTransportUpdatesAreCoupled() async throws {
+        let fixture = try LiveExportFixture.make()
+        defer { fixture.clean() }
+        try await fixture.seed("mixed-markers", items: [.user("Keep visible tools")])
+        try fixture.append(
+            to: "mixed-markers", tag: "tool_call", title: "exec",
+            input: ["command": .string("MIXED_MARKER_SECRET")],
+            kind: "other", toolCallID: "marked-terminal-only"
+        )
+        try fixture.append(
+            to: "mixed-markers", tag: "tool_call_update",
+            rawOutput: .object(["text": .string("MIXED_RESULT_SECRET")]),
+            toolCallID: "marked-terminal-only", hiddenTransport: true
+        )
+        try fixture.append(
+            to: "mixed-markers", tag: "tool_call", title: "exec",
+            input: ["command": .string("VISIBLE_EXTERNAL_EXEC")],
+            kind: "other", toolCallID: "genuine-exec"
+        )
+        let (streams, output, errors) = CLIStreams.buffered()
+
+        try await fixture.launch(["export", "mixed-markers"], streams: streams)
+
+        #expect(output.contents.contains("Execute: VISIBLE_EXTERNAL_EXEC"))
+        #expect(!output.contents.contains("MIXED_MARKER_SECRET"))
+        #expect(!output.contents.contains("MIXED_RESULT_SECRET"))
+        #expect(errors.contents.isEmpty)
+    }
+
+    @Test("transport provenance is session-owned even when an unrelated plugin reuses the same call ID")
+    func transportIdentityNeverBleedsAcrossSessions() async throws {
+        let fixture = try LiveExportFixture.make()
+        defer { fixture.clean() }
+        try await fixture.seed(
+            "transport-owner",
+            items: [.user("Protected session")],
+            hiddenTransportIDs: ["shared-call-id"]
+        )
+        try fixture.append(
+            to: "transport-owner", tag: "tool_call", title: "exec",
+            input: ["command": .string("OWNER_ONLY_SECRET")],
+            kind: "other", toolCallID: "shared-call-id"
+        )
+        try await fixture.seed("plugin-owner", items: [.user("Plugin session")])
+        try fixture.append(
+            to: "plugin-owner", tag: "tool_call", title: "exec",
+            input: ["command": .string("UNRELATED_PLUGIN_VISIBLE")],
+            kind: "other", toolCallID: "shared-call-id"
+        )
+        let (protectedStreams, protectedOutput, _) = CLIStreams.buffered()
+        let (pluginStreams, pluginOutput, _) = CLIStreams.buffered()
+
+        try await fixture.launch(["export", "transport-owner"], streams: protectedStreams)
+        try await fixture.launch(["export", "plugin-owner"], streams: pluginStreams)
+
+        #expect(!protectedOutput.contents.contains("OWNER_ONLY_SECRET"))
+        #expect(pluginOutput.contents.contains("Execute: UNRELATED_PLUGIN_VISIBLE"))
+    }
+
+    @Test("forked sessions inherit exact transport identities and cannot export parent transport secrets")
+    func forkInheritedTransportProvenanceRemainsPrivate() async throws {
+        let fixture = try LiveExportFixture.make()
+        defer { fixture.clean() }
+        try await fixture.seed(
+            "fork-source",
+            items: [.user("Fork-visible conversation")],
+            hiddenTransportIDs: ["fork-transport"]
+        )
+        try fixture.append(
+            to: "fork-source", tag: "tool_call", title: "exec",
+            input: ["command": .string("FORK_INHERITED_SECRET")],
+            kind: "other", toolCallID: "fork-transport"
+        )
+        try fixture.append(
+            to: "fork-source", tag: "tool_call", title: "exec",
+            input: ["command": .string("VISIBLE_FORK_PLUGIN")],
+            kind: "other", toolCallID: "fork-plugin"
+        )
+        let forked = try await LiveConversationStore(openGrokHome: fixture.state).fork(
+            sourceSessionID: "fork-source",
+            destinationSessionID: "fork-child",
+            workingDirectory: fixture.workspace
+        )
+        #expect(forked.codeModeTransportCallIDs == ["fork-transport"])
+        let (streams, output, errors) = CLIStreams.buffered()
+
+        try await fixture.launch(["export", "fork-child"], streams: streams)
+
+        #expect(output.contents.contains("Fork-visible conversation"))
+        #expect(output.contents.contains("Execute: VISIBLE_FORK_PLUGIN"))
+        #expect(!output.contents.contains("FORK_INHERITED_SECRET"))
+        #expect(errors.contents.isEmpty)
+    }
+
+    @Test("malformed durable transport provenance fails closed before a secret-bearing journal can export")
+    func invalidTransportAuthorityNeverFallsBackToGuessing() async throws {
+        let fixture = try LiveExportFixture.make()
+        defer { fixture.clean() }
+        try await fixture.seed(
+            "invalid-provenance",
+            items: [.user("A prompt")],
+            hiddenTransportIDs: ["secret-call"]
+        )
+        try fixture.append(
+            to: "invalid-provenance", tag: "tool_call", title: "exec",
+            input: ["command": .string("MALFORMED_AUTHORITY_SECRET")],
+            kind: "other", toolCallID: "secret-call"
+        )
+        let directory = try SessionDocumentStore(grokHome: fixture.state).sessionDirectory(
+            sessionID: "invalid-provenance",
+            cwd: fixture.workspace.path
+        )
+        let summary = directory.appendingPathComponent(SessionDocumentStore.summaryFileName)
+        let decoded = try JSONDecoder().decode(JSONValue.self, from: PathSecurity.readNoFollow(summary))
+        guard case .object(var object) = decoded else {
+            Issue.record("session summary was not an object")
+            return
+        }
+        object["code_mode_transport_call_ids"] = .string("secret-call")
+        try SecureFile.write(at: summary, contents: JSONEncoder().encode(JSONValue.object(object)))
+        let (streams, output, errors) = CLIStreams.buffered()
+
+        await #expect(throws: CLIApplicationError.self) {
+            try await fixture.launch(["export", "invalid-provenance"], streams: streams)
+        }
+        #expect(output.contents.isEmpty)
+        #expect(errors.contents.isEmpty)
+    }
+
+    #if os(Windows)
+    @Test("Windows export accepts only canonical summary and journal files with verified owner-only DACLs")
+    func windowsOwnerOnlyDocumentsReachRealExport() async throws {
+        let fixture = try LiveExportFixture.make()
+        defer { fixture.clean() }
+        try await fixture.seed("windows-private", items: [.user("Owner-private Windows transcript")])
+        let journal = try fixture.journal("windows-private")
+        let summary = journal.deletingLastPathComponent()
+            .appendingPathComponent(SessionDocumentStore.summaryFileName)
+        let summaryIsPrivate = try SecureFile.isOwnerOnly(at: summary)
+        let journalIsPrivate = try SecureFile.isOwnerOnly(at: journal)
+        #expect(summaryIsPrivate)
+        #expect(journalIsPrivate)
+        let sessionDirectory = journal.deletingLastPathComponent()
+        let workspaceDirectory = sessionDirectory.deletingLastPathComponent()
+        let sessionsDirectory = workspaceDirectory.deletingLastPathComponent()
+        for directory in [sessionsDirectory, workspaceDirectory, sessionDirectory] {
+            let ownerPrivate = directory.path.withCString {
+                og_path_is_private_to_current_user($0, 1)
+            }
+            #expect(ownerPrivate == 1)
+        }
+        let (streams, output, errors) = CLIStreams.buffered()
+
+        try await fixture.launch(["export", "windows-private"], streams: streams)
+
+        #expect(output.contents == "## User\n\nOwner-private Windows transcript\n")
+        #expect(errors.contents.isEmpty)
+    }
+
+    @Test("Windows export refuses an independently verified permissive sessions-root DACL")
+    func windowsRejectsPermissiveSessionDirectory() async throws {
+        let fixture = try LiveExportFixture.make()
+        defer { fixture.clean() }
+        let broadHome = fixture.root.appendingPathComponent("permissive-state", isDirectory: true)
+        let broadSessions = broadHome.appendingPathComponent("sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: broadSessions, withIntermediateDirectories: true)
+        let ownerPrivate = broadSessions.path.withCString {
+            og_path_is_private_to_current_user($0, 1)
+        }
+        guard ownerPrivate == 0 else {
+            Issue.record("negative Windows ACL fixture did not create a permissive sessions directory")
+            return
+        }
+        let command = try CLICommandParser.parseOrThrow(["export", "victim"])
+        let (streams, output, errors) = CLIStreams.buffered()
+
+        await #expect(throws: CLIApplicationError.self) {
+            let session = try await LiveExportComposition.session(
+                for: command,
+                context: CLIApplicationContext(
+                    environment: ["OPENGROK_HOME": broadHome.path, "HOME": fixture.userHome.path],
+                    streams: streams,
+                    control: .never
+                )
+            )
+            try await session.waitForExit()
+        }
+        #expect(output.contents.isEmpty)
+        #expect(errors.contents.isEmpty)
+    }
+    #endif
+
     @Test("incremental assistant chunks coalesce while executable and web tools use Rust's summaries")
     func assistantChunksAndToolKindsRenderFaithfully() async throws {
         let fixture = try LiveExportFixture.make()
@@ -491,6 +832,64 @@ struct LiveExportCompositionParityTests {
             try await fixture.launch(["export", "malformed"], streams: streams)
         }
         #expect(output.contents.isEmpty)
+    }
+
+    @Test("missing, null, numeric, and foreign journal identities cannot reach stdout, files, or clipboard")
+    func everyReplayEnvelopeRequiresItsExactSessionIdentity() async throws {
+        let fixture = try LiveExportFixture.make()
+        defer { fixture.clean() }
+        let variants: [(name: String, owner: JSONValue?, omit: Bool, method: String)] = [
+            ("missing-owner", nil, true, "session/update"),
+            ("null-owner", .null, false, "session/update"),
+            ("numeric-owner", .number(.uint64(42)), false, "session/update"),
+            ("foreign-owner", .string("another-session"), false, "session/update"),
+            ("missing-xai-owner", nil, true, "_x.ai/session/update"),
+        ]
+        let clipboard = ExportClipboardCapture()
+        let services = LiveExportServices { text, _ in await clipboard.append(text) }
+
+        for variant in variants {
+            try await fixture.seed(variant.name, items: [.user("Visible preceding update")])
+            try fixture.append(
+                to: variant.name,
+                method: variant.method,
+                tag: variant.method == "session/update" ? "agent_message_chunk" : "rewind_marker",
+                text: "INJECTED_CROSS_SESSION_SECRET",
+                ownerValue: variant.owner,
+                omitOwner: variant.omit
+            )
+
+            let (stdoutStreams, stdout, stdoutErrors) = CLIStreams.buffered()
+            await #expect(throws: CLIApplicationError.self) {
+                try await fixture.launch(["export", variant.name], streams: stdoutStreams)
+            }
+            #expect(stdout.contents.isEmpty)
+            #expect(stdoutErrors.contents.isEmpty)
+
+            let destination = fixture.root.appendingPathComponent("\(variant.name).md")
+            let (fileStreams, fileOutput, fileErrors) = CLIStreams.buffered()
+            await #expect(throws: CLIApplicationError.self) {
+                try await fixture.launch(
+                    ["export", variant.name, destination.path],
+                    streams: fileStreams
+                )
+            }
+            #expect(!FileManager.default.fileExists(atPath: destination.path))
+            #expect(fileOutput.contents.isEmpty)
+            #expect(fileErrors.contents.isEmpty)
+
+            let (clipboardStreams, clipboardOutput, clipboardErrors) = CLIStreams.buffered()
+            await #expect(throws: CLIApplicationError.self) {
+                try await fixture.runInjected(
+                    ["export", variant.name, "--clipboard"],
+                    streams: clipboardStreams,
+                    services: services
+                )
+            }
+            #expect(clipboardOutput.contents.isEmpty)
+            #expect(clipboardErrors.contents.isEmpty)
+            #expect(await clipboard.snapshot().isEmpty)
+        }
     }
 
     #if !os(Windows)

@@ -1,8 +1,12 @@
 import Foundation
+import OpenGrokFileUtils
 import OpenGrokSessionPersistence
 import OpenGrokShared
 import OpenGrokShellSessionSupport
 import OpenGrokWebMediaTools
+#if os(Windows)
+import COpenGrokSockets
+#endif
 
 /// Export uses the same platform-capability-checked clipboard as live tools;
 /// injecting its one effect keeps unsupported/headless platforms fail-closed.
@@ -169,7 +173,7 @@ public enum LiveExportComposition {
             throw CLIApplicationError.failed("Session history exceeds the bounded workspace scan")
         }
 
-        var matchingJournals: [URL] = []
+        var matchingJournals: [ExportReplayJournal] = []
         for workspace in workspaces {
             let values: URLResourceValues
             do {
@@ -181,14 +185,19 @@ public enum LiveExportComposition {
             guard values.isSymbolicLink != true else { continue }
             let directory = workspace.appendingPathComponent(sessionID, isDirectory: true)
             guard manager.fileExists(atPath: directory.path) else { continue }
+            try requireRealDirectory(workspace, root: canonicalRoot)
             try requireRealDirectory(directory, root: canonicalRoot)
 
             let summary = directory.appendingPathComponent(SessionDocumentStore.summaryFileName)
             guard manager.fileExists(atPath: summary.path) else { continue }
-            try requirePrivateRegularFile(summary, root: canonicalRoot, maximumBytes: maximumSummaryBytes)
+            let summaryBytes = try readPrivateRegularFile(
+                summary,
+                root: canonicalRoot,
+                maximumBytes: maximumSummaryBytes
+            )
             let value: JSONValue
             do {
-                value = try JSONDecoder().decode(JSONValue.self, from: Data(contentsOf: summary))
+                value = try JSONDecoder().decode(JSONValue.self, from: summaryBytes)
             } catch {
                 throw CLIApplicationError.failed("Failed to read session summary: \(error)")
             }
@@ -196,6 +205,31 @@ public enum LiveExportComposition {
                   let cwd = value["info"]?["cwd"]?.stringValue
             else {
                 throw CLIApplicationError.failed("Session summary identity does not match '\(sessionID)'.")
+            }
+            let knownTransportIDs: Set<String>
+            if let provenance = value["code_mode_transport_call_ids"], !provenance.isNull {
+                guard let identifiers = provenance.arrayValue,
+                      identifiers.count <= maximumJournalRecords
+                else {
+                    throw CLIApplicationError.failed(
+                        "Session summary contains invalid Code Mode transport provenance."
+                    )
+                }
+                var validated = Set<String>()
+                for identifier in identifiers {
+                    guard let value = identifier.stringValue,
+                          !value.isEmpty,
+                          value.utf8.count <= 1_024
+                    else {
+                        throw CLIApplicationError.failed(
+                            "Session summary contains an invalid Code Mode transport identity."
+                        )
+                    }
+                    validated.insert(value)
+                }
+                knownTransportIDs = validated
+            } else {
+                knownTransportIDs = []
             }
             let expected: URL
             do {
@@ -215,8 +249,15 @@ public enum LiveExportComposition {
 
             let journal = directory.appendingPathComponent(SessionDocumentStore.updatesFileName)
             guard manager.fileExists(atPath: journal.path) else { continue }
-            try requirePrivateRegularFile(journal, root: canonicalRoot, maximumBytes: maximumJournalBytes)
-            matchingJournals.append(journal)
+            let journalBytes = try readPrivateRegularFile(
+                journal,
+                root: canonicalRoot,
+                maximumBytes: maximumJournalBytes
+            )
+            matchingJournals.append(ExportReplayJournal(
+                bytes: journalBytes,
+                knownTransportIDs: knownTransportIDs
+            ))
         }
 
         guard matchingJournals.count <= 1 else {
@@ -226,16 +267,8 @@ public enum LiveExportComposition {
         }
         guard let journal = matchingJournals.first else { throw notFound(sessionID) }
 
-        let contents: String
-        do {
-            guard let text = String(data: try Data(contentsOf: journal), encoding: .utf8) else {
-                throw CLIApplicationError.failed("Session update journal is not valid UTF-8.")
-            }
-            contents = text
-        } catch let error as CLIApplicationError {
-            throw error
-        } catch {
-            throw CLIApplicationError.failed("Failed to read session update journal: \(error)")
+        guard let contents = String(data: journal.bytes, encoding: .utf8) else {
+            throw CLIApplicationError.failed("Session update journal is not valid UTF-8.")
         }
 
         let decoder = JSONDecoder()
@@ -251,12 +284,23 @@ public enum LiveExportComposition {
             } catch {
                 throw CLIApplicationError.failed("Session update journal contains an invalid envelope: \(error)")
             }
-            if let owner = envelope.params["sessionId"]?.stringValue, owner != sessionID {
-                throw CLIApplicationError.failed("Session update journal contains another session's update.")
+            if envelope.method == "session/update" || envelope.method == "_x.ai/session/update" {
+                guard let owner = envelope.params["sessionId"]?.stringValue,
+                      owner == sessionID
+                else {
+                    throw CLIApplicationError.failed(
+                        "Session update journal contains an invalid or cross-session update identity."
+                    )
+                }
             }
             envelopes.append(envelope)
         }
-        return filteredLiveEnvelopes(envelopes)
+        let live = filteredLiveEnvelopes(envelopes)
+        let transportIDs = codeModeTransportCallIDs(
+            in: live,
+            knownTransportIDs: journal.knownTransportIDs
+        )
+        return live.filter { !isCodeModeTransportUpdate($0, hiddenIDs: transportIDs) }
     }
 
     private static func requireRealDirectory(_ directory: URL, root: URL?) throws {
@@ -269,6 +313,15 @@ public enum LiveExportComposition {
         guard values.isDirectory == true, values.isSymbolicLink != true else {
             throw CLIApplicationError.failed("Session history must use real private directories.")
         }
+        #if os(Windows)
+        guard directory.path.withCString({ path in
+            og_path_is_private_to_current_user(path, 1)
+        }) == 1 else {
+            throw CLIApplicationError.failed(
+                "Session history directory is not private to the current Windows user."
+            )
+        }
+        #endif
         if let root {
             let resolved = directory.resolvingSymlinksInPath().standardizedFileURL
             guard isStrictDescendant(resolved, of: root) else {
@@ -277,11 +330,11 @@ public enum LiveExportComposition {
         }
     }
 
-    private static func requirePrivateRegularFile(
+    private static func readPrivateRegularFile(
         _ file: URL,
         root: URL,
         maximumBytes: Int
-    ) throws {
+    ) throws -> Data {
         let values: URLResourceValues
         do {
             values = try file.resourceValues(forKeys: [
@@ -303,20 +356,23 @@ public enum LiveExportComposition {
         guard (values.fileSize ?? 0) <= maximumBytes else {
             throw CLIApplicationError.failed("Session document exceeds the bounded export size.")
         }
-        #if !os(Windows)
         do {
-            let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
-            if let permissions = attributes[.posixPermissions] as? NSNumber,
-               permissions.intValue & 0o077 != 0
-            {
+            guard try SecureFile.isOwnerOnly(at: file) else {
                 throw CLIApplicationError.failed("Session document is not owner-private.")
             }
+            let bytes = try PathSecurity.readNoFollow(file)
+            guard bytes.count <= maximumBytes else {
+                throw CLIApplicationError.failed("Session document exceeds the bounded export size.")
+            }
+            guard try SecureFile.isOwnerOnly(at: file) else {
+                throw CLIApplicationError.failed("Session document is not owner-private.")
+            }
+            return bytes
         } catch let error as CLIApplicationError {
             throw error
         } catch {
-            throw CLIApplicationError.failed("Failed to inspect session document ownership: \(error)")
+            throw CLIApplicationError.failed("Failed to securely read session document: \(error)")
         }
-        #endif
     }
 
     /// Rust: `session/storage/mod.rs:1378-1469`; a rewind removes its marker
@@ -361,41 +417,100 @@ public enum LiveExportComposition {
         return survivors
     }
 
+    /// Rust: `session/storage/mod.rs:1625-1712`. Titles alone are not
+    /// provenance: plugins legitimately expose object-input `exec`/`wait`.
+    private static func codeModeTransportCallIDs(
+        in envelopes: [SessionUpdateEnvelope],
+        knownTransportIDs: Set<String>
+    ) -> Set<String> {
+        let updates = envelopes.compactMap { envelope -> ExportToolUpdate? in
+            guard envelope.method == "session/update",
+                  let update = envelope.params["update"],
+                  let kind = update["sessionUpdate"]?.stringValue,
+                  kind == "tool_call" || kind == "tool_call_update",
+                  let identifier = update["toolCallId"]?.stringValue,
+                  !identifier.isEmpty
+            else { return nil }
+            return ExportToolUpdate(
+                identifier: identifier,
+                isCall: kind == "tool_call",
+                update: update,
+                marked: envelope.params["_meta"]?["open-grok/codeModeTransport"]?.boolValue
+                    == true
+            )
+        }
+        var hiddenIDs = knownTransportIDs
+
+        for entry in updates where entry.marked {
+            if !entry.isCall
+                || ["exec", "wait"].contains(entry.update["title"]?.stringValue ?? "")
+            {
+                hiddenIDs.insert(entry.identifier)
+            }
+        }
+
+        var recognizedExecIDs = Set(updates.compactMap { entry -> String? in
+            guard entry.isCall,
+                  entry.update["title"]?.stringValue == "exec",
+                  hiddenIDs.contains(entry.identifier)
+            else { return nil }
+            return entry.identifier
+        })
+        for entry in updates {
+            guard entry.isCall,
+                  entry.update["title"]?.stringValue == "exec",
+                  entry.update["kind"]?.stringValue == "other",
+                  case .string? = entry.update["rawInput"]
+            else { continue }
+            hiddenIDs.insert(entry.identifier)
+            recognizedExecIDs.insert(entry.identifier)
+        }
+
+        let cellIDs = Set(updates.compactMap { entry -> String? in
+            guard recognizedExecIDs.contains(entry.identifier),
+                  let identifier = entry.update["rawOutput"]?["cell_id"]?.stringValue,
+                  !identifier.isEmpty
+            else { return nil }
+            return identifier
+        })
+        for entry in updates {
+            guard entry.isCall,
+                  entry.update["title"]?.stringValue == "wait",
+                  entry.update["kind"]?.stringValue == "other",
+                  let cellID = entry.update["rawInput"]?["cell_id"]?.stringValue,
+                  cellIDs.contains(cellID)
+            else { continue }
+            hiddenIDs.insert(entry.identifier)
+        }
+        return hiddenIDs
+    }
+
+    private static func isCodeModeTransportUpdate(
+        _ envelope: SessionUpdateEnvelope,
+        hiddenIDs: Set<String>
+    ) -> Bool {
+        guard envelope.method == "session/update",
+              let update = envelope.params["update"],
+              let kind = update["sessionUpdate"]?.stringValue,
+              kind == "tool_call" || kind == "tool_call_update",
+              let identifier = update["toolCallId"]?.stringValue
+        else { return false }
+        return hiddenIDs.contains(identifier)
+    }
+
     /// Rust: `scrollback/export.rs:13-73`; the shared projector already hides
-    /// synthetic/host prompts and secret-bearing Code Mode transport updates.
+    /// synthetic/host prompts. Transport calls were removed before projection.
     static func renderMarkdown(from envelopes: [SessionUpdateEnvelope]) -> String {
         let replay = envelopes.compactMap { envelope -> SessionUpdate? in
             guard envelope.method == "session/update" else { return nil }
             return .acp(envelope.params)
         }
         let projection = SessionTranscriptProjector.project(replay)
-        let hiddenTransportIDs = Set(envelopes.compactMap { envelope -> String? in
-            guard envelope.method == "session/update",
-                  envelope.params["_meta"]?["open-grok/codeModeTransport"]?.boolValue == true,
-                  let update = envelope.params["update"],
-                  let tag = update["sessionUpdate"]?.stringValue,
-                  tag == "tool_call" || tag == "tool_call_update",
-                  let identifier = update["toolCallId"]?.stringValue,
-                  !identifier.isEmpty
-            else { return nil }
-            if tag == "tool_call",
-               update["title"]?.stringValue != "exec",
-               update["title"]?.stringValue != "wait"
-            {
-                return nil
-            }
-            return identifier
-        })
         let toolSummaries = envelopes.compactMap { envelope -> String? in
             guard envelope.method == "session/update",
                   let update = envelope.params["update"],
                   update["sessionUpdate"]?.stringValue == "tool_call"
             else { return nil }
-            if let callID = update["toolCallId"]?.stringValue,
-               hiddenTransportIDs.contains(callID)
-            {
-                return nil
-            }
             return toolSummary(update)
         }
 
@@ -583,6 +698,18 @@ public enum LiveExportComposition {
         case user(String, UInt64?)
         case assistant(String)
         case tool(String)
+    }
+
+    private struct ExportReplayJournal {
+        let bytes: Data
+        let knownTransportIDs: Set<String>
+    }
+
+    private struct ExportToolUpdate {
+        let identifier: String
+        let isCall: Bool
+        let update: JSONValue
+        let marked: Bool
     }
 
     private struct ExportPromptRunTracker {
