@@ -3267,16 +3267,6 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             usage: "/hooks"
         ),
         PagerCommandDefinition(
-            name: "hooks-trust",
-            summary: "Trust this project for hook execution",
-            usage: "/hooks-trust"
-        ),
-        PagerCommandDefinition(
-            name: "hooks-untrust",
-            summary: "Remove trust for the current project",
-            usage: "/hooks-untrust"
-        ),
-        PagerCommandDefinition(
             name: "plugins",
             summary: "View plugins",
             usage: "/plugins"
@@ -3576,6 +3566,19 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         )
     ]
 
+    private static let folderTrustCommands: [PagerCommandDefinition] = [
+        PagerCommandDefinition(
+            name: "hooks-trust",
+            summary: "Trust this project for hook execution",
+            usage: "/hooks-trust"
+        ),
+        PagerCommandDefinition(
+            name: "hooks-untrust",
+            summary: "Remove trust for the current project",
+            usage: "/hooks-untrust"
+        ),
+    ]
+
     public static var builtinCommandCatalog: [OpenGrokPagerCommandRegistration] {
         builtinCommands.map { command in
             OpenGrokPagerCommandRegistration(
@@ -3630,11 +3633,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         folderTrustCommandsEnabled: Bool = false,
         mouseReportingToggleEnabled: Bool
     ) -> [PagerCommandDefinition] {
-        builtinCommands.compactMap { command in
-            if ["hooks-trust", "hooks-untrust"].contains(command.name),
-               !folderTrustCommandsEnabled {
-                return nil
-            }
+        let sessionCommands = builtinCommands
+            + (folderTrustCommandsEnabled ? folderTrustCommands : [])
+        return sessionCommands.compactMap { command in
             if command.name == "workflows", !workflowsEnabled {
                 return nil
             }

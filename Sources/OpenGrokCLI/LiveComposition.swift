@@ -3283,7 +3283,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let skillCatalog = LiveSkills.commandCatalog(
             skills: discoveredSkills,
             reservedNames: OpenGrokPagerInteractiveController.builtinCommandNames
-                .union(["feedback", "announcements"])
+                .union(["feedback", "announcements", "hooks-trust", "hooks-untrust"])
         )
         let conversationStore = LiveConversationStore(openGrokHome: openGrokHome)
         var conversationRecord = try await resolveConversationRecord(
