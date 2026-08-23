@@ -53,6 +53,8 @@ public struct LiveAuthServices: Sendable {
     public var readSecretLine: @Sendable () -> String?
     /// Whether stdin is a terminal that can be prompted.
     public var isInteractive: @Sendable () -> Bool
+    /// Managed-policy sync uses the same injectable network boundary as auth.
+    public var managedPolicySetupServices: LiveManagedSetupServices
 
     public init(
         makeTransport: @escaping @Sendable () -> any HTTPTransport,
@@ -60,7 +62,8 @@ public struct LiveAuthServices: Sendable {
         codexDeviceLogin: @escaping CodexLoginFlow,
         openBrowser: (@Sendable (URL) -> Void)?,
         readSecretLine: @escaping @Sendable () -> String?,
-        isInteractive: @escaping @Sendable () -> Bool
+        isInteractive: @escaping @Sendable () -> Bool,
+        managedPolicySetupServices: LiveManagedSetupServices = .production
     ) {
         self.makeTransport = makeTransport
         self.codexBrowserLogin = codexBrowserLogin
@@ -68,6 +71,7 @@ public struct LiveAuthServices: Sendable {
         self.openBrowser = openBrowser
         self.readSecretLine = readSecretLine
         self.isInteractive = isInteractive
+        self.managedPolicySetupServices = managedPolicySetupServices
     }
 
     public static let production = LiveAuthServices(
@@ -306,6 +310,20 @@ public enum LiveAuthComposition {
                 streams: streams,
                 services: services
             )
+        }
+        if accountTarget == .xai {
+            let result = await LiveManagedPolicyLifecycle.postLogin(
+                environment: environment,
+                services: LiveManagedPolicyLifecycleServices(
+                    setupServices: services.managedPolicySetupServices
+                )
+            )
+            if !options.json, case .updated(let isTeam) = result {
+                streams.err(isTeam
+                    ? "Applied your team's managed configuration.\n"
+                    : "Applied your deployment's managed configuration.\n")
+            }
+            LiveManagedPolicyLifecycle.start(environment: environment)
         }
         try emitStatus(options: options, environment: environment, streams: streams)
     }
@@ -611,6 +629,12 @@ public enum LiveAuthComposition {
             )
         } catch {
             throw CLIApplicationError.failed(describe(error))
+        }
+
+        if accountTarget == .xai || accountTarget == .all {
+            LiveManagedPolicyLifecycle.stop(environment: environment)
+            LiveManagedPolicyLifecycle.clearOrphan(environment: environment)
+            LiveManagedPolicyLifecycle.start(environment: environment)
         }
 
         if !options.json {
