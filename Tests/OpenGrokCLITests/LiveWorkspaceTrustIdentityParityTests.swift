@@ -647,13 +647,16 @@ struct LiveWorkspaceTrustIdentityParityTests {
         try fixture.writeProject(in: foreign, name: "foreign", marker: marker)
         try fixture.grantSourceTrust()
 
-        #expect(LiveWorkspaceTrustIdentity.resolve(
+        let resolvedIdentity = LiveWorkspaceTrustIdentity.resolve(
             workingDirectory: foreign,
             environment: fixture.environment
-        ) == foreign)
+        )
+        let expectedIdentity = foreign.standardizedFileURL.resolvingSymlinksInPath().path
+        #expect(resolvedIdentity.path == expectedIdentity)
         let security = fixture.resolve(foreign)
         #expect(security.projectTrusted == false)
-        #expect(security.document[path: ["workspace_identity", "checkout"]] == nil)
+        let projectConfiguration = security.document[path: ["workspace_identity", "checkout"]]
+        #expect(projectConfiguration == nil)
 
         let connections = MCPSessionConnections()
         let entries = await LiveMCPComposition.connectConfiguredClientsForHub(
@@ -676,11 +679,14 @@ struct LiveWorkspaceTrustIdentityParityTests {
         try fixture.writeProject(in: foreign, name: "outside-registry")
         try fixture.grantSourceTrust()
 
-        #expect(LiveWorkspaceTrustIdentity.resolve(
+        let resolvedIdentity = LiveWorkspaceTrustIdentity.resolve(
             workingDirectory: foreign,
             environment: fixture.environment
-        ) == foreign)
-        #expect(fixture.resolve(foreign).projectTrusted == false)
+        )
+        let expectedIdentity = foreign.standardizedFileURL.resolvingSymlinksInPath().path
+        let projectTrusted = fixture.resolve(foreign).projectTrusted
+        #expect(resolvedIdentity.path == expectedIdentity)
+        #expect(projectTrusted == false)
     }
 
     @Test("a symlinked registry checkout cannot redirect source trust into a foreign repository")
@@ -698,11 +704,14 @@ struct LiveWorkspaceTrustIdentityParityTests {
         try fixture.writeProject(in: foreign, name: "symlink-target")
         try fixture.grantSourceTrust()
 
-        #expect(LiveWorkspaceTrustIdentity.resolve(
+        let resolvedIdentity = LiveWorkspaceTrustIdentity.resolve(
             workingDirectory: alias,
             environment: fixture.environment
-        ) == foreign)
-        #expect(fixture.resolve(alias).projectTrusted == false)
+        )
+        let expectedIdentity = foreign.standardizedFileURL.resolvingSymlinksInPath().path
+        let projectTrusted = fixture.resolve(alias).projectTrusted
+        #expect(resolvedIdentity.path == expectedIdentity)
+        #expect(projectTrusted == false)
         #endif
     }
 
@@ -729,9 +738,12 @@ struct LiveWorkspaceTrustIdentityParityTests {
             workingDirectory: linked,
             environment: fixture.environment
         )
-        #expect(identity == linked)
-        #expect(identity != fixture.root)
-        #expect(identity != checkout)
+        let expectedIdentity = linked.standardizedFileURL.resolvingSymlinksInPath().path
+        let repositoryParent = fixture.root.standardizedFileURL.resolvingSymlinksInPath().path
+        let primaryCheckout = checkout.standardizedFileURL.resolvingSymlinksInPath().path
+        #expect(identity.path == expectedIdentity)
+        #expect(identity.path != repositoryParent)
+        #expect(identity.path != primaryCheckout)
     }
 
     @Test("non-Git directories retain their exact canonical identity and never inherit a foreign repo")
@@ -743,12 +755,17 @@ struct LiveWorkspaceTrustIdentityParityTests {
         try fixture.writeProject(in: plain, name: "plain")
         try fixture.grantSourceTrust()
 
-        #expect(LiveWorkspaceTrustIdentity.resolve(
+        let resolvedIdentity = LiveWorkspaceTrustIdentity.resolve(
             workingDirectory: plain,
             environment: fixture.environment
-        ) == plain)
-        #expect(fixture.resolve(plain).projectTrusted == false)
-        #expect(fixture.resolve(plain, explicitTrust: true).projectTrusted)
-        #expect(PersistentFolderTrustStore(environment: fixture.environment).isTrusted(plain))
+        )
+        let expectedIdentity = plain.standardizedFileURL.resolvingSymlinksInPath().path
+        #expect(resolvedIdentity.path == expectedIdentity)
+        let initiallyTrusted = fixture.resolve(plain).projectTrusted
+        #expect(initiallyTrusted == false)
+        let explicitlyTrusted = fixture.resolve(plain, explicitTrust: true).projectTrusted
+        #expect(explicitlyTrusted)
+        let persistedTrust = PersistentFolderTrustStore(environment: fixture.environment).isTrusted(plain)
+        #expect(persistedTrust)
     }
 }
