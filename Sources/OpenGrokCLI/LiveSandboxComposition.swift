@@ -19,7 +19,7 @@ import Foundation
 import OpenGrokConfig
 import OpenGrokSandbox
 
-protocol LiveSandboxRuntime: Sendable {
+public protocol LiveSandboxRuntime: Sendable {
     func apply(profileName: ProfileName, workspaceRoot: URL) throws
     func isSandboxActive() -> Bool
     func activeProfileName() -> String?
@@ -27,8 +27,10 @@ protocol LiveSandboxRuntime: Sendable {
     func shouldAutoAllowBash() -> Bool
 }
 
-struct LiveSandboxRuntimeAdapter: LiveSandboxRuntime {
-    func apply(profileName: ProfileName, workspaceRoot: URL) throws {
+public struct LiveSandboxRuntimeAdapter: LiveSandboxRuntime {
+    public init() {}
+
+    public func apply(profileName: ProfileName, workspaceRoot: URL) throws {
         _ = try bootstrapSandbox(
             profileName: profileName,
             workspace: workspaceRoot,
@@ -37,10 +39,10 @@ struct LiveSandboxRuntimeAdapter: LiveSandboxRuntime {
         )
     }
 
-    func isSandboxActive() -> Bool { OpenGrokSandbox.isSandboxActive() }
-    func activeProfileName() -> String? { OpenGrokSandbox.activeProfileName() }
-    func setAutoAllowBash(_ enabled: Bool) { OpenGrokSandbox.setAutoAllowBash(enabled) }
-    func shouldAutoAllowBash() -> Bool { OpenGrokSandbox.shouldAutoAllowBash() }
+    public func isSandboxActive() -> Bool { OpenGrokSandbox.isSandboxActive() }
+    public func activeProfileName() -> String? { OpenGrokSandbox.activeProfileName() }
+    public func setAutoAllowBash(_ enabled: Bool) { OpenGrokSandbox.setAutoAllowBash(enabled) }
+    public func shouldAutoAllowBash() -> Bool { OpenGrokSandbox.shouldAutoAllowBash() }
 }
 
 /// The sandbox decision for one session.
@@ -80,7 +82,7 @@ public enum LiveSandboxComposition {
     ///
     /// Precedence, highest first (`agent/config.rs:1267-1285`):
     /// requirements `[sandbox] profile` > CLI `--sandbox` > env `GROK_SANDBOX` >
-    /// config `[sandbox] profile` > `"off"`.
+    /// config `[sandbox] profile` > `"workspace"`.
     public static func resolveProfileName(
         document: TOMLValue?,
         requirements: [TOMLValue] = [],
@@ -100,7 +102,7 @@ public enum LiveSandboxComposition {
         if case .string(let name)? = document?[path: ["sandbox", "profile"]], !name.isEmpty {
             return name
         }
-        return "off"
+        return "workspace"
     }
 
     /// `[sandbox] auto_allow_bash`, same precedence shape.
@@ -199,22 +201,32 @@ public enum LiveSandboxComposition {
         runtime.setAutoAllowBash(false)
 
         let persistedName = persistedProfile.map { ProfileName(parsing: $0).description }
+        let requiredName = requirements.compactMap { layer -> String? in
+            guard case .string(let value)? = layer[path: ["sandbox", "profile"]],
+                  !value.isEmpty else { return nil }
+            return ProfileName(parsing: value).description
+        }.first
         let requestedName: String
-        if let cliProfile, !cliProfile.isEmpty {
-            requestedName = ProfileName(parsing: cliProfile).description
-            if let persistedName, requestedName != persistedName {
+        if let persistedName {
+            if let cliProfile, !cliProfile.isEmpty,
+               ProfileName(parsing: cliProfile).description != persistedName {
                 throw SandboxError.configConflict(
-                    "cannot resume this session with sandbox profile '\(requestedName)' — "
+                    "cannot resume this session with sandbox profile '\(cliProfile)' — "
                         + "it was created with '\(persistedName)'"
                 )
             }
-        } else if let persistedName {
+            if let requiredName, requiredName != persistedName {
+                throw SandboxError.configConflict(
+                    "cannot resume this session under required sandbox profile '\(requiredName)' — "
+                        + "it was created with '\(persistedName)'"
+                )
+            }
             requestedName = persistedName
         } else {
             requestedName = ProfileName(parsing: resolveProfileName(
                 document: document,
                 requirements: requirements,
-                cliProfile: nil,
+                cliProfile: cliProfile,
                 environment: environment
             )).description
         }
@@ -224,6 +236,11 @@ public enum LiveSandboxComposition {
         let mode = SandboxMode.from(profile: profile)
 
         if profile == .off {
+            guard !runtime.isSandboxActive() else {
+                throw SandboxError.configConflict(
+                    "an active process sandbox cannot be disabled for another session"
+                )
+            }
             return LiveSandboxDecision(
                 profileName: profile.description,
                 mode: mode,
@@ -232,9 +249,15 @@ public enum LiveSandboxComposition {
             )
         }
         if runtime.isSandboxActive() {
+            guard let activeName = runtime.activeProfileName(),
+                  ProfileName(parsing: activeName).description == profile.description else {
+                throw SandboxError.configConflict(
+                    "the active process sandbox does not match requested profile '\(profile.description)'"
+                )
+            }
             runtime.setAutoAllowBash(resolvedAutoAllowBash)
             return LiveSandboxDecision(
-                profileName: runtime.activeProfileName() ?? profile.description,
+                profileName: activeName,
                 mode: mode,
                 enforced: true,
                 autoAllowBash: runtime.shouldAutoAllowBash()
@@ -242,11 +265,21 @@ public enum LiveSandboxComposition {
         }
 
         do {
-            try runtime.apply(profileName: profile, workspaceRoot: workspaceRoot)
+            let canonicalWorkspaceRoot = workspaceRoot.standardizedFileURL
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+            try runtime.apply(profileName: profile, workspaceRoot: canonicalWorkspaceRoot)
             guard runtime.isSandboxActive() else {
                 runtime.setAutoAllowBash(false)
                 throw SandboxError.enforcementFailed(
                     "sandbox bootstrap returned without active enforcement"
+                )
+            }
+            guard let activeName = runtime.activeProfileName(),
+                  ProfileName(parsing: activeName).description == profile.description else {
+                runtime.setAutoAllowBash(false)
+                throw SandboxError.enforcementFailed(
+                    "sandbox bootstrap activated a different profile than required '\(profile.description)'"
                 )
             }
             runtime.setAutoAllowBash(resolvedAutoAllowBash)

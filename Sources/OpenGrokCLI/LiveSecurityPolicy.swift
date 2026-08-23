@@ -300,9 +300,9 @@ struct LiveSecurityContext: Sendable {
         } ?? base
 
         let requirements = [
-            layers?.userRequirements,
-            layers?.systemRequirements,
             layers?.mdmRequirements,
+            layers?.systemRequirements,
+            layers?.userRequirements,
         ].compactMap { $0 }
 
         let home = URL(
