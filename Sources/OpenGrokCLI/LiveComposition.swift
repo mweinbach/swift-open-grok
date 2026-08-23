@@ -1490,6 +1490,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             if LiveSessionsComposition.handles(command) {
                 return try await LiveSessionsComposition.session(for: command, context: context)
             }
+            if LiveExportComposition.handles(command) {
+                return try await LiveExportComposition.session(for: command, context: context)
+            }
             if LiveShareComposition.handles(command) {
                 return try await LiveShareComposition.session(
                     for: command,
@@ -1571,6 +1574,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 throw CLIApplicationError.unsupported(route: options.mode.rawValue)
             }
             try Self.validateUnsupportedOptions(options)
+            try await LiveManagedPolicyGate.enforce(environment: context.environment)
 
             let prompt = try Self.resolvePrompt(
                 options,
@@ -1648,7 +1652,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     options: options,
                     context: context,
                     dependencies: dependencies,
-                    interactiveSurfaceAvailable: interactiveInput != nil && interactiveSink != nil
+                    interactiveSurfaceAvailable: interactiveInput != nil && interactiveSink != nil,
+                    managedPolicyAlreadyEnforced: true
                 )
             } catch {
                 await interactiveInput?.close()
@@ -3245,10 +3250,19 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         /// constructed. The caller derives it from the real input and sink,
         /// not from stdout TTY-ness; a `false` here keeps `ask_user_question`
         /// off the advertised list and plan approval on the generic sheet.
-        interactiveSurfaceAvailable: Bool = false
+        interactiveSurfaceAvailable: Bool = false,
+        managedPolicyAlreadyEnforced: Bool = false
     ) async throws -> LiveSessionFoundation {
-        let sourceCwd = try resolveWorkingDirectory(options.common.cwd)
+        if !managedPolicyAlreadyEnforced {
+            try await LiveManagedPolicyGate.enforce(environment: context.environment)
+        }
+        let invocationCwd = try resolveWorkingDirectory(options.common.cwd)
         let openGrokHome = resolveOpenGrokHome(environment: context.environment)
+        let sourceCwd = try await resolveResumeWorkingDirectory(
+            options: options,
+            invocationWorkingDirectory: invocationCwd,
+            openGrokHome: openGrokHome
+        )
         let autoGCPolicy = WorktreeAutoGCPolicy(
             enabled: GrokEnvGates.worktreeAutoGc(environment: context.environment) ?? true,
             maxAge: GrokEnvGates.worktreeAutoGcMaxAge(environment: context.environment)
@@ -4388,6 +4402,50 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         })
     }
 
+    private static func resolveResumeWorkingDirectory(
+        options: CLIExecutionOptions,
+        invocationWorkingDirectory: URL,
+        openGrokHome: URL
+    ) async throws -> URL {
+        guard !options.forkSession,
+              options.worktree == nil,
+              !options.continueSession,
+              let requestedSessionID = options.sessionToResume?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !requestedSessionID.isEmpty
+        else {
+            return invocationWorkingDirectory
+        }
+
+        do {
+            try LiveConversationStore.validateSessionID(requestedSessionID)
+        } catch {
+            return invocationWorkingDirectory
+        }
+
+        let store = LiveConversationStore(openGrokHome: openGrokHome)
+        guard let record = try await store.loadIfPresent(sessionID: requestedSessionID) else {
+            return invocationWorkingDirectory
+        }
+        let persistedWorkingDirectory = try resolveWorkingDirectory(record.workingDirectory)
+
+        if options.common.cwd != nil {
+            guard LiveToolExecutor.workspaceRootsMatch(
+                invocationWorkingDirectory,
+                persistedWorkingDirectory
+            ) else {
+                throw CLIApplicationError.failed(
+                    "session \(requestedSessionID) belongs to workspace "
+                        + "\(persistedWorkingDirectory.path), not the requested workspace "
+                        + "\(invocationWorkingDirectory.path)"
+                )
+            }
+            return invocationWorkingDirectory
+        }
+
+        return persistedWorkingDirectory
+    }
+
     private static func resolveConversationRecord(
         options: CLIExecutionOptions,
         lookupWorkingDirectory: URL,
@@ -4456,14 +4514,44 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     "--session-id requires --fork-session when restoring a different session"
                 )
             }
-            sourceRecord.workingDirectory = workingDirectory.standardizedFileURL.path
+            if options.worktree != nil {
+                sourceRecord.workingDirectory = workingDirectory.standardizedFileURL.path
+            } else {
+                let persistedWorkingDirectory = URL(
+                    fileURLWithPath: sourceRecord.workingDirectory,
+                    isDirectory: true
+                )
+                guard LiveToolExecutor.workspaceRootsMatch(
+                    persistedWorkingDirectory,
+                    workingDirectory
+                ) else {
+                    throw CLIApplicationError.failed(
+                        "session \(sourceRecord.sessionID) belongs to workspace "
+                            + "\(persistedWorkingDirectory.path), not the requested workspace "
+                            + "\(workingDirectory.path)"
+                    )
+                }
+            }
             return sourceRecord
         }
 
         if let requestedSessionID = options.sessionID {
             try LiveConversationStore.validateSessionID(requestedSessionID)
-            if var existing = try await store.loadIfPresent(sessionID: requestedSessionID) {
-                existing.workingDirectory = workingDirectory.standardizedFileURL.path
+            if let existing = try await store.loadIfPresent(sessionID: requestedSessionID) {
+                let persistedWorkingDirectory = URL(
+                    fileURLWithPath: existing.workingDirectory,
+                    isDirectory: true
+                )
+                guard LiveToolExecutor.workspaceRootsMatch(
+                    persistedWorkingDirectory,
+                    workingDirectory
+                ) else {
+                    throw CLIApplicationError.failed(
+                        "session \(requestedSessionID) belongs to workspace "
+                            + "\(persistedWorkingDirectory.path), not the requested workspace "
+                            + "\(workingDirectory.path)"
+                    )
+                }
                 return existing
             }
             return LiveConversationRecord.new(
