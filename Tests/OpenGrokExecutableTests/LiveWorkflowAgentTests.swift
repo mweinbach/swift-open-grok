@@ -365,17 +365,26 @@ struct LiveWorkflowChildAgentTests {
 struct LiveWorkflowCapabilityTests {
 
     @Test("a child cannot escalate beyond the parent session's mode")
-    func cannotEscalate() {
-        #expect(LiveWorkflowCapability.clamp(requested: "all", parent: .readOnly) == .readOnly)
-        #expect(LiveWorkflowCapability.clamp(requested: "execute", parent: .readOnly) == .readOnly)
-        #expect(LiveWorkflowCapability.clamp(requested: "read_write", parent: .readOnly) == .readOnly)
+    func cannotEscalate() throws {
+        let all = try LiveWorkflowCapability.clamp(requested: "all", parent: .readOnly)
+        let execute = try LiveWorkflowCapability.clamp(requested: "execute", parent: .readOnly)
+        let write = try LiveWorkflowCapability.clamp(requested: "read_write", parent: .readOnly)
+        #expect(all == .readOnly)
+        #expect(execute == .readOnly)
+        #expect(write == .readOnly)
     }
 
-    @Test("a child may narrow, and an unknown request falls back to the parent")
-    func mayNarrow() {
-        #expect(LiveWorkflowCapability.clamp(requested: "read_only", parent: .all) == .readOnly)
-        #expect(LiveWorkflowCapability.clamp(requested: nil, parent: .readWrite) == .readWrite)
-        #expect(LiveWorkflowCapability.clamp(requested: "nonsense", parent: .readWrite) == .readWrite)
+    @Test("a child may narrow, but an unknown capability fails closed")
+    func mayNarrow() throws {
+        let narrowed = try LiveWorkflowCapability.clamp(requested: "read_only", parent: .all)
+        let inherited = try LiveWorkflowCapability.clamp(requested: nil, parent: .readWrite)
+        #expect(narrowed == .readOnly)
+        #expect(inherited == .readWrite)
+        #expect(throws: RhaiHostError.failed(
+            "invalid capability_mode 'nonsense' (expected read-only, read-write, execute, or all)"
+        )) {
+            try LiveWorkflowCapability.clamp(requested: "nonsense", parent: .readWrite)
+        }
     }
 
     @Test("the clamped mode is what the tool surface is built for")
