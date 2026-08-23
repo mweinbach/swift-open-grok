@@ -120,6 +120,7 @@ public struct ProcessSpawnRequest: Sendable, Equatable {
 /// unavailable remote policy. YOLO never disables `requireSandbox`.
 public actor LocalWorkspaceOps {
     public nonisolated let root: URL
+    public nonisolated let sessionGitMetadata: WorkspaceSessionGitMetadata
     public nonisolated let boundary: PathBoundary
     public let permissions: PermissionHandle
     public nonisolated let pipeline: PermissionPipeline
@@ -141,6 +142,7 @@ public actor LocalWorkspaceOps {
     ) {
         self.config = config
         self.root = config.root
+        self.sessionGitMetadata = WorkspaceSessionGitMetadata.resolve(at: config.root)
         self.boundary = PathBoundary(root: config.root)
         let perms = PermissionHandle(
             config: config.permissionConfig,
