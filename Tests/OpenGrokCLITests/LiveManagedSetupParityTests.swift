@@ -1200,6 +1200,88 @@ struct LiveManagedSetupParityTests {
         #expect(fixture.stderr.contents.isEmpty)
     }
 
+    @Test("cancellation after tenant eviction still commits one complete managed-policy bundle")
+    func cancellationDuringTenantCommitCannotLeaveMixedAdministratorPolicy() async throws {
+        let fixture = try ManagedSetupFixture()
+        defer { fixture.dispose() }
+        let managedPath = fixture.state.appendingPathComponent(MANAGED_CONFIG_FILENAME)
+        let requirementsPath = fixture.state.appendingPathComponent(REQUIREMENTS_FILENAME)
+        let markerPath = fixture.state.appendingPathComponent(MANAGED_CONFIG_CACHE_FILE)
+        try "[features]\ntelemetry = false\n".write(
+            to: managedPath,
+            atomically: true,
+            encoding: .utf8
+        )
+        try "fail_closed = false\n".write(
+            to: requirementsPath,
+            atomically: true,
+            encoding: .utf8
+        )
+        let priorMarker = ManagedConfigCache(
+            syncedAt: UInt64(Date().timeIntervalSince1970),
+            principal: "previous-tenant",
+            hadManagedConfig: true,
+            hadRequirements: true,
+            keyFingerprint: Blake3.hexDigest(Array("prior-deployment-key".utf8)),
+            failClosed: false,
+            rollbackFloor: UInt64(Date().timeIntervalSince1970)
+        )
+        try JSONEncoder().encode(priorMarker).write(to: markerPath)
+        var environment = fixture.environment
+        environment["GROK_DEPLOYMENT_KEY"] = "replacement-deployment-key"
+        let taskEnvironment = environment
+        let replacementManaged = "[features]\ntelemetry = true\n"
+        let replacementRequirements = "fail_closed = true\n"
+        let transport = ManagedSetupRecordingTransport([
+            try fixture.response(json: [
+                "deployment_id": "replacement-tenant",
+                "managed_config": replacementManaged,
+                "requirements": replacementRequirements,
+            ]),
+        ])
+        var services = LiveManagedSetupServices(makeTransport: { transport })
+        services.afterFirstManagedArtifactCommit = {
+            withUnsafeCurrentTask { task in
+                task?.cancel()
+            }
+        }
+        let taskServices = services
+        let streams = fixture.streams
+        let task = Task {
+            try await LiveManagedSetupComposition.run(
+                options: CLIUtilityOptions(name: "setup"),
+                environment: taskEnvironment,
+                streams: streams,
+                services: taskServices
+            )
+        }
+
+        do {
+            let outcome = try await task.value
+            Issue.record("cancelled managed commit unexpectedly returned: \(outcome)")
+        } catch is CancellationError {
+            // Cancellation is observed only after the locked bundle is coherent.
+        } catch {
+            Issue.record("cancelled managed commit returned an unexpected error: \(error)")
+        }
+
+        let currentManaged = try String(contentsOf: managedPath, encoding: .utf8)
+        let currentRequirements = try String(contentsOf: requirementsPath, encoding: .utf8)
+        let marker = try JSONDecoder().decode(
+            ManagedConfigCache.self,
+            from: Data(contentsOf: markerPath)
+        )
+        #expect(currentManaged == replacementManaged)
+        #expect(currentRequirements == replacementRequirements)
+        #expect(marker.principal == "replacement-tenant")
+        #expect(marker.keyFingerprint == Blake3.hexDigest(Array("replacement-deployment-key".utf8)))
+        #expect(marker.hadManagedConfig)
+        #expect(marker.hadRequirements)
+        #expect(marker.failClosed)
+        #expect(fixture.stdout.contents.isEmpty)
+        #expect(fixture.stderr.contents.isEmpty)
+    }
+
     @Test("cancellation during a returning OAuth refresh never persists a new team or policy")
     func cancelledOAuthRefreshCannotReplaceTeamCredentialsOrPolicy() async throws {
         let fixture = try ManagedSetupFixture()

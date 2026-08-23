@@ -25,6 +25,7 @@ final class ManagedSetupNoRedirectDelegate: NSObject, URLSessionTaskDelegate, Se
 public struct LiveManagedSetupServices: Sendable {
     public var makeTransport: @Sendable () -> any HTTPTransport
     public var now: @Sendable () -> Date
+    var afterFirstManagedArtifactCommit: (@Sendable () -> Void)?
 
     public init(
         makeTransport: @escaping @Sendable () -> any HTTPTransport,
@@ -32,6 +33,7 @@ public struct LiveManagedSetupServices: Sendable {
     ) {
         self.makeTransport = makeTransport
         self.now = now
+        afterFirstManagedArtifactCommit = nil
     }
 
     public static let production = LiveManagedSetupServices(
@@ -342,7 +344,8 @@ public enum LiveManagedSetupComposition {
             fetched,
             home: home,
             environment: operationEnvironment,
-            now: services.now()
+            now: services.now(),
+            afterFirstManagedArtifactCommit: services.afterFirstManagedArtifactCommit
         )
         try Task.checkCancellation()
         switch outcome {
@@ -787,7 +790,8 @@ public enum LiveManagedSetupComposition {
         _ fetched: LiveManagedFetchedPolicy,
         home: URL,
         environment: [String: String],
-        now: Date
+        now: Date,
+        afterFirstManagedArtifactCommit: (@Sendable () -> Void)?
     ) throws -> LiveManagedSetupOutcome {
         try Task.checkCancellation()
         let lock: AdvisoryLock
@@ -828,9 +832,10 @@ public enum LiveManagedSetupComposition {
         }
         let fingerprint = fetched.principal.keyFingerprint
         do {
-            try Task.checkCancellation()
             try rejectSymbolicManagedArtifacts(in: home)
             try Task.checkCancellation()
+            // Once an artifact changes, finish the entire locked commit before
+            // observing cancellation; otherwise tenants can inherit a mixed bundle.
             if managedConfigIdentityChangedAt(
                 home,
                 newPrincipal: principal,
@@ -838,24 +843,21 @@ public enum LiveManagedSetupComposition {
             ) {
                 try removeArtifacts(home: home, includingMarker: false)
             }
-            try Task.checkCancellation()
             try installArtifact(
                 fetched.body.managedConfig,
                 at: home.appendingPathComponent(MANAGED_CONFIG_FILENAME)
             )
-            try Task.checkCancellation()
+            afterFirstManagedArtifactCommit?()
             try installArtifact(
                 fetched.body.requirements,
                 at: home.appendingPathComponent(REQUIREMENTS_FILENAME)
             )
             if let envelope = fetched.verifiedEnvelope {
-                try Task.checkCancellation()
                 try writeSidecar(home, sidecar: envelope)
             } else {
                 try removeIfPresent(home.appendingPathComponent(SIGNATURE_SIDECAR_FILE))
             }
             if let claim = fetched.verifiedClaimEnvelope {
-                try Task.checkCancellation()
                 try writeManagedIdentitySidecar(home, sidecar: claim)
             } else {
                 try removeIfPresent(home.appendingPathComponent(MANAGED_IDENTITY_SIDECAR_FILE))
@@ -872,7 +874,6 @@ public enum LiveManagedSetupComposition {
             )
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-            try Task.checkCancellation()
             try AtomicFile.write(
                 home.appendingPathComponent(MANAGED_CONFIG_CACHE_FILE),
                 data: encoder.encode(marker),
@@ -905,7 +906,6 @@ public enum LiveManagedSetupComposition {
     }
 
     private static func installArtifact(_ contents: String?, at path: URL) throws {
-        try Task.checkCancellation()
         guard let contents, !contents.isEmpty else {
             try removeIfPresent(path)
             return
@@ -927,7 +927,6 @@ public enum LiveManagedSetupComposition {
     }
 
     private static func removeIfPresent(_ path: URL) throws {
-        try Task.checkCancellation()
         do {
             try FileManager.default.removeItem(at: path)
         } catch {
