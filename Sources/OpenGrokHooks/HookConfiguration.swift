@@ -246,14 +246,22 @@ private func buildSpecs(
                         errors.append(.invalidConfiguration(name: name, path: sourcePath, detail: "command handler requires a 'command' field"))
                         continue
                     }
-                    let expanded = expandHookEnvironment(command, extra: extra, environment: environment)
+                    let expanded = expandHookEnvironmentSkippingRunnerVariables(
+                        command,
+                        extra: extra,
+                        environment: environment
+                    )
                     specs.append(HookSpec(name: name, event: event, handlerType: handlerType, configuredMatcher: configuredMatcher, matcher: compiledMatcher, command: expanded, commandRaw: command, timeoutMs: timeoutMs, sourceDirectory: sourceDirectory, extraEnvironment: extra, sourceKind: sourceKind))
                 case .http:
                     guard let url = rawHandler.url else {
                         errors.append(.invalidConfiguration(name: name, path: sourcePath, detail: "http handler requires a 'url' field"))
                         continue
                     }
-                    let expanded = expandHookEnvironment(url, extra: extra, environment: environment)
+                    let expanded = expandHookEnvironmentSkippingRunnerVariables(
+                        url,
+                        extra: extra,
+                        environment: environment
+                    )
                     specs.append(HookSpec(name: name, event: event, handlerType: handlerType, configuredMatcher: configuredMatcher, matcher: compiledMatcher, url: expanded, urlRaw: url, timeoutMs: timeoutMs, sourceDirectory: sourceDirectory, extraEnvironment: extra, sourceKind: sourceKind))
                 }
             }
@@ -292,6 +300,41 @@ public func expandHookEnvironment(
     extra: [String: String] = [:],
     environment: [String: String] = ProcessInfo.processInfo.environment
 ) -> String {
+    expandHookEnvironment(
+        input,
+        extra: extra,
+        environment: environment,
+        skippingEnvironmentKeys: []
+    )
+}
+
+/// Keep runner-owned references unresolved until their authentic session exists.
+/// Hook/plugin-owned values still win over the process environment.
+public func expandHookEnvironmentSkippingRunnerVariables(
+    _ input: String,
+    extra: [String: String] = [:],
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> String {
+    expandHookEnvironment(
+        input,
+        extra: extra,
+        environment: environment,
+        skippingEnvironmentKeys: runnerReservedEnvironmentKeys
+    )
+}
+
+private func expandHookEnvironment(
+    _ input: String,
+    extra: [String: String],
+    environment: [String: String],
+    skippingEnvironmentKeys: Set<String>
+) -> String {
+    func replacement(for name: String) -> String? {
+        if let owned = extra[name] { return owned }
+        guard !skippingEnvironmentKeys.contains(name) else { return nil }
+        return environment[name]
+    }
+
     var output = ""
     var index = input.startIndex
     while index < input.endIndex {
@@ -315,15 +358,15 @@ public func expandHookEnvironment(
             let body = String(input[bodyStart..<close])
             let name = body.prefix { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_") }
             if !name.isEmpty && name.count == body.count {
-                let replacement = extra[String(name)] ?? environment[String(name)]
-                output.append(contentsOf: replacement ?? String(input[dollar...close]))
+                let resolved = replacement(for: String(name))
+                output.append(contentsOf: resolved ?? String(input[dollar...close]))
             } else {
                 output.append(contentsOf: input[dollar...close])
             }
             index = input.index(after: close)
             continue
         }
-        guard input[index].isASCII && (input[index].isLetter || input[index].isNumber || input[index] == "_") else {
+        guard input[index].isASCII && (input[index].isLetter || input[index] == "_") else {
             output.append("$")
             continue
         }
@@ -332,7 +375,7 @@ public func expandHookEnvironment(
             index = input.index(after: index)
         }
         let name = String(input[nameStart..<index])
-        output.append(contentsOf: extra[name] ?? environment[name] ?? String(input[dollar..<index]))
+        output.append(contentsOf: replacement(for: name) ?? String(input[dollar..<index]))
     }
     return output
 }

@@ -572,7 +572,7 @@ private func unresolvedEnvironmentVariables(in command: String, extra: [String: 
                 if !runnerReservedEnvironmentKeys.contains(nameString) && extra[nameString] == nil && environment[nameString] == nil { names.insert(nameString) }
             }
             index = command.index(after: close)
-        } else if command[index].isASCII && (command[index].isLetter || command[index].isNumber || command[index] == "_") {
+        } else if command[index].isASCII && (command[index].isLetter || command[index] == "_") {
             let start = index
             while index < command.endIndex && command[index].isASCII && (command[index].isLetter || command[index].isNumber || command[index] == "_") { index = command.index(after: index) }
             let name = String(command[start..<index])
@@ -641,7 +641,17 @@ private func runHTTP(
     guard let rawURL = spec.url else {
         return HookInvocation(result: .failed("http hook has no 'url' field"), elapsedMs: elapsedMilliseconds(since: started))
     }
-    let urlString = expandHookEnvironment(rawURL, extra: spec.extraEnvironment, environment: context.environment)
+    var runtimeEnvironment = spec.extraEnvironment
+    runtimeEnvironment["GROK_HOOK_EVENT"] = envelope.hookEventName.runtimeWireName
+    runtimeEnvironment["GROK_HOOK_NAME"] = spec.name
+    runtimeEnvironment["GROK_SESSION_ID"] = context.sessionId
+    runtimeEnvironment["GROK_WORKSPACE_ROOT"] = context.workspaceRoot.path
+    runtimeEnvironment["CLAUDE_PROJECT_DIR"] = context.workspaceRoot.path
+    let urlString = expandHookEnvironment(
+        rawURL,
+        extra: runtimeEnvironment,
+        environment: context.environment
+    )
     guard let url = URL(string: urlString), validateHookURL(url) else {
         return HookInvocation(result: .failed("blocked by SSRF protection: only https URLs and public hosts are allowed"), elapsedMs: elapsedMilliseconds(since: started), httpInfo: HookHTTPInfo(url: urlString, rawURL: spec.urlRaw))
     }
