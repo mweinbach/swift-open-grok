@@ -141,8 +141,56 @@ private struct ManagedPolicyLifecycleFixture {
     }
 }
 
+private final class ManagedPolicyLifecycleMilestones: @unchecked Sendable {
+    private let lock = NSLock()
+    private var observers: [UUID: AsyncStream<Void>.Continuation] = [:]
+
+    func signal() {
+        let pending = lock.withLock { Array(observers.values) }
+        for observer in pending {
+            observer.yield(())
+        }
+    }
+
+    func wait(until condition: @escaping @Sendable () -> Bool) async -> Bool {
+        guard !condition() else { return true }
+
+        let identifier = UUID()
+        let (events, continuation) = AsyncStream<Void>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        lock.withLock { observers[identifier] = continuation }
+        defer {
+            let observer = lock.withLock { observers.removeValue(forKey: identifier) }
+            observer?.finish()
+        }
+
+        guard !condition() else { return true }
+        return await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                for await _ in events {
+                    if condition() { return true }
+                }
+                return condition()
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(nanoseconds: 2_000_000_000)
+                } catch {
+                    return false
+                }
+                return false
+            }
+            let observed = await group.next() ?? false
+            group.cancelAll()
+            return observed
+        }
+    }
+}
+
 private final class ManagedPolicyLifecycleSleepProbe: @unchecked Sendable {
     private let lock = NSLock()
+    private let milestones = ManagedPolicyLifecycleMilestones()
     private var intervals: [UInt64] = []
     private var continuations: [CheckedContinuation<Void, any Error>] = []
     private var cancelled = false
@@ -162,6 +210,7 @@ private final class ManagedPolicyLifecycleSleepProbe: @unchecked Sendable {
                     continuations.append(continuation)
                     return false
                 }
+                milestones.signal()
                 if shouldCancel {
                     continuation.resume(throwing: CancellationError())
                 }
@@ -192,16 +241,13 @@ private final class ManagedPolicyLifecycleSleepProbe: @unchecked Sendable {
     }
 
     func waitForSleep(count: Int) async -> Bool {
-        for _ in 0..<2_000 {
-            if requestedIntervals.count >= count { return true }
-            await Task.yield()
-        }
-        return requestedIntervals.count >= count
+        await milestones.wait { self.requestedIntervals.count >= count }
     }
 }
 
 private final class ManagedPolicyLifecycleDelayedTransport: HTTPTransport, @unchecked Sendable {
     private let lock = NSLock()
+    private let milestones = ManagedPolicyLifecycleMilestones()
     private var requests: [HTTPRequest] = []
     private var pending: CheckedContinuation<HTTPResponse, any Error>?
     private var returned = false
@@ -220,8 +266,10 @@ private final class ManagedPolicyLifecycleDelayedTransport: HTTPTransport, @unch
                 requests.append(request)
                 pending = continuation
             }
+            milestones.signal()
         }
         lock.withLock { returned = true }
+        milestones.signal()
         return response
     }
 
@@ -239,19 +287,11 @@ private final class ManagedPolicyLifecycleDelayedTransport: HTTPTransport, @unch
     }
 
     func waitForRequest() async -> Bool {
-        for _ in 0..<2_000 {
-            if requestCount != 0 { return true }
-            await Task.yield()
-        }
-        return requestCount != 0
+        await milestones.wait { self.requestCount != 0 }
     }
 
     func waitForReturn() async -> Bool {
-        for _ in 0..<2_000 {
-            if hasReturned { return true }
-            await Task.yield()
-        }
-        return hasReturned
+        await milestones.wait { self.hasReturned }
     }
 }
 
