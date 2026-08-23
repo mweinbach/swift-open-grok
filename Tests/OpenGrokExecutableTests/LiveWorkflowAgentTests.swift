@@ -572,14 +572,15 @@ struct LiveWorkflowHostTests {
         )
 
         let written = try await host.writeScratchFile(name: "report.md", content: "hello")
-        #expect(written.hasPrefix(scratch.path))
+        #expect(written == "scratch/report.md")
         #expect(try await host.readScratchFile(name: "report.md") == "hello")
 
-        // A traversing name is reduced to its last component rather than
-        // escaping into the workspace.
-        let escaped = try await host.writeScratchFile(name: "../../evil.md", content: "no")
-        #expect(escaped == scratch.appendingPathComponent("evil.md").path)
-        #expect(!escaped.contains(".."))
+        await #expect(throws: RhaiHostError.self) {
+            _ = try await host.writeScratchFile(name: "../../evil.md", content: "no")
+        }
+        #expect(!FileManager.default.fileExists(
+            atPath: scratch.appendingPathComponent("evil.md").path
+        ))
     }
 
     @Test("render_template reports unsupported so a script can fall back")
