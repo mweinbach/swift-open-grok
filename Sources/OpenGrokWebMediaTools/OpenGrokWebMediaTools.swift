@@ -189,11 +189,14 @@ public protocol ClipboardCommandRunner: Sendable {
 
 public struct SystemClipboardCommandRunner: ClipboardCommandRunner {
     public var environment: [String: String]
+    public var platform: WebMediaPlatform
 
     public init(
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        platform: WebMediaPlatform = .current
     ) {
         self.environment = environment
+        self.platform = platform
     }
 
     public func run(
@@ -271,17 +274,41 @@ public struct SystemClipboardCommandRunner: ClipboardCommandRunner {
 
     private func resolveExecutable(_ executable: String) -> String? {
         let fileManager = FileManager.default
-        if executable.contains("/") {
+        if Self.isExplicitExecutablePath(executable, platform: platform) {
             return fileManager.isExecutableFile(atPath: executable) ? executable : nil
         }
-        let path = environment["PATH"] ?? ""
-        for directory in path.split(separator: ":", omittingEmptySubsequences: false) {
-            let candidate = URL(fileURLWithPath: String(directory)).appendingPathComponent(executable).path
+        let path = environment["PATH"]
+            ?? (platform == .windows ? environment["Path"] ?? environment["path"] : nil)
+            ?? ""
+        for directory in Self.executableSearchDirectories(path, platform: platform) {
+            let candidate = URL(fileURLWithPath: directory).appendingPathComponent(executable).path
             if fileManager.isExecutableFile(atPath: candidate) {
                 return candidate
             }
         }
         return nil
+    }
+
+    static func executableSearchDirectories(
+        _ value: String,
+        platform: WebMediaPlatform
+    ) -> [String] {
+        let separator: Character = platform == .windows ? ";" : ":"
+        return value.split(
+            separator: separator,
+            omittingEmptySubsequences: platform == .windows
+        ).map(String.init)
+    }
+
+    static func isExplicitExecutablePath(
+        _ executable: String,
+        platform: WebMediaPlatform
+    ) -> Bool {
+        if executable.contains("/") { return true }
+        guard platform == .windows else { return false }
+        if executable.contains("\\") { return true }
+        let bytes = Array(executable.utf8.prefix(2))
+        return bytes.count == 2 && bytes[1] == 0x3a
     }
 }
 
@@ -393,7 +420,9 @@ public struct SystemClipboardProvider: ClipboardMediaProvider {
             status[.clipboardText] = hasDisplay
             status[.clipboardImage] = hasDisplay
             status[.clipboardFileURLs] = hasDisplay
-        case .windows, .other:
+        case .windows:
+            status[.clipboardText] = Self.windowsClipboardExecutable(environment: environment) != nil
+        case .other:
             break
         }
         return status
@@ -533,6 +562,18 @@ public struct SystemClipboardProvider: ClipboardMediaProvider {
     }
 
     private func validatePlatformCapability(_ capability: WebMediaCapability) throws {
+        if platform == .windows {
+            guard capability == .clipboardText,
+                  Self.windowsClipboardExecutable(environment: environment) != nil
+            else {
+                throw ClipboardError.capabilityUnavailable(
+                    capability: capability,
+                    platform: platform,
+                    detail: "Windows supports only text clipboard writes through its trusted system directory"
+                )
+            }
+            return
+        }
         guard platform == .macOS || platform == .linux else {
             throw ClipboardError.capabilityUnavailable(
                 capability: capability,
@@ -605,9 +646,55 @@ public struct SystemClipboardProvider: ClipboardMediaProvider {
                 specs.append(ClipboardCommandSpec(executable: "xsel", arguments: ["--clipboard", "--input"]))
             }
             return specs
-        case .windows, .other:
+        case .windows:
+            guard let executable = Self.windowsClipboardExecutable(environment: environment) else {
+                return []
+            }
+            return [ClipboardCommandSpec(executable: executable, arguments: [])]
+        case .other:
             return []
         }
+    }
+
+    static func windowsClipboardExecutable(environment: [String: String]) -> String? {
+        guard let configuredRoot = environment["SystemRoot"]
+            ?? environment["SYSTEMROOT"]
+            ?? environment["windir"]
+            ?? environment["WINDIR"],
+              !configuredRoot.isEmpty,
+              !configuredRoot.unicodeScalars.contains("\0")
+        else {
+            return nil
+        }
+
+        let normalized = configuredRoot.replacingOccurrences(of: "/", with: "\\")
+        let bytes = Array(normalized.utf8)
+        guard bytes.count >= 3,
+              (0x41...0x5a).contains(bytes[0]) || (0x61...0x7a).contains(bytes[0]),
+              bytes[1] == 0x3a,
+              bytes[2] == 0x5c
+        else {
+            return nil
+        }
+
+        let components = normalized.dropFirst(3).split(
+            separator: "\\",
+            omittingEmptySubsequences: true
+        )
+        let invalidCharacters = CharacterSet(charactersIn: "<>:\"|?*")
+        guard !components.isEmpty,
+              !components.contains(where: { component in
+                  component == "."
+                      || component == ".."
+                      || component.unicodeScalars.contains(where: invalidCharacters.contains)
+              })
+        else {
+            return nil
+        }
+
+        return String(normalized.prefix(2)) + "\\"
+            + components.joined(separator: "\\")
+            + "\\System32\\clip.exe"
     }
 
     private func imageWriteSpecs(mimeType: String) -> [ClipboardCommandSpec] {
