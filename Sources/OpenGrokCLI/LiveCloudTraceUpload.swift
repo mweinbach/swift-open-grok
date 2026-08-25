@@ -15,9 +15,42 @@ enum LiveCloudTraceUpload {
         let endpoint: URL
         let bucket: String
         let region: String
-        let accessKeyID: String
-        let secretAccessKey: String
+        let accessKeyID: String?
+        let secretAccessKey: String?
         let sessionToken: String?
+        let webIdentity: LiveAWSWebIdentityCredentials.Descriptor?
+
+        init(
+            endpoint: URL,
+            bucket: String,
+            region: String,
+            accessKeyID: String,
+            secretAccessKey: String,
+            sessionToken: String?
+        ) {
+            self.endpoint = endpoint
+            self.bucket = bucket
+            self.region = region
+            self.accessKeyID = accessKeyID
+            self.secretAccessKey = secretAccessKey
+            self.sessionToken = sessionToken
+            self.webIdentity = nil
+        }
+
+        init(
+            endpoint: URL,
+            bucket: String,
+            region: String,
+            webIdentity: LiveAWSWebIdentityCredentials.Descriptor
+        ) {
+            self.endpoint = endpoint
+            self.bucket = bucket
+            self.region = region
+            self.accessKeyID = nil
+            self.secretAccessKey = nil
+            self.sessionToken = nil
+            self.webIdentity = webIdentity
+        }
     }
 
     enum Failure: Error, Sendable, Equatable {
@@ -35,14 +68,17 @@ enum LiveCloudTraceUpload {
         case invalidMultipartETag
         case multipartRejected(Int)
         case multipartTransport
+        case credentialExchangeRejected(Int)
+        case credentialExchangeTransport
+        case invalidCredentialResponse
         case authorizationChanged
 
         var message: String {
             switch self {
             case .unsupportedCredentialSource:
-                return "Direct S3 trace upload only supports managed static, environment, or private AWS shared-profile credentials."
+                return "Direct S3 trace upload only supports managed static, environment, private shared-profile, or file-backed AWS web-identity credentials."
             case .missingCredentials:
-                return "Direct S3 trace upload requires scoped managed, environment, or private shared-profile AWS credentials."
+                return "Direct S3 trace upload requires scoped managed, environment, private shared-profile, or file-backed web-identity AWS credentials."
             case .invalidCredentials:
                 return "Direct S3 trace upload rejected malformed AWS credentials."
             case .invalidBucket:
@@ -67,8 +103,14 @@ enum LiveCloudTraceUpload {
                 return "S3 storage rejected the multipart upload (HTTP \(status))."
             case .multipartTransport:
                 return "Direct S3 multipart trace upload could not complete its request safely."
+            case .credentialExchangeRejected(let status):
+                return "AWS STS rejected the trace upload web-identity credentials (HTTP \(status))."
+            case .credentialExchangeTransport:
+                return "Direct S3 trace upload could not safely exchange AWS web-identity credentials."
+            case .invalidCredentialResponse:
+                return "AWS STS returned invalid, expired, or mismatched temporary trace upload credentials."
             case .authorizationChanged:
-                return "Direct S3 trace upload authorization changed before a multipart request."
+                return "Direct S3 trace upload authorization changed before a credential or storage request."
             }
         }
     }
@@ -79,8 +121,6 @@ enum LiveCloudTraceUpload {
     private static let requestTimeout: TimeInterval = 60
     private static let hexadecimalDigits = Array("0123456789ABCDEF".utf8)
     private static let unsupportedCredentialEnvironmentKeys: Set<String> = [
-        "AWS_WEB_IDENTITY_TOKEN_FILE",
-        "AWS_ROLE_ARN",
         "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
         "AWS_CONTAINER_CREDENTIALS_FULL_URI",
         "AWS_CONTAINER_AUTHORIZATION_TOKEN",
@@ -114,14 +154,13 @@ enum LiveCloudTraceUpload {
         let bucket = try bucketName(from: bucketURL)
 
         let credentials = try resolveCredentials(document: document, environment: environment)
-        let accessKeyID = credentials.accessKeyID
-        let secretAccessKey = credentials.secretAccessKey
-        let sessionToken = credentials.sessionToken
-        guard isValidAccessKeyID(accessKeyID),
-              isValidCredential(secretAccessKey),
-              sessionToken.map(isValidCredential) ?? true
-        else {
-            throw Failure.invalidCredentials
+        if case .staticKeys(let accessKeyID, let secretAccessKey, let sessionToken) = credentials {
+            guard isValidAccessKeyID(accessKeyID),
+                  isValidCredential(secretAccessKey),
+                  sessionToken.map(isValidCredential) ?? true
+            else {
+                throw Failure.invalidCredentials
+            }
         }
 
         let region = configured(environment["GROK_TRACE_UPLOAD_REGION"])
@@ -159,14 +198,38 @@ enum LiveCloudTraceUpload {
             endpoint = resolved
         }
 
-        return Authorization(
-            endpoint: endpoint,
-            bucket: bucket,
-            region: region,
-            accessKeyID: accessKeyID,
-            secretAccessKey: secretAccessKey,
-            sessionToken: sessionToken
-        )
+        switch credentials {
+        case .staticKeys(let accessKeyID, let secretAccessKey, let sessionToken):
+            return Authorization(
+                endpoint: endpoint,
+                bucket: bucket,
+                region: region,
+                accessKeyID: accessKeyID,
+                secretAccessKey: secretAccessKey,
+                sessionToken: sessionToken
+            )
+        case .webIdentity(let descriptor):
+            try LiveAWSWebIdentityCredentials.validateRegion(region, descriptor: descriptor)
+            return Authorization(
+                endpoint: endpoint,
+                bucket: bucket,
+                region: region,
+                webIdentity: descriptor
+            )
+        }
+    }
+
+    private enum ResolvedCredentials {
+        case staticKeys(accessKeyID: String, secretAccessKey: String, sessionToken: String?)
+        case webIdentity(LiveAWSWebIdentityCredentials.Descriptor)
+
+        init(_ values: (accessKeyID: String, secretAccessKey: String, sessionToken: String?)) {
+            self = .staticKeys(
+                accessKeyID: values.accessKeyID,
+                secretAccessKey: values.secretAccessKey,
+                sessionToken: values.sessionToken
+            )
+        }
     }
 
     /// Rust `agent/config.rs:507-550` supplies managed inline credentials before
@@ -175,22 +238,22 @@ enum LiveCloudTraceUpload {
     private static func resolveCredentials(
         document: TOMLValue,
         environment: [String: String]
-    ) throws -> (accessKeyID: String, secretAccessKey: String, sessionToken: String?) {
+    ) throws -> ResolvedCredentials {
         if let inline = configured(environment["GROK_TRACE_UPLOAD_CREDENTIALS"])
             ?? configured(document[path: ["endpoints", "trace_upload_credentials"]]?.stringValue)
         {
             guard !inline.isEmpty, inline.utf8.count <= maximumCredentialFileBytes else {
                 throw Failure.invalidCredentials
             }
-            return try parseManagedCredentials(Data(inline.utf8))
+            return try ResolvedCredentials(parseManagedCredentials(Data(inline.utf8)))
         }
 
         if let path = configured(environment["GROK_TRACE_UPLOAD_CREDENTIALS_FILE"])
             ?? configured(document[path: ["endpoints", "trace_upload_credentials_file"]]?.stringValue)
         {
-            return try parseManagedCredentials(
+            return try ResolvedCredentials(parseManagedCredentials(
                 managedCredentialData(at: path, environment: environment)
-            )
+            ))
         }
 
         let environmentKey = environment["AWS_ACCESS_KEY_ID"]
@@ -210,18 +273,25 @@ enum LiveCloudTraceUpload {
             else {
                 throw Failure.missingCredentials
             }
-            return (environmentKey, environmentSecret, environment["AWS_SESSION_TOKEN"])
+            return .staticKeys(
+                accessKeyID: environmentKey,
+                secretAccessKey: environmentSecret,
+                sessionToken: environment["AWS_SESSION_TOKEN"]
+            )
         }
 
+        let webIdentityConfigured = try LiveAWSWebIdentityCredentials.configurationIsPresent(
+            environment: environment
+        )
         if unsupportedCredentialEnvironmentKeys.contains(where: {
             configured(environment[$0]) != nil
         }) {
             throw Failure.unsupportedCredentialSource
         }
 
-        let profile = configured(environment["AWS_PROFILE"])
+        let explicitlySelectedProfile = configured(environment["AWS_PROFILE"])
             ?? configured(environment["AWS_DEFAULT_PROFILE"])
-            ?? "default"
+        let profile = explicitlySelectedProfile ?? "default"
         guard isValidProfile(profile) else {
             throw Failure.invalidCredentials
         }
@@ -259,6 +329,11 @@ enum LiveCloudTraceUpload {
                 .appendingPathComponent("credentials", isDirectory: false)
                 .path
         } else {
+            if webIdentityConfigured {
+                return .webIdentity(try LiveAWSWebIdentityCredentials.descriptor(
+                    environment: environment
+                ))
+            }
             throw Failure.missingCredentials
         }
 
@@ -276,6 +351,11 @@ enum LiveCloudTraceUpload {
             )
         } catch let error as FileUtilsError {
             if case .notFound = error {
+                if webIdentityConfigured {
+                    return .webIdentity(try LiveAWSWebIdentityCredentials.descriptor(
+                        environment: environment
+                    ))
+                }
                 throw Failure.missingCredentials
             }
             throw Failure.invalidCredentials
@@ -286,7 +366,25 @@ enum LiveCloudTraceUpload {
         guard let content = String(data: bytes, encoding: .utf8) else {
             throw Failure.invalidCredentials
         }
-        return try parseSharedCredentials(content, profile: profile)
+        do {
+            return try ResolvedCredentials(parseSharedCredentials(content, profile: profile))
+        } catch let error as Failure {
+            guard case .missingCredentials = error,
+                  explicitlySelectedProfile == nil,
+                  webIdentityConfigured,
+                  !content.split(whereSeparator: \.isNewline).contains(where: { rawLine in
+                      let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                      guard line.hasPrefix("["), line.hasSuffix("]") else { return false }
+                      return line.dropFirst().dropLast()
+                          .trimmingCharacters(in: .whitespacesAndNewlines) == "default"
+                  })
+            else {
+                throw error
+            }
+            return .webIdentity(try LiveAWSWebIdentityCredentials.descriptor(
+                environment: environment
+            ))
+        }
     }
 
     private static func managedCredentialData(
@@ -670,8 +768,11 @@ enum LiveCloudTraceUpload {
     ) throws -> HTTPRequest {
         guard isValidBucket(authorization.bucket),
               isValidRegion(authorization.region),
-              isValidAccessKeyID(authorization.accessKeyID),
-              isValidCredential(authorization.secretAccessKey),
+              authorization.webIdentity == nil,
+              let accessKeyID = authorization.accessKeyID,
+              let secretAccessKey = authorization.secretAccessKey,
+              isValidAccessKeyID(accessKeyID),
+              isValidCredential(secretAccessKey),
               authorization.sessionToken.map(isValidCredential) ?? true
         else {
             throw Failure.invalidCredentials
@@ -745,7 +846,7 @@ enum LiveCloudTraceUpload {
         ].joined(separator: "\n")
 
         let dateKey = hmacSHA256(
-            key: Array("AWS4\(authorization.secretAccessKey)".utf8),
+            key: Array("AWS4\(secretAccessKey)".utf8),
             message: Array(date.utf8)
         )
         let regionKey = hmacSHA256(key: dateKey, message: Array(authorization.region.utf8))
@@ -756,7 +857,7 @@ enum LiveCloudTraceUpload {
             .joined()
 
         headers["Authorization"] = "AWS4-HMAC-SHA256 "
-            + "Credential=\(authorization.accessKeyID)/\(credentialScope), "
+            + "Credential=\(accessKeyID)/\(credentialScope), "
             + "SignedHeaders=\(signedHeaders), "
             + "Signature=\(signature)"
 

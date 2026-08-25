@@ -239,9 +239,66 @@ enum LiveTraceUpload {
             }
         }
 
+        var authorizedCloud = initialAuthorization.cloud
+        var temporaryCredentials: LiveAWSWebIdentityCredentials.TemporaryCredentials?
         if let cloud = initialAuthorization.cloud,
+           let descriptor = cloud.webIdentity
+        {
+            let current = try await authorize(
+                sessionID: sessionID,
+                home: home,
+                document: document,
+                environment: environment,
+                uploadEnabled: uploadEnabled
+            )
+            guard current.endpoint == initialAuthorization.endpoint,
+                  current.cloud == initialAuthorization.cloud,
+                  current.google == initialAuthorization.google
+            else {
+                throw refusal("the authorized trace storage endpoint changed before upload")
+            }
+
+            let exchanged: LiveAWSWebIdentityCredentials.TemporaryCredentials
+            do {
+                exchanged = try await LiveAWSWebIdentityCredentials.exchange(
+                    descriptor: descriptor,
+                    region: cloud.region,
+                    transport: transport
+                )
+            } catch let failure as LiveCloudTraceUpload.Failure {
+                throw LiveTraceUploadFailure.cloud(failure.message)
+            }
+
+            let reauthorized = try await authorize(
+                sessionID: sessionID,
+                home: home,
+                document: document,
+                environment: environment,
+                uploadEnabled: uploadEnabled
+            )
+            guard reauthorized.endpoint == initialAuthorization.endpoint,
+                  reauthorized.cloud == initialAuthorization.cloud,
+                  reauthorized.google == initialAuthorization.google,
+                  exchanged.isUsable()
+            else {
+                throw refusal("the authorized AWS web-identity credentials changed before upload")
+            }
+
+            authorizedCloud = LiveCloudTraceUpload.Authorization(
+                endpoint: cloud.endpoint,
+                bucket: cloud.bucket,
+                region: cloud.region,
+                accessKeyID: exchanged.accessKeyID,
+                secretAccessKey: exchanged.secretAccessKey,
+                sessionToken: exchanged.sessionToken
+            )
+            temporaryCredentials = exchanged
+        }
+
+        if let cloud = authorizedCloud,
            archive.count >= LiveCloudTraceUpload.maximumArchiveBytes
         {
+            let exchangedCredentials = temporaryCredentials
             do {
                 return try await LiveS3MultipartUpload.upload(
                     sessionID: sessionID,
@@ -259,11 +316,12 @@ enum LiveTraceUpload {
                         guard current.endpoint == initialAuthorization.endpoint,
                               current.cloud == initialAuthorization.cloud,
                               current.google == initialAuthorization.google,
-                              let authorizedCloud = current.cloud
+                              current.cloud != nil,
+                              exchangedCredentials?.isUsable() ?? true
                         else {
                             throw LiveCloudTraceUpload.Failure.authorizationChanged
                         }
-                        return authorizedCloud
+                        return cloud
                     }
                 )
             } catch let failure as LiveCloudTraceUpload.Failure {
@@ -292,9 +350,12 @@ enum LiveTraceUpload {
             else {
                 throw refusal("the authorized trace storage endpoint changed before upload")
             }
+            guard temporaryCredentials?.isUsable() ?? true else {
+                throw refusal("the authorized AWS web-identity credentials expired before upload")
+            }
 
             let request: HTTPRequest
-            if let cloud = authorization.cloud {
+            if let cloud = authorizedCloud {
                 do {
                     request = try LiveCloudTraceUpload.request(
                         authorization: cloud,
@@ -381,7 +442,7 @@ enum LiveTraceUpload {
                 continue
             }
 
-            if let cloud = authorization.cloud {
+            if let cloud = authorizedCloud {
                 guard response.body.isEmpty,
                       response.metadata.url == nil || response.metadata.url == authorization.endpoint
                 else {
