@@ -203,9 +203,12 @@ private func targets() -> [Target] {
         publicHeadersPath: "include",
         linkerSettings: [
             .linkedLibrary("curl", .when(platforms: [.linux])),
+            .linkedLibrary("crypto", .when(platforms: [.linux])),
             .linkedLibrary("ws2_32", .when(platforms: [.windows])),
             .linkedLibrary("advapi32", .when(platforms: [.windows])),
             .linkedLibrary("winhttp", .when(platforms: [.windows])),
+            .linkedLibrary("ncrypt", .when(platforms: [.windows])),
+            .linkedLibrary("bcrypt", .when(platforms: [.windows])),
         ]
     ))
     t.append(.target(name: "OpenGrokExtraCA", dependencies: dep(w0s2, w0s3, w0s4, ["OpenGrokTracing"])))

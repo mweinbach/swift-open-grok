@@ -1443,8 +1443,8 @@ struct LiveCloudTraceUploadParityTests {
         }
     }
 
-    @Test("Google Cloud buckets remain fail-closed even when valid AWS credentials exist")
-    func googleCloudRemainsExplicitlyUnavailable() async throws {
+    @Test("Google Cloud buckets never accept otherwise valid AWS credentials")
+    func googleCloudRejectsAWSOnlyCredentials() async throws {
         let fixture = try CloudTraceUploadFixture()
         defer { fixture.clean() }
         try await fixture.seed("google-cloud-refusal")
@@ -1460,7 +1460,7 @@ struct LiveCloudTraceUploadParityTests {
 
         #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
         #expect(result.output.isEmpty)
-        #expect(result.errors.contains("direct cloud-storage upload method is not available"))
+        #expect(result.errors.contains("Google Application Default Credentials"))
         #expect(transport.recordedRequests.isEmpty)
         #expect(!FileManager.default.fileExists(atPath: fixture.archiveDirectory.path))
     }

@@ -23,6 +23,11 @@ private struct TraceUploadFixture {
         )
         home = root.appendingPathComponent("state", isDirectory: true)
         workspace = root.appendingPathComponent("workspace", isDirectory: true)
+        #if os(Windows)
+        try OpenGrokConfig.createDirAllOwnerOnly(root, stateRoot: root)
+        try OpenGrokConfig.createDirAllOwnerOnly(home, stateRoot: home)
+        try OpenGrokConfig.createDirAllOwnerOnly(workspace, stateRoot: root)
+        #else
         for directory in [root, home, workspace] {
             try FileManager.default.createDirectory(
                 at: directory,
@@ -30,6 +35,7 @@ private struct TraceUploadFixture {
                 attributes: [.posixPermissions: 0o700]
             )
         }
+        #endif
         try ("[telemetry]\ntrace_upload = true\n" + endpointConfiguration).write(
             to: home.appendingPathComponent("config.toml"),
             atomically: true,
@@ -564,7 +570,7 @@ struct LiveTraceUploadParityTests {
         #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
         #expect(result.output.isEmpty)
         if bucket.hasPrefix("gs://") {
-            #expect(result.errors.contains("direct cloud-storage upload method is not available"))
+            #expect(result.errors.contains("Google Application Default Credentials"))
         } else {
             #expect(result.errors.contains("AWS"))
         }

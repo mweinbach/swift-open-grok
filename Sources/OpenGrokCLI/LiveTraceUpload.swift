@@ -72,15 +72,18 @@ enum LiveTraceUpload {
         let endpoint: URL
         let credentials: GrokAuthCredentials
         let cloud: LiveCloudTraceUpload.Authorization?
+        let google: LiveGoogleCloudTraceUpload.Authorization?
 
         init(
             endpoint: URL,
             credentials: GrokAuthCredentials,
-            cloud: LiveCloudTraceUpload.Authorization? = nil
+            cloud: LiveCloudTraceUpload.Authorization? = nil,
+            google: LiveGoogleCloudTraceUpload.Authorization? = nil
         ) {
             self.endpoint = endpoint
             self.credentials = credentials
             self.cloud = cloud
+            self.google = google
         }
     }
 
@@ -100,11 +103,6 @@ enum LiveTraceUpload {
         }
 
         let directBucket = configuredDirectBucket(document: document, environment: environment)
-        if directBucket?.hasPrefix("gs://") == true {
-            throw refusal(
-                "the configured direct cloud-storage upload method is not available in this build"
-            )
-        }
 
         let managedAuthentication = liveManagedAuthenticationConfiguration(
             environment: environment
@@ -159,6 +157,24 @@ enum LiveTraceUpload {
             userToken: sessionAuth?.key,
             deploymentKey: deploymentKey
         )
+        if let bucket = directBucket, bucket.hasPrefix("gs://") {
+            let google: LiveGoogleCloudTraceUpload.Authorization
+            do {
+                google = try LiveGoogleCloudTraceUpload.authorize(
+                    sessionID: sessionID,
+                    bucketURL: bucket,
+                    document: document,
+                    environment: environment
+                )
+            } catch let error as LiveGoogleCloudTraceUpload.Failure {
+                throw refusal(error.message)
+            }
+            return Authorization(
+                endpoint: google.endpoint,
+                credentials: credentials,
+                google: google
+            )
+        }
         if let bucket = directBucket, bucket.hasPrefix("s3://") {
             let cloud: LiveCloudTraceUpload.Authorization
             do {
@@ -192,6 +208,37 @@ enum LiveTraceUpload {
         retryNotice: (@Sendable (TimeInterval) -> Void)?
     ) async throws -> String {
         let transport = services.makeTransport()
+        if let google = initialAuthorization.google {
+            do {
+                return try await LiveGoogleCloudTraceUpload.upload(
+                    sessionID: sessionID,
+                    archive: archive,
+                    authorization: google,
+                    transport: transport,
+                    authorizeRequest: {
+                        let current = try await authorize(
+                            sessionID: sessionID,
+                            home: home,
+                            document: document,
+                            environment: environment,
+                            uploadEnabled: uploadEnabled
+                        )
+                        guard current.endpoint == initialAuthorization.endpoint,
+                              current.cloud == initialAuthorization.cloud,
+                              current.google == initialAuthorization.google,
+                              let authorizedGoogle = current.google
+                        else {
+                            throw LiveGoogleCloudTraceUpload.Failure.authorizationChanged
+                        }
+                        return authorizedGoogle
+                    },
+                    sleep: services.sleep
+                )
+            } catch let failure as LiveGoogleCloudTraceUpload.Failure {
+                throw LiveTraceUploadFailure.cloud(failure.message)
+            }
+        }
+
         if let cloud = initialAuthorization.cloud,
            archive.count >= LiveCloudTraceUpload.maximumArchiveBytes
         {
@@ -211,6 +258,7 @@ enum LiveTraceUpload {
                         )
                         guard current.endpoint == initialAuthorization.endpoint,
                               current.cloud == initialAuthorization.cloud,
+                              current.google == initialAuthorization.google,
                               let authorizedCloud = current.cloud
                         else {
                             throw LiveCloudTraceUpload.Failure.authorizationChanged
@@ -239,7 +287,8 @@ enum LiveTraceUpload {
                 uploadEnabled: uploadEnabled
             )
             guard authorization.endpoint == initialAuthorization.endpoint,
-                  authorization.cloud == initialAuthorization.cloud
+                  authorization.cloud == initialAuthorization.cloud,
+                  authorization.google == initialAuthorization.google
             else {
                 throw refusal("the authorized trace storage endpoint changed before upload")
             }
