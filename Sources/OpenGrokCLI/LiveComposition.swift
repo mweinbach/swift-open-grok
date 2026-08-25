@@ -1235,6 +1235,7 @@ public struct OpenGrokLiveCompositionDependencies: Sendable {
 public struct OpenGrokLiveInteractiveInput: Sendable {
     public let events: AsyncThrowingStream<InputEvent, Error>
     private let closeOperation: @Sendable () async -> Void
+    private let emittedEventCountOperation: (@Sendable () -> UInt64)?
     /// Suspend-for-child entry point (`suspend_for_child`,
     /// event_loop.rs:356-423). `nil` on inputs that cannot suspend, which is
     /// every construction that does not own a real reader and raw-mode lease.
@@ -1243,11 +1244,17 @@ public struct OpenGrokLiveInteractiveInput: Sendable {
     public init(
         events: AsyncThrowingStream<InputEvent, Error>,
         close: @escaping @Sendable () async -> Void,
-        suspendControl: (@Sendable () async -> LiveInputSuspension?)? = nil
+        suspendControl: (@Sendable () async -> LiveInputSuspension?)? = nil,
+        emittedEventCount: (@Sendable () -> UInt64)? = nil
     ) {
         self.events = events
         self.closeOperation = close
         self.suspendControl = suspendControl
+        self.emittedEventCountOperation = emittedEventCount
+    }
+
+    var emittedEventCount: UInt64? {
+        emittedEventCountOperation?()
     }
 
     public func close() async {
@@ -1423,7 +1430,8 @@ extension OpenGrokLiveInteractiveInput {
             suspendControl: {
                 guard await resource.beginSuspension() else { return nil }
                 return LiveInputSuspension(end: { try await resource.endSuspension() })
-            }
+            },
+            emittedEventCount: { emitter.emittedEventCount }
         )
     }
 

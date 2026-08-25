@@ -823,18 +823,27 @@ actor LiveInteractiveInputResource {
 }
 
 final class LiveInteractiveInputEmitter: @unchecked Sendable {
+    private let lock = NSLock()
     private let continuation: AsyncThrowingStream<InputEvent, Error>.Continuation
+    private var emittedCount: UInt64 = 0
 
     init(continuation: AsyncThrowingStream<InputEvent, Error>.Continuation) {
         self.continuation = continuation
     }
 
+    var emittedEventCount: UInt64 {
+        lock.withLock { emittedCount }
+    }
+
     func yield(_ event: InputEvent) {
-        continuation.yield(event)
+        lock.withLock {
+            emittedCount += 1
+            continuation.yield(event)
+        }
     }
 
     func finish(throwing error: Error? = nil) {
-        continuation.finish(throwing: error)
+        lock.withLock { continuation.finish(throwing: error) }
     }
 }
 

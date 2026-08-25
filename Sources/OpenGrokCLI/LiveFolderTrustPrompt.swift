@@ -51,14 +51,21 @@ enum LiveFolderTrustPrompt {
             return .proceed(interactiveInput)
         }
 
+        // AsyncThrowingStream cannot distinguish buffered startup consent from
+        // fresh input. Custom inputs without producer provenance cannot show
+        // this prompt; allowing them would silently reopen the security gate.
+        guard let initialStartupCutoff = interactiveInput.emittedEventCount else {
+            throw CLIApplicationError.failed(
+                "Folder trust requires ordered terminal input; project access is blocked."
+            )
+        }
+
         let bridge = LiveFolderTrustPromptInputBridge(upstream: interactiveInput)
         bridge.start()
-        // The input producer starts before this preflight. Giving its bridge the
-        // first turn drains already-buffered startup typeahead while the gate is
-        // disarmed; otherwise a prompt typed during launch could answer "n".
-        await Task.yield()
 
         do {
+            let startupCutoff = interactiveInput.emittedEventCount ?? initialStartupCutoff
+            bridge.beginPainting(discardingThrough: startupCutoff)
             try await terminal.write(render(workspace: workspace))
             bridge.arm()
             var answers = bridge.answers.makeAsyncIterator()
@@ -131,6 +138,7 @@ private enum LiveFolderTrustPromptAnswer: Sendable {
 private final class LiveFolderTrustPromptInputBridge: @unchecked Sendable {
     private enum Phase {
         case discardStartup
+        case painting
         case pending
         case buffering
         case forwarding
@@ -143,6 +151,9 @@ private final class LiveFolderTrustPromptInputBridge: @unchecked Sendable {
     private let eventContinuation: AsyncThrowingStream<InputEvent, Error>.Continuation
     private let events: AsyncThrowingStream<InputEvent, Error>
     private var phase: Phase = .discardStartup
+    private var consumedEventCount: UInt64 = 0
+    private var startupCutoff: UInt64 = 0
+    private var eventsDuringPaint: [InputEvent] = []
     private var bufferedEvents: [InputEvent] = []
     private var task: Task<Void, Never>?
     private var upstreamFinished = false
@@ -176,9 +187,28 @@ private final class LiveFolderTrustPromptInputBridge: @unchecked Sendable {
         lock.withLock { self.task = task }
     }
 
+    func beginPainting(discardingThrough startupCutoff: UInt64) {
+        lock.withLock {
+            guard phase == .discardStartup else { return }
+            self.startupCutoff = startupCutoff
+            phase = .painting
+        }
+    }
+
     func arm() {
         lock.withLock {
-            if phase == .discardStartup { phase = .pending }
+            guard phase == .painting else { return }
+            phase = .pending
+            for event in eventsDuringPaint {
+                receiveAfterStartupLocked(event)
+            }
+            eventsDuringPaint.removeAll(keepingCapacity: false)
+            if upstreamFinished {
+                answerContinuation.finish(throwing: upstreamFailure)
+                if phase != .buffering {
+                    eventContinuation.finish(throwing: upstreamFailure)
+                }
+            }
         }
     }
 
@@ -208,6 +238,7 @@ private final class LiveFolderTrustPromptInputBridge: @unchecked Sendable {
         let task = lock.withLock { () -> Task<Void, Never>? in
             guard phase != .stopped else { return nil }
             phase = .stopped
+            eventsDuringPaint.removeAll(keepingCapacity: false)
             bufferedEvents.removeAll(keepingCapacity: false)
             answerContinuation.finish()
             eventContinuation.finish()
@@ -220,20 +251,28 @@ private final class LiveFolderTrustPromptInputBridge: @unchecked Sendable {
 
     private func receive(_ event: InputEvent) {
         lock.withLock {
-            switch phase {
-            case .discardStartup, .stopped:
-                return
-            case .buffering:
-                bufferedEvents.append(event)
-            case .forwarding:
-                eventContinuation.yield(event)
-            case .pending:
-                guard case .key(let key) = event,
-                      let answer = Self.answer(for: key)
-                else { return }
-                phase = .buffering
-                answerContinuation.yield(answer)
-            }
+            consumedEventCount += 1
+            guard consumedEventCount > startupCutoff else { return }
+            receiveAfterStartupLocked(event)
+        }
+    }
+
+    private func receiveAfterStartupLocked(_ event: InputEvent) {
+        switch phase {
+        case .discardStartup, .stopped:
+            return
+        case .painting:
+            eventsDuringPaint.append(event)
+        case .buffering:
+            bufferedEvents.append(event)
+        case .forwarding:
+            eventContinuation.yield(event)
+        case .pending:
+            guard case .key(let key) = event,
+                  let answer = Self.answer(for: key)
+            else { return }
+            phase = .buffering
+            answerContinuation.yield(answer)
         }
     }
 
@@ -241,6 +280,7 @@ private final class LiveFolderTrustPromptInputBridge: @unchecked Sendable {
         lock.withLock {
             upstreamFinished = true
             upstreamFailure = error
+            if phase == .painting { return }
             answerContinuation.finish(throwing: error)
             // An answer and following composer events can arrive in one read.
             // Keep the downstream continuation open until its buffered tail is

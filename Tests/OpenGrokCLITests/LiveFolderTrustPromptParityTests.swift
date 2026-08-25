@@ -26,6 +26,7 @@ private final class FolderTrustPromptProbe: PagerTerminalSink, @unchecked Sendab
     private let stream: AsyncThrowingStream<InputEvent, Error>
     private let continuation: AsyncThrowingStream<InputEvent, Error>.Continuation
     private var pendingStartup: [InputEvent]
+    private var emittedEventCount: UInt64 = 0
     private var terminalOutput = ""
     private var answered = false
     private var samplerCount = 0
@@ -51,14 +52,15 @@ private final class FolderTrustPromptProbe: PagerTerminalSink, @unchecked Sendab
             return pendingStartup
         }
         for event in startup {
-            continuation.yield(event)
+            emit(event)
         }
         return OpenGrokLiveInteractiveInput(
             events: stream,
             close: { [self] in
                 lock.withLock { closedCount += 1 }
                 continuation.finish()
-            }
+            },
+            emittedEventCount: { [self] in lock.withLock { emittedEventCount } }
         )
     }
 
@@ -76,20 +78,22 @@ private final class FolderTrustPromptProbe: PagerTerminalSink, @unchecked Sendab
         }
         guard shouldRespond else { return }
 
-        Task { [self] in
-            // A real key arrives after the prompt paint; pre-painted keys are
-            // intentionally discarded as upstream's startup typeahead.
-            for _ in 0..<12 { await Task.yield() }
-            switch response {
-            case .answer(let answer, let following, let finish):
-                continuation.yield(.key(answer))
-                for event in following { continuation.yield(event) }
-                if finish { continuation.finish() }
-            case .eof:
-                continuation.finish()
-            case .none:
-                return
-            }
+        switch response {
+        case .answer(let answer, let following, let finish):
+            emit(.key(answer))
+            for event in following { emit(event) }
+            if finish { continuation.finish() }
+        case .eof:
+            continuation.finish()
+        case .none:
+            return
+        }
+    }
+
+    private func emit(_ event: InputEvent) {
+        lock.withLock {
+            emittedEventCount += 1
+            continuation.yield(event)
         }
     }
 
@@ -506,7 +510,12 @@ struct LiveFolderTrustPromptParityTests {
                 following: [.key(KeyEvent(key: "q"))],
                 finish: true
             ),
-            startup: [.key(KeyEvent(key: "n")), .paste("y"), .key(KeyEvent(key: "x"))]
+            startup: [
+                .key(KeyEvent(key: "n")),
+                .paste("y"),
+                .key(KeyEvent(key: "y")),
+                .key(KeyEvent(key: "x")),
+            ]
         )
 
         let outcome = try await fixture.preflight(probe: probe)
@@ -519,6 +528,34 @@ struct LiveFolderTrustPromptParityTests {
         let remaining = try await iterator.next()
         #expect(remaining == .key(KeyEvent(key: "q")))
         #expect(try await iterator.next() == nil)
+        await input.close()
+    }
+
+    @Test("unsequenced startup input cannot authorize an untrusted repository")
+    func unsequencedStartupFailsClosed() async throws {
+        let fixture = try FolderTrustPromptFixture()
+        defer { fixture.dispose() }
+        let probe = FolderTrustPromptProbe(response: .none)
+        let pair = AsyncThrowingStream<InputEvent, Error>.makeStream()
+        pair.continuation.yield(.key(KeyEvent(key: "y")))
+        let input = OpenGrokLiveInteractiveInput(
+            events: pair.stream,
+            close: { pair.continuation.finish() }
+        )
+
+        await #expect(throws: CLIApplicationError.self) {
+            try await LiveFolderTrustPrompt.preflight(
+                workingDirectory: fixture.workspace,
+                environment: fixture.environment,
+                explicitTrust: false,
+                interactiveInput: input,
+                hasInteractiveSurface: true,
+                terminal: fixture.terminal(for: probe)
+            )
+        }
+
+        #expect(probe.text.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fixture.trustPath.path))
         await input.close()
     }
 
