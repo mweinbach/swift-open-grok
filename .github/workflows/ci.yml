@@ -103,7 +103,7 @@ jobs:
       - name: Toolchain
         run: |
           apt-get update
-          apt-get install -y bubblewrap zsh
+          apt-get install -y bubblewrap libcurl4-openssl-dev zsh
           swift --version
       - name: Verify bubblewrap namespace
         run: |

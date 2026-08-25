@@ -74,9 +74,9 @@ public struct WebSocketURL: Sendable, Hashable {
     /// matching virtual hosts on `Host` will not recognise `grok.com:443`.
     public var hostHeader: String {
         let isDefaultPort = (isSecure && port == 443) || (!isSecure && port == 80)
-        if isDefaultPort { return host }
-        if host.contains(":") { return "[\(host)]:\(port)" }
-        return "\(host):\(port)"
+        let authorityHost = host.contains(":") ? "[\(host)]" : host
+        if isDefaultPort { return authorityHost }
+        return "\(authorityHost):\(port)"
     }
 
     public var absoluteString: String {
@@ -305,11 +305,35 @@ public enum WebSocketDialer {
         }
         return channel
         #else
+        #if os(Linux)
+        if url.isSecure {
+            do {
+                return try await PortableTLSConnector.connect(
+                    host: url.host,
+                    port: url.port,
+                    timeoutSeconds: connectTimeoutSeconds,
+                    extraRootCertificates: HTTPTLSConfiguration().extraRootCertificates
+                )
+            } catch let error as PortableTLSError {
+                if case .connectTimedOut = error {
+                    throw WebSocketDialError.connectTimeout(
+                        seconds: connectTimeoutSeconds,
+                        url: url.absoluteString
+                    )
+                }
+                throw WebSocketDialError.connectionFailed(
+                    url: url.absoluteString,
+                    reason: error.description
+                )
+            }
+        }
+        #else
         guard !url.isSecure else {
             throw WebSocketDialError.unsupportedPlatform(
                 "portable sockets provide plaintext ws:// only; cannot reach \(url.absoluteString)"
             )
         }
+        #endif
         do {
             return try await PortableSocketConnector.tcp(
                 host: url.host,
@@ -334,6 +358,11 @@ public enum WebSocketDialer {
         to url: WebSocketURL,
         options: WebSocketDialOptions = WebSocketDialOptions()
     ) async throws -> any WebSocketClient {
+        #if os(Windows)
+        if url.isSecure {
+            return try await WindowsWebSocketClient.connect(to: url, options: options)
+        }
+        #endif
         let channel = try await channel(to: url, connectTimeoutSeconds: options.connectTimeoutSeconds)
         do {
             return try await WebSocketClientUpgrade.connect(

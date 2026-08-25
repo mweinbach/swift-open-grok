@@ -57,6 +57,8 @@ struct WebSocketURLTests {
         let bare = try WebSocketURL.parse("ws://[::1]/ws")
         #expect(bare.host == "::1")
         #expect(bare.port == 80)
+        #expect(bare.hostHeader == "[::1]")
+        #expect(bare.absoluteString == "ws://[::1]/ws")
 
         let ported = try WebSocketURL.parse("ws://[::1]:2419/ws")
         #expect(ported.host == "::1")
@@ -150,7 +152,7 @@ struct WebSocketDialOptionsTests {
         #endif
     }
 
-    #if !canImport(Network)
+    #if !canImport(Network) && !os(Linux) && !os(Windows)
     @Test("secure portable sockets fail closed without a trusted TLS transport")
     func securePortableSocketsFailClosed() async throws {
         let url = try WebSocketURL.parse("wss://code.grok.com/ws/code-agent")

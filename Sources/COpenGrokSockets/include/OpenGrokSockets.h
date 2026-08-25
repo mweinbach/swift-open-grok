@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "OpenGrokWindowsWebSocket.h"
 
 #ifdef _WIN32
 typedef intptr_t OGSocketHandle;
@@ -43,6 +44,25 @@ int64_t og_socket_write_all(
     size_t length
 );
 int og_socket_close(OGSocketHandle handle);
+
+typedef intptr_t OGTLSHandle;
+
+#define OG_TLS_INVALID ((OGTLSHandle)0)
+
+int og_tls_connect(
+    const char *url,
+    double timeout_seconds,
+    const void *trusted_pem_bundle,
+    size_t trusted_pem_bundle_length,
+    OGTLSHandle *handle
+);
+int64_t og_tls_read(OGTLSHandle handle, void *buffer, size_t capacity);
+int64_t og_tls_write_all(OGTLSHandle handle, const void *buffer, size_t length);
+void og_tls_interrupt(OGTLSHandle handle);
+void og_tls_destroy(OGTLSHandle handle);
+int og_tls_last_error_code(void);
+const char *og_tls_last_error_message(void);
+
 int og_named_pipe_listener_create(const char *pipe_name, OGSocketHandle *listener);
 int og_named_pipe_secure_listener_create(const char *pipe_name, OGSocketHandle *listener);
 int og_named_pipe_listener_accept(OGSocketHandle listener, OGSocketHandle *handle);
