@@ -194,8 +194,17 @@ enum LiveCloudTraceUpload {
         }
 
         let environmentKey = environment["AWS_ACCESS_KEY_ID"]
-        let environmentSecret = environment["AWS_SECRET_ACCESS_KEY"]
-        if environmentKey != nil || environmentSecret != nil || environment["AWS_SESSION_TOKEN"] != nil {
+        let primaryEnvironmentSecret = environment["AWS_SECRET_ACCESS_KEY"]
+        let fallbackEnvironmentSecret = environment["SECRET_ACCESS_KEY"]
+        let environmentSecret: String?
+        if let primaryEnvironmentSecret,
+           !primaryEnvironmentSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            environmentSecret = primaryEnvironmentSecret
+        } else {
+            environmentSecret = fallbackEnvironmentSecret
+        }
+        if environmentKey != nil || primaryEnvironmentSecret != nil
+            || fallbackEnvironmentSecret != nil || environment["AWS_SESSION_TOKEN"] != nil {
             guard let environmentKey, !environmentKey.isEmpty,
                   let environmentSecret, !environmentSecret.isEmpty
             else {

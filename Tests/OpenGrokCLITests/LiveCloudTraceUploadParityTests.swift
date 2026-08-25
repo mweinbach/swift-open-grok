@@ -952,8 +952,66 @@ struct LiveCloudTraceUploadParityTests {
     }
 
     @Test(
+        "AWS environment secrets use the SDK-compatible legacy alias and precedence",
+        arguments: ["legacy-only", "blank-primary", "primary-wins"]
+    )
+    func legacyEnvironmentSecretMatchesAWSProvider(_ scenario: String) throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        var environment = try fixture.environment()
+        environment["SECRET_ACCESS_KEY"] = "PRIVATE_LEGACY_AWS_SECRET"
+        switch scenario {
+        case "legacy-only":
+            environment.removeValue(forKey: "AWS_SECRET_ACCESS_KEY")
+        case "blank-primary":
+            environment["AWS_SECRET_ACCESS_KEY"] = " \t "
+        default:
+            environment["AWS_SECRET_ACCESS_KEY"] = "PRIVATE_PRIMARY_AWS_SECRET"
+        }
+
+        let authorization = try LiveCloudTraceUpload.authorize(
+            sessionID: "legacy-environment-secret",
+            bucketURL: "s3://trace-private-bucket",
+            document: LiveManagedSetupComposition.trustedConfigDocument(environment: environment),
+            environment: environment
+        )
+
+        let expected = scenario == "primary-wins"
+            ? "PRIVATE_PRIMARY_AWS_SECRET" : "PRIVATE_LEGACY_AWS_SECRET"
+        #expect(authorization.secretAccessKey == expected)
+    }
+
+    @Test("legacy AWS secret aliases reach a real signed trace upload without credential leakage")
+    func legacyEnvironmentSecretReachesSignedTraceUpload() async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let sessionID = "legacy-aws-secret-upload"
+        try await fixture.seed(sessionID)
+        var environment = try fixture.environment()
+        environment.removeValue(forKey: "AWS_SECRET_ACCESS_KEY")
+        environment["SECRET_ACCESS_KEY"] = "PRIVATE_LEGACY_SIGNING_SECRET"
+        let transport = MockHTTPTransport(responses: [
+            .init(metadata: HTTPResponseMetadata(statusCode: 200)),
+        ])
+
+        let result = await fixture.run(
+            sessionID,
+            environment: environment,
+            services: fixture.services(transport)
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.success.rawValue)
+        #expect(result.errors.isEmpty)
+        #expect(transport.recordedRequests.count == 1)
+        let request = try #require(transport.recordedRequests.first)
+        #expect(request.headers["Authorization"]?.contains("Credential=AKIDEXAMPLE/") == true)
+        #expect(request.headers["Authorization"]?.contains("PRIVATE_LEGACY_SIGNING_SECRET") == false)
+        #expect(!result.output.contains("PRIVATE_LEGACY_SIGNING_SECRET"))
+    }
+
+    @Test(
         "partial environment AWS credentials never mix with or downgrade to a shared profile",
-        arguments: ["access-only", "secret-only", "token-only"]
+        arguments: ["access-only", "secret-only", "legacy-secret-only", "token-only"]
     )
     func partialEnvironmentCredentialsNeverFallThrough(_ scenario: String) throws {
         let fixture = try CloudTraceUploadFixture()
@@ -967,6 +1025,7 @@ struct LiveCloudTraceUploadParityTests {
         switch scenario {
         case "access-only": environment["AWS_ACCESS_KEY_ID"] = "PARTIALKEY"
         case "secret-only": environment["AWS_SECRET_ACCESS_KEY"] = "PRIVATE_PARTIAL_SECRET"
+        case "legacy-secret-only": environment["SECRET_ACCESS_KEY"] = "PRIVATE_PARTIAL_LEGACY_SECRET"
         default: environment["AWS_SESSION_TOKEN"] = "PRIVATE_PARTIAL_TOKEN"
         }
 
