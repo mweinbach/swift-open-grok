@@ -10,7 +10,9 @@ struct OpenGrokVersionGenerator {
 
         let outputURL = URL(fileURLWithPath: arguments[0])
         let version = arguments[1]
-        let releaseVersion = arguments[2].isEmpty ? nil : arguments[2]
+        let releaseVersion = arguments[2].isEmpty || arguments[2] == "--no-release-version"
+            ? nil
+            : arguments[2]
         let shortCommit = arguments.count == 4 ? arguments[3] : nil
         guard !version.isEmpty else {
             throw GeneratorError.emptyVersion

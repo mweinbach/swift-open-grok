@@ -65,7 +65,9 @@ struct OpenGrokVersionBuildPlugin: BuildToolPlugin {
 
         let generator = try context.tool(named: "OpenGrokVersionGenerator")
 
-        var arguments = [outputFile.path, displayVersion, releaseVersion ?? ""]
+        // Windows process launching drops empty argv elements, so absence
+        // needs an explicit token rather than an empty release argument.
+        var arguments = [outputFile.path, displayVersion, releaseVersion ?? "--no-release-version"]
         if let shortCommit, !shortCommit.isEmpty {
             arguments.append(shortCommit)
         }
