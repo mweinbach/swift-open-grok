@@ -354,11 +354,58 @@ private func secureExistingWindowsOwnerDirectory(_ directory: URL) throws {
     }
 }
 
+private func windowsOwnerDirectoryIsVolumeRoot(_ directory: URL) throws -> Bool {
+    let native = try windowsOwnerDirectoryNativePath(directory)
+    let uncPrefix = "\\\\?\\UNC\\"
+    if String(native.prefix(uncPrefix.count)).caseInsensitiveCompare(uncPrefix) == .orderedSame {
+        let components = native.dropFirst(uncPrefix.count)
+            .split(separator: "\\", omittingEmptySubsequences: true)
+        guard components.count >= 2 else {
+            throw windowsOwnerDirectoryError(
+                directory,
+                operation: "validate session directory",
+                detail: "UNC paths require an absolute server and share"
+            )
+        }
+        return components.count == 2
+    }
+
+    let prefix = "\\\\?\\"
+    guard native.hasPrefix(prefix) else {
+        throw windowsOwnerDirectoryError(
+            directory,
+            operation: "validate session directory",
+            detail: "path is not an absolute Windows volume path"
+        )
+    }
+    let drive = native.dropFirst(prefix.count)
+    let bytes = Array(drive.utf8)
+    guard bytes.count >= 3,
+          (65...90).contains(bytes[0]) || (97...122).contains(bytes[0]),
+          bytes[1] == 58,
+          bytes[2] == 92
+    else {
+        throw windowsOwnerDirectoryError(
+            directory,
+            operation: "validate session directory",
+            detail: "path is not an absolute Windows drive path"
+        )
+    }
+    return bytes.count == 3
+}
+
 private func createWindowsOwnerOnlyDirectoryChain(_ directory: URL, stateRoot: URL?) throws {
     var ancestry = [directory.standardizedFileURL]
     while let current = ancestry.last {
+        if try windowsOwnerDirectoryIsVolumeRoot(current) { break }
         let parent = current.deletingLastPathComponent()
-        guard parent.path != current.path else { break }
+        guard parent.path != current.path else {
+            throw windowsOwnerDirectoryError(
+                current,
+                operation: "validate session directory",
+                detail: "directory ancestry did not reach an absolute Windows volume root"
+            )
+        }
         ancestry.append(parent)
     }
     ancestry.reverse()

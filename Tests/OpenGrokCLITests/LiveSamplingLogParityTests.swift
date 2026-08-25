@@ -6,6 +6,7 @@ import Testing
 
 #if os(Windows)
 import COpenGrokSockets
+import OpenGrokConfig
 import OpenGrokFileUtils
 #endif
 
@@ -34,11 +35,15 @@ private struct LiveSamplingLogFixture {
         #endif
         home = root.appendingPathComponent("owner", isDirectory: true)
         workspace = root.appendingPathComponent("workspace", isDirectory: true)
+        #if os(Windows)
+        try OpenGrokConfig.createDirAllOwnerOnly(home, stateRoot: home)
+        #else
         try FileManager.default.createDirectory(
             at: home,
             withIntermediateDirectories: false,
             attributes: [.posixPermissions: 0o700]
         )
+        #endif
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: false)
     }
 
@@ -387,6 +392,44 @@ struct LiveSamplingLogParityTests {
     }
 
     #if os(Windows)
+    @Test("Windows sampling hardens only an existing state root and never traverses a synthetic volume parent")
+    func windowsExistingStateRootIsHardenedWithoutTouchingAncestors() throws {
+        let fixture = try LiveSamplingLogFixture()
+        defer { fixture.cleanup() }
+        let inherited = fixture.root.appendingPathComponent("existing-inherited-owner", isDirectory: true)
+        try FileManager.default.createDirectory(at: inherited, withIntermediateDirectories: false)
+
+        let parentPath = try WindowsSecurePath.extendedLengthPath(fixture.root.path)
+        let statePath = try WindowsSecurePath.extendedLengthPath(inherited.path)
+        #expect(parentPath.withCString { og_path_is_private_to_current_user($0, 1) } != 1)
+        #expect(statePath.withCString { og_path_is_private_to_current_user($0, 1) } != 1)
+
+        let logger = try #require(try LiveSamplingLog.makeIfEnabled(
+            openGrokHome: inherited,
+            cliEnabled: true,
+            environment: [:]
+        ))
+        let scope = try logger.begin(
+            config: SamplerConfig(
+                apiKey: "WINDOWS_PRIVATE_CREDENTIAL_123456789ABC",
+                baseURL: "https://example.invalid",
+                model: "safe-model"
+            ),
+            request: ConversationRequest(items: [.user("WINDOWS_PRIVATE_PROMPT")]),
+            requestID: RequestId("WINDOWS_PRIVATE_REQUEST_12345678")
+        )
+        try scope.record(.completed)
+
+        let log = inherited.appendingPathComponent("logs", isDirectory: true)
+            .appendingPathComponent("sampling.jsonl")
+        #expect(FileManager.default.fileExists(atPath: log.path))
+        #expect(statePath.withCString { og_path_is_private_to_current_user($0, 1) } == 1)
+        #expect(parentPath.withCString { og_path_is_private_to_current_user($0, 1) } != 1)
+        let contents = try String(contentsOf: log, encoding: .utf8)
+        #expect(!contents.contains("WINDOWS_PRIVATE_PROMPT"))
+        #expect(!contents.contains("WINDOWS_PRIVATE_CREDENTIAL_123456789ABC"))
+    }
+
     @Test("native Windows diagnostics pin owner-private files against replacement")
     func windowsFileIdentityRemainsPinned() throws {
         let fixture = try LiveSamplingLogFixture()
