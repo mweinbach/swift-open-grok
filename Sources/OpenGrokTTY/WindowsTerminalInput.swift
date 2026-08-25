@@ -294,7 +294,7 @@ import OpenGrokTerminalCore
 import WinSDK
 
 private struct WindowsPendingRead {
-    let token: UUID
+    let token: Foundation.UUID
     let continuation: CheckedContinuation<TerminalInputEvent?, Error>
 }
 
@@ -342,7 +342,7 @@ private final class WindowsConsoleInputState: @unchecked Sendable {
 
     func nextEvent() async throws -> TerminalInputEvent? {
         if Task.isCancelled { throw TerminalInputError.cancelled }
-        let token = UUID()
+        let token = Foundation.UUID()
         return try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation { continuation in
                 installRead(token: token, continuation: continuation)
@@ -467,7 +467,7 @@ private final class WindowsConsoleInputState: @unchecked Sendable {
     }
 
     private func installRead(
-        token: UUID,
+        token: Foundation.UUID,
         continuation: CheckedContinuation<TerminalInputEvent?, Error>
     ) {
         if Task.isCancelled {
@@ -491,7 +491,7 @@ private final class WindowsConsoleInputState: @unchecked Sendable {
         }
     }
 
-    private func cancelRead(token: UUID) {
+    private func cancelRead(token: Foundation.UUID) {
         lock.lock()
         guard let read = pendingRead, read.token == token else {
             lock.unlock()
@@ -580,7 +580,7 @@ private final class WindowsConsoleInputState: @unchecked Sendable {
             return .key(WindowsConsoleKeyRecord(
                 utf16CodeUnit: key.uChar.UnicodeChar,
                 virtualKeyCode: key.wVirtualKeyCode,
-                keyDown: key.bKeyDown,
+                keyDown: key.bKeyDown.boolValue,
                 repeatCount: key.wRepeatCount,
                 controlKeyState: key.dwControlKeyState
             ))
@@ -602,7 +602,7 @@ private final class WindowsConsoleInputState: @unchecked Sendable {
                 height: visible?.height ?? Int(size.Y)
             )
         case 0x0010:
-            return .focus(record.Event.FocusEvent.bSetFocus)
+            return .focus(record.Event.FocusEvent.bSetFocus.boolValue)
         default:
             // Menu records do not correspond to interactive input.
             return .resize(width: 0, height: 0)
@@ -792,15 +792,15 @@ private final class WindowsConsoleResizeRegistry: @unchecked Sendable {
     static let shared = WindowsConsoleResizeRegistry()
 
     private let lock = NSLock()
-    private var callbacks: [UUID: @Sendable (TerminalSize) -> Void] = [:]
+    private var callbacks: [Foundation.UUID: @Sendable (TerminalSize) -> Void] = [:]
 
-    func register(id: UUID, callback: @escaping @Sendable (TerminalSize) -> Void) {
+    func register(id: Foundation.UUID, callback: @escaping @Sendable (TerminalSize) -> Void) {
         lock.lock()
         callbacks[id] = callback
         lock.unlock()
     }
 
-    func remove(id: UUID) {
+    func remove(id: Foundation.UUID) {
         lock.lock()
         callbacks.removeValue(forKey: id)
         lock.unlock()
@@ -819,7 +819,7 @@ private final class WindowsConsoleResizeRegistry: @unchecked Sendable {
 public final class WindowsTerminalResizeMonitor: TerminalResizeSource, @unchecked Sendable {
     private let fd: Int32
     private let intervalNanoseconds: UInt64
-    private let id = UUID()
+    private let id = Foundation.UUID()
     private let lock = NSLock()
     private var continuation: AsyncStream<TerminalSize>.Continuation?
     private var pollTask: Task<Void, Never>?
@@ -840,12 +840,12 @@ public final class WindowsTerminalResizeMonitor: TerminalResizeSource, @unchecke
         lock.lock()
         guard !started, !stopped else {
             lock.unlock()
-            return AsyncStream { $0.finish() }
+            return AsyncStream<TerminalSize>(bufferingPolicy: .unbounded) { $0.finish() }
         }
         started = true
         lock.unlock()
 
-        return AsyncStream { continuation in
+        return AsyncStream<TerminalSize>(bufferingPolicy: .unbounded) { continuation in
             lock.lock()
             guard !stopped else {
                 lock.unlock()
