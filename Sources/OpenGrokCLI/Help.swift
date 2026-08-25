@@ -120,7 +120,10 @@ public enum OpenGrokHelp {
             open-grok agent [stdio|headless|serve|leader] [OPTIONS]
 
               stdio      ACP over stdin/stdout (upstream's `agent stdio`).
-              headless   One-shot run with --output-format.
+              headless   Persistent authenticated xAI WebSocket agent relay.
+                         Bare `agent` starts the same persistent relay.
+                         --reauth         Refresh the xAI browser login.
+                         --grok-ws-url URL --grok-ws-origin ORIGIN
               serve      Agent WebSocket server.
                          --bind ADDR      default 127.0.0.1:2419
                          --secret SECRET  env GROK_AGENT_SECRET

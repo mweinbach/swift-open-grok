@@ -1721,6 +1721,32 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             if LivePluginComposition.handles(command) {
                 return try await LivePluginComposition.session(for: command, context: context)
             }
+            if case .launch(let relayOptions) = command, relayOptions.agentRelay != nil {
+                let context = try LiveEndpointLaunchOverrides.applying(
+                    options: relayOptions,
+                    to: context
+                )
+                try Self.validateUnsupportedOptions(relayOptions)
+                guard !relayOptions.common.leader else {
+                    throw CLIApplicationError.unsupported(
+                        route: "agent headless leader attachment, which is unavailable in this build"
+                    )
+                }
+                return try await LiveAgentRelayComposition.session(
+                    options: relayOptions,
+                    context: context,
+                    services: Self.liveACPServices(
+                        dependencies: dependencies,
+                        liveBoundaries: { sessionID in
+                            exportBoundaries.boundary(for: sessionID)
+                        },
+                        registerExportBoundary: { sessionID, boundary in
+                            exportBoundaries.register(sessionID: sessionID, boundary: boundary)
+                        }
+                    ),
+                    remoteSettings: dependencies.remoteSettingsSnapshot
+                )
+            }
             guard case .launch(let options) = command else {
                 throw CLIApplicationError.unsupported(route: command.routeName)
             }
@@ -3240,7 +3266,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // `--tools` / `--disallowed-tools` are honored by
         // `LiveAgentToolPolicy.resolveLaunchPolicy` at tool-executor
         // construction — not refused here.
-        if options.advanced.reauthenticate { return "--reauth" }
+        if options.advanced.reauthenticate && options.agentRelay == nil {
+            return "--reauth"
+        }
         if let storageMode = options.advanced.storageMode, storageMode != "local" {
             return "--storage-mode"
         }

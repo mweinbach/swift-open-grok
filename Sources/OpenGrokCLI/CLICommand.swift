@@ -269,6 +269,16 @@ public struct CLIAdvancedOptions: Sendable, Equatable {
     }
 }
 
+public struct CLIAgentRelayOptions: Sendable, Equatable {
+    public var grokWSOrigin: String?
+    public var grokWSURL: String?
+
+    public init(grokWSOrigin: String? = nil, grokWSURL: String? = nil) {
+        self.grokWSOrigin = grokWSOrigin
+        self.grokWSURL = grokWSURL
+    }
+}
+
 public struct CLIExecutionOptions: Sendable, Equatable {
     public var mode: CLIRunMode
     public var common: CLICommonOptions
@@ -316,6 +326,9 @@ public struct CLIExecutionOptions: Sendable, Equatable {
     public var oauth: Bool
     public var agentOptions: CLIAgentOptions
     public var advanced: CLIAdvancedOptions
+    /// `agent` and `agent headless` own a persistent authenticated relay;
+    /// root `headless` remains the separate single-prompt launcher.
+    public var agentRelay: CLIAgentRelayOptions?
 
     public init(
         mode: CLIRunMode = .interactive,
@@ -344,7 +357,8 @@ public struct CLIExecutionOptions: Sendable, Equatable {
         minimalRendering: Bool = false,
         oauth: Bool = false,
         agentOptions: CLIAgentOptions = CLIAgentOptions(),
-        advanced: CLIAdvancedOptions = CLIAdvancedOptions()
+        advanced: CLIAdvancedOptions = CLIAdvancedOptions(),
+        agentRelay: CLIAgentRelayOptions? = nil
     ) {
         self.mode = mode
         self.common = common
@@ -373,6 +387,7 @@ public struct CLIExecutionOptions: Sendable, Equatable {
         self.oauth = oauth
         self.agentOptions = agentOptions
         self.advanced = advanced
+        self.agentRelay = agentRelay
     }
 
     /// The effective resume target from `--resume` or `--load`, with the
@@ -903,21 +918,58 @@ public enum CLICommandParser {
         seed: CLICommonOptions,
         environment: [String: String]
     ) throws -> CLICommand {
-        guard let first = args.first else {
-            return .launch(try parseLaunch([], mode: .interactive, seed: seed, environment: environment))
+        if let first = args.first {
+            switch first {
+            case "stdio", "acp":
+                return .launch(try parseLaunch(
+                    Array(args.dropFirst()),
+                    mode: .acp,
+                    seed: seed,
+                    environment: environment
+                ))
+            case "serve":
+                return .serve(try parseServe(
+                    Array(args.dropFirst()),
+                    seed: seed,
+                    environment: environment
+                ))
+            case "leader":
+                return .leader(try parseLeader(Array(args.dropFirst()), seed: seed))
+            default:
+                break
+            }
         }
-        switch first {
-        case "stdio", "acp":
-            return .launch(try parseLaunch(Array(args.dropFirst()), mode: .acp, seed: seed, environment: environment))
-        case "headless":
-            return .launch(try parseLaunch(Array(args.dropFirst()), mode: .headless, seed: seed, environment: environment))
-        case "serve":
-            return .serve(try parseServe(Array(args.dropFirst()), seed: seed, environment: environment))
-        case "leader":
-            return .leader(try parseLeader(Array(args.dropFirst()), seed: seed))
-        default:
-            return .launch(try parseLaunch(args, mode: .interactive, seed: seed, environment: environment))
+
+        var state = LaunchState(mode: .headless, enteredViaModeWord: true)
+        state.common = seed
+        var relay = CLIAgentRelayOptions()
+        var cursor = ArgumentCursor(args)
+        var consumedMode = false
+
+        while let token = cursor.pop() {
+            if token == "headless" {
+                guard !consumedMode else {
+                    throw CLIParseError.unexpectedArgument(token)
+                }
+                consumedMode = true
+                continue
+            }
+            guard let option = OptionToken(token) else {
+                throw CLIParseError.unexpectedArgument(token)
+            }
+            switch option.name {
+            case "--grok-ws-origin":
+                relay.grokWSOrigin = try cursor.value(for: option)
+            case "--grok-ws-url":
+                relay.grokWSURL = try cursor.value(for: option)
+            default:
+                try state.consume(option, cursor: &cursor)
+            }
         }
+
+        var options = try state.finish(environment: environment)
+        options.agentRelay = relay
+        return .launch(options)
     }
 
     private static func parseSessions(
