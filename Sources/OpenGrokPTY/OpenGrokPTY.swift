@@ -1380,7 +1380,18 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
             return
         }
         let status: ProcessExit = .code(Int32(bitPattern: code))
-        lock.withLock { exitStatus = status }
+        let handles = lock.withLock { () -> (console: HPCON?, input: HANDLE?) in
+            exitStatus = status
+            let console = pseudoConsole
+            pseudoConsole = nil
+            let input = inputWrite
+            inputWrite = nil
+            return (console, input)
+        }
+        if let input = handles.input { CloseHandle(input) }
+        // conhost retains the output writer after the child exits. Closing its
+        // console while the reader still drains is what lets output() finish.
+        if let console = handles.console { ClosePseudoConsole(console) }
         continuation.resume(returning: status)
     }
     #endif
