@@ -31,7 +31,7 @@ public enum CodexSessionScanner {
         requestedCwd: String,
         now: Date = Date(),
         codexHome: URL? = nil,
-        environment: [String: String] = [:]
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> [ForeignSessionSummary] {
         guard let home = resolveCodexHome(codexHome, environment: environment),
               let root = CodexApprovedRoot(home)
@@ -78,10 +78,10 @@ public enum CodexSessionScanner {
         environment: [String: String]
     ) -> URL? {
         if let override { return override }
-        if let envPath = environment["CODEX_HOME"] ?? ProcessInfo.processInfo.environment["CODEX_HOME"] {
+        if let envPath = environment["CODEX_HOME"], !envPath.isEmpty {
             return URL(fileURLWithPath: envPath, isDirectory: true)
         }
-        guard let home = environment["HOME"] ?? ProcessInfo.processInfo.environment["HOME"] else {
+        guard let home = environment["HOME"], !home.isEmpty else {
             return nil
         }
         return URL(fileURLWithPath: home, isDirectory: true)

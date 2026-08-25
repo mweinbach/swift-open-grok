@@ -42,7 +42,7 @@ public enum ClaudeSessionScanner {
         requestedCwd: String,
         now: Date = Date(),
         configDir: URL? = nil,
-        environment: [String: String] = [:]
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> [ForeignSessionSummary] {
         guard let configDir = resolveConfigDir(configDir, environment: environment),
               let approvedRoot = ForeignSessionApprovedRoot(configDir)
@@ -79,10 +79,10 @@ public enum ClaudeSessionScanner {
         environment: [String: String]
     ) -> URL? {
         if let override { return override }
-        if let envPath = environment["CLAUDE_CONFIG_DIR"] ?? ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"] {
+        if let envPath = environment["CLAUDE_CONFIG_DIR"], !envPath.isEmpty {
             return URL(fileURLWithPath: envPath, isDirectory: true)
         }
-        guard let home = environment["HOME"] ?? ProcessInfo.processInfo.environment["HOME"] else {
+        guard let home = environment["HOME"], !home.isEmpty else {
             return nil
         }
         return URL(fileURLWithPath: home, isDirectory: true)

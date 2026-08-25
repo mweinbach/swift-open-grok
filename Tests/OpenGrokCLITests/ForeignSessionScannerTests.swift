@@ -283,6 +283,32 @@ struct ClaudeSessionScannerTests {
         ])
         #expect(resolved?.path.hasSuffix(".claude") == true)
     }
+
+    @Test("an explicitly empty Claude environment never consults the parent process")
+    func emptyClaudeEnvironmentFailsClosed() {
+        #expect(ClaudeSessionScanner.resolveConfigDir(nil, environment: [:]) == nil)
+        #expect(ClaudeSessionScanner.resolveConfigDir(
+            nil,
+            environment: ["CLAUDE_CONFIG_DIR": "", "HOME": ""]
+        ) == nil)
+        #expect(ClaudeSessionScanner.scan(
+            requestedCwd: "/work/repo",
+            environment: [:]
+        ).isEmpty)
+    }
+
+    @Test("an injected Claude home never inherits a process-global config override")
+    func injectedClaudeHomeRemainsAuthoritative() throws {
+        let injectedHome = try makeTempDir("claude-injected-home")
+        defer { dispose(injectedHome) }
+        let expected = injectedHome.appendingPathComponent(".claude", isDirectory: true)
+
+        let resolved = ClaudeSessionScanner.resolveConfigDir(
+            nil,
+            environment: ["HOME": injectedHome.path]
+        )
+        #expect(resolved?.standardizedFileURL == expected.standardizedFileURL)
+    }
 }
 
 // MARK: - Codex scanner
@@ -396,6 +422,32 @@ struct CodexSessionScannerTests {
             "HOME": "/Users/test"
         ])
         #expect(resolved?.path.hasSuffix(".codex") == true)
+    }
+
+    @Test("an explicitly empty Codex environment never consults the parent process")
+    func emptyCodexEnvironmentFailsClosed() {
+        #expect(CodexSessionScanner.resolveCodexHome(nil, environment: [:]) == nil)
+        #expect(CodexSessionScanner.resolveCodexHome(
+            nil,
+            environment: ["CODEX_HOME": "", "HOME": ""]
+        ) == nil)
+        #expect(CodexSessionScanner.scan(
+            requestedCwd: "/work/repo",
+            environment: [:]
+        ).isEmpty)
+    }
+
+    @Test("an injected Codex home never inherits a process-global store override")
+    func injectedCodexHomeRemainsAuthoritative() throws {
+        let injectedHome = try makeTempDir("codex-injected-home")
+        defer { dispose(injectedHome) }
+        let expected = injectedHome.appendingPathComponent(".codex", isDirectory: true)
+
+        let resolved = CodexSessionScanner.resolveCodexHome(
+            nil,
+            environment: ["HOME": injectedHome.path]
+        )
+        #expect(resolved?.standardizedFileURL == expected.standardizedFileURL)
     }
 
     @Test("scan extracts vscode source from rollout")
