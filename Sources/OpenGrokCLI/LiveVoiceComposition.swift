@@ -8,6 +8,7 @@
 // `xai-grok-pager/src/app/dispatch/voice.rs` (650c1db7).
 
 import Foundation
+import OpenGrokAuth
 import OpenGrokVoice
 
 // MARK: - Capability surface
@@ -43,9 +44,15 @@ public struct LiveVoicePipelineHandle: Sendable {
     public init(
         auth: any VoiceAuthProvider,
         config: VoiceConfig = VoiceConfig(),
-        capture: any VoiceAudioCapture = SystemVoiceAudioCapture()
+        capture: any VoiceAudioCapture = SystemVoiceAudioCapture(),
+        transcription: any VoiceTranscriptionTransport = URLSessionVoiceTranscriptionTransport()
     ) {
-        self.pipeline = VoicePipeline(config: config, auth: auth, capture: capture)
+        self.pipeline = VoicePipeline(
+            config: config,
+            auth: auth,
+            capture: capture,
+            transcription: transcription
+        )
     }
 
     public func shutdown() async {
@@ -72,10 +79,47 @@ public enum LiveVoiceComposition {
     public static func makePipeline(
         auth: any VoiceAuthProvider,
         config: VoiceConfig = VoiceConfig(),
-        capabilities: LiveVoiceCapabilities
+        capabilities: LiveVoiceCapabilities,
+        capture: any VoiceAudioCapture = SystemVoiceAudioCapture(),
+        transcription: any VoiceTranscriptionTransport = URLSessionVoiceTranscriptionTransport()
     ) -> LiveVoicePipelineHandle? {
         guard capabilities.isAvailable else { return nil }
-        return LiveVoicePipelineHandle(auth: auth, config: config)
+        return LiveVoicePipelineHandle(
+            auth: auth,
+            config: config,
+            capture: capture,
+            transcription: transcription
+        )
+    }
+}
+
+/// Resolve the same session-scoped, policy-vetted xAI credential as chat.
+///
+/// Reopening the owner's auth store for each request follows token rotation by
+/// another manager or leader process without pinning a stale bearer. The
+/// captured environment is immutable so another session's process environment
+/// cannot silently authorize this voice connection.
+public struct LiveVoiceAuth: VoiceAuthProvider {
+    private let openGrokHome: URL
+    private let environment: [String: String]
+
+    public init(openGrokHome: URL, environment: [String: String]) {
+        self.openGrokHome = openGrokHome
+        self.environment = environment
+    }
+
+    public func bearer() async -> String? {
+        let manager = AuthManager(
+            grokHome: openGrokHome,
+            config: liveManagedAuthenticationConfiguration(environment: environment),
+            environment: environment
+        )
+        do {
+            let token = try await manager.getValidToken()
+            return token.isEmpty ? nil : token
+        } catch {
+            return nil
+        }
     }
 }
 
@@ -100,15 +144,18 @@ public struct LiveVoiceCommandResult: Equatable, Sendable {
 
 public struct LiveVoiceSessionState: Sendable {
     public var capabilities: LiveVoiceCapabilities
+    public var auth: (any VoiceAuthProvider)?
     public var pipeline: LiveVoicePipelineHandle?
     public var isListening: Bool
 
     public init(
         capabilities: LiveVoiceCapabilities = LiveVoiceComposition.resolveCapabilities(),
+        auth: (any VoiceAuthProvider)? = nil,
         pipeline: LiveVoicePipelineHandle? = nil,
         isListening: Bool = false
     ) {
         self.capabilities = capabilities
+        self.auth = auth
         self.pipeline = pipeline
         self.isListening = isListening
     }
@@ -118,7 +165,11 @@ public enum LiveVoiceCommands {
     /// Toggle dictation for `/voice` and the Ctrl+Space toggle chord.
     ///
     /// Returns a status the pager can surface; never `_ =` this result.
-    public static func toggle(state: inout LiveVoiceSessionState) async -> LiveVoiceCommandResult {
+    public static func toggle(
+        state: inout LiveVoiceSessionState,
+        capture: any VoiceAudioCapture = SystemVoiceAudioCapture(),
+        transcription: any VoiceTranscriptionTransport = URLSessionVoiceTranscriptionTransport()
+    ) async -> LiveVoiceCommandResult {
         guard state.capabilities.isAvailable else {
             return LiveVoiceCommandResult(
                 action: .unavailable(
@@ -137,9 +188,8 @@ public enum LiveVoiceCommands {
         }
 
         if state.pipeline == nil {
-            guard let auth = StaticVoiceAuth.shared(
-                ProcessInfo.processInfo.environment["XAI_API_KEY"] ?? ""
-            ) else {
+            guard let auth = state.auth,
+                  await auth.bearer() != nil else {
                 return LiveVoiceCommandResult(
                     action: .unavailable(reason: "not signed in"),
                     message: "Voice dictation requires `open-grok login` or XAI_API_KEY."
@@ -147,7 +197,9 @@ public enum LiveVoiceCommands {
             }
             state.pipeline = LiveVoiceComposition.makePipeline(
                 auth: auth,
-                capabilities: state.capabilities
+                capabilities: state.capabilities,
+                capture: capture,
+                transcription: transcription
             )
         }
         guard let pipeline = state.pipeline else {

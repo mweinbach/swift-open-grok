@@ -950,7 +950,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // link-click proofs never touch the real browser seam.
         self.urlOpener = urlOpener ?? authServices.openBrowser
         self.voiceState = LiveVoiceSessionState(
-            capabilities: LiveVoiceComposition.resolveCapabilities(environment: environment)
+            capabilities: LiveVoiceComposition.resolveCapabilities(environment: environment),
+            auth: LiveVoiceAuth(openGrokHome: resolvedOpenGrokHome, environment: environment)
         )
         // Explicit init override wins (tests); otherwise the startup-resolved
         // gate from effective UiConfig / env. Never re-read process cwd here.

@@ -181,9 +181,14 @@ public struct URLSessionVoiceTranscriptionTransport: VoiceTranscriptionTransport
 
     public func connect(request: VoiceTranscriptionRequest) async throws -> any VoiceTranscriptionSession {
         do {
-            let client = try URLSessionWebSocketClient.connect(
-                url: request.url,
-                headers: request.headers
+            let url = try WebSocketURL.parse(request.url.absoluteString)
+            let headers = try Self.handshakeHeaders(request.headers)
+            let client = try await WebSocketDialer.connect(
+                to: url,
+                options: WebSocketDialOptions(
+                    headers: headers,
+                    connectTimeoutSeconds: 15
+                )
             )
             let session = URLSessionVoiceTranscriptionSession(client: client)
             guard let event = try await withVoiceTimeout(
@@ -212,6 +217,38 @@ public struct URLSessionVoiceTranscriptionTransport: VoiceTranscriptionTransport
             throw VoiceError.cancelled
         } catch {
             throw VoiceError.webSocket("connect: \(error)")
+        }
+    }
+
+    private static func handshakeHeaders(
+        _ headers: [String: String]
+    ) throws -> [(String, String)] {
+        let reserved: Set<String> = [
+            "host",
+            "upgrade",
+            "connection",
+            "sec-websocket-key",
+            "sec-websocket-version",
+        ]
+        let punctuation = Set("!#$%&'*+-.^_`|~".utf8)
+
+        return try headers.sorted { $0.key < $1.key }.map { name, value in
+            let isValidName = !name.isEmpty && name.utf8.allSatisfy { byte in
+                (48...57).contains(byte)
+                    || (65...90).contains(byte)
+                    || (97...122).contains(byte)
+                    || punctuation.contains(byte)
+            }
+            let isValidValue = !value.utf8.contains { byte in
+                byte == 0 || byte == 10 || byte == 13
+            }
+            guard isValidName,
+                  isValidValue,
+                  !reserved.contains(name.lowercased())
+            else {
+                throw VoiceError.configuration("invalid WebSocket transcription request header")
+            }
+            return (name, value)
         }
     }
 }
