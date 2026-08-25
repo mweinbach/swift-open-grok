@@ -680,6 +680,53 @@ struct MCPOAuthBrowserFlowTests {
         #expect(tokenObject["refresh_token"] as? String == "rt-flow")
     }
 
+    @Test("a fresh token written to the real credential store completes without a callback")
+    func credentialStoreCompletesBrowserFlow() async throws {
+        let transport = scriptedAuthServer { _ in emptyResponse(500) }
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let browserWriteError = LockedBox<String?>(nil)
+
+        try await mcpAuthenticateServer(
+            serverName: "disk-flow",
+            serverURL: serverURL,
+            home: home,
+            transport: transport,
+            byoConfig: nil,
+            force: true,
+            openBrowser: { _ in
+                do {
+                    try MCPCredentialStore.insertAndSave(
+                        home: home,
+                        serverName: "disk-flow",
+                        serverURL: serverURL,
+                        credentials: MCPStoredCredentials(
+                            clientId: "dcr-client-1",
+                            tokenResponse: MCPOAuthTokenResponse(
+                                accessToken: "at-disk-flow",
+                                refreshToken: "rt-disk-flow"
+                            )
+                        )
+                    )
+                } catch {
+                    browserWriteError.mutate { $0 = String(describing: error) }
+                }
+            },
+            timeoutSeconds: 2,
+            credentialPollIntervalSeconds: 0.01,
+            singleFlight: MCPOAuthSingleFlight()
+        )
+
+        #expect(browserWriteError.value == nil)
+        let stored = try MCPFileCredentialStorage(
+            home: home,
+            serverName: "disk-flow",
+            serverURL: serverURL
+        ).load()
+        #expect(stored?.tokenResponse?.accessToken == "at-disk-flow")
+        #expect(stored?.tokenResponse?.refreshToken == "rt-disk-flow")
+    }
+
     @Test("a stray probe does not consume the wait; POST /callback is decisive")
     func listenerRouting() async throws {
         let listener = try MCPOAuthLoopbackListener(port: 0)

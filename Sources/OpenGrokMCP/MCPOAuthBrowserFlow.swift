@@ -53,6 +53,18 @@ struct MCPOAuthCallbackPayload: Sendable, Equatable {
     var issuer: String?
 }
 
+private struct MCPOAuthCredentialPollSnapshot: Sendable {
+    let storage: MCPFileCredentialStorage
+    let accessToken: String?
+
+    func credentialsChanged() -> Bool {
+        guard let currentToken = (try? storage.load())?.tokenResponse?.accessToken else {
+            return false
+        }
+        return currentToken != accessToken
+    }
+}
+
 func mcpParseOAuthCallbackParams(
     _ params: [String: String]
 ) -> Result<MCPOAuthCallbackPayload, MCPOAuthFlowError> {
@@ -163,7 +175,7 @@ final class MCPOAuthLoopbackListener: @unchecked Sendable {
     fileprivate func awaitCallbackOrCredential(
         timeoutSeconds: TimeInterval,
         credentialPollIntervalSeconds: TimeInterval,
-        credentialsChanged: @escaping @Sendable () -> Bool
+        credentialPollSnapshot: MCPOAuthCredentialPollSnapshot
     ) async throws -> MCPOAuthBrowserCompletion {
         let sFd = serverFd
         guard sFd >= 0 else {
@@ -173,14 +185,17 @@ final class MCPOAuthLoopbackListener: @unchecked Sendable {
         let interval = max(0.001, credentialPollIntervalSeconds)
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(with: Result {
-                    try Self.serveUntilCallbackOrCredential(
+                do {
+                    let completion = try Self.serveUntilCallbackOrCredential(
                         fd: sFd,
                         timeoutSeconds: timeout,
                         credentialPollIntervalSeconds: interval,
-                        credentialsChanged: credentialsChanged
+                        credentialPollSnapshot: credentialPollSnapshot
                     )
-                })
+                    continuation.resume(returning: completion)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
             }
         }
     }
@@ -232,7 +247,7 @@ final class MCPOAuthLoopbackListener: @unchecked Sendable {
         fd: OGSocketHandle,
         timeoutSeconds: TimeInterval,
         credentialPollIntervalSeconds: TimeInterval,
-        credentialsChanged: @escaping @Sendable () -> Bool
+        credentialPollSnapshot: MCPOAuthCredentialPollSnapshot
     ) throws -> MCPOAuthBrowserCompletion {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         var nextCredentialPoll = Date().addingTimeInterval(credentialPollIntervalSeconds)
@@ -244,7 +259,7 @@ final class MCPOAuthLoopbackListener: @unchecked Sendable {
                         + "re-run authentication to try again")
             }
             if now >= nextCredentialPoll {
-                if credentialsChanged() { return .credentialsStored }
+                if credentialPollSnapshot.credentialsChanged() { return .credentialsStored }
                 nextCredentialPoll = now.addingTimeInterval(credentialPollIntervalSeconds)
                 continue
             }
@@ -492,12 +507,10 @@ public func mcpRunBrowserAuthFlow(
     let completion = try await listener.awaitCallbackOrCredential(
         timeoutSeconds: timeoutSeconds,
         credentialPollIntervalSeconds: credentialPollIntervalSeconds,
-        credentialsChanged: {
-            guard let tokenNow = (try? storage.load())?.tokenResponse?.accessToken else {
-                return false
-            }
-            return tokenNow != tokenBeforeBrowser
-        }
+        credentialPollSnapshot: MCPOAuthCredentialPollSnapshot(
+            storage: storage,
+            accessToken: tokenBeforeBrowser
+        )
     )
 
     if case .callback(let callback) = completion {
