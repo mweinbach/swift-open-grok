@@ -233,7 +233,10 @@ public func renderPagerFrame(_ state: PagerRenderState) -> PagerRenderResult {
             toastOccluder: toastPlan?.rect
         ),
         scrollbarHit: scrollbarHit,
-        toastOccluder: toastPlan?.rect
+        toastOccluder: toastPlan?.rect,
+        followUpSuggestions: chrome.followUpSuggestions.height > 0
+            ? chrome.followUpSuggestions
+            : nil
     )
 
     var buffer = CellBuffer(area: bounds)
@@ -420,6 +423,7 @@ private struct ChromeLayout {
     var conversation: TerminalRect
     var completions: TerminalRect
     var turnStatus: TerminalRect
+    var followUpSuggestions: TerminalRect
     var input: TerminalRect
     var shortcuts: TerminalRect
 }
@@ -459,6 +463,7 @@ private func makeChromeLayout(
             conversation: empty,
             completions: empty,
             turnStatus: empty,
+            followUpSuggestions: empty,
             input: empty,
             shortcuts: empty
         )
@@ -524,6 +529,11 @@ private func makeChromeLayout(
         : 0
 
     let composerHeight = take(pagerComposerHeight(state.input, width: bounds.width))
+    let followUpSuggestionsVisible = state.followUpSuggestions?.labels.isEmpty == false
+        && !state.overlays.isActive
+        && bounds.height > PagerLayoutMetrics.shortTerminalRows
+    let followUpSuggestionsHeight = followUpSuggestionsVisible ? take(1) : 0
+    let followUpSuggestionsGap = followUpSuggestionsHeight > 0 ? take(1) : 0
     // `prompt_gap` is 0 in compact mode (`agent_view/render.rs:1138-1145`;
     // the turn-status-gap and short-terminal arms of that expression have no
     // port seam yet — this port's turn status always keeps its own gap row).
@@ -538,7 +548,15 @@ private func makeChromeLayout(
     let completionsGap = completionsHeight > 0 ? take(1) : 0
 
     let conversationHeight = max(0, remaining)
-    _ = (statusGap, announcementGap, bottomGap, promptGap, turnStatusGap, completionsGap)
+    _ = (
+        statusGap,
+        announcementGap,
+        bottomGap,
+        promptGap,
+        turnStatusGap,
+        completionsGap,
+        followUpSuggestionsGap
+    )
 
     var y = bounds.y
     func place(_ height: Int, gapAfter: Int = 0) -> TerminalRect {
@@ -553,7 +571,8 @@ private func makeChromeLayout(
     let todoPane = place(todoPaneHeight, gapAfter: todoPaneGap)
     let conversation = place(conversationHeight, gapAfter: completionsGap)
     let completions = place(completionsHeight, gapAfter: turnStatusGap)
-    let turnStatus = place(turnStatusHeight, gapAfter: promptGap)
+    let turnStatus = place(turnStatusHeight, gapAfter: followUpSuggestionsGap)
+    let followUpSuggestions = place(followUpSuggestionsHeight, gapAfter: promptGap)
     let input = place(composerHeight, gapAfter: bottomGap)
     let shortcuts = place(shortcutsHeight)
 
@@ -565,6 +584,7 @@ private func makeChromeLayout(
         conversation: conversation,
         completions: completions,
         turnStatus: turnStatus,
+        followUpSuggestions: followUpSuggestions,
         input: input,
         shortcuts: shortcuts
     )

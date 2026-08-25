@@ -99,6 +99,18 @@ public struct AllowlistedRemoteSettings: Sendable, Equatable {
     public var compactionMode: String?
     public var compactionDetail: String?
 
+    // -- Permission prompts (PermissionPromptSettings) --
+
+    /// Authenticated remote default only; managed requirement pins still win.
+    public var rememberToolApprovals: Bool?
+    /// Authenticated auto-mode default; managed, environment, and local policy win.
+    public var autoModeEnabled: Bool?
+
+    // -- Goal and todo orchestration (LiveGoalCoordinator) --
+
+    public var todoGateEnabled: Bool?
+    public var todoGateMaxFiresPerPrompt: UInt32?
+
     // -- Network and media egress (LiveWebTools / LiveImageTools / LiveVideoComposition) --
 
     public var webFetchEnabled: Bool?
@@ -144,6 +156,17 @@ extension AllowlistedRemoteSettings {
         self.cancelRewindEnabled = remote.cancelRewindEnabled
         self.compactionMode = remote.compactionMode
         self.compactionDetail = remote.compactionDetail
+        self.rememberToolApprovals = remote.rememberToolApprovals
+        switch remote.autoMode {
+        case .bool(let enabled):
+            self.autoModeEnabled = enabled
+        case .object(let configuration):
+            self.autoModeEnabled = configuration["enabled"]?.boolValue
+        default:
+            self.autoModeEnabled = nil
+        }
+        self.todoGateEnabled = remote.todoGateEnabled
+        self.todoGateMaxFiresPerPrompt = remote.todoGateMaxFiresPerPrompt
         self.webFetchEnabled = remote.webFetchEnabled
         self.webFetchProxy = remote.webFetchProxy
         self.webFetchAllowedDomains = remote.webFetchAllowedDomains
@@ -180,6 +203,10 @@ public let remoteSettingsAllowlistedWireNames: Set<String> = [
     "cancel_rewind_enabled",
     "compaction_mode",
     "compaction_detail",
+    "remember_tool_approvals",
+    "auto_mode",
+    "todo_gate_enabled",
+    "todo_gate_max_fires_per_prompt",
     "web_fetch_enabled",
     "web_fetch_proxy",
     "web_fetch_allowed_domains",

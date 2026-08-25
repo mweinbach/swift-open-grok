@@ -1204,7 +1204,7 @@ struct ParityCompositionTests {
         #expect(readerError.contents == "open-grok: sampling\n")
         #expect(executorError.contents == "open-grok: sampling\n")
         #expect(requests[0].tools.map(\.name) == ["read_file"])
-        #expect(requests[1].tools.map(\.name) == ["run_terminal_cmd"])
+        #expect(requests[1].tools.map(\.name) == ["run_terminal_command", "run_terminal_cmd"])
     }
 
     @Test("live headless composition executes provider tool calls and resamples")
@@ -1664,7 +1664,7 @@ struct ParityCompositionTests {
         // peer delivery independently of the selected sampling provider.
         let advertised = Set(requests.first?.tools.map(\.name) ?? [])
         #expect(advertised == Set([
-            "run_terminal_cmd", "read_file", "list_dir", "grep",
+            "run_terminal_command", "run_terminal_cmd", "read_file", "list_dir", "grep",
             "glob", "view_image", "search_replace", "write", "apply_patch",
             "image_gen", "image_edit", "image_to_video", "reference_to_video",
             "get_command_or_subagent_output", "wait_commands_or_subagents", "kill_command_or_subagent",

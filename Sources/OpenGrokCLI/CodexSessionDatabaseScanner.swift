@@ -446,16 +446,7 @@ enum CodexSessionDatabaseScanner {
     }
 
     private static func rolloutID(from path: URL) -> String? {
-        let name = path.lastPathComponent
-        let stem: String
-        if name.hasSuffix(".jsonl.zst") {
-            stem = String(name.dropLast(".jsonl.zst".count))
-        } else if name.hasSuffix(".jsonl") {
-            stem = String(name.dropLast(".jsonl".count))
-        } else {
-            return nil
-        }
-        return CodexSessionScanner.rolloutID(from: stem)
+        CodexSessionScanner.rolloutID(fromPath: path)
     }
 
     private static func persistedSource(_ source: String) -> ForeignSessionSource? {

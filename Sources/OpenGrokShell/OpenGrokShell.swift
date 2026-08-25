@@ -704,26 +704,60 @@ public struct DefaultOpenGrokShellACPRuntimeFactory: OpenGrokShellACPRuntimeFact
 }
 
 public actor ProviderBackedACPPromptDriver: ACPPromptDriver {
+    public struct ImageStaging: Sendable {
+        public typealias Stage = @Sendable (
+            AcpSessionId,
+            String,
+            [OpenGrokACP.ImageContent]
+        ) async throws -> Void
+        public typealias Clear = @Sendable (AcpSessionId, String) async -> Void
+
+        public let stage: Stage
+        public let clear: Clear
+
+        public init(stage: @escaping Stage, clear: @escaping Clear) {
+            self.stage = stage
+            self.clear = clear
+        }
+    }
+
     private let providerSession: any OpenGrokShellProviderSession
     private let turnDriver: any OpenGrokShellTurnDriver
+    private let imageStaging: ImageStaging?
     private var activeTurnID: String?
+    private var activeWireSessionID: AcpSessionId?
+    private var activeTurnHasImages = false
+    private var cancelledTurnIDs: Set<String> = []
 
     public init(
         providerSession: any OpenGrokShellProviderSession,
-        turnDriver: any OpenGrokShellTurnDriver
+        turnDriver: any OpenGrokShellTurnDriver,
+        imageStaging: ImageStaging? = nil
     ) {
         self.providerSession = providerSession
         self.turnDriver = turnDriver
+        self.imageStaging = imageStaging
     }
 
     public func run(
         context: ACPPromptContext,
         emit: @escaping @Sendable (SessionNotification, ACPNotificationDisposition) async -> Void
     ) async throws -> PromptResponse {
-        let text = try Self.promptText(for: context.request.prompt)
+        let images = try Self.promptImages(for: context.request.prompt)
+        let text = try Self.promptText(
+            for: context.request.prompt,
+            allowingImages: imageStaging != nil
+        )
         let turnID = context.request.messageId ?? UUID().uuidString
         activeTurnID = turnID
-        defer { activeTurnID = nil }
+        activeWireSessionID = context.request.sessionId
+        activeTurnHasImages = !images.isEmpty
+        defer {
+            activeTurnID = nil
+            activeWireSessionID = nil
+            activeTurnHasImages = false
+            cancelledTurnIDs.remove(turnID)
+        }
         let schema = context.request.meta?["outputSchema"] ?? context.request.meta?["jsonSchema"]
         let request = OpenGrokShellTurnRequest(
             promptID: turnID,
@@ -731,15 +765,36 @@ public actor ProviderBackedACPPromptDriver: ACPPromptDriver {
             turnID: turnID,
             jsonSchema: schema
         )
-        let result = try await turnDriver.submit(providerSession: providerSession, request: request) { update in
-            guard case let .assistantText(value) = update else { return }
-            await emit(
-                SessionNotification(
-                    sessionId: context.request.sessionId,
-                    update: .agentMessageChunk(ContentChunk(content: .text(value)))
-                ),
-                .live
-            )
+        let result: OpenGrokShellTurnResult
+        do {
+            if !images.isEmpty, let imageStaging {
+                try await imageStaging.stage(context.request.sessionId, turnID, images)
+                guard !cancelledTurnIDs.contains(turnID) else {
+                    throw CancellationError()
+                }
+                try Task.checkCancellation()
+            }
+            result = try await turnDriver.submit(
+                providerSession: providerSession,
+                request: request
+            ) { update in
+                guard case let .assistantText(value) = update else { return }
+                await emit(
+                    SessionNotification(
+                        sessionId: context.request.sessionId,
+                        update: .agentMessageChunk(ContentChunk(content: .text(value)))
+                    ),
+                    .live
+                )
+            }
+        } catch {
+            if !images.isEmpty, let imageStaging {
+                await imageStaging.clear(context.request.sessionId, turnID)
+            }
+            throw error
+        }
+        if !images.isEmpty, let imageStaging {
+            await imageStaging.clear(context.request.sessionId, turnID)
         }
         var meta: AcpMeta? = nil
         if let structuredOutput = result.structuredOutput {
@@ -756,7 +811,10 @@ public actor ProviderBackedACPPromptDriver: ACPPromptDriver {
         )
     }
 
-    static func promptText(for blocks: [ContentBlock]) throws -> String {
+    static func promptText(
+        for blocks: [ContentBlock],
+        allowingImages: Bool = false
+    ) throws -> String {
         try blocks.map { block in
             switch block {
             case .text(let value):
@@ -773,6 +831,9 @@ public actor ProviderBackedACPPromptDriver: ACPPromptDriver {
             case .resourceLink(let link):
                 return link.uri
             case .image:
+                if allowingImages {
+                    return ""
+                }
                 throw OpenGrokShellError.invalidTurnRequest(
                     "ACP prompt images are not supported"
                 )
@@ -782,6 +843,40 @@ public actor ProviderBackedACPPromptDriver: ACPPromptDriver {
                 )
             }
         }.joined()
+    }
+
+    static func promptImages(for blocks: [ContentBlock]) throws -> [OpenGrokACP.ImageContent] {
+        let maximumImageBytes = 1_500_000
+        let maximumTotalBytes = 8_000_000
+        let supportedMIMETypes: Set<String> = [
+            "image/png", "image/jpeg", "image/webp", "image/gif",
+        ]
+        var images: [OpenGrokACP.ImageContent] = []
+        var totalBytes = 0
+
+        for block in blocks {
+            guard case .image(let image) = block else { continue }
+            let mimeType = image.mimeType.lowercased()
+            guard image.uri == nil,
+                  images.count < maxPlaceholdersPerPrompt,
+                  supportedMIMETypes.contains(mimeType),
+                  image.data.utf8.count <= ((maximumImageBytes + 2) / 3) * 4,
+                  let bytes = Data(base64Encoded: image.data),
+                  !bytes.isEmpty,
+                  bytes.count <= maximumImageBytes,
+                  totalBytes <= maximumTotalBytes - bytes.count
+            else {
+                throw OpenGrokShellError.invalidTurnRequest(
+                    "ACP prompt image is malformed, unsupported, oversized, or URI-backed"
+                )
+            }
+            totalBytes += bytes.count
+            images.append(OpenGrokACP.ImageContent(
+                data: bytes.base64EncodedString(),
+                mimeType: mimeType
+            ))
+        }
+        return images
     }
 
     static func stopReason(for result: OpenGrokShellTurnResult) -> OpenGrokACP.StopReason {
@@ -802,7 +897,11 @@ public actor ProviderBackedACPPromptDriver: ACPPromptDriver {
     }
 
     public func cancel(sessionId: AcpSessionId) async {
-        guard let activeTurnID else { return }
+        guard let activeTurnID, activeWireSessionID == sessionId else { return }
+        cancelledTurnIDs.insert(activeTurnID)
+        if activeTurnHasImages, let imageStaging {
+            await imageStaging.clear(sessionId, activeTurnID)
+        }
         try? await turnDriver.cancel(providerSession: providerSession, turnID: activeTurnID)
     }
 }

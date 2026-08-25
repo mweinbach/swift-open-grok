@@ -96,15 +96,19 @@ struct MermaidCRLFParityTests {
         #expect(parsed.config == RenderConfig())
     }
 
-    @Test("the public family sets describe all five implemented renderers")
+    @Test("the public family sets describe every pinned Rust dispatcher family")
     func publicDiagramFamilyClassification() throws {
         let supported: Set<String> = [
             "graph", "flowchart", "stateDiagram", "stateDiagram-v2",
             "classDiagram", "classDiagram-v2", "erDiagram", "sequenceDiagram",
+            "pie", "mindmap", "timeline", "journey", "gantt", "gitGraph", "kanban",
+            "quadrantChart", "xychart-beta", "radar-beta", "sankey-beta", "packet-beta",
+            "requirementDiagram", "block-beta", "C4Context", "C4Container", "C4Component",
+            "C4Dynamic", "C4Deployment", "info",
         ]
         #expect(MermaidDiagramFamily.supported == supported)
         #expect(MermaidDiagramFamily.supported.isDisjoint(with: MermaidDiagramFamily.knownButUnsupported))
-        #expect(MermaidDiagramFamily.knownButUnsupported.contains("pie"))
+        #expect(MermaidDiagramFamily.knownButUnsupported.contains("flowchart-elk"))
 
         let families: [(source: String, token: String, kind: MermaidDiagram.Kind)] = [
             ("graph TD\r\nA --> B", "graph", .flowchart),

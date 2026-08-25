@@ -58,6 +58,7 @@ struct LiveToolExecutor: Sendable {
     private let registryToolNames: Set<String>
     private let initiallyAdvertisedMCPToolNames: Set<String>
     private let sessionToolPolicy: LiveAgentToolPolicy?
+    private let workingDirectoryScopeMutations = LiveWorkingDirectoryScopeMutationCoordinator()
     /// The same gate the file tools run through. `run_terminal_cmd` used to
     /// dispatch straight to `composition.invoke`, so shell execution never saw
     /// a deny rule, a PreToolUse hook, or the permission modal.
@@ -305,6 +306,86 @@ struct LiveToolExecutor: Sendable {
     /// on a parallel copy (AGENTS.md §3).
     var mcpSessionConnections: MCPSessionConnections { mcpConnections }
     var mcpToolset: FinalizedToolset { fileToolBridge.toolset }
+    /// Passing this capability is the only way a child inherits root grants.
+    var resourceAuthorizationScope: ToolResourceAuthorizationScope {
+        fileToolBridge.toolset.resources.authorizationScope
+    }
+
+    /// Additional approved roots shared only with explicitly scoped children.
+    func additionalWorkingDirectories() -> [URL] {
+        let scope = resourceAuthorizationScope
+        let baseline = Set(scope.baseRoots.map {
+            Self.canonicalWorkspaceRoot(URL(fileURLWithPath: $0)).path
+        })
+        return scope.allowedRoots.compactMap { root in
+            let canonical = Self.canonicalWorkspaceRoot(URL(fileURLWithPath: root))
+            return baseline.contains(canonical.path) ? nil : canonical
+        }
+    }
+
+    /// Update filesystem and permission gates together for the authenticated
+    /// root only. Child sessions may inherit the capability but cannot mutate it.
+    func updateAdditionalWorkingDirectories(
+        _ directories: [URL],
+        sessionID: String
+    ) async throws {
+        let resources = fileToolBridge.toolset.resources
+        guard !sessionID.isEmpty,
+              sessionID == resources.authorizationSessionID,
+              sessionID == resources.sessionId
+        else {
+            throw CLIApplicationError.failed(
+                "only the authenticated root session can change working-directory authority"
+            )
+        }
+        try await validateWorkspaceAuthority(
+            sessionID: sessionID,
+            workingDirectory: workingDirectory,
+            requiresRegisteredSession: true
+        )
+        guard let permissionPipeline else {
+            throw CLIApplicationError.failed(
+                "additional working directories require the session permission gate"
+            )
+        }
+
+        var validated: [URL] = []
+        var seen = Set<String>()
+        let primaryRoot = Self.canonicalWorkspaceRoot(workingDirectory)
+        for directory in directories {
+            guard directory.isFileURL else {
+                throw CLIApplicationError.failed("additional working directories must be local paths")
+            }
+            let canonical = Self.canonicalWorkspaceRoot(directory)
+            var isDirectory = ObjCBool(false)
+            guard canonical.path != "/",
+                  FileManager.default.fileExists(atPath: canonical.path, isDirectory: &isDirectory),
+                  isDirectory.boolValue
+            else {
+                throw CLIApplicationError.failed(
+                    "additional working directory is missing, unsafe, or not a directory"
+                )
+            }
+            if sandbox.enforced,
+               canonical.path != primaryRoot.path,
+               !canonical.path.hasPrefix(primaryRoot.path + "/") {
+                throw CLIApplicationError.failed(
+                    "an enforced operating-system sandbox cannot expand its workspace boundary"
+                )
+            }
+            if seen.insert(canonical.path).inserted {
+                validated.append(canonical)
+            }
+        }
+
+        let permissions = await permissionPipeline.permissions
+        try await workingDirectoryScopeMutations.replace(
+            directories: validated,
+            scope: resources.authorizationScope,
+            permissions: permissions,
+            sessionID: sessionID
+        )
+    }
     /// Rewind snapshots, memory and goals. Optional so every construction site
     /// that predates them keeps compiling and simply advertises none of their
     /// tools; see `LiveSessionServices.swift`.
@@ -360,6 +441,7 @@ struct LiveToolExecutor: Sendable {
         // that passes nothing simply has no CLI permission tier.
         permissionOptions: CLIPermissionOptions = CLIPermissionOptions(),
         inheritedPermissionHandle: PermissionHandle? = nil,
+        authorizationScope: ToolResourceAuthorizationScope? = nil,
         sandboxAutoAllowBash: (@Sendable () -> Bool)? = nil,
         // Plan mode is a root-session interaction: a subagent calling
         // `exit_plan_mode` would present a plan dialog indistinguishable from
@@ -507,7 +589,7 @@ struct LiveToolExecutor: Sendable {
             planFilePath: ".opengrok/plan.md",
             sessionDirectory: standardizedWorkingDirectory.path
         )
-        let fileToolResources = FileToolSession.makeResources(
+        let sessionResources = FileToolSession.makeResources(
             workspaceRoot: standardizedWorkingDirectory.path,
             sessionId: sessionID,
             agentId: "main",
@@ -519,6 +601,24 @@ struct LiveToolExecutor: Sendable {
             inheritedPermissionHandle: inheritedPermissionHandle,
             sandboxAutoAllowBash: sandboxPredicate
         )
+        let fileToolResources: ToolResources
+        if let authorizationScope {
+            fileToolResources = ToolResources(
+                cwd: sessionResources.cwd,
+                sessionFolder: sessionResources.sessionFolder,
+                locks: sessionResources.locks,
+                permissionPipeline: sessionResources.permissionPipeline,
+                hunkTracker: sessionResources.hunkTracker,
+                promptIndex: sessionResources.promptIndex,
+                sessionId: sessionResources.sessionId,
+                agentId: sessionResources.agentId,
+                allowedRoots: sessionResources.allowedRoots,
+                extras: sessionResources.extras,
+                authorizationScope: authorizationScope
+            )
+        } else {
+            fileToolResources = sessionResources
+        }
         let pinnedGitIgnore = security.requirements.first {
             $0[path: ["tools", "respect_gitignore"]]?.boolValue != nil
         }?[path: ["tools", "respect_gitignore"]]?.boolValue
@@ -629,16 +729,11 @@ struct LiveToolExecutor: Sendable {
                 kind: planModeKinds[BuiltinToolCatalog.exitPlanModeQualifiedId]
             ))
         }
-        // `ask_user_question` — root sessions with a live interactive question
-        // surface, and nothing else. The `userQuestions` gate is the honest
-        // form of upstream's `ask_user_question_enabled` strip
-        // (`xai-grok-agent/src/builder.rs:819-825`): headless/ACP/child
-        // compositions pass no surface, so the model is never offered a tool
-        // that would block on a sheet no one can see. The subagent guard also
-        // diverges from upstream's inherit-the-parent-gate
-        // (`xai-grok-shell/src/agent/subagent/mod.rs:196-198`) — see the strip
-        // in `applyChildToolPolicy` for why the port's children cannot ask.
-        if !subagent, let userQuestions {
+        // Children inherit only the explicitly scoped, parent-authorized
+        // presenter; an arbitrary presenter cannot make a headless child
+        // interactive or impersonate its parent.
+        if let userQuestions,
+           (!subagent || userQuestions is any ScopedUserQuestionPresenting) {
             fileToolResources.userQuestions = userQuestions
             builder.setHandler(
                 qualifiedId: BuiltinToolCatalog.askUserQuestionQualifiedId,
@@ -968,7 +1063,9 @@ struct LiveToolExecutor: Sendable {
         let backgroundTaskTools: [ToolSpec]
         let terminalTools: [ToolSpec]
         let monitorTools: [ToolSpec]
-        if toolPolicy?.allows(liveToolName: Self.runTerminalTool.name) == false {
+        // The legacy spelling owns the complete alias-aware policy matcher;
+        // testing only the public name would bypass old deny/capability rules.
+        if toolPolicy?.allows(liveToolName: LiveRunTerminalToolRuntime.legacyName) == false {
             backgroundTaskTools = []
             terminalTools = []
             // The monitor rides the same process surface `run_terminal_cmd`
@@ -979,7 +1076,11 @@ struct LiveToolExecutor: Sendable {
             backgroundTaskTools = LiveBackgroundTaskTools
                 .toolSpecs(environment: environment, subagentsPresent: advertisesSubagents)
                 .filter { toolPolicy?.allows(liveToolName: $0.name) ?? true }
-            terminalTools = [Self.runTerminalTool] + backgroundTaskTools
+            // Existing persisted Code Mode cells still call the short alias.
+            // Keep it callable beside the upstream public name until the cell
+            // namespace can expose compatibility aliases without advertising
+            // them as a second provider tool.
+            terminalTools = [Self.runTerminalTool, Self.legacyRunTerminalTool] + backgroundTaskTools
             // `monitor` — enablement is the host's presence (only the
             // interactive foundation constructs one; its event sink's idle
             // half is the controller's queue), then the per-tool profile
@@ -1078,7 +1179,7 @@ struct LiveToolExecutor: Sendable {
             .union(sessionCollaborationToolNames)
             .union(schedulerToolNames)
             .union(monitorToolNames)
-            .union([Self.runTerminalTool.name])
+            .union(LiveRunTerminalToolRuntime.supportedNames)
         var sessionOwnedToolNames = Set(sessionTools.map(\.name))
         if sessionServices?.handles(LiveGoalTools.toolName) == true {
             sessionOwnedToolNames.insert(LiveGoalTools.toolName)
@@ -1128,7 +1229,7 @@ struct LiveToolExecutor: Sendable {
     func currentToolSpecs() -> [ToolSpec] {
         var current = tools.filter {
             !initiallyAdvertisedMCPToolNames.contains($0.name)
-                && ($0.name != LiveLspComposition.toolName
+                && (($0.name != LiveLspComposition.toolName && $0.name != "lsp")
                     || mcpToolset.tool(named: $0.name) != nil)
         }
         for definition in mcpToolset.topLevelDefinitions() {
@@ -1176,6 +1277,18 @@ struct LiveToolExecutor: Sendable {
 
     func failClosedAfterFolderTrustPersistenceFailure() {
         folderTrustRuntime.failClosed()
+        let scope = resourceAuthorizationScope
+        guard scope.replaceAllowedRoots(
+            scope.baseRoots,
+            authorizationSessionID: scope.authorizationSessionID
+        ) else { return }
+        if let permissionPipeline {
+            let sessionID = scope.authorizationSessionID
+            Task {
+                let permissions = await permissionPipeline.permissions
+                await permissions.replaceWorkingDirectoryRules(sessionID: sessionID, roots: [])
+            }
+        }
     }
 
     var folderTrustRegistrationID: UUID { folderTrustBinding.id }
@@ -1196,9 +1309,30 @@ struct LiveToolExecutor: Sendable {
             environment: environment
         ) else {
             folderTrustRuntime.failClosed()
+            await revokeAdditionalWorkingDirectoryAuthority()
             return 0
         }
+        if !trusted {
+            await revokeAdditionalWorkingDirectoryAuthority()
+        }
         return await folderTrustBinding.reload(trusted: trusted)
+    }
+
+    private func revokeAdditionalWorkingDirectoryAuthority() async {
+        let scope = resourceAuthorizationScope
+        guard scope.replaceAllowedRoots(
+            scope.baseRoots,
+            authorizationSessionID: scope.authorizationSessionID
+        ) else {
+            folderTrustRuntime.failClosed()
+            return
+        }
+        guard let permissionPipeline else { return }
+        let permissions = await permissionPipeline.permissions
+        await permissions.replaceWorkingDirectoryRules(
+            sessionID: scope.authorizationSessionID,
+            roots: []
+        )
     }
 
     func runStop(
@@ -1698,8 +1832,9 @@ struct LiveToolExecutor: Sendable {
             }
         }
 
-        guard call.name == Self.runTerminalTool.name
-            || backgroundTaskToolNames.contains(call.name)
+        let isAdvertisedTerminal = LiveRunTerminalToolRuntime.supportedNames.contains(call.name)
+            && tools.contains { $0.name == Self.runTerminalTool.name }
+        guard isAdvertisedTerminal || backgroundTaskToolNames.contains(call.name)
         else {
             return .failure(.unsupported("unknown tool '\(call.name)'"))
         }
@@ -1724,7 +1859,7 @@ struct LiveToolExecutor: Sendable {
         // Chained rather than two independent `if`s. The two are disjoint today,
         // so it makes no behavioural difference — but the next gated tool will
         // be copied from the shape that is here.
-        if call.name == Self.runTerminalTool.name {
+        if isAdvertisedTerminal {
             if let denial = await gateTerminalCommand(args: args, call: call) {
                 return .failure(denial)
             }
@@ -1875,7 +2010,8 @@ struct LiveToolExecutor: Sendable {
             access: .read(nil),
             toolName: call.name,
             toolCallId: call.callId,
-            permissionModeLabel: await sessionPermissionMode?.permissionModeLabel()
+            permissionModeLabel: await sessionPermissionMode?.permissionModeLabel(),
+            sessionID: fileToolBridge.toolset.resources.authorizationSessionID
         ))
         if prepared.mayDispatch { return nil }
         switch prepared.decision {
@@ -1929,7 +2065,8 @@ struct LiveToolExecutor: Sendable {
             access: .bash("kill_task \(taskID)"),
             toolName: call.name,
             toolCallId: call.callId,
-            permissionModeLabel: await sessionPermissionMode?.permissionModeLabel()
+            permissionModeLabel: await sessionPermissionMode?.permissionModeLabel(),
+            sessionID: fileToolBridge.toolset.resources.authorizationSessionID
         ))
         if prepared.mayDispatch { return nil }
         switch prepared.decision {
@@ -1973,7 +2110,8 @@ struct LiveToolExecutor: Sendable {
             access: .bash(command),
             toolName: call.name,
             toolCallId: call.callId,
-            permissionModeLabel: await sessionPermissionMode?.permissionModeLabel()
+            permissionModeLabel: await sessionPermissionMode?.permissionModeLabel(),
+            sessionID: fileToolBridge.toolset.resources.authorizationSessionID
         ))
         if prepared.mayDispatch { return nil }
 
@@ -1993,7 +2131,7 @@ struct LiveToolExecutor: Sendable {
         }
     }
 
-    /// Run `run_terminal_cmd` through the permission pipeline.
+    /// Run either terminal spelling through the same permission pipeline.
     ///
     /// Returns the error to fail the call with, or nil to proceed. Fails closed
     /// on every path that is not an explicit allow: a session with no pipeline,
@@ -2008,18 +2146,22 @@ struct LiveToolExecutor: Sendable {
                 "'\(call.name)' has no permission gate configured for this session"
             )
         }
-        guard case .object(let object) = args,
-              case .string(let command)? = object["command"],
-              !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else {
-            return .invalidCall("run_terminal_cmd requires a non-empty command")
+        if let failure = LiveRunTerminalToolRuntime.validationError(
+            for: args,
+            toolName: call.name
+        ) {
+            return failure
         }
+        guard case .object(let object) = args,
+              case .string(let command)? = object["command"]
+        else { return .invalidCall("\(call.name) requires a non-empty command") }
 
         let prepared = await permissionPipeline.prepare(PrepareToolAccessRequest(
             access: .bash(command),
             toolName: call.name,
             toolCallId: call.callId,
-            permissionModeLabel: await sessionPermissionMode?.permissionModeLabel()
+            permissionModeLabel: await sessionPermissionMode?.permissionModeLabel(),
+            sessionID: fileToolBridge.toolset.resources.authorizationSessionID
         ))
         if prepared.mayDispatch { return nil }
 
@@ -2192,8 +2334,14 @@ struct LiveToolExecutor: Sendable {
     }
 
     private static let runTerminalTool = ToolSpec(
-        name: "run_terminal_cmd",
+        name: LiveRunTerminalToolRuntime.canonicalName,
         description: "Run a validated shell command in the workspace with bounded output and cancellable process cleanup.",
+        parameters: BuiltinToolCatalog.terminalCommandSchema
+    )
+
+    private static let legacyRunTerminalTool = ToolSpec(
+        name: LiveRunTerminalToolRuntime.legacyName,
+        description: "Compatibility alias for run_terminal_command; runs through the identical workspace permission gate.",
         parameters: .object([
             "type": .string("object"),
             "properties": .object([
@@ -2203,11 +2351,7 @@ struct LiveToolExecutor: Sendable {
                 ]),
                 "timeout_ms": .object([
                     "type": .string("integer"),
-                    "description": .string("Optional timeout in milliseconds.")
-                ]),
-                "output_byte_limit": .object([
-                    "type": .string("integer"),
-                    "description": .string("Maximum captured output bytes before truncation.")
+                    "description": .string("Optional foreground timeout in milliseconds (maximum 300000).")
                 ]),
                 "description": .object([
                     "type": .string("string"),
@@ -2216,13 +2360,6 @@ struct LiveToolExecutor: Sendable {
                 "is_background": .object([
                     "type": .string("boolean"),
                     "description": .string("Run as a background task.")
-                ]),
-                "environment": .object([
-                    "type": .string("object"),
-                    "description": .string("Optional environment variables for the command."),
-                    "additionalProperties": .object([
-                        "type": .string("string")
-                    ])
                 ])
             ]),
             "required": .array([.string("command")]),
@@ -2231,7 +2368,63 @@ struct LiveToolExecutor: Sendable {
     )
 }
 
+private actor LiveWorkingDirectoryScopeMutationCoordinator {
+    func replace(
+        directories: [URL],
+        scope: ToolResourceAuthorizationScope,
+        permissions: PermissionHandle,
+        sessionID: String
+    ) async throws {
+        let previousRoots = scope.allowedRoots
+        let previousPermissions = await permissions.workingDirectoryRoots(sessionID: sessionID)
+        let desiredRoots = scope.baseRoots + directories.map(\.path)
+        let desiredPaths = Set(desiredRoots)
+        let narrowedRoots = previousRoots.filter { desiredPaths.contains($0) }
+
+        // Revoke the filesystem boundary before changing its permission grant.
+        guard scope.replaceAllowedRoots(
+            narrowedRoots,
+            authorizationSessionID: sessionID
+        ) else {
+            throw CLIApplicationError.failed("working-directory authorization identity changed")
+        }
+
+        // Install additions before publishing their filesystem boundary. This
+        // makes every transient state strictly narrower than the desired state.
+        await permissions.replaceWorkingDirectoryRules(sessionID: sessionID, roots: directories)
+        let accepted = await permissions.workingDirectoryRoots(sessionID: sessionID)
+        guard Set(accepted.map(\.path)) == Set(directories.map(\.path)),
+              scope.replaceAllowedRoots(desiredRoots, authorizationSessionID: sessionID)
+        else {
+            await permissions.replaceWorkingDirectoryRules(
+                sessionID: sessionID,
+                roots: previousPermissions
+            )
+            guard scope.replaceAllowedRoots(
+                previousRoots,
+                authorizationSessionID: sessionID
+            ) else {
+                throw CLIApplicationError.failed(
+                    "working-directory authorization rollback failed; access remains restricted"
+                )
+            }
+            throw CLIApplicationError.failed(
+                "working-directory permission and filesystem boundaries could not be synchronized"
+            )
+        }
+    }
+}
+
 struct LiveRunTerminalToolRuntime: OpenGrokShellToolRuntime, Sendable {
+    static let canonicalName = "run_terminal_command"
+    static let legacyName = "run_terminal_cmd"
+    static let supportedNames: Set<String> = [canonicalName, legacyName]
+
+    private static let defaultForegroundTimeoutMilliseconds = 120_000
+    private static let maximumForegroundTimeoutMilliseconds = 300_000
+    private static let maximumBackgroundTimeoutMilliseconds = 36_000_000
+    private static let outputByteLimit = 30_000
+
     /// The session's subagent host, so `get_task_output` / `wait_tasks` /
     /// `kill_task` resolve subagent ids against the coordinator when the
     /// shell disowns them. `nil` in sessions without the spawn surface (and
@@ -2250,31 +2443,40 @@ struct LiveRunTerminalToolRuntime: OpenGrokShellToolRuntime, Sendable {
                 subagents: subagents
             )
         }
-        guard call.name == "run_terminal_cmd" else {
+        guard Self.supportedNames.contains(call.name) else {
             return .failure(.unsupported("unknown tool '\(call.name)'"))
+        }
+        if let failure = Self.validationError(for: call.args, toolName: call.name) {
+            return .failure(failure)
         }
         guard case .object(let object) = call.args,
               case .string(let command)? = object["command"],
               !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else {
-            return .failure(.invalidCall("run_terminal_cmd requires a non-empty command"))
+            return .failure(.invalidCall("\(call.name) requires a non-empty command"))
         }
 
-        let timeoutMilliseconds = Self.integer(object["timeout_ms"])
-            .map { max(1, min(3_600_000, $0)) }
-            ?? 30_000
-        let outputByteLimit = Self.integer(object["output_byte_limit"])
-            .map { max(1, min(1_000_000, $0)) }
-            ?? 30_000
-        let isBackground = Self.boolean(object["is_background"]) ?? false
+        let isBackground = Self.boolean(object["background"])
+            ?? Self.boolean(object["is_background"])
+            ?? false
+        let requestedTimeout = Self.integer(object["timeout"])
+            ?? Self.integer(object["timeout_ms"])
+        let timeoutMilliseconds: Int
+        if let requestedTimeout, requestedTimeout > 0 {
+            let ceiling = isBackground
+                ? Self.maximumBackgroundTimeoutMilliseconds
+                : Self.maximumForegroundTimeoutMilliseconds
+            timeoutMilliseconds = min(requestedTimeout, ceiling)
+        } else {
+            timeoutMilliseconds = isBackground ? 0 : Self.defaultForegroundTimeoutMilliseconds
+        }
         let description = Self.string(object["description"])
-        let environment = Self.stringDictionary(object["environment"])
         let request = ShellCommandRequest(
             command: command,
             workingDirectory: process.workingDirectory,
-            environment: environment,
+            environment: [:],
             timeout: .milliseconds(Int64(timeoutMilliseconds)),
-            outputByteLimit: outputByteLimit,
+            outputByteLimit: Self.outputByteLimit,
             toolCallID: call.callID,
             autoBackgroundOnTimeout: true,
             foregroundBlockBudget: .seconds(10),
@@ -2345,6 +2547,58 @@ struct LiveRunTerminalToolRuntime: OpenGrokShellToolRuntime, Sendable {
         _ = call
     }
 
+    /// Validate before permission hooks as well as at the legacy runtime seam,
+    /// so aliases cannot reintroduce model-controlled process authority.
+    static func validationError(
+        for arguments: JSONValue,
+        toolName: String
+    ) -> OpenGrokShellToolRuntimeError? {
+        guard case .object(let fields) = arguments,
+              case .string(let command)? = fields["command"],
+              !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return .invalidCall("\(toolName) requires a non-empty command")
+        }
+
+        if toolName == canonicalName,
+           Self.string(fields["description"]) == nil {
+            return .invalidCall("\(toolName) requires a description")
+        }
+
+        if fields["environment"] != nil || fields["output_byte_limit"] != nil {
+            return .invalidCall(
+                "\(toolName) cannot override its process environment or output limit"
+            )
+        }
+
+        if let canonical = fields["background"], Self.boolean(canonical) == nil {
+            return .invalidCall("\(toolName) background must be a boolean")
+        }
+        if let legacy = fields["is_background"], Self.boolean(legacy) == nil {
+            return .invalidCall("\(toolName) is_background must be a boolean")
+        }
+        if let canonical = Self.boolean(fields["background"]),
+           let legacy = Self.boolean(fields["is_background"]),
+           canonical != legacy {
+            return .invalidCall("\(toolName) received conflicting background aliases")
+        }
+
+        if let canonical = fields["timeout"],
+           Self.integer(canonical).map({ $0 >= 0 }) != true {
+            return .invalidCall("\(toolName) timeout must be a non-negative integer")
+        }
+        if let legacy = fields["timeout_ms"],
+           Self.integer(legacy).map({ $0 >= 0 }) != true {
+            return .invalidCall("\(toolName) timeout_ms must be a non-negative integer")
+        }
+        if let canonical = Self.integer(fields["timeout"]),
+           let legacy = Self.integer(fields["timeout_ms"]),
+           canonical != legacy {
+            return .invalidCall("\(toolName) received conflicting timeout aliases")
+        }
+        return nil
+    }
+
     /// Map process terminal metadata to a card display state.
     /// Rust: `ToolOutput::Bash(b) => b.exit_code != 0` (`output.rs:727-730`).
     static func displayState(for result: ShellCommandResult) -> OpenGrokShellToolState {
@@ -2407,15 +2661,6 @@ struct LiveRunTerminalToolRuntime: OpenGrokShellToolRuntime, Sendable {
     private static func string(_ value: JSONValue?) -> String? {
         guard case .string(let string)? = value else { return nil }
         return string
-    }
-
-    private static func stringDictionary(_ value: JSONValue?) -> [String: String] {
-        guard case .object(let object)? = value else { return [:] }
-        return object.reduce(into: [:]) { result, entry in
-            if case .string(let value) = entry.value {
-                result[entry.key] = value
-            }
-        }
     }
 
     private static func promptText(for result: ShellCommandResult) -> String {

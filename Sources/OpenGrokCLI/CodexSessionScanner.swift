@@ -98,8 +98,8 @@ public enum CodexSessionScanner {
         let root: CodexApprovedRoot
     }
 
-    /// Codex stores rollouts in date-partitioned directories:
-    /// `sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl`
+    /// Codex stores plain and single-frame zstd rollouts in date-partitioned
+    /// directories: `sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl[.zst]`.
     ///
     /// We walk the date directories for the last 31 days (matching Rust's
     /// `DAYS_IN_WINDOW`) and collect the newest candidates.
@@ -120,9 +120,7 @@ public enum CodexSessionScanner {
                 options: [.skipsHiddenFiles]
             ) else { continue }
             for entry in entries {
-                guard entry.pathExtension == "jsonl" else { continue }
-                let name = entry.deletingPathExtension().lastPathComponent
-                guard let id = rolloutID(from: name) else { continue }
+                guard let id = rolloutID(fromPath: entry) else { continue }
                 guard let opened = root.openRegularFile(entry), opened.size > 0 else { continue }
                 guard isForeignSessionWithin(opened.modified, now: now, window: maxAge) else {
                     continue
@@ -205,6 +203,19 @@ public enum CodexSessionScanner {
         return id
     }
 
+    static func rolloutID(fromPath path: URL) -> String? {
+        let name = path.lastPathComponent
+        let stem: String
+        if name.hasSuffix(".jsonl.zst") {
+            stem = String(name.dropLast(".jsonl.zst".count))
+        } else if name.hasSuffix(".jsonl") {
+            stem = String(name.dropLast(".jsonl".count))
+        } else {
+            return nil
+        }
+        return rolloutID(from: stem)
+    }
+
     // MARK: - Candidate reading
 
     static func readRolloutCandidate(
@@ -234,15 +245,27 @@ public enum CodexSessionScanner {
         )
     }
 
-    /// Read the first few JSONL records from a rollout, bounded to
-    /// `maxHeadBytes`.
+    /// Read the first few JSONL records from a plain or single-frame zstd
+    /// rollout. The compressed input and decoded output have independent caps.
     static func readHead(_ candidate: RolloutCandidate) -> String {
         guard let opened = candidate.root.openRegularFile(candidate.path),
               opened.size > 0
         else { return "" }
-        let limit = Int(min(opened.size, UInt64(maxHeadBytes)))
+        let compressed = candidate.path.lastPathComponent.hasSuffix(".jsonl.zst")
+        let ceiling = compressed ? CodexZstdSessionReader.maxCompressedBytes : maxHeadBytes
+        let limit = Int(min(opened.size, UInt64(ceiling)))
         let handle = FileHandle(fileDescriptor: opened.descriptor, closeOnDealloc: false)
-        let data = handle.readData(ofLength: limit)
+        let input = handle.readData(ofLength: limit)
+        let data: Data
+        if compressed {
+            do {
+                data = try CodexZstdSessionReader.decodeHead(input)
+            } catch {
+                return ""
+            }
+        } else {
+            data = input
+        }
         return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
     }
 
@@ -386,6 +409,8 @@ public enum CodexSessionScanner {
         if b.modified < a.modified { return .orderedAscending }
         if a.id < b.id { return .orderedAscending }
         if a.id > b.id { return .orderedDescending }
+        if a.path.path < b.path.path { return .orderedAscending }
+        if a.path.path > b.path.path { return .orderedDescending }
         return .orderedSame
     }
 }

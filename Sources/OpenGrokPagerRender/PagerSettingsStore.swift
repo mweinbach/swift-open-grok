@@ -29,6 +29,9 @@ public enum PagerSettingsStoreError: Error, CustomStringConvertible, Equatable {
     case customModelKeyContainsNewlines
     case customModelSlugContainsNewlines
     case invalidCustomModelKeyCharacters(String)
+    case invalidCustomModelProvider(String)
+    case invalidCustomModelBackend(String)
+    case invalidCustomModelDocument(String)
 
     public var description: String {
         switch self {
@@ -41,6 +44,12 @@ public enum PagerSettingsStoreError: Error, CustomStringConvertible, Equatable {
             return "✗ Catalog key must be a TOML table suffix (letters, digits, :, ., -, _)"
         case .customModelSlugContainsNewlines:
             return "✗ Model id cannot be empty or contain newlines"
+        case .invalidCustomModelProvider(let provider):
+            return "Unsupported custom model provider: \(provider)"
+        case .invalidCustomModelBackend(let backend):
+            return "Unsupported custom model API backend: \(backend)"
+        case .invalidCustomModelDocument(let message):
+            return "Could not load custom models: \(message)"
         }
     }
 }
@@ -92,7 +101,7 @@ public struct CustomModelDraft: Sendable, Equatable, Codable {
     }
 }
 
-/// A custom model record stored in `$OPENGROK_HOME/custom_models.json`.
+/// One upstream `[model.<key>]` record, with JSON decoding kept for migration.
 public struct PagerCustomModelRecord: Codable, Sendable, Equatable, Identifiable {
     public var id: String { key }
     public var key: String
@@ -102,6 +111,9 @@ public struct PagerCustomModelRecord: Codable, Sendable, Equatable, Identifiable
     public var contextWindow: Int?
     public var maxOutputTokens: Int?
     public var reasoningEfforts: [String]?
+    public var name: String?
+    public var apiBackend: String?
+    public var envKey: String?
 
     public enum CodingKeys: String, CodingKey {
         case key
@@ -111,6 +123,9 @@ public struct PagerCustomModelRecord: Codable, Sendable, Equatable, Identifiable
         case contextWindow = "context_window"
         case maxOutputTokens = "max_output_tokens"
         case reasoningEfforts = "reasoning_efforts"
+        case name
+        case apiBackend = "api_backend"
+        case envKey = "env_key"
 
         case modelIdCamel = "modelId"
         case modelAlias = "model"
@@ -119,6 +134,10 @@ public struct PagerCustomModelRecord: Codable, Sendable, Equatable, Identifiable
         case maxOutputTokensCamel = "maxOutputTokens"
         case maxCompletionTokens = "max_completion_tokens"
         case reasoningEffortsCamel = "reasoningEfforts"
+        case displayName = "display_name"
+        case apiBackendCamel = "apiBackend"
+        case backend
+        case envKeyCamel = "envKey"
     }
 
     public init(
@@ -128,7 +147,10 @@ public struct PagerCustomModelRecord: Codable, Sendable, Equatable, Identifiable
         baseUrl: String? = nil,
         contextWindow: Int? = nil,
         maxOutputTokens: Int? = nil,
-        reasoningEfforts: [String]? = nil
+        reasoningEfforts: [String]? = nil,
+        name: String? = nil,
+        apiBackend: String? = nil,
+        envKey: String? = nil
     ) {
         self.key = key
         self.modelId = modelId
@@ -137,6 +159,9 @@ public struct PagerCustomModelRecord: Codable, Sendable, Equatable, Identifiable
         self.contextWindow = contextWindow
         self.maxOutputTokens = maxOutputTokens
         self.reasoningEfforts = reasoningEfforts
+        self.name = name
+        self.apiBackend = apiBackend
+        self.envKey = envKey
     }
 
     public init(from decoder: Decoder) throws {
@@ -174,6 +199,23 @@ public struct PagerCustomModelRecord: Codable, Sendable, Equatable, Identifiable
         } else {
             self.reasoningEfforts = try c.decodeIfPresent([String].self, forKey: .reasoningEffortsCamel)
         }
+        if let name = try c.decodeIfPresent(String.self, forKey: .name) {
+            self.name = name
+        } else {
+            self.name = try c.decodeIfPresent(String.self, forKey: .displayName)
+        }
+        if let backend = try c.decodeIfPresent(String.self, forKey: .apiBackend) {
+            self.apiBackend = backend
+        } else if let backend = try c.decodeIfPresent(String.self, forKey: .apiBackendCamel) {
+            self.apiBackend = backend
+        } else {
+            self.apiBackend = try c.decodeIfPresent(String.self, forKey: .backend)
+        }
+        if let key = try c.decodeIfPresent(String.self, forKey: .envKey) {
+            self.envKey = key
+        } else {
+            self.envKey = try c.decodeIfPresent(String.self, forKey: .envKeyCamel)
+        }
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -185,10 +227,13 @@ public struct PagerCustomModelRecord: Codable, Sendable, Equatable, Identifiable
         try c.encodeIfPresent(contextWindow, forKey: .contextWindow)
         try c.encodeIfPresent(maxOutputTokens, forKey: .maxOutputTokens)
         try c.encodeIfPresent(reasoningEfforts, forKey: .reasoningEfforts)
+        try c.encodeIfPresent(name, forKey: .name)
+        try c.encodeIfPresent(apiBackend, forKey: .apiBackend)
+        try c.encodeIfPresent(envKey, forKey: .envKey)
     }
 }
 
-/// Reads and writes the settings rows that live in `config.toml` and `$OPENGROK_HOME/custom_models.json`.
+/// Reads and writes settings and custom `[model.<key>]` tables in `config.toml`.
 ///
 /// Writes are read-modify-write against the file on every call rather than
 /// against a cached tree: another process — a second pager, `open-grok config` —
@@ -340,8 +385,13 @@ public struct PagerSettingsStore: Sendable {
         return Set(array.compactMap(\.stringValue))
     }
 
-    /// Load all custom model records from `$OPENGROK_HOME/custom_models.json`.
+    /// Load upstream's `[model.<key>]` tables, migrating the former JSON file once.
     public func loadCustomModels() throws -> [PagerCustomModelRecord] {
+        let root = try customModelRoot(migratingLegacy: true)
+        return try customModelRecords(from: root)
+    }
+
+    private func legacyCustomModels() throws -> [PagerCustomModelRecord] {
         guard FileManager.default.fileExists(atPath: customModelsPath.path) else { return [] }
         let data = try Data(contentsOf: customModelsPath)
         let decoder = JSONDecoder()
@@ -351,24 +401,128 @@ public struct PagerSettingsStore: Sendable {
         if let dict = try? decoder.decode([String: PagerCustomModelRecord].self, from: data) {
             return Array(dict.values).sorted { $0.key < $1.key }
         }
-        return []
+        throw PagerSettingsStoreError.invalidCustomModelDocument(
+            "\(customModelsPath.lastPathComponent) contains invalid JSON"
+        )
     }
 
-    private func writeCustomModelsFile(_ models: [PagerCustomModelRecord]) throws {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(models)
-        let dir = customModelsPath.deletingLastPathComponent()
-        if !FileManager.default.fileExists(atPath: dir.path) {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    private func customModelRoot(migratingLegacy: Bool) throws -> TOMLValue {
+        var root: TOMLValue
+        if FileManager.default.fileExists(atPath: configPath.path) {
+            do {
+                let data = try Data(contentsOf: configPath)
+                root = data.isEmpty ? .table(TOMLTable()) : try parseTOML(data)
+            } catch {
+                throw PagerSettingsStoreError.invalidCustomModelDocument(
+                    "refusing to overwrite unparseable \(configPath.lastPathComponent): \(error)"
+                )
+            }
+        } else {
+            root = .table(TOMLTable())
         }
-        let tempURL = dir.appendingPathComponent(".custom_models.\(UUID().uuidString).tmp")
-        try data.write(to: tempURL, options: .atomic)
-        _ = try? FileManager.default.removeItem(at: customModelsPath)
-        try FileManager.default.moveItem(at: tempURL, to: customModelsPath)
+
+        guard migratingLegacy,
+              customModelsPath != configPath,
+              FileManager.default.fileExists(atPath: customModelsPath.path)
+        else { return root }
+
+        let legacy = try legacyCustomModels()
+        var existing = Set(try customModelRecords(from: root).map(\.key))
+        for record in legacy where existing.insert(record.key).inserted {
+            try Self.validateCustomModelKey(record.key)
+            try Self.validateCustomModelSlug(record.modelId)
+            try upsertCustomModelRecord(record, in: &root)
+        }
+        try writeCustomModelRoot(root)
+        try FileManager.default.removeItem(at: customModelsPath)
+        return root
     }
 
-    /// Save the current custom model draft into `$OPENGROK_HOME/custom_models.json`.
+    private func customModelRecords(from root: TOMLValue) throws -> [PagerCustomModelRecord] {
+        guard let section = root["model"] else { return [] }
+        guard let models = section.table else {
+            throw PagerSettingsStoreError.pathBlocked(path: "model")
+        }
+        return models.pairs.compactMap { key, value in
+            guard let table = value.table else { return nil }
+            let modelID = table["model"]?.stringValue
+                ?? table["model_id"]?.stringValue
+                ?? key
+            let outputTokens = table["max_completion_tokens"]?.int64Value
+                ?? table["max_output_tokens"]?.int64Value
+            return PagerCustomModelRecord(
+                key: key,
+                modelId: modelID,
+                provider: table["provider"]?.stringValue ?? "xai",
+                baseUrl: table["base_url"]?.stringValue,
+                contextWindow: table["context_window"]?.int64Value.flatMap(Int.init(exactly:)),
+                maxOutputTokens: outputTokens.flatMap(Int.init(exactly:)),
+                reasoningEfforts: table["reasoning_efforts"]?.arrayValue?.compactMap(\.stringValue),
+                name: table["name"]?.stringValue,
+                apiBackend: table["api_backend"]?.stringValue,
+                envKey: table["env_key"]?.stringValue
+                    ?? table["env_key"]?.arrayValue?.compactMap(\.stringValue).first
+            )
+        }
+    }
+
+    private func upsertCustomModelRecord(
+        _ record: PagerCustomModelRecord,
+        in root: inout TOMLValue
+    ) throws {
+        var table = root[path: ["model", record.key]]?.table ?? TOMLTable()
+        table.insert(.string(record.modelId), forKey: "model")
+        table.insert(.string(record.provider), forKey: "provider")
+        if let name = record.name { table.insert(.string(name), forKey: "name") }
+        if let baseURL = record.baseUrl { table.insert(.string(baseURL), forKey: "base_url") }
+        if let contextWindow = record.contextWindow {
+            table.insert(.integer(Int64(contextWindow)), forKey: "context_window")
+        }
+        if let outputTokens = record.maxOutputTokens {
+            table.insert(.integer(Int64(outputTokens)), forKey: "max_completion_tokens")
+        }
+        if let efforts = record.reasoningEfforts {
+            table.insert(.array(efforts.map(TOMLValue.string)), forKey: "reasoning_efforts")
+        }
+        if let backend = record.apiBackend {
+            table.insert(.string(backend), forKey: "api_backend")
+        }
+        if let envKey = record.envKey {
+            table.insert(.string(envKey), forKey: "env_key")
+            table.removeValue(forKey: "api_key")
+        }
+        try setValue(.table(table), at: ["model", record.key], in: &root)
+    }
+
+    private func writeCustomModelRoot(_ root: TOMLValue) throws {
+        try FileManager.default.createDirectory(
+            at: configPath.deletingLastPathComponent(),
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try writeAtomically(configPath, contents: TOMLEncoder.encode(root), mode: 0o600)
+    }
+
+    private static func canonicalCustomModelProvider(_ raw: String) -> String? {
+        switch raw.lowercased() {
+        case "xai": return "xai"
+        case "codex", "openai", "openai_codex": return "codex"
+        case "kimi", "kimi_code", "moonshot", "moonshot_ai": return "kimi"
+        case "fireworks", "fireworks_ai": return "fireworks"
+        case "deepseek", "deep_seek", "deepseek_api": return "deepseek"
+        case "meta", "meta_ai", "meta_api": return "meta"
+        case "opencode_go", "opencode-go", "open_code_go": return "opencode_go"
+        case "wafer", "wafer_ai": return "wafer"
+        case "zai", "z_ai", "z-ai", "zai_api", "glm": return "zai"
+        case "runinfra", "run_infra", "run-infra": return "runinfra"
+        case "gemini", "google", "google_gemini", "ai_studio", "aistudio", "gemini_api":
+            return "gemini"
+        case "openrouter", "open_router", "open-router": return "openrouter"
+        default: return nil
+        }
+    }
+
+    /// Save the current draft into its upstream `[model.<key>]` config table.
     @discardableResult
     public func saveCustomModelDraft(_ draftToSave: CustomModelDraft? = nil) throws -> PagerCustomModelRecord {
         let draft = draftToSave ?? getDraft()
@@ -380,38 +534,53 @@ public struct PagerSettingsStore: Sendable {
 
         let trimmedProvider = draft.provider.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedBaseUrl = draft.baseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedName = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedBackend = draft.backend.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedEnvKey = draft.envKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestedProvider = trimmedProvider.isEmpty
+            ? trimmedKey.split(separator: ":", maxSplits: 1).first.map(String.init) ?? "xai"
+            : trimmedProvider
+        guard let provider = Self.canonicalCustomModelProvider(requestedProvider)
+            ?? (trimmedProvider.isEmpty ? "xai" : nil)
+        else {
+            throw PagerSettingsStoreError.invalidCustomModelProvider(requestedProvider)
+        }
+        guard trimmedBackend.isEmpty
+            || ["chat_completions", "responses", "messages"].contains(trimmedBackend)
+        else {
+            throw PagerSettingsStoreError.invalidCustomModelBackend(trimmedBackend)
+        }
         let record = PagerCustomModelRecord(
             key: trimmedKey,
             modelId: trimmedSlug,
-            provider: trimmedProvider.isEmpty ? "xai" : trimmedProvider,
+            provider: provider,
             baseUrl: trimmedBaseUrl.isEmpty ? nil : trimmedBaseUrl,
-            contextWindow: draft.contextWindow > 0 ? draft.contextWindow : Self.customModelContextWindowDefault
+            contextWindow: draft.contextWindow > 0 ? draft.contextWindow : Self.customModelContextWindowDefault,
+            name: trimmedName.isEmpty ? nil : trimmedName,
+            apiBackend: trimmedBackend.isEmpty ? nil : trimmedBackend,
+            envKey: trimmedEnvKey.isEmpty ? nil : trimmedEnvKey
         )
 
-        var models = (try? loadCustomModels()) ?? []
-        if let idx = models.firstIndex(where: { $0.key == trimmedKey }) {
-            models[idx] = record
-        } else {
-            models.append(record)
-        }
-
-        try writeCustomModelsFile(models)
+        var root = try customModelRoot(migratingLegacy: true)
+        try upsertCustomModelRecord(record, in: &root)
+        try writeCustomModelRoot(root)
         var mutableSelf = self
         mutableSelf.clearDraft()
         return record
     }
 
-    /// Delete a custom model by its key from `$OPENGROK_HOME/custom_models.json`.
+    /// Remove one upstream `[model.<key>]` config table.
     @discardableResult
     public func deleteCustomModel(key: String) throws -> Bool {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
-        var models = (try? loadCustomModels()) ?? []
-        guard let idx = models.firstIndex(where: { $0.key == trimmed }) else {
+        try Self.validateCustomModelKey(trimmed)
+        var root = try customModelRoot(migratingLegacy: true)
+        guard root[path: ["model", trimmed]] != nil else {
             return false
         }
-        models.remove(at: idx)
-        try writeCustomModelsFile(models)
+        removeValue(at: ["model", trimmed], in: &root)
+        try writeCustomModelRoot(root)
         return true
     }
 
@@ -469,9 +638,11 @@ public struct PagerSettingsStore: Sendable {
     @discardableResult
     public func writeMultiSelect(key: String, enabled: Set<String>) throws -> String {
         if key == "custom_models.list" {
-            var models = (try? loadCustomModels()) ?? []
-            models.removeAll { !enabled.contains($0.key) }
-            try writeCustomModelsFile(models)
+            var root = try customModelRoot(migratingLegacy: true)
+            for record in try customModelRecords(from: root) where !enabled.contains(record.key) {
+                removeValue(at: ["model", record.key], in: &root)
+            }
+            try writeCustomModelRoot(root)
             return "custom_models.list"
         }
 

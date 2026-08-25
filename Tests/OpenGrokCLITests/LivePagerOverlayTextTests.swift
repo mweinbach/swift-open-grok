@@ -34,6 +34,25 @@ struct LivePagerOverlayTextTests {
             == "Browse commands and keyboard shortcuts")
     }
 
+    @Test("the command palette never advertises policy-disabled or unbacked commands")
+    func commandRowsRespectLiveFeatureAuthority() {
+        let unavailable = LivePagerOverlayText.commandRows(
+            autoPermissionModeAvailable: false,
+            workingDirectoryCommandsAvailable: false
+        )
+        #expect(!unavailable.contains { $0.id == "/auto" })
+        #expect(!unavailable.contains { $0.id == "/add-dir" })
+        #expect(!unavailable.contains { $0.id == "/remove-dir" })
+
+        let available = LivePagerOverlayText.commandRows(
+            autoPermissionModeAvailable: true,
+            workingDirectoryCommandsAvailable: true
+        )
+        #expect(available.contains { $0.id == "/auto" })
+        #expect(available.contains { $0.id == "/add-dir" })
+        #expect(available.contains { $0.id == "/remove-dir" })
+    }
+
     @Test("copy counts assistant responses backwards from the end, 1-based")
     func assistantResponseCountsBackwards() {
         let items: [PagerConversationItem] = [

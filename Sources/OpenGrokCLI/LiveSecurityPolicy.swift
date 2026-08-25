@@ -91,8 +91,13 @@ actor LiveSessionWritePolicy {
     private var allowsEdits = false
     private var bashPrefixGrants: [String] = []
     private var otherGrants: Set<String> = []
+    private weak var projectPermissionHandle: PermissionHandle?
 
     init() {}
+
+    func attachProjectPermissionHandle(_ handle: PermissionHandle) {
+        projectPermissionHandle = handle
+    }
 
     func isAllowed(_ access: AccessKind) -> Bool {
         switch access {
@@ -111,7 +116,18 @@ actor LiveSessionWritePolicy {
         }
     }
 
-    func allowForSession(_ access: AccessKind) {
+    @discardableResult
+    func allowForSession(
+        _ access: AccessKind,
+        rememberProjectApproval: Bool = false
+    ) async -> Bool {
+        if rememberProjectApproval,
+           let grant = liveProjectPermissionGrant(for: access) {
+            guard let projectPermissionHandle,
+                  await projectPermissionHandle.grant(grant)
+            else { return false }
+        }
+
         switch access {
         case .edit:
             allowsEdits = true
@@ -128,6 +144,37 @@ actor LiveSessionWritePolicy {
         case .read, .grep, .webSearch:
             break
         }
+        return true
+    }
+}
+
+func liveProjectPermissionGrant(for access: AccessKind) -> SessionGrant? {
+    switch access {
+    case .bash(let command):
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              matchesSessionBashGrant(trimmed, grant: trimmed)
+        else { return nil }
+        return SessionGrant(access: .bash(trimmed), scope: .project, pattern: trimmed)
+    case .webFetch(let url):
+        guard let components = URLComponents(string: url),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              let rawHost = components.host,
+              !rawHost.isEmpty
+        else { return nil }
+        let host = rawHost.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        guard !host.isEmpty else { return nil }
+        return SessionGrant(access: .webFetch(url), scope: .project, pattern: host)
+    case .mcpTool(let name, let input):
+        guard !name.isEmpty, name.utf8.count <= 256 else { return nil }
+        return SessionGrant(
+            access: .mcpTool(name: name, input: input),
+            scope: .project,
+            pattern: name
+        )
+    case .edit, .read, .grep, .webSearch:
+        return nil
     }
 }
 
@@ -139,13 +186,28 @@ actor LiveSessionWritePolicy {
 struct LivePermissionModalPrompter: PermissionPrompter {
     let coordinator: PagerPermissionCoordinator
     let sessionPolicy: LiveSessionWritePolicy
+    let rememberToolApprovals: Bool
+
+    init(
+        coordinator: PagerPermissionCoordinator,
+        sessionPolicy: LiveSessionWritePolicy,
+        rememberToolApprovals: Bool? = nil
+    ) {
+        self.coordinator = coordinator
+        self.sessionPolicy = sessionPolicy
+        // Legacy direct fixtures predate the trusted settings resolver. Live
+        // composition must always pass its resolved, default-false value.
+        self.rememberToolApprovals = rememberToolApprovals ?? true
+    }
 
     func prompt(
         access: AccessKind,
         toolName: String,
         toolCallId: String
     ) async -> PermissionDecision {
-        if await sessionPolicy.isAllowed(access) { return .allow }
+        if mayRemember(access), await sessionPolicy.isAllowed(access) {
+            return .allow
+        }
         guard await coordinator.hasPresenter else {
             return .reject(LiveWriteDenialPrompter.denialMessage(
                 toolName: toolName,
@@ -156,17 +218,71 @@ struct LivePermissionModalPrompter: PermissionPrompter {
             id: toolCallId.isEmpty ? UUID().uuidString : toolCallId,
             toolName: toolName,
             targetPath: Self.targetPath(for: access),
-            detail: Self.detail(for: access)
+            detail: Self.detail(for: access),
+            options: permissionOptions(for: access)
         )
         switch await coordinator.decision(for: request) {
         case .allowOnce:
             return .allow
         case .allowSession:
-            await sessionPolicy.allowForSession(access)
+            guard mayRemember(access) else {
+                return .reject("'\(toolName)' cannot be approved for this session.")
+            }
+            guard await sessionPolicy.allowForSession(
+                access,
+                rememberProjectApproval: rememberToolApprovals
+            ) else {
+                return .reject("'\(toolName)' could not save its private project approval.")
+            }
             return .allow
         case .deny:
             return .reject("'\(toolName)' was denied.")
         }
+    }
+
+    private func mayRemember(_ access: AccessKind) -> Bool {
+        switch access {
+        case .edit, .read, .grep, .webSearch:
+            return true
+        case .bash(let command):
+            return rememberToolApprovals
+                && matchesSessionBashGrant(command, grant: command)
+        case .webFetch, .mcpTool:
+            return rememberToolApprovals
+        }
+    }
+
+    private func permissionOptions(for access: AccessKind) -> [PagerPermissionOption] {
+        if case .edit = access {
+            return PagerPermissionRequest.defaultOptions
+        }
+
+        var options: [PagerPermissionOption] = []
+        if mayRemember(access) {
+            let label: String?
+            switch access {
+            case .bash(let command):
+                label = "Yes, always allow this command: \(command)"
+            case .webFetch(let url):
+                label = "Yes, always allow this URL: \(url)"
+            case .mcpTool(let name, _):
+                label = "Yes, always allow this tool: \(name)"
+            case .edit, .read, .grep, .webSearch:
+                label = nil
+            }
+            if let label {
+                options.append(PagerPermissionOption(
+                    decision: .allowSession,
+                    label: label
+                ))
+            }
+        }
+        options.append(PagerPermissionOption(decision: .allowOnce, label: "Yes, proceed"))
+        options.append(PagerPermissionOption(
+            decision: .deny,
+            label: "No, and tell Grok what to do differently"
+        ))
+        return options
     }
 
     /// Second line of the sheet.
@@ -360,7 +476,8 @@ struct LiveSecurityContext: Sendable {
             cliAllowRules: cli.allowRules,
             cliDenyRules: cli.denyRules,
             cliMode: cli.mode.map { DefaultPermissionMode(parsing: $0.rawValue) },
-            cliAlwaysApprove: cli.alwaysApprove
+            cliAlwaysApprove: cli.alwaysApprove,
+            readFile: legacyClaudePermissionReader(environment: environment)
         ))
 
         return LiveSecurityContext(
@@ -422,7 +539,8 @@ struct LiveSecurityContext: Sendable {
             cwd: workspaceRoot,
             home: home,
             projectTrusted: false,
-            cliDenyRules: cli.denyRules
+            cliDenyRules: cli.denyRules,
+            readFile: legacyClaudePermissionReader(environment: environment)
         ))
         let failure = "Failed to load security configuration: \(error)"
         permissions.config.rules.append(PermissionRule(
@@ -445,6 +563,15 @@ struct LiveSecurityContext: Sendable {
             managedMCPPolicy: managedMCPPolicy,
             configurationLoadFailure: failure
         )
+    }
+
+    private static func legacyClaudePermissionReader(
+        environment: [String: String]
+    ) -> @Sendable (URL) -> Data? {
+        if LiveClaudeSettingsImport.isImported(environment: environment) {
+            return { _ in nil }
+        }
+        return { url in try? Data(contentsOf: url) }
     }
 
     /// Runtime reconnects and hub launches cannot inherit a caller-supplied
@@ -560,6 +687,17 @@ actor LiveSessionPermissionMode {
         return enabling
             ? "\u{26A0} Always-approve ON: all tool actions auto-run"
             : "\u{2713} Always-approve off"
+    }
+
+    /// `/auto` treats always-approve as off: both ask and always-approve
+    /// enter classifier mode; an existing auto session returns to ask.
+    func toggleAutoMode() async -> String {
+        if displayMode == .auto {
+            await apply(.ask)
+            return "Mode: Normal"
+        }
+        await apply(.auto)
+        return "Mode: Auto"
     }
 
     /// Shift+Tab cycle: ask → auto → always-approve → ask (`modes.rs` when

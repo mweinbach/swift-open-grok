@@ -237,6 +237,12 @@ public enum LiveLeaderComposition {
             promptDriver: promptDriver,
             workspaceBoundary: workspace.acpBoundary
         )
+        await runtime.setCombineQueuedPrompts(
+            LiveInteractiveControllerRenderer.resolveUIConfig(
+                workingDirectory: cwd,
+                environment: environment
+            ).inputModes.combineQueuedPrompts
+        )
 
         let authConfig = liveManagedAuthenticationConfiguration(environment: environment)
         let manager = AuthManager(

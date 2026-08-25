@@ -15,16 +15,17 @@ public enum MermaidDiagramFamily {
     public static let supported: Set<String> = [
         "graph", "flowchart", "stateDiagram", "stateDiagram-v2",
         "classDiagram", "classDiagram-v2", "erDiagram", "sequenceDiagram",
+        "pie", "mindmap", "timeline", "journey", "gantt", "gitGraph", "kanban",
+        "quadrantChart", "xychart-beta", "radar-beta", "sankey-beta", "packet-beta",
+        "requirementDiagram", "block-beta", "C4Context", "C4Container", "C4Component",
+        "C4Dynamic", "C4Deployment", "info",
     ]
 
     /// Leading tokens Mermaid recognizes that this port does not render. The
     /// dispatcher reports these as `unsupportedDiagramType` rather than trying
     /// to parse them as a flowchart.
     public static let knownButUnsupported: Set<String> = [
-        "journey", "gantt", "pie", "mindmap", "timeline", "info", "kanban", "gitGraph",
-        "requirementDiagram", "C4Context", "C4Container", "C4Component", "C4Dynamic",
-        "C4Deployment", "sankey-beta", "packet-beta", "xychart-beta", "radar-beta",
-        "block-beta", "flowchart-elk", "quadrantChart",
+        "flowchart-elk",
     ]
 
     /// The leading token of `source`, ignoring blanks and `%%` comments.

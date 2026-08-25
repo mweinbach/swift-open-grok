@@ -22,11 +22,15 @@ enum LivePagerOverlayText {
     /// help text so the palette cannot drift from `/help`.
     static func commandRows(
         workflowsEnabled: Bool = true,
-        mouseReportingToggleEnabled: Bool = false
+        mouseReportingToggleEnabled: Bool = false,
+        autoPermissionModeAvailable: Bool = true,
+        workingDirectoryCommandsAvailable: Bool = false
     ) -> [PagerListRow] {
         OpenGrokPagerInteractiveController.helpText(
             workflowsEnabled: workflowsEnabled,
-            mouseReportingToggleEnabled: mouseReportingToggleEnabled
+            mouseReportingToggleEnabled: mouseReportingToggleEnabled,
+            autoPermissionModeAvailable: autoPermissionModeAvailable,
+            workingDirectoryCommandsAvailable: workingDirectoryCommandsAvailable
         )
             .split(separator: "\n", omittingEmptySubsequences: false)
             .compactMap { line in

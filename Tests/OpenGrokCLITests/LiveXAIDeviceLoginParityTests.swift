@@ -128,9 +128,10 @@ struct LiveXAIDeviceLoginParityTests {
             services: fixture.services(transport: transport)
         )
 
-        #expect(transport.recordedRequests.count == 2)
+        #expect(transport.recordedRequests.count == 3)
         #expect(transport.recordedRequests[0].url.path == "/oauth2/device/code")
         #expect(transport.recordedRequests[1].url.path == "/oauth2/token")
+        #expect(transport.recordedRequests[2].url.path == "/v1/user")
         #expect(transport.recordedRequests[0].headers["x-grok-client-surface"] == "headless")
         let store = try readAuthJSON(at: fixture.authFile)
         let scope = GrokComConfig.default(environment: environment).authScope
@@ -177,7 +178,8 @@ struct LiveXAIDeviceLoginParityTests {
                 services: fixture.services(transport: transport)
             )
 
-            #expect(transport.recordedRequests.count == 2)
+            #expect(transport.recordedRequests.count == 3)
+            #expect(transport.recordedRequests[2].url.path == "/v1/user")
             #expect(FileManager.default.fileExists(atPath: fixture.authFile.path))
         }
     }

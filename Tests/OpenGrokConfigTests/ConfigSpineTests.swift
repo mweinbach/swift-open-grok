@@ -127,6 +127,10 @@ struct RemoteSettingsAllowlistTests {
         rs.cancelRewindEnabled = false
         rs.compactionMode = "segments"
         rs.compactionDetail = "minimal"
+        rs.rememberToolApprovals = true
+        rs.autoMode = .object(["enabled": .bool(false)])
+        rs.todoGateEnabled = true
+        rs.todoGateMaxFiresPerPrompt = 4
 
         let projected = AllowlistedRemoteSettings(projecting: rs)
         #expect(projected.traceUploadEnabled == true)
@@ -136,6 +140,10 @@ struct RemoteSettingsAllowlistTests {
         #expect(projected.cancelRewindEnabled == false)
         #expect(projected.compactionMode == "segments")
         #expect(projected.compactionDetail == "minimal")
+        #expect(projected.rememberToolApprovals == true)
+        #expect(projected.autoModeEnabled == false)
+        #expect(projected.todoGateEnabled == true)
+        #expect(projected.todoGateMaxFiresPerPrompt == 4)
     }
 
     @Test("allowlisted wire name set is complete")
@@ -147,7 +155,8 @@ struct RemoteSettingsAllowlistTests {
             "workspace_command_enabled", "zdr_access_enabled", "gate_message",
             "session_recap", "session_search", "doom_loop_recovery", "trace_upload_enabled", "two_pass_compaction_enabled",
             "ask_user_question_enabled", "write_file_enabled", "cancel_rewind_enabled",
-            "compaction_mode", "compaction_detail",
+            "compaction_mode", "compaction_detail", "remember_tool_approvals", "auto_mode",
+            "todo_gate_enabled", "todo_gate_max_fires_per_prompt",
             "web_fetch_enabled", "web_fetch_proxy", "web_fetch_allowed_domains",
             "image_gen_enabled", "video_gen_enabled", "imagine_tools_disabled",
         ]
@@ -162,7 +171,7 @@ struct RemoteSettingsAllowlistTests {
             "file_toolset",
             "feedback_enabled",
             "default_model", "subscription_tier", "permission_mode",
-            "auto_mode", "suggestions_enabled", "auto_compact_threshold_percent",
+            "suggestions_enabled", "auto_compact_threshold_percent",
             "compaction_wall_clock_budget_secs", "subagents_max_depth",
         ]
         for name in shouldNotBeAllowlisted {

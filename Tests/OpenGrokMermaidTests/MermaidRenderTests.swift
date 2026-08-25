@@ -487,7 +487,7 @@ struct MermaidRendererAPITests {
 
     @Test("unsupported families are reported by name")
     func unsupportedFamilies() {
-        for family in ["pie", "gantt", "mindmap", "timeline", "quadrantChart"] {
+        for family in ["flowchart-elk"] {
             #expect(throws: MermaidError.unsupportedDiagramType(family)) {
                 try MermaidRenderer.parse("\(family)\n  something")
             }

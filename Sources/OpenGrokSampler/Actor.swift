@@ -56,7 +56,7 @@ public enum SamplerActor {
                             completion: completion,
                             codexTurnState: turnState
                         )
-                        state.remove(requestId: requestId)
+                        state.remove(requestId: requestId, token: cancelToken)
                     }
                     tasks[requestId] = task
 
@@ -131,8 +131,9 @@ final class ActorStateBox: @unchecked Sendable {
         return prev
     }
 
-    func remove(requestId: RequestId) {
+    func remove(requestId: RequestId, token: CancellationToken) {
         lock.lock(); defer { lock.unlock() }
+        guard activeRequests[requestId] === token else { return }
         activeRequests.removeValue(forKey: requestId)
     }
 

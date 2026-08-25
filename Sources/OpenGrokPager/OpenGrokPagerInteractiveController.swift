@@ -21,6 +21,36 @@ public enum PagerLocalCommandOutcome: Sendable, Equatable {
     case submit(String)
 }
 
+/// Commands whose authority or operating-system side effects belong to the
+/// production render adapter, never to the terminal-independent controller.
+public enum OpenGrokPagerBackedSlashCommand: Sendable, Equatable {
+    case toggleAuto
+    case toggleSandboxedAlwaysApprove
+    case shareSession(sessionID: String)
+    case editPrompt(draft: String)
+    case addWorkingDirectory(path: String, sessionID: String)
+    case removeWorkingDirectory(path: String, sessionID: String)
+    case importClaudeSettings
+}
+
+public enum OpenGrokPagerBackedSlashOutcome: Sendable, Equatable {
+    case completed
+    case notice(String)
+    case editedPrompt(String)
+}
+
+/// A renderer may advertise these commands only when their real production
+/// implementations are reachable. Auto remains independently feature-gated.
+public protocol OpenGrokPagerBackedSlashRenderAdapter:
+    OpenGrokPagerInteractiveRenderAdapter {
+    var autoPermissionModeAvailable: Bool { get }
+    var workingDirectoryCommandsAvailable: Bool { get }
+
+    func performBackedSlashCommand(
+        _ command: OpenGrokPagerBackedSlashCommand
+    ) async throws -> OpenGrokPagerBackedSlashOutcome
+}
+
 /// The image-capable extension of the ordinary pager runtime. Attachment
 /// bytes stay on this typed, in-memory seam instead of entering prompt
 /// metadata, queue notifications, or path-based clipboard fallbacks.
@@ -312,6 +342,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         var text: String { area.text }
         var isEmpty: Bool { area.isEmpty }
         var cursor: Int { characterOffset(fromUTF8: area.cursor, in: area.text) }
+        var hasAttachments: Bool { !pastedImages.isEmpty || !area.allElements.isEmpty }
 
         func state(
             pendingKey: String? = nil,
@@ -1165,7 +1196,14 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         let builtinCommands = Self.sessionBuiltinCommands(
             workflowsEnabled: workflowsEnabled,
             folderTrustCommandsEnabled: folderTrustCommandsEnabled,
-            mouseReportingToggleEnabled: mouseReportingToggleEnabled
+            mouseReportingToggleEnabled: mouseReportingToggleEnabled,
+            backedSlashCommandsEnabled: renderer is any OpenGrokPagerBackedSlashRenderAdapter,
+            autoPermissionModeAvailable:
+                (renderer as? any OpenGrokPagerBackedSlashRenderAdapter)?
+                    .autoPermissionModeAvailable ?? false,
+            workingDirectoryCommandsAvailable:
+                (renderer as? any OpenGrokPagerBackedSlashRenderAdapter)?
+                    .workingDirectoryCommandsAvailable ?? false
         )
         self.commands = PagerCommandRegistry(
             commands: builtinCommands + definitions + localCommands.map { registration in
@@ -1792,6 +1830,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                             ) {
                                 outcome = lifecycle
                             }
+                        case .editedPrompt(let edited):
+                            editor.replace(with: edited)
+                            try await emit(.promptChanged(promptState()))
+                            await inputPumpGate.resume()
                         case .drain:
                             // An interjection fallback prompt waits at the
                             // front; idle means this loop must start it.
@@ -1940,6 +1982,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                 ) {
                                     outcome = lifecycle
                                 }
+                                continue
+                            case .editedPrompt(let edited):
+                                recordHistory(prompt)
+                                editor.replace(with: edited)
+                                try await emit(.promptChanged(promptState()))
+                                await inputPumpGate.resume()
                                 continue
                             case .drain:
                                 // An interjection fallback prompt waits at
@@ -2278,6 +2326,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                             queueKind: Self.passThroughQueueEntryKind
                                         )
                                         await inputPumpGate.resume()
+                                    case .editedPrompt(let edited):
+                                        recordHistory(prompt)
+                                        editor.replace(with: edited)
+                                        try await emit(.promptChanged(promptState()))
+                                        await inputPumpGate.resume()
                                     case .handled:
                                         recordHistory(prompt)
                                         editor.reset()
@@ -2388,6 +2441,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                 historyText: text,
                                 queueKind: Self.passThroughQueueEntryKind
                             )
+                            await inputPumpGate.resume()
+                        case .editedPrompt(let edited):
+                            editor.replace(with: edited)
+                            try await emit(.promptChanged(promptState()))
                             await inputPumpGate.resume()
                         case .drain, .handled, .notACommand:
                             // `.drain` mid-turn: the fallback prompt waits at
@@ -2699,6 +2756,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                         queueKind: Self.passThroughQueueEntryKind,
                         images: entryImages
                     )
+                case .editedPrompt(let edited):
+                    editor.replace(with: edited)
+                    try await emit(.promptChanged(promptState()))
                 case .drain, .quit, .handled, .notACommand:
                     // `.drain`: the fallback prompt is already at the front;
                     // this loop picks it up on the next iteration.
@@ -3362,8 +3422,12 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "View the full conversation transcript in your pager ($PAGER)",
             usage: "/transcript"
         ),
-        // `/expand` sits between `/transcript` and `/context`, upstream's
-        // registry order minus the absent `/edit-prompt`
+        PagerCommandDefinition(
+            name: "edit-prompt",
+            summary: "Open an external editor for an empty prompt; use the command palette to preserve a draft",
+            usage: "/edit-prompt"
+        ),
+        // `/expand` follows `/edit-prompt`, upstream's registry order
         // (`slash/commands/mod.rs:95-98`). Copy verbatim from
         // `expand.rs:19-33`; no aliases upstream. Its
         // `ModeSupport::MinimalOnly(UseInstead)` gate lives with the
@@ -3440,14 +3504,22 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Toggle Fast mode (priority routing) for the current model",
             usage: "/fast"
         ),
-        // `/always-approve` (`slash/commands/always_approve.rs:16-32`);
-        // summary is upstream's description verbatim (`always_approve.rs:21-23`),
-        // placed after `/fast` and before `/multiline` because this port
-        // has no `/auto` (`slash/commands/mod.rs:106-109`).
+        // `/always-approve`, `/yolo-2`, and `/auto` retain upstream's
+        // permission-command display order (`slash/commands/mod.rs:106-110`).
         PagerCommandDefinition(
             name: "always-approve",
             summary: "Toggle always-approve mode (skip all permission prompts)",
             usage: "/always-approve"
+        ),
+        PagerCommandDefinition(
+            name: "yolo-2",
+            summary: "Toggle always-approve mode while an OS sandbox is active",
+            usage: "/yolo-2"
+        ),
+        PagerCommandDefinition(
+            name: "auto",
+            summary: "Toggle auto mode (classifier approves safe tools)",
+            usage: "/auto"
         ),
         PagerCommandDefinition(
             name: "multiline",
@@ -3469,8 +3541,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         // `/hooks`, `/plugins`, `/marketplace`, `/skills`
         // (`slash/commands/plugin.rs:15-106`): names, descriptions and usage
         // verbatim, in upstream's display order after `/vim-mode`
-        // (`slash/commands/mod.rs:110-114`; upstream's `/share` neighbor is
-        // not ported). All four open the tabbed extensions modal on their
+        // (`slash/commands/mod.rs:110-114`). All four open the tabbed extensions modal on their
         // tab — a read-only viewer here, so the modal advertises no
         // add/remove/toggle/install keys (recorded divergence).
         PagerCommandDefinition(
@@ -3492,6 +3563,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             name: "skills",
             summary: "View skills",
             usage: "/skills"
+        ),
+        PagerCommandDefinition(
+            name: "share",
+            summary: "Share this session via URL",
+            usage: "/share"
         ),
         PagerCommandDefinition(
             name: "session-info",
@@ -3614,12 +3690,6 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             summary: "Open coding data, retention, and training settings"
         ),
         PagerCommandDefinition(
-            name: "theme",
-            aliases: ["t"],
-            summary: "Switch the color theme",
-            usage: "/theme [name]"
-        ),
-        PagerCommandDefinition(
             name: "tutorial",
             aliases: ["tour", "onboarding"],
             summary: "Quick tips to get the most out of Open Grok"
@@ -3672,6 +3742,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             usage: "/logout [codex]"
         ),
         PagerCommandDefinition(
+            name: "import-claude",
+            summary: "Open the Claude settings import modal",
+            usage: "/import-claude"
+        ),
+        PagerCommandDefinition(
             name: "delete",
             summary: "Delete this session and return home"
         ),
@@ -3694,6 +3769,22 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             aliases: ["agents-dashboard", "sessions"],
             summary: "Open the Agent Dashboard — a fullscreen overview of every running session",
             usage: "/dashboard"
+        ),
+        PagerCommandDefinition(
+            name: "add-dir",
+            summary: "Add a directory to this session's working set",
+            usage: "/add-dir <path>"
+        ),
+        PagerCommandDefinition(
+            name: "remove-dir",
+            summary: "Remove a directory from this session's working set",
+            usage: "/remove-dir <path>"
+        ),
+        PagerCommandDefinition(
+            name: "theme",
+            aliases: ["t"],
+            summary: "Switch the color theme",
+            usage: "/theme [name]"
         ),
         PagerCommandDefinition(
             name: "remember",
@@ -3808,12 +3899,16 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     public static func visibleBuiltinCommandCatalog(
         workflowsEnabled: Bool = true,
         folderTrustCommandsEnabled: Bool = false,
-        mouseReportingToggleEnabled: Bool = false
+        mouseReportingToggleEnabled: Bool = false,
+        autoPermissionModeAvailable: Bool = true,
+        workingDirectoryCommandsAvailable: Bool = false
     ) -> [OpenGrokPagerCommandRegistration] {
         sessionBuiltinCommands(
             workflowsEnabled: workflowsEnabled,
             folderTrustCommandsEnabled: folderTrustCommandsEnabled,
-            mouseReportingToggleEnabled: mouseReportingToggleEnabled
+            mouseReportingToggleEnabled: mouseReportingToggleEnabled,
+            autoPermissionModeAvailable: autoPermissionModeAvailable,
+            workingDirectoryCommandsAvailable: workingDirectoryCommandsAvailable
         )
         .filter { !$0.isHidden && $0.availability.isAvailable }
         .map { command in
@@ -3843,12 +3938,26 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     static func sessionBuiltinCommands(
         workflowsEnabled: Bool,
         folderTrustCommandsEnabled: Bool = false,
-        mouseReportingToggleEnabled: Bool
+        mouseReportingToggleEnabled: Bool,
+        backedSlashCommandsEnabled: Bool = true,
+        autoPermissionModeAvailable: Bool = true,
+        workingDirectoryCommandsAvailable: Bool = false
     ) -> [PagerCommandDefinition] {
         let sessionCommands = builtinCommands
             + (folderTrustCommandsEnabled ? folderTrustCommands : [])
         return sessionCommands.compactMap { command in
             if command.name == "workflows", !workflowsEnabled {
+                return nil
+            }
+            if ["auto", "yolo-2", "share", "edit-prompt", "import-claude"].contains(command.name),
+               !backedSlashCommandsEnabled {
+                return nil
+            }
+            if command.name == "auto", !autoPermissionModeAvailable {
+                return nil
+            }
+            if ["add-dir", "remove-dir"].contains(command.name),
+               !backedSlashCommandsEnabled || !workingDirectoryCommandsAvailable {
                 return nil
             }
             if command.name == "toggle-mouse-reporting", !mouseReportingToggleEnabled {
@@ -4138,6 +4247,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     private enum SlashOutcome {
         case notACommand
         case handled
+        case editedPrompt(String)
         case quit
         case submit(String, promptKind: PagerPromptKind)
         case passThrough(String)
@@ -4439,6 +4549,22 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 }
                 try await emit(.overlay(.showDashboard))
                 return .handled
+            case "add-dir", "remove-dir":
+                let path = Self.rawArgumentTail(of: invocation)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !path.isEmpty else {
+                    try await emit(.notice("Usage: /\(command.name) <path>"))
+                    return .handled
+                }
+                guard let sessionID = activeSessionID ?? lastSessionID ?? launchSessionID,
+                      !sessionID.isEmpty else {
+                    try await emit(.notice("No active session"))
+                    return .handled
+                }
+                let request: OpenGrokPagerBackedSlashCommand = command.name == "add-dir"
+                    ? .addWorkingDirectory(path: path, sessionID: sessionID)
+                    : .removeWorkingDirectory(path: path, sessionID: sessionID)
+                return try await performBackedSlashCommand(request)
             case "release-notes":
                 // Arguments are ignored — upstream's `ReleaseNotesCommand::run`
                 // declares `_args` (release_notes.rs:27). The fetch, the
@@ -4467,6 +4593,17 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 // the live handle owns the flip.
                 try await handleGlobal(.toggleAlwaysApprove, isTurnRunning: isTurnRunning)
                 return .handled
+            case "auto":
+                return try await performBackedSlashCommand(.toggleAuto)
+            case "yolo-2":
+                return try await performBackedSlashCommand(.toggleSandboxedAlwaysApprove)
+            case "share":
+                guard let sessionID = activeSessionID ?? lastSessionID ?? launchSessionID,
+                      !sessionID.isEmpty else {
+                    try await emit(.notice("No active session to share"))
+                    return .handled
+                }
+                return try await performBackedSlashCommand(.shareSession(sessionID: sessionID))
             case "rename":
                 let title = Self.rejoined(invocation.arguments)
                 guard !title.isEmpty else {
@@ -4492,6 +4629,37 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 // (`transcript.rs:36-41`, `Action::OpenTranscriptPager`).
                 try await emit(.overlay(.transcriptPager))
                 return .handled
+            case "edit-prompt":
+                guard activePagerMode == .minimal else {
+                    try await emit(.notice(
+                        "/edit-prompt isn't available in fullscreen mode "
+                        + "(the full TUI has no external-editor path — Ctrl+G is the tasks pane there). "
+                        + "Run /minimal to switch this session."
+                    ))
+                    return .handled
+                }
+                guard (activeSessionID ?? lastSessionID ?? launchSessionID) != nil else {
+                    try await emit(.notice("No active session"))
+                    return .handled
+                }
+                guard !editor.hasAttachments else {
+                    try await emit(.notice(
+                        "External prompt editing is not available while the draft has attachments."
+                    ))
+                    return .handled
+                }
+                // A typed command occupies its own composer, while a palette
+                // dispatch arrives as a control signal and keeps the draft.
+                let original = editor.text
+                let draft = original == text ? "" : original
+                let outcome = try await performBackedSlashCommand(.editPrompt(draft: draft))
+                if case .editedPrompt = outcome, editor.text != original {
+                    try await emit(.notice(
+                        "The draft changed while the external editor was open; the newer draft was kept."
+                    ))
+                    return .editedPrompt(editor.text)
+                }
+                return outcome
             case "find":
                 let query = invocation.arguments
                     .joined(separator: " ")
@@ -4800,10 +4968,37 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                     ))
                 }
                 return .handled
+            case "import-claude":
+                return try await performBackedSlashCommand(.importClaudeSettings)
             default:
                 try await emit(.notice("unknown command: /\(command.name)"))
                 return .handled
             }
+        }
+    }
+
+    private func performBackedSlashCommand(
+        _ command: OpenGrokPagerBackedSlashCommand
+    ) async throws -> SlashOutcome {
+        guard let renderer = renderer as? any OpenGrokPagerBackedSlashRenderAdapter else {
+            try await emit(.notice("This command is unavailable in the current session."))
+            return .handled
+        }
+        do {
+            switch try await renderer.performBackedSlashCommand(command) {
+            case .completed:
+                return .handled
+            case .notice(let message):
+                if !message.isEmpty {
+                    try await emit(.notice(message))
+                }
+                return .handled
+            case .editedPrompt(let text):
+                return .editedPrompt(text)
+            }
+        } catch {
+            try await emit(.notice(String(describing: error)))
+            return .handled
         }
     }
 
@@ -5050,6 +5245,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /effort <level>           Set reasoning effort for the current model
       /fast                     Toggle Fast mode (priority routing) for the current model
       /always-approve           Toggle always-approve mode (skip all permission prompts)
+      /yolo-2                   Toggle always-approve mode while an OS sandbox is active
+      /auto                     Toggle auto mode (classifier approves safe tools)
       /new    /clear            Start a new session
       /fork [directive]         Branch the current session into a peer agent
       /resume                   Resume a previous session
@@ -5059,6 +5256,8 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /queue                    Prompts queued behind the running turn
       /tasks                    List background tasks, subagents, and scheduled tasks
       /dashboard  /sessions     Open the Agent Dashboard session roster
+      /add-dir <path>           Add a directory to this session's working set
+      /remove-dir <path>        Remove a directory from this session's working set
       /btw <question>           Ask a side question without interrupting
       /expand                   Re-print the last collapsed block, fully expanded (minimal)
       /context                  View context usage
@@ -5066,11 +5265,13 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /minimal                  Reopen this session in minimal (scrollback-native) mode
       /fullscreen  /full        Reopen this session in fullscreen mode
       /session-info             Show session info
+      /share                    Share this session via URL
       /mcps                     Show MCP server status
       /doctor [fix [FIX]]       Check this session and show available fixes
       /copy [N] [file]          Copy a response to the clipboard or a file
       /export [file]            Export the conversation
       /transcript  /log         View the transcript in your pager ($PAGER)
+      /edit-prompt              Open the minimal-mode prompt in an external editor
       /find [text]              Search the conversation scrollback
       /jump                     Jump to a turn in the conversation
       /rewind [n]  /undo        Rewind to before a previous turn
@@ -5096,6 +5297,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
       /privacy                  Coding data, retention and training settings
       /login [provider]         Connect xAI, OpenAI Codex, or an API-key provider
       /logout [codex]           Log out of xAI or OpenAI Codex
+      /import-claude            Open the Claude settings import modal
       /theme [name]  /t         Switch the color theme
       /release-notes /changelog View release notes for the current version
       /tutorial                 Quick tips
@@ -5141,7 +5343,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
 
     public static func helpText(
         workflowsEnabled: Bool = true,
-        mouseReportingToggleEnabled: Bool = false
+        mouseReportingToggleEnabled: Bool = false,
+        autoPermissionModeAvailable: Bool = true,
+        workingDirectoryCommandsAvailable: Bool = false
     ) -> String {
         var lines = helpText.split(separator: "\n", omittingEmptySubsequences: false)
         if !workflowsEnabled {
@@ -5152,6 +5356,17 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         if !mouseReportingToggleEnabled {
             lines = lines.filter {
                 !$0.trimmingCharacters(in: .whitespaces).hasPrefix("/toggle-mouse-reporting")
+            }
+        }
+        if !autoPermissionModeAvailable {
+            lines = lines.filter {
+                !$0.trimmingCharacters(in: .whitespaces).hasPrefix("/auto")
+            }
+        }
+        if !workingDirectoryCommandsAvailable {
+            lines = lines.filter {
+                let command = $0.trimmingCharacters(in: .whitespaces)
+                return !command.hasPrefix("/add-dir") && !command.hasPrefix("/remove-dir")
             }
         }
         return lines.joined(separator: "\n")

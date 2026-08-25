@@ -44,15 +44,15 @@ struct PagerExtensionsCommandTests {
     @Test("display order matches upstream: after /vim-mode, before /session-info")
     func displayOrderMatchesUpstream() {
         // `slash/commands/mod.rs:110-116`: vim_mode, hooks, plugins,
-        // marketplace, skills, share, session_info — `/share` is not ported,
-        // so the four sit contiguously between the neighbors that are.
+        // marketplace, skills, share, session_info.
         let names = OpenGrokPagerInteractiveController.builtinCommands.map(\.name)
         let vimIndex = names.firstIndex(of: "vim-mode")
         #expect(vimIndex != nil)
         guard let vimIndex else { return }
         #expect(Array(names[(vimIndex + 1)...(vimIndex + 4)])
             == ["hooks", "plugins", "marketplace", "skills"])
-        #expect(names[vimIndex + 5] == "session-info")
+        #expect(names[vimIndex + 5] == "share")
+        #expect(names[vimIndex + 6] == "session-info")
     }
 
     @Test("all four are visible in /help")

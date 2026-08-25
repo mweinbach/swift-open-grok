@@ -106,19 +106,24 @@ public struct PrepareToolAccessRequest: Sendable {
     public var toolCallId: String
     public var applyPatchLabel: Bool
     public var permissionModeLabel: String?
+    /// Immutable root-session identity stamped by the owning tool resources.
+    /// Missing identities never satisfy session-scoped working-directory grants.
+    public var sessionID: String?
 
     public init(
         access: AccessKind,
         toolName: String,
         toolCallId: String,
         applyPatchLabel: Bool = false,
-        permissionModeLabel: String? = nil
+        permissionModeLabel: String? = nil,
+        sessionID: String? = nil
     ) {
         self.access = access
         self.toolName = toolName
         self.toolCallId = toolCallId
         self.applyPatchLabel = applyPatchLabel
         self.permissionModeLabel = permissionModeLabel
+        self.sessionID = sessionID
     }
 }
 
@@ -302,7 +307,8 @@ public actor PermissionPipeline {
         let decision = await permissions.request(
             access: request.access,
             toolName: request.toolName,
-            toolCallId: request.toolCallId
+            toolCallId: request.toolCallId,
+            sessionID: request.sessionID
         )
         return PreparedToolAccess(
             decision: decision,

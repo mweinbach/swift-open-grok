@@ -4,6 +4,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <limits.h>
+#include <stdlib.h>
 #include <wchar.h>
 
 typedef unsigned long (__cdecl *open_grok_compress_bound_fn)(unsigned long);
@@ -13,12 +14,45 @@ typedef int (__cdecl *open_grok_compress_fn)(
 typedef int (__cdecl *open_grok_uncompress_fn)(
     unsigned char *, unsigned long *, const unsigned char *, unsigned long
 );
+typedef void *(__cdecl *open_grok_zlib_alloc_fn)(
+    void *, unsigned int, unsigned int
+);
+typedef void (__cdecl *open_grok_zlib_free_fn)(void *, void *);
+
+// Match z_stream's Windows ABI without depending on headers beside Git's DLL.
+typedef struct {
+    unsigned char *next_in;
+    unsigned int avail_in;
+    unsigned long total_in;
+    unsigned char *next_out;
+    unsigned int avail_out;
+    unsigned long total_out;
+    char *message;
+    void *state;
+    open_grok_zlib_alloc_fn allocate;
+    open_grok_zlib_free_fn deallocate;
+    void *opaque;
+    int data_type;
+    unsigned long adler;
+    unsigned long reserved;
+} open_grok_zlib_stream;
+
+typedef const char *(__cdecl *open_grok_zlib_version_fn)(void);
+typedef int (__cdecl *open_grok_inflate_init_fn)(
+    open_grok_zlib_stream *, int, const char *, int
+);
+typedef int (__cdecl *open_grok_inflate_fn)(open_grok_zlib_stream *, int);
+typedef int (__cdecl *open_grok_inflate_end_fn)(open_grok_zlib_stream *);
 
 static INIT_ONCE open_grok_zlib_once = INIT_ONCE_STATIC_INIT;
 static HMODULE open_grok_zlib_module = NULL;
 static open_grok_compress_bound_fn open_grok_compress_bound_symbol = NULL;
 static open_grok_compress_fn open_grok_compress_symbol = NULL;
 static open_grok_uncompress_fn open_grok_uncompress_symbol = NULL;
+static open_grok_zlib_version_fn open_grok_zlib_version_symbol = NULL;
+static open_grok_inflate_init_fn open_grok_inflate_init_symbol = NULL;
+static open_grok_inflate_fn open_grok_inflate_symbol = NULL;
+static open_grok_inflate_end_fn open_grok_inflate_end_symbol = NULL;
 
 static HMODULE open_grok_load_zlib_path(const wchar_t *path) {
     wchar_t full_path[32768];
@@ -166,7 +200,27 @@ static BOOL CALLBACK open_grok_initialize_zlib(
         open_grok_compress_bound_symbol = NULL;
         open_grok_compress_symbol = NULL;
         open_grok_uncompress_symbol = NULL;
+        return TRUE;
     }
+
+    // Keep Git's existing compress/uncompress provider usable when a DLL lacks
+    // the additional streaming entry points needed only by document extraction.
+    open_grok_zlib_version_symbol = (open_grok_zlib_version_fn)GetProcAddress(
+        open_grok_zlib_module,
+        "zlibVersion"
+    );
+    open_grok_inflate_init_symbol = (open_grok_inflate_init_fn)GetProcAddress(
+        open_grok_zlib_module,
+        "inflateInit2_"
+    );
+    open_grok_inflate_symbol = (open_grok_inflate_fn)GetProcAddress(
+        open_grok_zlib_module,
+        "inflate"
+    );
+    open_grok_inflate_end_symbol = (open_grok_inflate_end_fn)GetProcAddress(
+        open_grok_zlib_module,
+        "inflateEnd"
+    );
     return TRUE;
 }
 
@@ -240,6 +294,91 @@ int open_grok_zlib_uncompress(
     );
     *destination_length = (size_t)output_length;
     return status;
+}
+
+int open_grok_zlib_inflater_is_available(void) {
+    open_grok_ensure_zlib();
+    return open_grok_zlib_version_symbol != NULL
+        && open_grok_inflate_init_symbol != NULL
+        && open_grok_inflate_symbol != NULL
+        && open_grok_inflate_end_symbol != NULL;
+}
+
+void *open_grok_zlib_inflater_create(
+    const uint8_t *source,
+    size_t source_length,
+    int raw
+) {
+    if (!open_grok_zlib_inflater_is_available()
+        || source_length > UINT_MAX
+        || (source_length != 0 && source == NULL)) {
+        return NULL;
+    }
+
+    const char *version = open_grok_zlib_version_symbol();
+    if (version == NULL) {
+        return NULL;
+    }
+
+    open_grok_zlib_stream *stream = calloc(1, sizeof(*stream));
+    if (stream == NULL) {
+        return NULL;
+    }
+
+    int status = open_grok_inflate_init_symbol(
+        stream,
+        raw ? -15 : 15,
+        version,
+        (int)sizeof(*stream)
+    );
+    if (status != 0) {
+        free(stream);
+        return NULL;
+    }
+    stream->next_in = (unsigned char *)source;
+    stream->avail_in = (unsigned int)source_length;
+    return stream;
+}
+
+int open_grok_zlib_inflater_step(
+    void *inflater,
+    uint8_t *destination,
+    size_t *destination_length
+) {
+    if (inflater == NULL
+        || destination_length == NULL
+        || *destination_length > UINT_MAX
+        || (*destination_length != 0 && destination == NULL)
+        || open_grok_inflate_symbol == NULL) {
+        return -6;
+    }
+
+    open_grok_zlib_stream *stream = inflater;
+    unsigned int capacity = (unsigned int)*destination_length;
+    stream->next_out = destination;
+    stream->avail_out = capacity;
+    int status = open_grok_inflate_symbol(stream, 0);
+    *destination_length = (size_t)(capacity - stream->avail_out);
+    return status;
+}
+
+size_t open_grok_zlib_inflater_remaining_input(void *inflater) {
+    if (inflater == NULL) {
+        return 0;
+    }
+    open_grok_zlib_stream *stream = inflater;
+    return (size_t)stream->avail_in;
+}
+
+void open_grok_zlib_inflater_destroy(void *inflater) {
+    if (inflater == NULL) {
+        return;
+    }
+    open_grok_zlib_stream *stream = inflater;
+    if (open_grok_inflate_end_symbol != NULL) {
+        open_grok_inflate_end_symbol(stream);
+    }
+    free(stream);
 }
 #else
 const char *open_grok_zlib_version(void) {

@@ -16,11 +16,21 @@ public enum ReadFileTool {
         public var path: String
         public var offset: Int?
         public var limit: Int?
+        public var pages: String?
+        public var format: String?
 
-        public init(path: String, offset: Int? = nil, limit: Int? = nil) {
+        public init(
+            path: String,
+            offset: Int? = nil,
+            limit: Int? = nil,
+            pages: String? = nil,
+            format: String? = nil
+        ) {
             self.path = path
             self.offset = offset
             self.limit = limit
+            self.pages = pages
+            self.format = format
         }
 
         public static func parse(_ args: JSONValue) throws -> Input {
@@ -37,7 +47,15 @@ public enum ReadFileTool {
             }
             let offset = int(obj, "offset")
             let limit = int(obj, "limit")
-            return Input(path: path, offset: offset, limit: limit)
+            let pages = string(obj, "pages")
+            let format = string(obj, "format")
+            if obj["pages"] != nil && pages == nil {
+                throw SessionFSError.invalidInput("pages must be a string")
+            }
+            if obj["format"] != nil && format == nil {
+                throw SessionFSError.invalidInput("format must be a string")
+            }
+            return Input(path: path, offset: offset, limit: limit, pages: pages, format: format)
         }
     }
 
@@ -54,7 +72,9 @@ public enum ReadFileTool {
             try SessionFS.enforceRoots(absolute, roots: resources.allowedRoots)
             try GitIgnoreAccessPolicy.enforce(path: absolute, resources: resources, operation: "read")
 
-            if let mime = SessionFS.imageMIME(for: absolute), SessionFS.fileExists(absolute) {
+            let document = try DocumentExtraction.identify(path: absolute)
+            if document == nil,
+               let mime = SessionFS.imageMIME(for: absolute), SessionFS.fileExists(absolute) {
                 let data = try SessionFS.readBytes(at: absolute)
                 let b64 = data.base64EncodedString()
                 let value: JSONValue = .object([
@@ -81,7 +101,57 @@ public enum ReadFileTool {
                 )
             }
 
-            let text = try SessionFS.readText(at: absolute)
+            let text: String
+            if let document {
+                let deadline = DocumentExtractionDeadline()
+                switch document {
+                case .pdf:
+                    let bytes = try DocumentExtraction.readBounded(path: absolute, label: "PDF")
+                    switch try PDFDocumentExtractor.extract(
+                        bytes,
+                        pages: input.pages,
+                        format: input.format,
+                        deadline: deadline
+                    ) {
+                    case .text(let extracted, _):
+                        text = extracted
+                    case .images(let pages, let totalPages):
+                        let blocks: [ContentBlock] = pages.map { page in
+                            .image(
+                                mimeType: "image/jpeg",
+                                data: page.bytes.base64EncodedString(),
+                                mediaId: nil,
+                                filename: "page-\(page.pageNumber).jpg",
+                                path: absolute,
+                                metadata: ["page_number": String(page.pageNumber)]
+                            )
+                        }
+                        let value: JSONValue = .object([
+                            "type": .string("pdf_page_images"),
+                            "path": .string(absolute),
+                            "total_pages": .number(.int64(Int64(totalPages))),
+                            "file_size": .number(.int64(Int64(bytes.count))),
+                            "pages": .array(pages.map { page in
+                                .object([
+                                    "page_number": .number(.int64(Int64(page.pageNumber))),
+                                    "mime_type": .string("image/jpeg"),
+                                    "data": .string(page.bytes.base64EncodedString()),
+                                ])
+                            }),
+                        ])
+                        return .success(TypedToolOutput(
+                            toolId: FileToolIDs.readFile,
+                            value: value,
+                            modelOutput: blocks
+                        ))
+                    }
+                case .pptx:
+                    let bytes = try DocumentExtraction.readBounded(path: absolute, label: "PPTX")
+                    text = try PowerPointDocumentExtractor.extract(bytes, deadline: deadline)
+                }
+            } else {
+                text = try SessionFS.readText(at: absolute)
+            }
             let lines = SessionFS.logicalLines(text)
 
             let start: Int
@@ -153,6 +223,14 @@ public enum ReadFileTool {
                     modelOutput: [.text(text: content)]
                 )
             )
+        } catch let error as DocumentExtractionError {
+            if case .cancelled = error {
+                return .failure(.cancelled(
+                    toolId: FileToolIDs.readFile,
+                    detail: "read_file was cancelled while processing a document"
+                ))
+            }
+            return .failure(.invalidArguments(error.localizedDescription))
         } catch let e as SessionFSError {
             return .failure(.invalidArguments(e.description))
         } catch {

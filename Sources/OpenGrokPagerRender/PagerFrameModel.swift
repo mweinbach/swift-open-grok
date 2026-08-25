@@ -1756,6 +1756,8 @@ public struct PagerRenderState: Sendable, Equatable {
     public var announcementBanner: PagerAnnouncementBanner?
     public var conversation: [PagerConversationItem]
     public var turnStatus: PagerTurnStatus?
+    /// Server-originated response chips, distinct from composer completions.
+    public var followUpSuggestions: PagerFollowUpSuggestions?
     public var completions: PagerCompletionMenu?
     public var input: PagerComposerState
     public var shortcuts: PagerShortcutsBar?
@@ -1877,6 +1879,7 @@ public struct PagerRenderState: Sendable, Equatable {
         announcementBanner: PagerAnnouncementBanner? = nil,
         conversation: [PagerConversationItem] = [],
         turnStatus: PagerTurnStatus? = nil,
+        followUpSuggestions: PagerFollowUpSuggestions? = nil,
         completions: PagerCompletionMenu? = nil,
         input: PagerComposerState = PagerComposerState(),
         shortcuts: PagerShortcutsBar? = nil,
@@ -1910,6 +1913,7 @@ public struct PagerRenderState: Sendable, Equatable {
         self.announcementBanner = announcementBanner
         self.conversation = conversation
         self.turnStatus = turnStatus
+        self.followUpSuggestions = followUpSuggestions
         self.completions = completions
         self.input = input
         self.shortcuts = shortcuts
@@ -2400,6 +2404,10 @@ public struct PagerFrameLayout: Sendable, Equatable {
     /// `conversationHit?.toastOccluder` so mouse routers that only hold
     /// layout still see it.
     public var toastOccluder: TerminalRect?
+    /// Dedicated upstream follow-up row; absent on short terminals or overlays.
+    public var followUpSuggestions: TerminalRect?
+    /// Exactly the server follow-up chips that fit and actually painted.
+    public var followUpSuggestionChips: [PagerFollowUpSuggestionChip]
 
     public init(
         bounds: TerminalRect,
@@ -2424,7 +2432,9 @@ public struct PagerFrameLayout: Sendable, Equatable {
         scrollbarHit: PagerScrollbarHitModel? = nil,
         composerHit: PagerComposerHitModel? = nil,
         textSelection: PagerTextSelectionModel? = nil,
-        toastOccluder: TerminalRect? = nil
+        toastOccluder: TerminalRect? = nil,
+        followUpSuggestions: TerminalRect? = nil,
+        followUpSuggestionChips: [PagerFollowUpSuggestionChip] = []
     ) {
         self.bounds = bounds
         self.statusBar = statusBar
@@ -2449,6 +2459,8 @@ public struct PagerFrameLayout: Sendable, Equatable {
         self.composerHit = composerHit
         self.textSelection = textSelection
         self.toastOccluder = toastOccluder
+        self.followUpSuggestions = followUpSuggestions
+        self.followUpSuggestionChips = followUpSuggestionChips
     }
 }
 
@@ -2510,12 +2522,14 @@ public struct PagerRenderEngine: Sendable {
     public init() {}
 
     public func render(_ state: PagerRenderState) -> PagerRenderResult {
-        renderPagerFrame(state)
+        var result = renderPagerFrame(state)
+        pagerApplyFollowUpSuggestions(state, to: &result)
+        return result
     }
 }
 
 public enum PagerRenderer {
     public static func render(_ state: PagerRenderState) -> PagerRenderResult {
-        renderPagerFrame(state)
+        PagerRenderEngine().render(state)
     }
 }

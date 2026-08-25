@@ -418,6 +418,12 @@ public struct GoalOrchestration: Codable, Sendable, Hashable {
     public var changesBaselineCommit: String?
     public var planFile: String?
     public var planBaselineFile: String?
+    public var roleSnapshots: [GoalRoleSnapshot]
+    public var carryForwardTodos: [GoalTodoSnapshot]
+    public var lastEvaluatorVerdict: GoalEvaluationVerdict?
+    public var plannerAttempts: UInt32
+    public var roundResumeAnchor: UInt32
+    public var lastPrematureStopPattern: String?
 
     public var scratchDirectoryReady: Bool
     public var liveSubagentTokens: UInt64
@@ -470,6 +476,12 @@ public struct GoalOrchestration: Codable, Sendable, Hashable {
         case changesBaselineCommit = "changes_baseline_commit"
         case planFile = "plan_file"
         case planBaselineFile = "plan_baseline_file"
+        case roleSnapshots = "role_snapshots"
+        case carryForwardTodos = "carry_forward_todos"
+        case lastEvaluatorVerdict = "last_evaluator_verdict"
+        case plannerAttempts = "planner_attempts"
+        case roundResumeAnchor = "round_resume_anchor"
+        case lastPrematureStopPattern = "last_premature_stop_pattern"
     }
 
     public init(
@@ -514,6 +526,12 @@ public struct GoalOrchestration: Codable, Sendable, Hashable {
         changesBaselineCommit: String? = nil,
         planFile: String? = nil,
         planBaselineFile: String? = nil,
+        roleSnapshots: [GoalRoleSnapshot] = [],
+        carryForwardTodos: [GoalTodoSnapshot] = [],
+        lastEvaluatorVerdict: GoalEvaluationVerdict? = nil,
+        plannerAttempts: UInt32 = 0,
+        roundResumeAnchor: UInt32 = 0,
+        lastPrematureStopPattern: String? = nil,
         scratchDirectoryReady: Bool = false,
         liveSubagentTokens: UInt64 = 0,
         liveTokensByModel: [GoalTokenBreakdown] = [],
@@ -565,6 +583,12 @@ public struct GoalOrchestration: Codable, Sendable, Hashable {
         self.changesBaselineCommit = changesBaselineCommit
         self.planFile = planFile
         self.planBaselineFile = planBaselineFile
+        self.roleSnapshots = roleSnapshots
+        self.carryForwardTodos = carryForwardTodos
+        self.lastEvaluatorVerdict = lastEvaluatorVerdict
+        self.plannerAttempts = plannerAttempts
+        self.roundResumeAnchor = roundResumeAnchor
+        self.lastPrematureStopPattern = lastPrematureStopPattern
         self.scratchDirectoryReady = scratchDirectoryReady
         self.liveSubagentTokens = liveSubagentTokens
         self.liveTokensByModel = liveTokensByModel
@@ -619,6 +643,12 @@ public struct GoalOrchestration: Codable, Sendable, Hashable {
         changesBaselineCommit = try container.decodeIfPresent(String.self, forKey: .changesBaselineCommit)
         planFile = try container.decodeIfPresent(String.self, forKey: .planFile)
         planBaselineFile = try container.decodeIfPresent(String.self, forKey: .planBaselineFile)
+        roleSnapshots = try container.decodeIfPresent([GoalRoleSnapshot].self, forKey: .roleSnapshots) ?? []
+        carryForwardTodos = try container.decodeIfPresent([GoalTodoSnapshot].self, forKey: .carryForwardTodos) ?? []
+        lastEvaluatorVerdict = try container.decodeIfPresent(GoalEvaluationVerdict.self, forKey: .lastEvaluatorVerdict)
+        plannerAttempts = try container.decodeIfPresent(UInt32.self, forKey: .plannerAttempts) ?? 0
+        roundResumeAnchor = try container.decodeIfPresent(UInt32.self, forKey: .roundResumeAnchor) ?? 0
+        lastPrematureStopPattern = try container.decodeIfPresent(String.self, forKey: .lastPrematureStopPattern)
         scratchDirectoryReady = false
         liveSubagentTokens = 0
         liveTokensByModel = []
@@ -672,6 +702,20 @@ public struct GoalOrchestration: Codable, Sendable, Hashable {
         try container.encodeIfPresent(changesBaselineCommit, forKey: .changesBaselineCommit)
         try container.encodeIfPresent(planFile, forKey: .planFile)
         try container.encodeIfPresent(planBaselineFile, forKey: .planBaselineFile)
+        if !roleSnapshots.isEmpty {
+            try container.encode(roleSnapshots, forKey: .roleSnapshots)
+        }
+        if !carryForwardTodos.isEmpty {
+            try container.encode(carryForwardTodos, forKey: .carryForwardTodos)
+        }
+        try container.encodeIfPresent(lastEvaluatorVerdict, forKey: .lastEvaluatorVerdict)
+        if plannerAttempts > 0 {
+            try container.encode(plannerAttempts, forKey: .plannerAttempts)
+        }
+        if roundResumeAnchor > 0 {
+            try container.encode(roundResumeAnchor, forKey: .roundResumeAnchor)
+        }
+        try container.encodeIfPresent(lastPrematureStopPattern, forKey: .lastPrematureStopPattern)
     }
 }
 
@@ -1192,6 +1236,9 @@ public struct GoalTracker: Sendable {
         if value.status == .active { value.status = .userPaused }
         value.planningInFlight = false
         value.verifyingInFlight = false
+        for index in value.roleSnapshots.indices where value.roleSnapshots[index].state == .running {
+            value.roleSnapshots[index].state = .cancelled
+        }
         value.skeptic0SessionID = nil
         if !isCanonicalVerifierID(value.verifierID) { value.verifierID = generateVerifierID() }
         value.scratchDirectoryReady = value.status != .complete && value.status != .budgetLimited

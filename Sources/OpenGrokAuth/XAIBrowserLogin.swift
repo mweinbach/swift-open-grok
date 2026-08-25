@@ -410,12 +410,10 @@ public func xaiLoginRedirectURI(port: UInt16) -> String {
 /// silent-divergence footgun AGENTS.md §2 records for process-cwd defaults.
 ///
 /// Not ported here, recorded divergences: the external-auth-provider and
-/// devbox pre-flight arms (flow.rs:640-686), the opt-in device-flow transport
-/// (flow.rs:699-724), the manual paste channel (upstream's TUI paste box,
-/// login.rs:246-298), and post-exchange `/user` profile enrichment
-/// (`enrich_auth_inline`, login.rs:535). Personal id_tokens ARE validated
-/// via JWKS (`validateOIDCIdToken`, protocol.rs:639-715); external/devbox/
-/// device arms remain deferred. The server still re-validates the signed
+/// devbox pre-flight arms (flow.rs:640-686), and the manual paste channel
+/// (upstream's TUI paste box, login.rs:246-298). Personal id_tokens ARE validated
+/// via JWKS (`validateOIDCIdToken`, protocol.rs:639-715); external and devbox
+/// pre-flight arms remain deferred. The server still re-validates the signed
 /// access token on every API call (upstream's stated security boundary,
 /// protocol.rs:164-172).
 public func loginXAIBrowser(
@@ -533,7 +531,15 @@ public func loginXAIBrowser(
         auth.userID = validatedSubject
     }
 
-    // The one store write: AuthManager.update under the auth.json file lock.
+    auth = try await enrichXAIUserProfile(
+        auth: auth,
+        configuration: config,
+        environment: environment,
+        transport: transport
+    )
+    try Task.checkCancellation()
+
+    // The one store write includes identity, consent, and ZDR policy together.
     try await manager.loginWithSession(auth)
     return auth
 }

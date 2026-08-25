@@ -704,6 +704,26 @@ struct FsAtomicTests {
         try writeAtomically(tmp, contents: "two", mode: 0o600)
         #expect(try String(contentsOf: tmp, encoding: .utf8) == "two")
     }
+
+    #if !os(Windows)
+    @Test("explicit private mode replaces an existing world-readable file atomically")
+    func explicitModeDoesNotInheritDestinationPermissions() throws {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ogrok-atomic-private-\(UUID().uuidString).txt")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try "legacy".write(to: file, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: file.path)
+
+        try writeAtomically(file, contents: "private", mode: 0o600)
+
+        let permissions = try #require(
+            FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions]
+                as? NSNumber
+        )
+        #expect((permissions.intValue & 0o777) == 0o600)
+        #expect(try String(contentsOf: file, encoding: .utf8) == "private")
+    }
+    #endif
 }
 
 // MARK: - envBool re-export

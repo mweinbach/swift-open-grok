@@ -69,6 +69,9 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
     private var client: (any ACPPermissionReverseClient)?
     private var sessionId: AcpSessionId?
     private let timeoutSeconds: TimeInterval
+    private var rememberToolApprovals: Bool
+    private var preservesLegacyBroadBashDenial: Bool
+    private weak var permissionHandle: PermissionHandle?
     /// Per-session grants. A grant made by one ACP session must not authorize
     /// another session's tool call, and `x.ai/permissions/reset` for one
     /// session must not clear another's.
@@ -81,26 +84,48 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
     /// What one ACP session has been granted for its lifetime.
     private struct SessionGrants {
         var allowsEdits = false
-        var bashAllowed = false
+        var allowedBashCommands: Set<String> = []
+        var deniedBashCommands: Set<String> = []
         /// `reject-always` for bash. Denial outranks any later allow-always so
-        /// that "No, and don't run bash commands" is actually permanent.
-        var bashDenied = false
-        var alwaysAllowed: Set<String> = []
+        /// legacy clients retain their stricter pre-existing deny-all behavior.
+        var legacyBashDenied = false
+        var allowedWebFetchURLs: Set<String> = []
+        var allowedMCPTools: Set<String> = []
     }
 
     public init(
         client: (any ACPPermissionReverseClient)? = nil,
         sessionId: AcpSessionId? = nil,
-        timeoutSeconds: TimeInterval = LiveACPPermissionPrompter.defaultTimeoutSeconds
+        timeoutSeconds: TimeInterval = LiveACPPermissionPrompter.defaultTimeoutSeconds,
+        rememberToolApprovals: Bool? = nil
     ) {
         self.client = client
         self.sessionId = sessionId
         self.timeoutSeconds = timeoutSeconds
+        self.rememberToolApprovals = rememberToolApprovals ?? true
+        self.preservesLegacyBroadBashDenial = rememberToolApprovals == nil
     }
 
     /// Install (or clear) the reverse client. Cleared client → deny.
     public func attach(client: (any ACPPermissionReverseClient)?) {
         self.client = client
+    }
+
+    /// The engine remains authoritative for managed asks, shell-file floors,
+    /// protected edits, and later sandbox/hook ordering.
+    public func attachPermissionHandle(_ handle: PermissionHandle?) {
+        permissionHandle = handle
+    }
+
+    public func setRememberToolApprovals(_ enabled: Bool) {
+        rememberToolApprovals = enabled
+        preservesLegacyBroadBashDenial = false
+        guard !enabled else { return }
+        for session in Array(grants.keys) {
+            grants[session]?.allowedBashCommands.removeAll()
+            grants[session]?.allowedWebFetchURLs.removeAll()
+            grants[session]?.allowedMCPTools.removeAll()
+        }
     }
 
     /// Bind the ACP wire session id used when no turn is in flight and no
@@ -193,10 +218,23 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
         // property of one session, so an unattributable request has no grant
         // to consult and must reach the client (or fail closed above).
         if let decision = preapproved(access, session: sessionId) {
-            return decision
+            if !decision.isAllow {
+                return decision
+            }
+            if let permissionHandle {
+                if await permissionHandle.canReuseRememberedApproval(access),
+                   preapproved(access, session: sessionId)?.isAllow == true {
+                    return decision
+                }
+            } else {
+                return decision
+            }
         }
 
-        let options = Self.buildOptions(for: access)
+        let options = Self.buildOptions(
+            for: access,
+            rememberToolApprovals: rememberToolApprovals
+        )
         let optionById = Dictionary(uniqueKeysWithValues: options.map { ($0.optionId.rawValue, $0) })
         let request = RequestPermissionRequest(
             sessionId: sessionId,
@@ -249,7 +287,7 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
             return .reject(Self.failureMessage(toolName: toolName, detail: "invalid permission response"))
         }
 
-        return mapOutcome(
+        return await mapOutcome(
             response.outcome,
             optionById: optionById,
             access: access,
@@ -268,7 +306,7 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
         access: AccessKind,
         toolName: String,
         session: AcpSessionId
-    ) -> PermissionDecision {
+    ) async -> PermissionDecision {
         switch outcome {
         case .cancelled:
             // Cancelled is not allow — encode the distinction for readers.
@@ -284,12 +322,31 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
             case .allowOnce:
                 return .allow
             case .allowAlways:
+                if rememberToolApprovals,
+                   selected.optionId.rawValue == Self.alwaysAllowOptionId,
+                   let grant = liveProjectPermissionGrant(for: access),
+                   let permissionHandle {
+                    if await permissionHandle.projectApprovalStateURL != nil {
+                        guard await permissionHandle.grant(grant) else {
+                            return .reject(Self.failureMessage(
+                                toolName: toolName,
+                                detail: "could not save a private project approval"
+                            ))
+                        }
+                    }
+                }
                 grantSession(access: access, optionId: selected.optionId.rawValue, session: session)
                 return .allow
             case .rejectOnce:
                 return .reject("'\(toolName)' was denied.")
             case .rejectAlways:
                 denySession(access: access, optionId: selected.optionId.rawValue, session: session)
+                if rememberToolApprovals, case .bash(let command) = access {
+                    let prefix = command.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if matchesSessionBashGrant(prefix, grant: prefix) {
+                        await permissionHandle?.disallowBashPrefix(prefix)
+                    }
+                }
                 return .reject("'\(toolName)' was denied.")
             }
         }
@@ -304,14 +361,16 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
             if optionId == Self.allowEditsSessionOptionId || optionId == Self.alwaysAllowOptionId {
                 record.allowsEdits = true
             }
-        case .bash:
-            if optionId == Self.alwaysAllowOptionId {
-                record.bashAllowed = true
+        case .bash(let command):
+            if optionId == Self.alwaysAllowOptionId,
+               rememberToolApprovals,
+               matchesSessionBashGrant(command, grant: command) {
+                record.allowedBashCommands.insert(command.trimmingCharacters(in: .whitespaces))
             }
         case .webFetch(let url):
-            record.alwaysAllowed.insert(url)
+            if rememberToolApprovals { record.allowedWebFetchURLs.insert(url) }
         case .mcpTool(let name, _):
-            record.alwaysAllowed.insert(name)
+            if rememberToolApprovals { record.allowedMCPTools.insert(name) }
         case .read, .grep, .webSearch:
             break
         }
@@ -325,8 +384,11 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
         guard optionId == Self.rejectAlwaysOptionId else { return }
         var record = grants[session] ?? SessionGrants()
         switch access {
-        case .bash:
-            record.bashDenied = true
+        case .bash(let command):
+            record.deniedBashCommands.insert(command.trimmingCharacters(in: .whitespaces))
+            if preservesLegacyBroadBashDenial {
+                record.legacyBashDenied = true
+            }
         case .edit, .read, .grep, .webSearch, .webFetch, .mcpTool:
             return
         }
@@ -352,13 +414,23 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
                 return nil
             }
             return record.allowsEdits ? .allow : nil
-        case .bash:
-            if record.bashDenied { return .reject("bash commands were denied for this session.") }
-            return record.bashAllowed ? .allow : nil
+        case .bash(let command):
+            if record.legacyBashDenied || record.deniedBashCommands.contains(where: {
+                $0 == command.trimmingCharacters(in: .whitespaces)
+                    || matchesSessionBashGrant(command, grant: $0)
+            }) {
+                return .reject("this bash command was denied for this session.")
+            }
+            guard rememberToolApprovals else { return nil }
+            return record.allowedBashCommands.contains {
+                matchesSessionBashGrant(command, grant: $0)
+            } ? .allow : nil
         case .webFetch(let url):
-            return record.alwaysAllowed.contains(url) ? .allow : nil
+            return rememberToolApprovals && record.allowedWebFetchURLs.contains(url)
+                ? .allow : nil
         case .mcpTool(let name, _):
-            return record.alwaysAllowed.contains(name) ? .allow : nil
+            return rememberToolApprovals && record.allowedMCPTools.contains(name)
+                ? .allow : nil
         case .read, .grep, .webSearch:
             // NOT auto-allowed. `PermissionHandle` already allows safe access
             // on its own (PermissionManager.swift:355-363); a request that
@@ -381,7 +453,10 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
 
     private static let rejectOnceLabel = "No, and tell Grok what to do differently"
 
-    static func buildOptions(for access: AccessKind) -> [PermissionOption] {
+    static func buildOptions(
+        for access: AccessKind,
+        rememberToolApprovals: Bool = true
+    ) -> [PermissionOption] {
         switch access {
         case .edit:
             return [
@@ -401,14 +476,18 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
                     kind: .rejectOnce
                 ),
             ]
-        case .bash:
+        case .bash(let command):
             // Generic (non-TUI) bash options — `prompter.rs:428-460`.
-            return [
-                PermissionOption(
+            var options: [PermissionOption] = []
+            if rememberToolApprovals,
+               matchesSessionBashGrant(command, grant: command) {
+                options.append(PermissionOption(
                     optionId: PermissionOptionId(alwaysAllowOptionId),
-                    name: "Yes, and don't ask again for bash commands",
+                    name: "Yes, always allow this command: \(command)",
                     kind: .allowAlways
-                ),
+                ))
+            }
+            options.append(contentsOf: [
                 PermissionOption(
                     optionId: PermissionOptionId(allowOnceOptionId),
                     name: "Yes, proceed",
@@ -419,19 +498,39 @@ public actor LiveACPPermissionPrompter: PermissionPrompter {
                     name: rejectOnceLabel,
                     kind: .rejectOnce
                 ),
-                PermissionOption(
+            ])
+            if rememberToolApprovals {
+                options.append(PermissionOption(
                     optionId: PermissionOptionId(rejectAlwaysOptionId),
-                    name: "No, and don't run bash commands",
+                    name: "No, and don't run this command again",
                     kind: .rejectAlways
-                ),
-            ]
-        default:
-            return [
-                PermissionOption(
+                ))
+            }
+            return options
+        case .webFetch, .mcpTool:
+            var options: [PermissionOption] = []
+            if rememberToolApprovals {
+                options.append(PermissionOption(
                     optionId: PermissionOptionId(alwaysAllowOptionId),
                     name: "always allow",
                     kind: .allowAlways
+                ))
+            }
+            options.append(contentsOf: [
+                PermissionOption(
+                    optionId: PermissionOptionId(allowOnceOptionId),
+                    name: "allow once",
+                    kind: .allowOnce
                 ),
+                PermissionOption(
+                    optionId: PermissionOptionId(rejectOnceOptionId),
+                    name: "reject once",
+                    kind: .rejectOnce
+                ),
+            ])
+            return options
+        case .read, .grep, .webSearch:
+            return [
                 PermissionOption(
                     optionId: PermissionOptionId(allowOnceOptionId),
                     name: "allow once",

@@ -2,8 +2,9 @@
 //
 // Live wiring for LSP tools + the session handle used for post-edit sync.
 //
-// Registers `pull_diagnostics` when `features.lsp_tools` is enabled and at
-// least one language server is configured in `lsp.json`. The returned
+// Registers `pull_diagnostics` and upstream's six-operation `lsp` tool when
+// `features.lsp_tools` is enabled and at least one trusted language server is
+// configured in `lsp.json`. The returned
 // `LSPSession` is also what `LiveToolExecutor` uses after `search_replace`
 // (notify + drain → `<system-reminder>`), matching Rust's
 // `LspDiagnosticsReminder`. The heavy transport lives in `OpenGrokLSP`.
@@ -89,9 +90,9 @@ public enum LiveLspComposition {
 
     // MARK: - Registration
 
-    /// Register `pull_diagnostics` into a finalized toolset when enabled and
-    /// configured. Returns the live session handle, or nil when nothing was
-    /// registered.
+    /// Register diagnostics and semantic navigation into a finalized toolset
+    /// when enabled and configured. Returns their shared live session handle,
+    /// or nil when no trusted language server can be registered.
     @discardableResult
     public static func registerTools(
         toolset: FinalizedToolset,
@@ -133,6 +134,7 @@ public enum LiveLspComposition {
             exposure: .ordinary,
             handler: PullDiagnosticsToolHandler(session: session)
         ))
+        LiveLSPSemanticTools.register(into: toolset, session: session)
         return session
     }
 }

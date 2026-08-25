@@ -128,6 +128,10 @@ public enum LiveServeComposition {
         let store = InMemoryACPSessionStore()
         let workspace = LocalOpenGrokShellWorkspace(root: cwd, openGrokHome: home)
         let boundary = workspace.acpBoundary
+        let combineQueuedPrompts = LiveInteractiveControllerRenderer.resolveUIConfig(
+            workingDirectory: cwd,
+            environment: context.environment
+        ).inputModes.combineQueuedPrompts
 
         let host = ACPServeHost(
             configuration: ACPServeConfiguration(
@@ -153,6 +157,7 @@ public enum LiveServeComposition {
                     onSessionOpened: launchComponents.onSessionOpened,
                     onSessionClosed: launchComponents.onSessionClosed
                 )
+                await runtime.setCombineQueuedPrompts(combineQueuedPrompts)
                 // Re-attached per accepted connection: the serve host mints a
                 // runtime per client, and the gateway's emitters must follow
                 // the runtime whose sink is the LIVE socket — an emitter

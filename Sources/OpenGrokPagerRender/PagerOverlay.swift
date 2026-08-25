@@ -614,13 +614,66 @@ public enum PagerPermissionDecision: String, Sendable, Equatable, Hashable, Coda
     case deny
 }
 
+/// First-prompt cursor target; missing or unsupported values fail to allow-once.
+/// A global always-approve target never aliases a scoped session-approval row.
+public enum PagerDefaultSelectedPermission: String, Sendable, Equatable, Hashable, Codable {
+    case alwaysAllowAllSessions = "always_allow_all_sessions"
+    case allowCommandAlways = "allow_command_always"
+    case allowOnce = "allow_once"
+    case reject
+
+    public init(configuredValue: String?) {
+        let normalized = configuredValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+        self = normalized.flatMap(PagerDefaultSelectedPermission.init(rawValue:)) ?? .allowOnce
+    }
+
+    public func initialIndex(in options: [PagerPermissionOption]) -> Int {
+        let target: PagerPermissionDecision?
+        switch self {
+        case .allowOnce:
+            target = .allowOnce
+        case .allowCommandAlways:
+            target = .allowSession
+        case .reject:
+            target = .deny
+        case .alwaysAllowAllSessions:
+            // This surface has no separately authorized global-approval row.
+            target = nil
+        }
+        if let target, let index = options.firstIndex(where: { $0.decision == target }) {
+            return index
+        }
+        if let index = options.firstIndex(where: { $0.decision == .allowOnce }) {
+            return index
+        }
+        return options.firstIndex(where: { $0.decision == .deny }) ?? 0
+    }
+
+    fileprivate init(decision: PagerPermissionDecision) {
+        switch decision {
+        case .allowOnce: self = .allowOnce
+        case .allowSession: self = .allowCommandAlways
+        case .deny: self = .reject
+        }
+    }
+}
+
 public struct PagerPermissionOption: Sendable, Equatable, Hashable {
     public var decision: PagerPermissionDecision
     public var label: String
+    public var recordsStickySelection: Bool
 
-    public init(decision: PagerPermissionDecision, label: String) {
+    public init(
+        decision: PagerPermissionDecision,
+        label: String,
+        recordsStickySelection: Bool = true
+    ) {
         self.decision = decision
         self.label = label
+        self.recordsStickySelection = recordsStickySelection
     }
 }
 
@@ -638,6 +691,7 @@ public struct PagerPermissionRequest: Sendable, Equatable, Hashable, Identifiabl
     public var detail: String?
     public var diffPreview: [PagerDiffLine]
     public var options: [PagerPermissionOption]
+    public var initialSelectedIndex: Int?
 
     public init(
         id: String = UUID().uuidString,
@@ -645,7 +699,8 @@ public struct PagerPermissionRequest: Sendable, Equatable, Hashable, Identifiabl
         targetPath: String? = nil,
         detail: String? = nil,
         diffPreview: [PagerDiffLine] = [],
-        options: [PagerPermissionOption] = PagerPermissionRequest.defaultOptions
+        options: [PagerPermissionOption] = PagerPermissionRequest.defaultOptions,
+        initialSelectedIndex: Int? = nil
     ) {
         self.id = id
         self.toolName = toolName
@@ -653,13 +708,18 @@ public struct PagerPermissionRequest: Sendable, Equatable, Hashable, Identifiabl
         self.detail = detail
         self.diffPreview = diffPreview
         self.options = options.isEmpty ? PagerPermissionRequest.defaultOptions : options
+        self.initialSelectedIndex = initialSelectedIndex
     }
 
     /// The reference's option set for an edit permission
     /// (`workspace/src/permission/prompter.rs:380-406`), shortened to the three
     /// the integration owner asked for.
     public static let defaultOptions: [PagerPermissionOption] = [
-        PagerPermissionOption(decision: .allowSession, label: "Yes, allow all edits during this session"),
+        PagerPermissionOption(
+            decision: .allowSession,
+            label: "Yes, allow all edits during this session",
+            recordsStickySelection: false
+        ),
         PagerPermissionOption(decision: .allowOnce, label: "Yes"),
         PagerPermissionOption(decision: .deny, label: "No, and tell Grok what to do differently")
     ]
@@ -678,9 +738,14 @@ public struct PagerPermissionPrompt: Sendable, Equatable, Hashable {
     public var selectedIndex: Int
     public var diffScrollOffset: Int
 
-    public init(request: PagerPermissionRequest, selectedIndex: Int = 0, diffScrollOffset: Int = 0) {
+    public init(
+        request: PagerPermissionRequest,
+        selectedIndex: Int? = nil,
+        diffScrollOffset: Int = 0
+    ) {
         self.request = request
-        self.selectedIndex = selectedIndex
+        let preferred = selectedIndex ?? request.initialSelectedIndex ?? 0
+        self.selectedIndex = min(max(0, preferred), max(0, request.options.count - 1))
         self.diffScrollOffset = diffScrollOffset
     }
 
@@ -2298,8 +2363,24 @@ public actor PagerPermissionCoordinator {
 
     private var queue: [Waiter] = []
     private var presenter: (@Sendable (PagerPermissionRequest?) async -> Void)?
+    private var defaultSelectedPermission: PagerDefaultSelectedPermission?
+    private var stickySelectedPermission: PagerDefaultSelectedPermission?
 
-    public init() {}
+    public init(defaultSelectedPermission: PagerDefaultSelectedPermission? = nil) {
+        self.defaultSelectedPermission = defaultSelectedPermission
+    }
+
+    public func setDefaultSelectedPermission(_ value: PagerDefaultSelectedPermission) {
+        defaultSelectedPermission = value
+    }
+
+    public func resetSelectedPermission() {
+        stickySelectedPermission = nil
+    }
+
+    public var lastSelectedPermission: PagerDefaultSelectedPermission? {
+        stickySelectedPermission
+    }
 
     /// The request the overlay should currently display, or `nil`.
     public var currentRequest: PagerPermissionRequest? { queue.first?.request }
@@ -2320,10 +2401,11 @@ public actor PagerPermissionCoordinator {
     /// Suspend until the user decides. Safe to call from any task.
     public func decision(for request: PagerPermissionRequest) async -> PagerPermissionDecision {
         let wasIdle = queue.isEmpty
+        let selectedRequest = requestWithResolvedSelection(request)
         let result = await withCheckedContinuation { (continuation: CheckedContinuation<PagerPermissionDecision, Never>) in
-            queue.append(Waiter(request: request, continuation: continuation))
+            queue.append(Waiter(request: selectedRequest, continuation: continuation))
             if wasIdle, let presenter {
-                Task { await presenter(request) }
+                Task { await presenter(selectedRequest) }
             }
         }
         return result
@@ -2333,12 +2415,30 @@ public actor PagerPermissionCoordinator {
     /// stale key from a previous overlay cannot resolve the wrong request.
     public func resolve(requestID: String, decision: PagerPermissionDecision) {
         guard let head = queue.first, head.request.id == requestID else { return }
+        if let selected = head.request.options.first(where: { $0.decision == decision }),
+           selected.recordsStickySelection {
+            stickySelectedPermission = PagerDefaultSelectedPermission(decision: decision)
+        }
         queue.removeFirst()
         head.continuation.resume(returning: decision)
+        if !queue.isEmpty {
+            queue[0].request = requestWithResolvedSelection(queue[0].request)
+        }
         let next = queue.first?.request
         if let presenter {
             Task { await presenter(next) }
         }
+    }
+
+    private func requestWithResolvedSelection(
+        _ request: PagerPermissionRequest
+    ) -> PagerPermissionRequest {
+        guard let target = stickySelectedPermission ?? defaultSelectedPermission else {
+            return request
+        }
+        var selected = request
+        selected.initialSelectedIndex = target.initialIndex(in: selected.options)
+        return selected
     }
 
     /// Fail every outstanding request — session teardown, turn cancellation.

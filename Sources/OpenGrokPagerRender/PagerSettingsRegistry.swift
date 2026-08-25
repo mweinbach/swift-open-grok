@@ -297,9 +297,8 @@ public enum PagerSettingChoices {
 
     /// `DEFAULT_SELECTED_PERMISSION_CHOICES` (`defs.rs:226`).
     public static let defaultSelectedPermission: [PagerSettingChoice] = [
-        PagerSettingChoice(canonical: "always-allow-all-sessions", display: "Always allow (all sessions)"),
-        PagerSettingChoice(canonical: "allow-command-always", display: "Allow this command always"),
         PagerSettingChoice(canonical: "allow-once", display: "Allow once"),
+        PagerSettingChoice(canonical: "allow-command-always", display: "Allow this command always"),
         PagerSettingChoice(canonical: "reject", display: "Reject")
     ]
 
@@ -466,6 +465,16 @@ public let CUSTOM_MODEL_PROVIDER_CHOICES: [PagerSettingChoice] = [
         canonical: "deepseek",
         display: "DeepSeek",
         summary: "Direct DeepSeek API."
+    ),
+    PagerSettingChoice(
+        canonical: "meta",
+        display: "Meta",
+        summary: "Meta Model API."
+    ),
+    PagerSettingChoice(
+        canonical: "opencode_go",
+        display: "OpenCode Go",
+        summary: "OpenCode Go catalog."
     ),
     PagerSettingChoice(
         canonical: "wafer",
@@ -983,7 +992,7 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             label: "Default selected permission",
             description: "Which row the cursor preselects on permission prompts.",
             keywords: ["approval", "default"],
-            kind: .enumeration(default: "always-allow-all-sessions", choices: PagerSettingChoices.defaultSelectedPermission, supportsPreview: false),
+            kind: .enumeration(default: "allow-once", choices: PagerSettingChoices.defaultSelectedPermission, supportsPreview: false),
             storage: .config(path: "ui.default_selected_permission")
         ),
         PagerSettingMeta(

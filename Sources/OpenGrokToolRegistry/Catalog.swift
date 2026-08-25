@@ -91,6 +91,13 @@ public enum BuiltinToolCatalog {
             "target_file": stringProp("Path of the file to read."),
             "offset": intProp("1-indexed start line."),
             "limit": intProp("Number of lines to read."),
+            "pages": stringProp(
+                "Page range for PDF files, such as '1-5', '3', or '10-'. "
+                    + "Required for PDFs with more than 10 pages; maximum 20 pages per call."
+            ),
+            "format": stringProp(
+                "Output format for PDF files: 'image' renders pages visually; 'text' extracts text."
+            ),
         ],
         required: ["target_file"]
     )
@@ -671,14 +678,39 @@ public enum BuiltinToolCatalog {
 
     // MARK: - Execution & Terminal schemas
 
+    private static let bashTimeoutSchema: JSONValue = .object([
+        "type": .string("integer"),
+        "description": .string(
+            "Optional timeout in milliseconds (max 300000). Default: 120000 "
+                + "(2 minutes), enforced for foreground commands only."
+        ),
+        "default": .number(.int64(120_000)),
+    ])
+
     public static let bashSchema = objectSchema(
         properties: [
             "command": stringProp("The shell command line string to execute."),
-            "timeout": intProp("Timeout in milliseconds (default 120,000, max 300,000)."),
+            "timeout": bashTimeoutSchema,
             "description": stringProp("User-facing description of what the command does."),
             "is_background": boolProp("Whether to run the command in the background."),
         ],
-        required: ["command"]
+        required: ["command", "description"]
+    )
+
+    /// The provider-facing preset renames the underlying Bash field
+    /// `is_background` to `background` without changing dispatch semantics.
+    public static let terminalCommandSchema = objectSchema(
+        properties: [
+            "command": stringProp("The shell command line string to execute."),
+            "timeout": bashTimeoutSchema,
+            "description": stringProp(
+                "One sentence explanation of why this command needs to run and how it contributes to the goal."
+            ),
+            "background": boolProp(
+                "Run a long-lived command in the background and return its task identifier immediately."
+            ),
+        ],
+        required: ["command", "description"]
     )
 
     public static let killTaskSchema = objectSchema(
@@ -857,6 +889,46 @@ public enum BuiltinToolCatalog {
 
 // MARK: - Handler protocol
 
+/// Explicitly shared capability for one authenticated root session tree.
+/// Local child-worktree roots remain private to their own `ToolResources`;
+/// only roots published through this capability propagate to descendants.
+public final class ToolResourceAuthorizationScope: @unchecked Sendable {
+    public let authorizationSessionID: String
+    public let baseRoots: [String]
+
+    private let lock = NSLock()
+    private var currentRoots: [String]
+
+    public init(authorizationSessionID: String, allowedRoots: [String]) {
+        self.authorizationSessionID = authorizationSessionID
+        var observed = Set<String>()
+        self.baseRoots = allowedRoots.filter { observed.insert($0).inserted }
+        self.currentRoots = self.baseRoots
+    }
+
+    public var allowedRoots: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return currentRoots
+    }
+
+    @discardableResult
+    public func replaceAllowedRoots(
+        _ roots: [String],
+        authorizationSessionID: String
+    ) -> Bool {
+        guard !authorizationSessionID.isEmpty,
+              authorizationSessionID == self.authorizationSessionID
+        else { return false }
+        var observed = Set<String>()
+        let deduplicated = roots.filter { observed.insert($0).inserted }
+        lock.lock()
+        currentRoots = deduplicated
+        lock.unlock()
+        return true
+    }
+}
+
 /// Type-erased runtime handler bound at pack registration / finalize time.
 public protocol ToolHandler: Sendable {
     func invoke(
@@ -877,8 +949,22 @@ public final class ToolResources: @unchecked Sendable {
     public var promptIndex: Int
     public var sessionId: String
     public var agentId: String
-    /// Optional path boundary roots (workspace sandbox).
-    public var allowedRoots: [String]
+    /// The root-session identity is immutable even when legacy `sessionId`
+    /// metadata changes; only explicitly inherited descendants share it.
+    public let authorizationScope: ToolResourceAuthorizationScope
+    private let resourceAllowedRoots: [String]
+
+    public var authorizationSessionID: String {
+        authorizationScope.authorizationSessionID
+    }
+
+    /// Child worktree roots stay local; shared approved roots update atomically.
+    public var allowedRoots: [String] {
+        var observed = Set<String>()
+        return (resourceAllowedRoots + authorizationScope.allowedRoots).filter {
+            observed.insert($0).inserted
+        }
+    }
     public var extras: TypedExtensions
     /// The interactive question surface for `ask_user_question`, mirroring
     /// upstream's `UserQuestionSender` resource (`ask_user_question/mod.rs:379-402`).
@@ -897,7 +983,8 @@ public final class ToolResources: @unchecked Sendable {
         sessionId: String = "session",
         agentId: String = "main",
         allowedRoots: [String] = [],
-        extras: TypedExtensions = TypedExtensions()
+        extras: TypedExtensions = TypedExtensions(),
+        authorizationScope: ToolResourceAuthorizationScope? = nil
     ) {
         self.cwd = cwd
         self.sessionFolder = sessionFolder ?? cwd
@@ -907,7 +994,11 @@ public final class ToolResources: @unchecked Sendable {
         self.promptIndex = promptIndex
         self.sessionId = sessionId
         self.agentId = agentId
-        self.allowedRoots = allowedRoots
+        self.resourceAllowedRoots = allowedRoots
+        self.authorizationScope = authorizationScope ?? ToolResourceAuthorizationScope(
+            authorizationSessionID: sessionId,
+            allowedRoots: allowedRoots
+        )
         self.extras = extras
     }
 }

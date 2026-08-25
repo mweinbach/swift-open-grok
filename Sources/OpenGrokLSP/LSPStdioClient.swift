@@ -149,6 +149,7 @@ public actor LSPStdioClient {
     private var nextRequestID = 1
     private var pendingResponses: [Int: CheckedContinuation<LSPJSONRPCResponse, Error>] = [:]
     private var notificationHandler: (@Sendable (String, JSONValue?) async -> Void)?
+    private var initializedServerCapabilities: JSONValue = .object([:])
 
     public init(configuration: LSPStdioClientConfiguration) {
         self.configuration = configuration
@@ -210,6 +211,7 @@ public actor LSPStdioClient {
     }
 
     public func request(method: String, params: JSONValue? = nil) async throws -> JSONValue {
+        try Task.checkCancellation()
         if !started { try await start() }
         guard !closed else { throw LSPError.transportClosed }
 
@@ -236,17 +238,21 @@ public actor LSPStdioClient {
         // the write let a fast server's response reach `deliver` while
         // `pendingResponses` was still empty: the response was dropped, and the
         // continuation stored a moment later had nothing left to resume it.
-        let response: LSPJSONRPCResponse = try await withCheckedThrowingContinuation { continuation in
-            pendingResponses[requestID] = continuation
-            do {
-                try stdinPipe.fileHandleForWriting.write(contentsOf: packet)
-            } catch {
-                if let pending = pendingResponses.removeValue(forKey: requestID) {
-                    pending.resume(throwing: LSPError.transport(
-                        "LSP stdio write failed: \(error.localizedDescription)"
-                    ))
+        let response: LSPJSONRPCResponse = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                pendingResponses[requestID] = continuation
+                do {
+                    try stdinPipe.fileHandleForWriting.write(contentsOf: packet)
+                } catch {
+                    if let pending = pendingResponses.removeValue(forKey: requestID) {
+                        pending.resume(throwing: LSPError.transport(
+                            "LSP stdio write failed: \(error.localizedDescription)"
+                        ))
+                    }
                 }
             }
+        } onCancel: {
+            Task { await self.cancelPendingRequest(id: requestID) }
         }
 
         switch response {
@@ -358,6 +364,20 @@ public actor LSPStdioClient {
         }
     }
 
+    private func cancelPendingRequest(id: Int) async {
+        guard let continuation = pendingResponses.removeValue(forKey: id) else { return }
+        continuation.resume(throwing: CancellationError())
+        do {
+            try await notify(LSPJSONRPCNotification(
+                method: "$/cancelRequest",
+                params: .object(["id": .number(.int64(Int64(id)))])
+            ))
+        } catch {
+            // Cancellation is already final locally; a disconnected server
+            // cannot make its abandoned request authoritative again.
+        }
+    }
+
     private func deliver(_ message: LSPJSONRPCResponse) {
         switch message {
         case .result(let id, _):
@@ -383,8 +403,8 @@ public actor LSPStdioClient {
 extension LSPStdioClient {
     /// Client capabilities advertised at initialize.
     ///
-    /// Rust reference: `client.rs` `client_capabilities` — sync, publish,
-    /// and pull diagnostic support. Hover/goto omitted in this slice.
+    /// Rust reference: `client.rs` `client_capabilities` — sync, semantic
+    /// navigation, publish, and pull diagnostic support.
     public static var clientCapabilities: JSONValue {
         .object([
             "textDocument": .object([
@@ -396,6 +416,17 @@ extension LSPStdioClient {
                 ]),
                 "publishDiagnostics": .object([
                     "relatedInformation": .bool(true),
+                ]),
+                "definition": .object([
+                    "dynamicRegistration": .bool(false),
+                    "linkSupport": .bool(false),
+                ]),
+                "references": .object([
+                    "dynamicRegistration": .bool(false),
+                ]),
+                "hover": .object([
+                    "dynamicRegistration": .bool(false),
+                    "contentFormat": .array([.string("plaintext")]),
                 ]),
                 "diagnostic": .object([
                     "dynamicRegistration": .bool(false),
@@ -410,6 +441,10 @@ extension LSPStdioClient {
         ])
     }
 
+    public func serverCapabilities() -> JSONValue {
+        initializedServerCapabilities
+    }
+
     public func initialize(rootURI: String) async throws {
         let params: JSONValue = .object([
             "processId": .null,
@@ -420,10 +455,16 @@ extension LSPStdioClient {
                 "version": .string("0.0.0"),
             ]),
         ])
-        _ = try await request(
+        let result = try await request(
             method: "initialize",
             params: params
         )
+        guard case .object(let fields) = result,
+              case .object(let capabilities)? = fields["capabilities"]
+        else {
+            throw LSPError.parse("LSP initialize response is missing server capabilities")
+        }
+        initializedServerCapabilities = .object(capabilities)
         try await notify(LSPJSONRPCNotification(method: "initialized"))
     }
 

@@ -14,6 +14,7 @@
 // in `State<TodoState>` on the session's Resources with the same lifetime.
 
 import Foundation
+import OpenGrokGoalState
 import OpenGrokShared
 import OpenGrokToolProtocol
 import OpenGrokToolRegistry
@@ -50,6 +51,8 @@ struct LiveTodoItem: Sendable, Equatable {
 actor LiveTodoStore {
     private var order: [String] = []
     private var items: [String: LiveTodoItem] = [:]
+    private var activeGatePromptID: String?
+    private var gateFiresForPrompt: UInt32 = 0
 
     init() {}
 
@@ -58,6 +61,70 @@ actor LiveTodoStore {
     }
 
     var isEmpty: Bool { order.isEmpty }
+
+    var outstandingGoalSnapshots: [GoalTodoSnapshot] {
+        todos.compactMap { item in
+            guard item.status == .pending || item.status == .inProgress else {
+                return nil
+            }
+            return GoalTodoSnapshot(
+                id: item.id,
+                content: item.content,
+                status: item.status.rawValue
+            )
+        }
+    }
+
+    var currentGateFireCount: UInt32 { gateFiresForPrompt }
+
+    func restoreCarryForward(_ snapshots: [GoalTodoSnapshot]) {
+        for snapshot in snapshots {
+            guard items[snapshot.id] == nil,
+                  let status = LiveTodoStatus.fromCanonical(snapshot.status),
+                  status == .pending || status == .inProgress
+            else {
+                continue
+            }
+            upsert(LiveTodoItem(
+                id: snapshot.id,
+                content: snapshot.content,
+                status: status
+            ))
+        }
+    }
+
+    /// Rust suppresses TodoGate while the active goal loop supplies its own
+    /// continuation; the prompt-local cap applies only to ordinary turns.
+    func evaluateTurnEndGate(
+        promptID: String,
+        assistantMadeToolCall: Bool,
+        backingTaskCount: Int,
+        goalHarnessActive: Bool,
+        policy: GoalRuntimePolicy
+    ) -> GoalTodoGateDecision {
+        if activeGatePromptID != promptID {
+            activeGatePromptID = promptID
+            gateFiresForPrompt = 0
+        }
+        guard policy.todoGateEnabled,
+              !assistantMadeToolCall,
+              !goalHarnessActive,
+              gateFiresForPrompt < policy.maximumTodoGateFiresPerPrompt
+        else {
+            return .continueTurn
+        }
+        let snapshots = todos.map {
+            GoalTodoSnapshot(id: $0.id, content: $0.content, status: $0.status.rawValue)
+        }
+        let input = GoalTodoGateInput(todos: snapshots, backingTaskCount: backingTaskCount)
+        let decision = GoalTodoGate.evaluate(input)
+        if case .nudge = decision {
+            gateFiresForPrompt = gateFiresForPrompt == .max
+                ? .max
+                : gateFiresForPrompt + 1
+        }
+        return decision
+    }
 
     func clear() {
         order.removeAll()

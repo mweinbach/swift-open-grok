@@ -211,6 +211,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
 
     var conversation = LivePagerConversationState(markdown: PagerMarkdownRenderer())
     var prompt = OpenGrokPagerInteractivePromptState()
+    var liveFollowUpSuggestions = LiveFollowUpSuggestions()
+    var claudeImportPlan: LiveClaudeImportPlan?
     var terminalSize: OpenGrokTerminalCore.TerminalSize
     var restored = false
     /// Voice dictation state for `/voice` and Ctrl+Space. Capabilities are
@@ -348,6 +350,14 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// to env too): auth-file paths, Codex endpoints, and the picker's
     /// env-override statuses all resolve against this copy.
     let environment: [String: String]
+    /// Startup-cached auto-mode gate shared with slash-command visibility.
+    nonisolated let autoPermissionModeAvailable: Bool
+    /// True only after authenticated session-scoped root authority is installed.
+    nonisolated let workingDirectoryCommandsAvailable: Bool
+    /// The session-frozen trusted settings, including authenticated remote defaults.
+    let resolvedPermissionPromptSettings: PermissionPromptSettings?
+    /// The authenticated sharing clients used by the already-live ACP route.
+    let shareRoute: LiveShareRouteDependencies
     /// Injectable side effects of `/login codex` and `/logout codex` —
     /// transport, browser flow, browser opener. Tests substitute fakes so no
     /// socket, browser, or network is touched.
@@ -839,7 +849,11 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         pagerRuntime: LivePagerRuntimeAdapter? = nil,
         authServices: LivePagerAuthServices = .production,
         usageSources: [ModelProvider: any ProviderUsageSource] = [:],
-        urlOpener: (@Sendable (URL) -> Void)? = nil
+        urlOpener: (@Sendable (URL) -> Void)? = nil,
+        shareRoute: LiveShareRouteDependencies = .production(),
+        workingDirectoryCommandsAvailable: Bool = false,
+        remoteAutoModeEnabled: Bool? = nil,
+        permissionPromptSettings: PermissionPromptSettings? = nil
     ) {
         self.mode = mode
         self.sessionID = sessionID
@@ -884,6 +898,13 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         // theme degrades to GrokNight instead of to mush.
         let environment = resolvedEnvironment
         self.environment = environment
+        self.autoPermissionModeAvailable = LivePagerSlashParity.autoModeAvailable(
+            environment: environment,
+            remoteEnabled: remoteAutoModeEnabled
+        )
+        self.workingDirectoryCommandsAvailable = workingDirectoryCommandsAvailable
+        self.resolvedPermissionPromptSettings = permissionPromptSettings
+        self.shareRoute = shareRoute
         let resolvedUIConfiguration = uiConfiguration ?? Self.resolveUIConfig(
             workingDirectory: URL(fileURLWithPath: workingDirectory, isDirectory: true),
             environment: environment
@@ -1567,6 +1588,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             currentPromptID = request.metadata[
                 OpenGrokPagerInteractiveController.promptIDMetadataKey
             ]
+            liveFollowUpSuggestions.beginTurn(promptID: currentPromptID)
             let promptKind: PagerPromptKind
             if request.metadata[
                 OpenGrokPagerInteractiveController.cronTaskIDMetadataKey
@@ -1845,6 +1867,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
 
     func resetForNewSession(sessionID: String) {
         self.sessionID = sessionID
+        resetFollowUpSuggestionSession(to: sessionID)
         lastMainTurnRequestedAt = nil
         conversation.removeAll()
         selection.unfocus()
@@ -1854,6 +1877,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         lastHeaderScreenRows = 0
         queuedPromptCount = 0
         prompt = OpenGrokPagerInteractivePromptState()
+        claudeImportPlan = nil
         hasStartedFirstTurn = false
         currentPermissionRequestID = nil
         currentQuestionRequestID = nil
@@ -2154,6 +2178,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     func restoreTerminal() async throws {
         guard !restored else { return }
         restored = true
+        await uninstallFollowUpSuggestionRelay()
         cancelAwayRecapPregeneration()
         recapEpoch &+= 1
         if let recapTask {
@@ -3902,6 +3927,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
 
     @discardableResult
     func select(overlayID: String, rowID: String) async throws -> String? {
+        if overlayID == PagerClaudeImportOverlay.overlayID {
+            return try handleClaudeImportOverlaySelection(rowID: rowID)
+        }
         if overlayID.hasPrefix("permission:") {
             // The sheet's row ids are `PagerPermissionDecision` raw values, so a
             // click resolves the request exactly as the keyboard would.
@@ -4297,6 +4325,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // the globals while it has focus (`defaults.rs:997-1017`).
             if let dashboardRouting = try await handleDashboardChord(key) {
                 return dashboardRouting
+            }
+            if let routing = try handleClaudeImportOverlayKey(key) {
+                return routing
             }
             switch overlays.handle(key, viewportHeight: overlayViewportHeight) {
             case .ignored:
@@ -4697,6 +4728,9 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// upstream's `PersonaDetailOutcome::Close` arm
     /// (`agent_view/modals.rs:126-132`, mouse close `:165-170`).
     func handleOverlayDismissal(_ id: String) {
+        if id == PagerClaudeImportOverlay.overlayID {
+            claudeImportPlan = nil
+        }
         if id == LiveGboomOverlay.overlayID {
             gboom = nil
             publishMotionState()
@@ -5152,6 +5186,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                     canCancel: minimalHost == nil && !isCancelling && phase.allowsCancel
                 )
             },
+            followUpSuggestions: liveFollowUpSuggestions.renderModel,
             completions: completions,
             input: PagerComposerState(
                 text: prompt.text,

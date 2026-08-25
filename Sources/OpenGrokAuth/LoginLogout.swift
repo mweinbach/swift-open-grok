@@ -86,18 +86,36 @@ public func loginXAIWithAPIKey(
 }
 
 /// Login with a pre-built OIDC session (after browser/device/external flow).
+@discardableResult
 public func loginXAIWithSession(
     manager: AuthManager,
     auth: GrokAuth,
-    policy: ForceLoginTeam? = nil
-) async throws {
+    policy: ForceLoginTeam? = nil,
+    environment: [String: String]? = nil,
+    transport: (any HTTPTransport)? = nil
+) async throws -> GrokAuth {
     if let policy {
         try enforceLoginPrincipal(
             policy: policy,
             actual: peekAccessTokenPrincipalID(auth.key)
         )
     }
-    try await manager.loginWithSession(auth)
+
+    let enriched: GrokAuth
+    if let environment, let transport {
+        enriched = try await enrichXAIUserProfile(
+            auth: auth,
+            configuration: manager.grokComConfig,
+            environment: environment,
+            transport: transport
+        )
+    } else {
+        enriched = auth
+    }
+
+    try Task.checkCancellation()
+    try await manager.loginWithSession(enriched)
+    return enriched
 }
 
 import Foundation

@@ -42,6 +42,37 @@ public protocol Auth401AttributionCallback: Sendable {
     func record401(consumer: SamplingConsumer, sentBearerPrefix: String?)
 }
 
+/// Scrubbed evidence for distinguishing a stale request from a rejected live key.
+///
+/// Both inputs are reduced again at construction so even a direct or malformed
+/// callback invocation cannot leave a complete credential in recorded state.
+public struct Auth401AttributionRecord: Sendable, Equatable {
+    public let consumer: SamplingConsumer
+    public let sentBearerSuffix: String?
+    public let currentBearerSuffix: String?
+    public let isStaleSnapshot: Bool
+
+    public init(
+        consumer: SamplingConsumer,
+        sentBearer: String?,
+        currentBearer: String?
+    ) {
+        let sentSuffix = sentBearer.map(scrubbedBearerSuffix)
+        let currentSuffix = currentBearer.map(scrubbedBearerSuffix)
+        self.consumer = consumer
+        self.sentBearerSuffix = sentSuffix
+        self.currentBearerSuffix = currentSuffix
+        if let sentSuffix,
+           !sentSuffix.isEmpty,
+           let currentSuffix,
+           !currentSuffix.isEmpty {
+            self.isStaleSnapshot = sentSuffix != currentSuffix
+        } else {
+            self.isStaleSnapshot = false
+        }
+    }
+}
+
 /// Last 12 extended grapheme clusters, preserving short and non-ASCII tokens.
 public func scrubbedBearerSuffix(_ bearer: String) -> String {
     String(bearer.suffix(BEARER_SUFFIX_LEN))

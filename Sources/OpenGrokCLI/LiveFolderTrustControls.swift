@@ -335,6 +335,7 @@ final class LiveFolderTrustExecutorBinding: @unchecked Sendable {
             await previousLanguageSession.shutdown()
         }
         toolset.unregister(prefix: LiveLspComposition.toolName)
+        toolset.unregister(prefix: "lsp")
         guard isActive else {
             runtime.failClosed()
             return 0

@@ -234,6 +234,33 @@ public struct GrokAuth: Codable, Sendable, Equatable, CustomStringConvertible, C
         isZDRTeam || codingDataRetentionOptOut
     }
 
+    /// Merge the proxy profile without discarding fields omitted by its response.
+    /// Token material and expiry remain owned by the authenticated OAuth exchange.
+    mutating func applyUserProfileEnrichment(_ profile: UserInfo) {
+        userID = profile.userID
+        firstName = profile.firstName ?? firstName
+        lastName = profile.lastName ?? lastName
+        profileImageAssetID = profile.profileImageAssetID ?? profileImageAssetID
+        principalType = profile.principalType ?? principalType
+        principalID = profile.principalID ?? principalID
+        teamID = profile.teamID ?? teamID
+        teamName = profile.teamName ?? teamName
+        teamRole = profile.teamRole ?? teamRole
+        organizationID = profile.organizationID ?? organizationID
+        organizationName = profile.organizationName ?? organizationName
+        organizationRole = profile.organizationRole ?? organizationRole
+        userBlockedReason = profile.userBlockedReason ?? userBlockedReason
+        if let reasons = profile.teamBlockedReasons {
+            teamBlockedReasons = reasons
+        }
+        if let optOut = profile.codingDataRetentionOptOut {
+            codingDataRetentionOptOut = optOut
+        }
+        if let email = profile.email, !email.isEmpty {
+            self.email = email
+        }
+    }
+
     /// Carry `/user`-derived fields from a previous auth across refresh.
     public mutating func carryUserProfile(from prev: GrokAuth) {
         userID = prev.userID

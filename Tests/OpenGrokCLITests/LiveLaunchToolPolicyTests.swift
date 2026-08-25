@@ -49,6 +49,28 @@ struct LiveLaunchToolPolicyTests {
         #expect(resolved.denylist == ["run_terminal_cmd"])
         #expect(resolved.allows(liveToolName: "read_file"))
         #expect(!resolved.allows(liveToolName: "run_terminal_cmd"))
+        #expect(!resolved.allows(liveToolName: "run_terminal_command"))
+    }
+
+    @Test("canonical and legacy terminal names share allow, deny, and capability boundaries")
+    func terminalAliasesCannotBypassAuthority() throws {
+        for deniedName in ["run_terminal_cmd", "run_terminal_command"] {
+            let denied = try #require(LiveAgentToolPolicy.resolveLaunchPolicy(
+                tools: nil,
+                disallowedTools: deniedName,
+                profile: nil
+            ))
+            #expect(!denied.allows(liveToolName: "run_terminal_cmd"))
+            #expect(!denied.allows(liveToolName: "run_terminal_command"))
+        }
+
+        for policy in [
+            LiveAgentToolPolicy(unrestrictedWith: .readOnly),
+            LiveAgentToolPolicy(unrestrictedWith: .readWrite),
+        ] {
+            #expect(!policy.allows(liveToolName: "run_terminal_cmd"))
+            #expect(!policy.allows(liveToolName: "run_terminal_command"))
+        }
     }
 
     @Test("both flags: allowlist from --tools, denylist from --disallowed-tools")

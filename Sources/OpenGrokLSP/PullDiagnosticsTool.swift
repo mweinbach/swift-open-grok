@@ -59,6 +59,8 @@ public actor LSPSession {
     private var diagnosticsByServer: [String: DiagnosticsStore] = [:]
     private var initializedRoots: [String: String] = [:]
     private var pending: [PendingDiagnosticWait] = []
+    private var synchronizedDocumentContents: [String: String] = [:]
+    private var isShutdown = false
 
     public init(workspaceRoot: String, servers: [String: LspServerConfig]) {
         self.workspaceRoot = workspaceRoot
@@ -66,6 +68,7 @@ public actor LSPSession {
     }
 
     public func pullDiagnostics(path: String) async -> String {
+        guard !isShutdown else { return "LSP session is closed." }
         guard let resolved = LSPConfigLoader.resolveServer(for: path, servers: servers) else {
             return "No configured LSP server handles '\(path)'."
         }
@@ -108,6 +111,7 @@ public actor LSPSession {
     ///
     /// Rust reference: `client.rs` `notify_file_change` / `manager.rs` `notify_file_changed`.
     public func notifyFileChanged(path: String, content: String) async {
+        guard !isShutdown else { return }
         guard let resolved = LSPConfigLoader.resolveServer(for: path, servers: servers) else {
             return
         }
@@ -166,6 +170,7 @@ public actor LSPSession {
                 languageID: resolved.languageID,
                 end: newEnd
             )
+            synchronizedDocumentContents[uri] = content
             // A push can land between the write and commit; re-credit it now
             // that `latestSent` is known so drain is not stuck on NO_VERSION.
             if store.covers(uri: uri) == DiagnosticsStore.noVersion {
@@ -225,11 +230,35 @@ public actor LSPSession {
     }
 
     public func shutdown() async {
+        guard !isShutdown else { return }
+        isShutdown = true
         for client in clients.values {
             await client.close()
         }
         clients.removeAll()
         pending.removeAll()
+        synchronizedDocumentContents.removeAll()
+    }
+
+    func semanticServerConfigurations() -> [String: LspServerConfig] {
+        isShutdown ? [:] : servers
+    }
+
+    func semanticClient(
+        for serverName: String,
+        config: LspServerConfig
+    ) async throws -> LSPStdioClient {
+        guard !isShutdown else { throw LSPError.transportClosed }
+        return try await client(for: serverName, config: config)
+    }
+
+    func semanticDocumentIsSynchronized(
+        uri: String,
+        serverName: String,
+        content: String
+    ) -> Bool {
+        documents(for: serverName).contains(uri: uri)
+            && synchronizedDocumentContents[uri] == content
     }
 
     // MARK: - Private
@@ -328,6 +357,7 @@ public actor LSPSession {
     }
 
     private func client(for serverName: String, config: LspServerConfig) async throws -> LSPStdioClient {
+        guard !isShutdown else { throw LSPError.transportClosed }
         if let existing = clients[serverName] {
             return existing
         }
@@ -353,8 +383,16 @@ public actor LSPSession {
             )
         }
         try await client.start()
+        guard !isShutdown else {
+            await client.close()
+            throw LSPError.transportClosed
+        }
         if initializedRoots[serverName] != rootURI {
             try await client.initialize(rootURI: rootURI)
+            guard !isShutdown else {
+                await client.close()
+                throw LSPError.transportClosed
+            }
             initializedRoots[serverName] = rootURI
         }
         clients[serverName] = client

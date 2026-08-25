@@ -25,6 +25,7 @@ import OpenGrokTokenEstimation
 import OpenGrokProviderSession
 import OpenGrokSampler
 import OpenGrokSamplingTypes
+import OpenGrokWorkspace
 
 enum LiveSubagentAttachment {
     static let overlayID = "subagent-attachment"
@@ -1706,6 +1707,7 @@ extension LiveInteractiveControllerRenderer {
         } else {
             try renderer.start()
         }
+        await installFollowUpSuggestionRelay()
         try startTerminalNotificationReporting()
         if let permissionCoordinator {
             await permissionCoordinator.setPresenter { [weak self] request in
@@ -1901,7 +1903,9 @@ extension LiveInteractiveControllerRenderer {
         case .help:
             overlays.push(.help(lines: OpenGrokPagerInteractiveController.helpText(
                 workflowsEnabled: workflowsEnabled,
-                mouseReportingToggleEnabled: mouseReportingToggleEnabled
+                mouseReportingToggleEnabled: mouseReportingToggleEnabled,
+                autoPermissionModeAvailable: autoPermissionModeAvailable,
+                workingDirectoryCommandsAvailable: workingDirectoryCommandsAvailable
             )
                 .split(separator: "\n", omittingEmptySubsequences: false)
                 .map { PagerStyledLine(text: String($0)) }))
@@ -2147,7 +2151,9 @@ extension LiveInteractiveControllerRenderer {
                 rows: rows.isEmpty
                     ? LivePagerOverlayText.commandRows(
                         workflowsEnabled: workflowsEnabled,
-                        mouseReportingToggleEnabled: mouseReportingToggleEnabled
+                        mouseReportingToggleEnabled: mouseReportingToggleEnabled,
+                        autoPermissionModeAvailable: autoPermissionModeAvailable,
+                        workingDirectoryCommandsAvailable: workingDirectoryCommandsAvailable
                     )
                     : rows.map {
                         PagerListRow(
@@ -2699,17 +2705,40 @@ extension LiveInteractiveControllerRenderer {
                     }
                     do {
                         let customStore = CustomModelStore(grokHome: openGrokHome)
+                        let trimmedName = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let trimmedProvider = draft.provider.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let trimmedBaseURL = draft.baseUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let trimmedBackend = draft.backend.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let trimmedEnvKey = draft.envKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let inferredProvider = keyTrimmed.split(separator: ":", maxSplits: 1)
+                            .first.map(String.init)
+                        let provider: String
+                        if !trimmedProvider.isEmpty {
+                            provider = trimmedProvider
+                        } else if let inferredProvider,
+                                  CUSTOM_MODEL_PROVIDER_CHOICES.contains(where: {
+                                      $0.canonical == inferredProvider
+                                  }) {
+                            provider = inferredProvider
+                        } else {
+                            provider = "xai"
+                        }
                         let entry = CustomModelEntry(
                             key: keyTrimmed,
                             modelId: slugTrimmed,
-                            provider: draft.provider.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "xai" : draft.provider.trimmingCharacters(in: .whitespacesAndNewlines),
-                            baseUrl: draft.baseUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : draft.baseUrl.trimmingCharacters(in: .whitespacesAndNewlines),
-                            contextWindow: draft.contextWindow > 0 ? draft.contextWindow : 200_000
+                            provider: provider,
+                            baseUrl: trimmedBaseURL.isEmpty ? nil : trimmedBaseURL,
+                            contextWindow: draft.contextWindow > 0 ? draft.contextWindow : 200_000,
+                            name: trimmedName.isEmpty ? nil : trimmedName,
+                            apiBackend: trimmedBackend.isEmpty ? nil : trimmedBackend,
+                            envKey: trimmedEnvKey.isEmpty ? nil : trimmedEnvKey
                         )
                         try await customStore.upsertCustomModel(entry)
-                        _ = try store.saveCustomModelDraft()
+                        var mutableStore = store
+                        mutableStore.clearDraft()
                         note("Custom model saved")
                         reloadCatalogInput()
+                        refreshOpenProviderSettingsOverlay()
                     } catch {
                         note("Could not save custom model: \(error)")
                     }
@@ -2748,10 +2777,15 @@ extension LiveInteractiveControllerRenderer {
                 if !enabled {
                     do {
                         let customStore = CustomModelStore(grokHome: openGrokHome)
-                        _ = try await customStore.deleteCustomModel(key: choice)
-                        _ = try store.deleteCustomModel(key: choice)
+                        let removed = try await customStore.deleteCustomModel(key: choice)
+                        guard removed else {
+                            note("Custom model \(choice) was not found")
+                            return
+                        }
                         note("Removing custom model…")
                         reloadCatalogInput()
+                        refreshOpenProviderSettingsOverlay()
+                        await reconcileModelStateAfterCatalogRefresh()
                     } catch {
                         note("Could not remove custom model \(choice): \(error)")
                     }
@@ -2776,6 +2810,22 @@ extension LiveInteractiveControllerRenderer {
                     current.insert(discovered.id)
                 }
                 selectedChoice = descriptor.id
+            } else if key == "opencode_go_models" {
+                let descriptors = catalogStore?.openCodeGoDescriptors() ?? []
+                guard let descriptor = descriptors.first(where: {
+                    $0.id == choice || $0.key == choice
+                }) else {
+                    appendMessage(PagerMessage(
+                        role: .error,
+                        text: "OpenCode Go model \(choice) is not in the discovered catalog."
+                    ))
+                    return
+                }
+                for discovered in descriptors where current.contains(discovered.key) {
+                    current.remove(discovered.key)
+                    current.insert(discovered.id)
+                }
+                selectedChoice = descriptor.id
             } else {
                 selectedChoice = choice
             }
@@ -2784,10 +2834,12 @@ extension LiveInteractiveControllerRenderer {
                 try store.writeMultiSelect(key: key, enabled: current)
                 if key == "openrouter_models" {
                     catalogStore?.applyOpenRouterEnabledModels(current.sorted())
+                } else if key == "opencode_go_models" {
+                    catalogStore?.applyOpenCodeGoEnabledModels(current.sorted())
                 }
                 reloadCatalogInput()
                 refreshOpenProviderSettingsOverlay()
-                if key == "openrouter_models" {
+                if key == "openrouter_models" || key == "opencode_go_models" {
                     await reconcileModelStateAfterCatalogRefresh()
                 }
             } catch {
@@ -3012,6 +3064,23 @@ extension LiveInteractiveControllerRenderer {
     }
 
     private func populateProviderSettings(_ overlay: inout PagerSettingsOverlay) {
+        let permissionContext = LiveSecurityContext.resolve(
+            workspaceRoot: URL(fileURLWithPath: workingDirectory, isDirectory: true),
+            environment: environment,
+            isInteractive: false
+        )
+        let permissionSettings = resolvedPermissionPromptSettings ?? PermissionPromptSettings.resolve(
+            document: permissionContext.document,
+            requirements: permissionContext.requirements,
+            environment: environment
+        )
+        if permissionSettings.rememberToolApprovals {
+            overlay.gatedChoices["default_selected_permission"]?.remove("allow-command-always")
+        } else {
+            overlay.gatedChoices["default_selected_permission", default: []]
+                .insert("allow-command-always")
+        }
+
         let statuses = LiveLoginProviderPicker.statuses(
             openGrokHome: openGrokHome,
             environment: environment
@@ -3050,6 +3119,39 @@ extension LiveInteractiveControllerRenderer {
                     : nil
             }
         )
+        let openCodeDescriptors = catalogStore?.openCodeGoDescriptors() ?? []
+        overlay.dynamicChoices[.openCodeGoModels] = openCodeDescriptors.map { descriptor in
+            PagerSettingChoice(
+                canonical: descriptor.id,
+                display: descriptor.name,
+                summary: descriptor.id
+            )
+        }
+        let enabledOpenCodeModels: Set<String>
+        if let catalogStore {
+            enabledOpenCodeModels = Set(catalogStore.openCodeGoEnabledModels())
+        } else {
+            enabledOpenCodeModels = (try? stored.loadMultiSelect(key: "opencode_go_models")) ?? []
+        }
+        overlay.multiSelectEnabled["opencode_go_models"] = Set(
+            openCodeDescriptors.compactMap { descriptor in
+                enabledOpenCodeModels.contains(descriptor.id)
+                    || enabledOpenCodeModels.contains(descriptor.key)
+                    ? descriptor.id
+                    : nil
+            }
+        )
+
+        let customModels = (try? stored.loadCustomModels()) ?? []
+        overlay.dynamicChoices[.customModels] = customModels.map { model in
+            PagerSettingChoice(
+                canonical: model.key,
+                display: model.name ?? model.key,
+                summary: model.modelId
+            )
+        }
+        overlay.multiSelectEnabled["custom_models.list"] = Set(customModels.map(\.key))
+
         let activeCatalog = catalogStore?.pickerEntries() ?? modelCatalog
         overlay.dynamicChoices[.activeModelCatalog] = LiveModelPicker.sorted(activeCatalog).map {
             entry in
@@ -3060,6 +3162,13 @@ extension LiveInteractiveControllerRenderer {
                 summary: LiveModelPicker.description(for: entry)
             )
         }
+        overlay.dynamicChoices[.auxiliaryModelCatalog] = [
+            PagerSettingChoice(
+                canonical: "",
+                display: "Automatic",
+                summary: "Choose an economical model for the active provider."
+            )
+        ] + (overlay.dynamicChoices[.activeModelCatalog] ?? [])
     }
 
     private func refreshOpenProviderSettingsOverlay() {
@@ -3132,11 +3241,17 @@ extension LiveInteractiveControllerRenderer {
         if let index = pageFlipUserBlockIndex {
             try? revealBlock(at: index)
         }
-        var result = renderPagerFrame(renderState(conversation: conversation.items))
+        var result = PagerRenderEngine().render(
+            renderState(conversation: conversation.items)
+        )
         if conversation.setMarkdownWidth(result.layout.contentWidth) {
-            result = renderPagerFrame(renderState(conversation: conversation.items))
+            result = PagerRenderEngine().render(
+                renderState(conversation: conversation.items)
+            )
             if conversation.setMarkdownWidth(result.layout.contentWidth) {
-                result = renderPagerFrame(renderState(conversation: conversation.items))
+                result = PagerRenderEngine().render(
+                    renderState(conversation: conversation.items)
+                )
             }
         }
         // Max-scroll / follow-tail are scroll *state*, not hit geometry —

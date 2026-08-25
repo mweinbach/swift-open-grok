@@ -266,7 +266,11 @@ public struct LiveACPPromptDriver: ACPPromptDriver {
                 sessionID: context.session.sessionId.rawValue
             ) {
                 var request = context.request
-                request.prompt = [.text(expanded)]
+                let images = context.request.prompt.compactMap { block -> ContentBlock? in
+                    guard case .image = block else { return nil }
+                    return block
+                }
+                request.prompt = [.text(expanded)] + images
                 adaptedContext = ACPPromptContext(session: context.session, request: request)
             }
         }
@@ -389,6 +393,12 @@ public enum LiveACPComposition {
                     currentWorkingDirectory: cwd.path
                 )
             )
+        )
+        await runtimeComponents.runtime.setCombineQueuedPrompts(
+            LiveInteractiveControllerRenderer.resolveUIConfig(
+                workingDirectory: cwd,
+                environment: context.environment
+            ).inputModes.combineQueuedPrompts
         )
         // The outbound half of the notification gateway: the components'
         // emitters (recap, swarm acks, the mailbox observer) now target THIS

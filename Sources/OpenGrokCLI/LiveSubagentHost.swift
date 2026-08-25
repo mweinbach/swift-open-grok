@@ -45,6 +45,7 @@ import OpenGrokHooks
 import OpenGrokHooksPluginTypes
 import OpenGrokInterjection
 import OpenGrokModels
+import OpenGrokPagerRender
 import OpenGrokSampler
 import OpenGrokSamplingTypes
 import OpenGrokShared
@@ -52,6 +53,7 @@ import OpenGrokShell
 import OpenGrokShellBase
 import OpenGrokShellSessionSupport
 import OpenGrokSubagentResolution
+import OpenGrokToolRegistry
 import OpenGrokToolTypes
 import OpenGrokWorkspace
 
@@ -238,6 +240,10 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         var parentMaxTurns: Int? = nil
         /// Resolve the effective child's metadata, never the parent's catalog entry.
         var childModelContextDefault: (@Sendable (String) -> ModelSubagentContextMode?)? = nil
+        /// Injectable clock and observer keep provider retries real without
+        /// making focused regression cases wait through production backoffs.
+        var swarmRetrySleeper: (@Sendable (UInt64) async throws -> Void)? = nil
+        var swarmRetryStatusSink: (@Sendable (LiveSwarmRetryStatus) async -> Void)? = nil
     }
 
     enum ForkDirective: Sendable, Equatable {
@@ -279,6 +285,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     /// shell tools/tool_context.rs:76-117).
     nonisolated let foregroundWait = LiveForegroundWaitState()
     nonisolated let swarmRegistry = SwarmRegistry()
+    nonisolated let swarmRequestGate = LiveSwarmAdaptiveRequestGate()
 
     let context: Context
 
@@ -332,6 +339,8 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     private var childExecutors: [String: LiveToolExecutor] = [:]
     private var parentPermissionHandle: PermissionHandle?
     private var parentUsageHistory: LiveConversationHistory?
+    private var parentAuthorizationScope: ToolResourceAuthorizationScope?
+    private var parentQuestionCoordinator: PagerQuestionCoordinator?
 
     /// Child samplers capture credentials when their route is resolved.
     /// Unknown routes must therefore be cancelled on every provider mutation;
@@ -378,6 +387,19 @@ actor LiveSubagentHost: LiveSubagentQuerying {
     /// acknowledged fold before becoming visible as completed.
     func installParentUsageHistory(_ history: LiveConversationHistory) {
         parentUsageHistory = history
+    }
+
+    /// Scope identity belongs to the authenticated root, not to a mutable
+    /// tool-resource session field or an inherited permission handle.
+    func installParentAuthorizationScope(_ scope: ToolResourceAuthorizationScope) {
+        guard scope.authorizationSessionID == context.sessionID else { return }
+        parentAuthorizationScope = scope
+    }
+
+    /// Composition calls this only after confirming the root itself actually
+    /// advertises `ask_user_question`; child dispatch authenticates again.
+    func installParentQuestionCoordinator(_ coordinator: PagerQuestionCoordinator) {
+        parentQuestionCoordinator = coordinator
     }
 
     // MARK: - Active background work (status-chip push)
@@ -1721,13 +1743,53 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         // A child gets no standalone surface until it has its own bound route.
         var childWebToolContext = context.webToolContext
         childWebToolContext?.standaloneWebSearchBackend = nil
+        let activeChildren = await coordinator.listActive(parentSessionID: context.sessionID)
+        let activeChild = activeChildren.first {
+            $0.request.id == childID && $0.request.parentSessionID == context.sessionID
+        }
+        let inheritedAuthorizationScope: ToolResourceAuthorizationScope?
+        if activeChild != nil,
+           let scope = parentAuthorizationScope,
+           scope.authorizationSessionID == context.sessionID {
+            inheritedAuthorizationScope = scope
+        } else {
+            inheritedAuthorizationScope = nil
+        }
+
+        var effectiveDefinition = definition
+        var childQuestionPresenter: (any UserQuestionPresenting)?
+        if activeChild != nil,
+           inheritedAuthorizationScope != nil,
+           let parentQuestionCoordinator {
+            let bridge = LiveSubagentQuestionBridge(
+                coordinator: parentQuestionCoordinator,
+                children: coordinator,
+                parentSessionID: context.sessionID,
+                childSessionID: childID,
+                timeoutSeconds: LiveSubagentQuestionTimeout.resolve(
+                    security: context.securityContext,
+                    environment: context.environment
+                )
+            )
+            if await bridge.canPresent {
+                if !effectiveDefinition.toolConfig.toolNames.contains("ask_user_question") {
+                    effectiveDefinition.toolConfig.tools.append(
+                        AgentToolDefinition(id: "ask_user_question")
+                    )
+                }
+                if LiveAgentToolPolicy(definition: effectiveDefinition)
+                    .allows(liveToolName: "ask_user_question") {
+                    childQuestionPresenter = bridge
+                }
+            }
+        }
         let executor: LiveToolExecutor
         do {
             executor = try await LiveToolExecutor(
                 processBackend: context.processBackend,
                 sessionID: childID,
                 workingDirectory: cwd,
-                toolPolicy: LiveAgentToolPolicy(definition: definition),
+                toolPolicy: LiveAgentToolPolicy(definition: effectiveDefinition),
                 telemetryBootstrapContext: context.telemetryBootstrapContext,
                 fileAccessPolicy: context.fileAccessPolicy,
                 environment: context.environment,
@@ -1741,6 +1803,8 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                 sessionServices: nil,
                 permissionOptions: context.permissionOptions,
                 inheritedPermissionHandle: parentPermissionHandle,
+                authorizationScope: inheritedAuthorizationScope,
+                subagent: true,
                 // The team mailbox, with the child's own identity. Upstream
                 // children always carry the quartet: the builder pushes the
                 // collaboration tools past the definition's tool list
@@ -1753,7 +1817,8 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                         teamScopeID: context.sessionID,
                         agentID: childID
                     )
-                )
+                ),
+                userQuestions: childQuestionPresenter
             )
         } catch {
             return OpenGrokChildResult(
@@ -1765,7 +1830,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         }
         childExecutors[childID] = executor
         let hostedTools = childHostedTools(
-            definition: definition,
+            definition: effectiveDefinition,
             route: samplingRoute,
             executor: executor
         )
@@ -1817,9 +1882,8 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         }
         let history = LiveConversationHistory(record: record, store: context.conversationStore)
         let logicalTurnID = "\(childID)-\(bookkeeping[childID]?.turns ?? 0)"
-        let activeChildren = await coordinator.listActive(parentSessionID: context.sessionID)
-        let activeChild = activeChildren.first { $0.request.id == childID }
         let workflowOwned = activeChild?.request.owner == .workflow
+        let swarmOwned = activeChild?.request.owner == .swarm
         let parentPromptID: String? = workflowOwned
             ? nil
             : activeChild?.request.parentPromptID ?? LiveSubagentParentPromptContext.promptID
@@ -1830,6 +1894,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         var finalOutput = ""
         var terminalError: String? = nil
         var cancelled = false
+        var completedSamplingRounds = 0
         let maximumToolRounds = definition.maxTurns ?? context.parentMaxTurns
 
         while true {
@@ -1860,7 +1925,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             }
             let response: OpenGrokLiveSamplingResponse
             do {
-                response = try await samplingRoute.sampler.sample(OpenGrokLiveSamplingRequest(
+                let request = OpenGrokLiveSamplingRequest(
                     sessionID: childID,
                     cacheAffinityID: context.parentCacheAffinityID ?? context.sessionID,
                     turnID: "\(childID)-\(bookkeeping[childID]?.turns ?? 0)",
@@ -1873,11 +1938,17 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                     reasoningEffort: childEffort,
                     codexPermissions: childCodexPermissions,
                     maxOutputTokens: maxOutputTokens,
-                    retryOnlyBeforeOutput: maxOutputTokens != nil
-                )) { _ in
-                    // A child's tokens stream to no pane; the parent reads the
-                    // finished result, same as a workflow child.
-                }
+                    retryOnlyBeforeOutput: maxOutputTokens != nil || swarmOwned
+                )
+                response = try await sampleChildWithSwarmRetries(
+                    request,
+                    route: samplingRoute,
+                    childID: childID,
+                    swarmOwned: swarmOwned,
+                    replayAllowed: completedSamplingRounds == 0
+                        && bookkeeping[childID]?.toolCalls == 0
+                )
+                completedSamplingRounds += 1
             } catch is CancellationError {
                 cancelled = true
                 terminalError = "Subagent was cancelled"
@@ -2108,6 +2179,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                         workingDirectory: cwd,
                         call: call
                     )
+                    try Task.checkCancellation()
                     let content: String
                     switch outcome {
                     case .success(let value):

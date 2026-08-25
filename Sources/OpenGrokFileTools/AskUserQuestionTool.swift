@@ -28,6 +28,21 @@ import OpenGrokWorkspaceTypes
 public let askUserQuestionCancelText =
     "User declined to answer the questions. Continue with the task using your best judgment, or ask different questions."
 
+/// A parent-owned question surface delegated to one authenticated child.
+///
+/// The executor only advertises questions to subagents carrying this
+/// capability. The handler rechecks the immutable session and agent identity
+/// at dispatch so moving a presenter between tool-resource bags cannot grant
+/// another child access to the parent's interactive surface.
+public protocol ScopedUserQuestionPresenting: UserQuestionPresenting {
+    func authorizeQuestion(
+        sessionID: String,
+        authorizationSessionID: String,
+        agentID: String,
+        toolCallID: String
+    ) async -> Bool
+}
+
 /// ToolHandler for `ask_user_question`.
 public struct AskUserQuestionToolHandler: ToolHandler {
     public init() {}
@@ -72,10 +87,35 @@ public struct AskUserQuestionToolHandler: ToolHandler {
             ))
         }
 
+        if let scopedPresenter = presenter as? any ScopedUserQuestionPresenting,
+           !(await scopedPresenter.authorizeQuestion(
+               sessionID: resources.sessionId,
+               authorizationSessionID: resources.authorizationSessionID,
+               agentID: resources.agentId,
+               toolCallID: ctx.callId.rawValue
+           )) {
+            return .failure(.unauthorized(
+                "'\(clientName)' is not authorized to use this session's interactive question surface"
+            ))
+        }
+
+        guard !Task.isCancelled else {
+            return .failure(.cancelled(
+                toolId: askUserQuestionToolId,
+                detail: "interactive question was cancelled before presentation"
+            ))
+        }
+
         let outcome = await presenter.ask(
             questions: parsed.map(\.workspaceQuestion),
             toolCallID: ctx.callId.rawValue
         )
+        guard !Task.isCancelled else {
+            return .failure(.cancelled(
+                toolId: askUserQuestionToolId,
+                detail: "interactive question was cancelled during presentation"
+            ))
+        }
         switch outcome {
         case .answered(let answers):
             let message = formatAcceptedAnswers(answers, questions: parsed)

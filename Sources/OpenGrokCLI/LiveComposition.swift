@@ -11,6 +11,7 @@ import OpenGrokCrashHandler
 import OpenGrokDiagnostics
 import OpenGrokFileTools
 import OpenGrokFastWorktree
+import OpenGrokGoalState
 import OpenGrokHTTP
 import OpenGrokHooks
 import OpenGrokHooksPluginTypes
@@ -173,6 +174,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
     public let codexPermissions: CodexPermissions?
     public let bearerResolver: (any BearerResolver)?
     public let credentialProvider: (any AuthCredentialProvider)?
+    public let attributionCallback: (any Auth401AttributionCallback)?
     public let transport: (any HTTPTransport)?
 
     public var reasoningEffort: ReasoningEffort? { tuning.reasoningEffort }
@@ -194,6 +196,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         codexPermissions: CodexPermissions? = nil,
         bearerResolver: (any BearerResolver)? = nil,
         credentialProvider: (any AuthCredentialProvider)? = nil,
+        attributionCallback: (any Auth401AttributionCallback)? = nil,
         transport: (any HTTPTransport)? = nil
     ) {
         self.model = model
@@ -210,6 +213,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         self.codexPermissions = provider == .codex ? codexPermissions : nil
         self.bearerResolver = bearerResolver
         self.credentialProvider = credentialProvider
+        self.attributionCallback = attributionCallback
         self.transport = transport
     }
 
@@ -239,6 +243,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
             codexPermissions: permissions,
             bearerResolver: bearerResolver,
             credentialProvider: credentialProvider,
+            attributionCallback: attributionCallback,
             transport: transport
         )
     }
@@ -463,6 +468,7 @@ public struct OpenGrokLiveSamplingResponse: Sendable, Equatable {
     public let messageID: String?
     public let rawStopReason: String?
     public let stopSequence: String?
+    public let latencyStats: InferenceLatencyStats?
 
     public init(
         output: String,
@@ -473,7 +479,8 @@ public struct OpenGrokLiveSamplingResponse: Sendable, Equatable {
         costUsdTicks: Int64? = nil,
         messageID: String? = nil,
         rawStopReason: String? = nil,
-        stopSequence: String? = nil
+        stopSequence: String? = nil,
+        latencyStats: InferenceLatencyStats? = nil
     ) {
         self.output = output
         self.stopReason = stopReason
@@ -482,6 +489,7 @@ public struct OpenGrokLiveSamplingResponse: Sendable, Equatable {
         self.messageID = messageID
         self.rawStopReason = rawStopReason
         self.stopSequence = stopSequence
+        self.latencyStats = latencyStats
         let resolvedItems = items ?? [.assistant(AssistantItem(
             content: output,
             toolCalls: toolCalls
@@ -633,27 +641,20 @@ public struct OpenGrokLiveSampler: Sendable {
             codexMultiAgentV2: configuration.tuning.codexMultiAgentV2,
             codexPermissions: configuration.codexPermissions,
             doomLoopRecovery: configuration.doomLoopRecovery,
+            attributionCallback: configuration.attributionCallback,
             bearerResolver: bearerResolver
         )
-        let client = try SamplingClient(config: samplerConfig, transport: transport)
+        let runtime = try LiveSamplingRuntime(config: samplerConfig, transport: transport)
         let codexTurnStateRegistry = configuration.provider == .codex
             ? LiveCodexTurnStateRegistry()
             : nil
         return OpenGrokLiveSampler(codexTurnStateRegistry: codexTurnStateRegistry) { request, emit in
             await emit(.status("sampling"))
-            let turnClient: SamplingClient
-            if let codexTurnStateRegistry {
-                let state = codexTurnStateRegistry.state(
+            let turnState = codexTurnStateRegistry.map { registry in
+                registry.state(
                     sessionID: request.sessionID,
                     turnID: request.logicalTurnID ?? request.turnID
                 )
-                turnClient = try SamplingClient(
-                    config: samplerConfig,
-                    transport: transport,
-                    codexTurnState: state
-                )
-            } else {
-                turnClient = client
             }
             // Streamed events (text, reasoning, tool deltas, retries, backend
             // tools, typed failures) are forwarded as they arrive; the
@@ -667,7 +668,7 @@ public struct OpenGrokLiveSampler: Sendable {
                     )
                 }
                 : request.reasoningEffort
-            let response = try await turnClient.streamConversation(ConversationRequest(
+            let conversationRequest = ConversationRequest(
                 items: request.items,
                 tools: request.tools,
                 hostedTools: request.hostedTools,
@@ -680,13 +681,15 @@ public struct OpenGrokLiveSampler: Sendable {
                 xGrokTurnIdx: request.turnID,
                 reasoningEffort: requestedReasoningEffort,
                 jsonSchema: request.jsonSchema
-            ),
+            )
+            let result = try await runtime.sample(
+                conversationRequest,
+                codexTurnState: turnState,
                 codexPermissions: request.codexPermissions ?? configuration.codexPermissions,
-                doomLoopRecovery: configuration.doomLoopRecovery,
-                retryOnlyBeforeOutput: request.retryOnlyBeforeOutput
-            ) { event in
-                await emit(event)
-            }
+                retryOnlyBeforeOutput: request.retryOnlyBeforeOutput,
+                onEvent: emit
+            )
+            let response = result.response
             let output = response.assistantText()
             return OpenGrokLiveSamplingResponse(
                 output: output,
@@ -697,7 +700,8 @@ public struct OpenGrokLiveSampler: Sendable {
                 costUsdTicks: response.costUsdTicks,
                 messageID: response.messageID,
                 rawStopReason: response.rawStopReason,
-                stopSequence: response.stopSequence
+                stopSequence: response.stopSequence,
+                latencyStats: result.metrics
             )
         }
     }
@@ -1858,7 +1862,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         ),
                         fileAccessPolicy: Self.resolveFileAccessPolicy(
                             environment: context.environment,
-                            coordinator: permissionCoordinator
+                            coordinator: permissionCoordinator,
+                            rememberToolApprovals:
+                                foundation.permissionPromptSettings.rememberToolApprovals
                         ),
                         makeProcessBackend: dependencies.makeProcessBackend,
                         environment: context.environment,
@@ -1871,7 +1877,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     context.streams.out(LiveWorkflowComposition.renderDetail(
                         try await registry.view(runID: record.runID)
                     ))
-                    await toolExecutor.shutdown()
+                    await Self.shutdownSessionTools(
+                        foundation: foundation,
+                        streams: context.streams
+                    )
                     return CLIApplicationSession(waitForExit: {}, shutdown: {})
                 }
                 context.streams.out(
@@ -2072,7 +2081,15 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         // statuses against it (AGENTS.md §2, applied to env).
                         environment: context.environment,
                         codeModeActive: stack.toolSurface.isCodeMode,
-                        toolExecutor: toolExecutor
+                        toolExecutor: toolExecutor,
+                        pagerRuntime: runtime,
+                        shareRoute: dependencies.shareRoute,
+                        workingDirectoryCommandsAvailable:
+                            foundation.workingDirectoryCommandsAvailable,
+                        remoteAutoModeEnabled: dependencies.remoteSettingsSnapshot
+                            .map(AllowlistedRemoteSettings.init(projecting:))?
+                            .autoModeEnabled,
+                        permissionPromptSettings: foundation.permissionPromptSettings
                     )
                     let controller = OpenGrokPagerInteractiveController(
                         input: interactiveInput.events,
@@ -2669,7 +2686,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                                     streams: context.streams
                                 )
                                 await codeMode?.shutdown()
-                                await toolExecutor.shutdown()
+                                await Self.shutdownSessionTools(
+                                    foundation: foundation,
+                                    streams: context.streams
+                                )
                                 exportBoundaries.remove(sessionID: sessionID)
                                 let failure = LiveScreenModeRelaunch.exec(
                                     sessionID: relaunch.sessionID,
@@ -2706,7 +2726,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                                 streams: context.streams
                             )
                             await codeMode?.shutdown()
-                            await toolExecutor.shutdown()
+                            await Self.shutdownSessionTools(
+                                foundation: foundation,
+                                streams: context.streams
+                            )
                             exportBoundaries.remove(sessionID: sessionID)
                         }
                     )
@@ -2752,7 +2775,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             streams: context.streams
                         )
                         await codeMode?.shutdown()
-                        await toolExecutor.shutdown()
+                        await Self.shutdownSessionTools(
+                            foundation: foundation,
+                            streams: context.streams
+                        )
                         exportBoundaries.remove(sessionID: sessionID)
                     }
                 )
@@ -2802,7 +2828,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                             streams: context.streams
                         )
                         await codeMode?.shutdown()
-                        await toolExecutor.shutdown()
+                        await Self.shutdownSessionTools(
+                            foundation: foundation,
+                            streams: context.streams
+                        )
                         exportBoundaries.remove(sessionID: sessionID)
                     }
                 )
@@ -3104,7 +3133,6 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         if options.advanced.terminal { return "--terminal" }
         if options.advanced.fsRead { return "--fs-read" }
         if options.advanced.fsWrite { return "--fs-write" }
-        if options.advanced.todoGate { return "--todo-gate" }
         if options.advanced.logSampling { return "--log-sampling" }
         if options.advanced.noWaitForBackground { return "--no-wait-for-background" }
         // Default is 600 (`cli.rs:677-734`); any other value means the caller
@@ -3351,6 +3379,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let conversationStore: LiveConversationStore
         let conversationHistory: LiveConversationHistory
         let securityContext: LiveSecurityContext
+        let permissionPromptSettings: PermissionPromptSettings
+        let workingDirectoryCommandsAvailable: Bool
         let sessionSearchEnabled: Bool
         let sandboxDecision: LiveSandboxDecision
         let samplingConfiguration: OpenGrokLiveSamplingConfiguration
@@ -3553,16 +3583,35 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             throw error
         }
         let sessionID = conversationRecord.sessionID
-        let permissionCoordinator = PagerPermissionCoordinator()
-        let fileAccessPolicy = resolveFileAccessPolicy(
+        let permissionCoordinator = PagerPermissionCoordinator(defaultSelectedPermission: .allowOnce)
+        let provisionalFileAccessPolicy = resolveFileAccessPolicy(
             environment: context.environment,
-            coordinator: permissionCoordinator
+            coordinator: permissionCoordinator,
+            rememberToolApprovals: false
         )
         let securityContext = LiveSecurityContext.resolve(
             workspaceRoot: cwd.standardizedFileURL,
             environment: context.environment,
-            isInteractive: fileAccessPolicy.isInteractive,
+            isInteractive: provisionalFileAccessPolicy.isInteractive,
             cli: options.common.permissions
+        )
+        let permissionPromptSettings = PermissionPromptSettings.resolve(
+            document: securityContext.document,
+            requirements: securityContext.requirements,
+            environment: context.environment,
+            remoteRememberToolApprovals: dependencies.remoteSettingsSnapshot
+                .map(AllowlistedRemoteSettings.init(projecting:))?
+                .rememberToolApprovals
+        )
+        await permissionCoordinator.setDefaultSelectedPermission(
+            PagerDefaultSelectedPermission(
+                configuredValue: permissionPromptSettings.defaultSelectedPermission
+            )
+        )
+        let fileAccessPolicy = resolveFileAccessPolicy(
+            environment: context.environment,
+            coordinator: permissionCoordinator,
+            rememberToolApprovals: permissionPromptSettings.rememberToolApprovals
         )
         let sessionSearchEnabled = LiveSessionSearchPolicy(
             environment: context.environment,
@@ -3877,13 +3926,53 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             schedulerHost: schedulerHost,
             monitorHost: monitorHost
         )
-        if let subagentHost,
-           let permissions = await toolExecutor.permissionHandle()
-        {
-            await subagentHost.installParentPermissionHandle(permissions)
+        if let permissions = await toolExecutor.permissionHandle() {
+            await permissions.setRememberToolApprovals(
+                permissionPromptSettings.rememberToolApprovals
+            )
+            try await permissions.configureProjectApprovalPersistence(
+                workingDirectory: cwd,
+                openGrokHome: openGrokHome,
+                environment: context.environment,
+                clientIdentifier: nil
+            )
+            if case .prompt(let prompter) = fileAccessPolicy,
+               let modalPrompter = prompter as? LivePermissionModalPrompter {
+                await modalPrompter.sessionPolicy.attachProjectPermissionHandle(permissions)
+            }
+            if let subagentHost {
+                await subagentHost.installParentPermissionHandle(permissions)
+            }
+        }
+        if let subagentHost {
+            await subagentHost.installParentAuthorizationScope(
+                toolExecutor.resourceAuthorizationScope
+            )
+            if let questionCoordinator,
+               toolExecutor.tools.contains(where: { $0.name == "ask_user_question" }) {
+                await subagentHost.installParentQuestionCoordinator(questionCoordinator)
+            }
         }
         conversationRecord.sandboxProfile = sandboxDecision.profileName
         try await conversationStore.save(conversationRecord)
+        if interactiveSurfaceAvailable {
+            do {
+                let workingDirectories = try await LiveSessionWorkingDirectories(
+                    sessionID: sessionID,
+                    workingDirectory: cwd,
+                    openGrokHome: openGrokHome,
+                    environment: context.environment,
+                    executor: toolExecutor,
+                    history: launchHistory
+                )
+                try await LiveSessionWorkingDirectoryRegistry.shared.register(
+                    workingDirectories
+                )
+            } catch {
+                await toolExecutor.shutdown()
+                throw error
+            }
+        }
         return LiveSessionFoundation(
             options: options,
             cwd: cwd,
@@ -3896,6 +3985,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             conversationStore: conversationStore,
             conversationHistory: launchHistory,
             securityContext: securityContext,
+            permissionPromptSettings: permissionPromptSettings,
+            workingDirectoryCommandsAvailable: interactiveSurfaceAvailable,
             sessionSearchEnabled: sessionSearchEnabled,
             sandboxDecision: sandboxDecision,
             samplingConfiguration: samplingConfiguration,
@@ -4075,12 +4166,49 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         }
     }
 
+    private static func shutdownSessionTools(
+        foundation: LiveSessionFoundation,
+        streams: CLIStreams
+    ) async {
+        if foundation.workingDirectoryCommandsAvailable {
+            do {
+                try await LiveSessionWorkingDirectoryRegistry.shared.unregister(
+                    sessionID: foundation.sessionID
+                )
+            } catch {
+                streams.err(
+                    "open-grok: unable to revoke additional working directories: "
+                        + "\(error)\n"
+                )
+            }
+        }
+        await foundation.toolExecutor.shutdown()
+    }
+
     static func makeAgentStack(
         foundation: LiveSessionFoundation,
         context: CLIApplicationContext,
         dependencies: OpenGrokLiveCompositionDependencies,
         launchAutoUpdate: LiveLaunchAutoUpdate.Request? = nil
     ) async -> LiveAgentStack {
+        if let goal = foundation.toolExecutor.sessionServices?.goal {
+            let remoteSettings = dependencies.remoteSettingsSnapshot
+                .map(AllowlistedRemoteSettings.init(projecting:))
+            await goal.configureLiveRuntime(
+                sampler: foundation.sampler,
+                sessionID: foundation.sessionID,
+                model: foundation.samplingConfiguration.model,
+                history: foundation.conversationHistory,
+                todoStore: foundation.toolExecutor.todoStore,
+                policy: GoalRuntimePolicy(
+                    todoGateEnabled: foundation.options.advanced.todoGate
+                        || remoteSettings?.todoGateEnabled == true,
+                    maximumTodoGateFiresPerPrompt:
+                        remoteSettings?.todoGateMaxFiresPerPrompt
+                        ?? goalTodoGateMaximumFiresDefault
+                )
+            )
+        }
         // Code Mode is a session-wide decision: the tool surface it
         // projects is fixed for the life of the timeline, which is what
         // makes a `wait` after a yield resolvable.
@@ -4469,9 +4597,13 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             // outright, so a connected client could not approve anything. The
             // prompter denies whenever the reverse channel cannot answer, so
             // installing it never widens what a silent client authorizes.
-            let acpPermissionPrompter = LiveACPPermissionPrompter()
+            let acpPermissionPrompter = LiveACPPermissionPrompter(
+                rememberToolApprovals:
+                    foundation.permissionPromptSettings.rememberToolApprovals
+            )
             let permissionPipeline = foundation.toolExecutor.toolPermissionPipeline()
             if let permissions = await foundation.toolExecutor.permissionHandle() {
+                await acpPermissionPrompter.attachPermissionHandle(permissions)
                 await permissions.setPrompter(acpPermissionPrompter)
             }
             // Carrier hosts attach their actual runtime after this factory
@@ -4510,12 +4642,27 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             let promptDriver = LiveACPPromptDriver(
                 driver: ProviderBackedACPPromptDriver(
                     providerSession: providerSession,
-                    turnDriver: stack.turnDriver
+                    turnDriver: stack.turnDriver,
+                    imageStaging: LiveACPPromptImages(
+                        gateway: gateway,
+                        history: stack.conversationHistory,
+                        modelSwitch: stack.modelSwitch,
+                        providerConfiguration: foundation.providerConfiguration,
+                        rootSessionID: foundation.sessionID
+                    ).callbacks
                 ),
                 availableCommands: LiveSkills.availableCommands(
                     builtins: OpenGrokPagerInteractiveController.visibleBuiltinCommandCatalog(
                         workflowsEnabled: true,
-                        mouseReportingToggleEnabled: mouseReportingToggleEnabled
+                        mouseReportingToggleEnabled: mouseReportingToggleEnabled,
+                        autoPermissionModeAvailable: LivePagerSlashParity.autoModeAvailable(
+                            environment: context.environment,
+                            remoteEnabled: dependencies.remoteSettingsSnapshot
+                                .map(AllowlistedRemoteSettings.init(projecting:))?
+                                .autoModeEnabled
+                        ),
+                        workingDirectoryCommandsAvailable:
+                            foundation.workingDirectoryCommandsAvailable
                     ),
                     skills: foundation.skillCatalog
                 ),
@@ -4535,7 +4682,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     )
                     await stack.codeMode?.shutdown()
                     await acpSchedulerHost.shutdown()
-                    await foundation.toolExecutor.shutdown()
+                    await Self.shutdownSessionTools(
+                        foundation: foundation,
+                        streams: context.streams
+                    )
                 }
             )
             // The mailbox's accepted-send observer → client-facing
@@ -5689,7 +5839,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
     /// rather than hanging on a modal no terminal will paint.
     static func resolveFileAccessPolicy(
         environment: [String: String],
-        coordinator: PagerPermissionCoordinator? = nil
+        coordinator: PagerPermissionCoordinator? = nil,
+        rememberToolApprovals: Bool = false
     ) -> FileToolAccessPolicy {
         let raw = environment["OPENGROK_ALLOW_WRITES"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -5701,7 +5852,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             guard let coordinator else { return .prompt(LiveWriteDenialPrompter()) }
             return .prompt(LivePermissionModalPrompter(
                 coordinator: coordinator,
-                sessionPolicy: LiveSessionWritePolicy()
+                sessionPolicy: LiveSessionWritePolicy(),
+                rememberToolApprovals: rememberToolApprovals
             ))
         }
     }

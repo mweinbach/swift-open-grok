@@ -27,12 +27,30 @@ public struct MermaidDiagram: Equatable, Sendable {
         case classDiagram
         case entityRelationshipDiagram
         case sequenceDiagram
+        case pie
+        case mindmap
+        case timeline
+        case journey
+        case gantt
+        case gitGraph
+        case kanban
+        case quadrantChart
+        case xyChart
+        case radar
+        case sankey
+        case packet
+        case requirementDiagram
+        case blockDiagram
+        case c4Diagram
+        case information
     }
 
     public var kind: Kind
     public var graph: FlowchartGraph
     /// Family-specific structure that cannot be represented by graph edges alone.
     public var details: MermaidDiagramDetails?
+    /// Quantitative values, chronology, hierarchy, and chart-specific geometry.
+    public var visualization: MermaidVisualizationDiagram?
     /// Settings read from the source's frontmatter.
     public var config: RenderConfig
     /// Title read from the source's frontmatter, if any.
@@ -53,6 +71,7 @@ public enum MermaidRenderer {
         let kind: MermaidDiagram.Kind
         let graph: FlowchartGraph
         let details: MermaidDiagramDetails?
+        var visualization: MermaidVisualizationDiagram?
         switch token {
         case "stateDiagram", "stateDiagram-v2":
             kind = .stateDiagram
@@ -77,6 +96,15 @@ public enum MermaidRenderer {
             let diagram = try parseSequenceDiagram(body)
             graph = diagram.flowchartGraph
             details = .sequenceDiagram(diagram)
+        case "pie", "mindmap", "timeline", "journey", "gantt", "gitGraph", "kanban",
+             "quadrantChart", "xychart-beta", "radar-beta", "sankey-beta", "packet-beta",
+             "requirementDiagram", "block-beta", "C4Context", "C4Container", "C4Component",
+             "C4Dynamic", "C4Deployment", "info":
+            let parsedVisualization = try parseMermaidVisualization(body, token: token ?? "")
+            kind = parsedVisualization.kind
+            graph = parsedVisualization.graph
+            details = nil
+            visualization = parsedVisualization.diagram
         case let other?:
             throw MermaidError.unsupportedDiagramType(other)
         case nil:
@@ -87,8 +115,9 @@ public enum MermaidRenderer {
             kind: kind,
             graph: graph,
             details: details,
+            visualization: visualization,
             config: parsed.config,
-            title: parsed.frontmatter?.title
+            title: parsed.frontmatter?.title ?? visualization?.title
         )
     }
 
@@ -110,6 +139,14 @@ public enum MermaidRenderer {
         theme: MermaidTheme? = nil
     ) -> String {
         let resolvedTheme = theme ?? diagram.config.mermaidTheme() ?? .light
+        if let visualization = diagram.visualization {
+            return renderMermaidVisualizationSVG(
+                visualization,
+                layout: layout,
+                theme: resolvedTheme,
+                config: diagram.config
+            )
+        }
         return renderFlowchartSVG(layout, theme: resolvedTheme, config: diagram.config)
     }
 

@@ -24,7 +24,19 @@
 // Rust reference: crates/codegen/xai-grok-shell/src/session/acp_session_impl/
 // interjection.rs and run_loop.rs at the pinned commit (650c1db7).
 
+import OpenGrokACP
 import OpenGrokInterjection
+import OpenGrokSamplingTypes
+
+enum LiveACPImageInterjectionContext {
+    struct Pending: Sendable {
+        let sessionID: String
+        let text: String
+        let images: [OpenGrokACP.ImageContent]
+    }
+
+    @TaskLocal static var pending: Pending?
+}
 
 /// Mid-turn interjection buffer for one live session, shared between the
 /// producer (the subagent collaboration quartet's root delivery,
@@ -32,20 +44,40 @@ import OpenGrokInterjection
 /// drain points). `/btw` stopped producing here when it became a real side
 /// question (`startSideQuestion` in LiveComposition.swift).
 ///
-/// The attachment type is `String` for symmetry with the shared
-/// `InterjectionBuffer`; this port's composer has no image attachments on
-/// the interjection path, so the array is always empty (upstream's image
-/// pipeline, interjection.rs:122-150, has nothing to carry here).
 actor LiveSessionInterjections {
-    private let pendingInterjections = InterjectionBuffer<String>()
+    private let pendingInterjections = InterjectionBuffer<OpenGrokACP.ImageContent>()
+    private var strandedForNextTurns: [PendingInterjection<OpenGrokACP.ImageContent>] = []
+    private var authenticatedWireSessionID: String?
     /// Whether the sampling driver is inside a turn right now. Flipped by
     /// the driver at the same points upstream's `current_prompt_id` becomes
     /// Some/None around `process_conversation_turn`.
     private var turnActive = false
 
     /// The driver entered a turn; interjections may now merge into it.
-    func beginTurn() {
+    func beginTurn(sessionID: String? = nil) {
         turnActive = true
+        if let pending = LiveACPImageInterjectionContext.pending,
+           !pending.images.isEmpty,
+           sessionID != nil,
+           pending.sessionID == authenticatedWireSessionID {
+            pendingInterjections.push(PendingInterjection(
+                text: pending.text,
+                attachments: pending.images
+            ))
+        } else if !strandedForNextTurns.isEmpty {
+            let stranded = strandedForNextTurns.removeFirst()
+            if !stranded.attachments.isEmpty {
+                pendingInterjections.push(stranded)
+            }
+        }
+    }
+
+    func bindAuthenticatedSession(_ sessionID: String) -> Bool {
+        if let authenticatedWireSessionID {
+            return authenticatedWireSessionID == sessionID
+        }
+        authenticatedWireSessionID = sessionID
+        return true
     }
 
     /// The turn ended (completed or failed). The buffer is deliberately left
@@ -64,6 +96,7 @@ actor LiveSessionInterjections {
     func cancelTurn() {
         turnActive = false
         pendingInterjections.clear()
+        strandedForNextTurns.removeAll()
     }
 
     /// The `SessionCommand::Interject` decision (run_loop.rs:1962-1989):
@@ -71,24 +104,47 @@ actor LiveSessionInterjections {
     /// when no turn runs, in which case the CALLER queues the text as its own
     /// front-of-queue prompt turn (the buffer is drained exclusively by the
     /// turn loop, so pushing while idle would strand the message forever).
-    func interject(_ text: String) -> Bool {
+    func interject(_ text: String, images: [OpenGrokACP.ImageContent] = []) -> Bool {
         guard turnActive else { return false }
-        pendingInterjections.push(PendingInterjection(text: text))
+        pendingInterjections.push(PendingInterjection(text: text, attachments: images))
         return true
     }
 
     /// Drain for the turn loop's safe points (FIFO). The port of the manual
     /// `drain_all` inside `drain_pending_interjections`
     /// (interjection.rs:294).
-    func drainAll() -> [PendingInterjection<String>] {
+    func drainAll() -> [PendingInterjection<OpenGrokACP.ImageContent>] {
         pendingInterjections.drainAll()
+    }
+
+    func drainConversationItems(modelID: String) -> [ConversationItem] {
+        let acceptsImages = LivePromptImageCapability.supports(modelID: modelID)
+        return pendingInterjections.drainAll().map { entry in
+            var text = formatInterjection(entry.text)
+            if !entry.attachments.isEmpty, !acceptsImages {
+                text += "\n\n" + LivePromptImageCapability.textOnlyError
+            }
+
+            var user = UserItem(
+                content: [.text(text: text)],
+                syntheticReason: .interjection
+            )
+            if acceptsImages {
+                for image in entry.attachments {
+                    user.addImage("data:\(image.mimeType);base64,\(image.data)")
+                }
+            }
+            return .user(user)
+        }
     }
 
     /// Drain interjections stranded past the completed turn's final drain,
     /// for conversion into fallback prompt turns
     /// (`flush_stranded_interjections`, interjection.rs:105-116).
     func collectStranded() -> [String] {
-        pendingInterjections.drainAll().map(\.text)
+        let stranded = pendingInterjections.drainAll()
+        strandedForNextTurns.append(contentsOf: stranded)
+        return stranded.map(\.text)
     }
 
     /// Test observability: whether anything is buffered.

@@ -358,12 +358,29 @@ struct LiveAskUserQuestionReachabilityTests {
         let withSurface = try await foundation(interactiveSurfaceAvailable: true)
         #expect(withSurface.questionCoordinator != nil)
         #expect(withSurface.planApprovalCoordinator != nil)
+        #expect(withSurface.workingDirectoryCommandsAvailable)
+        #expect(
+            await LiveSessionWorkingDirectoryRegistry.shared.backend(
+                sessionID: withSurface.sessionID
+            ) != nil
+        )
         #expect(Set(withSurface.toolExecutor.tools.map(\.name)).contains("ask_user_question"))
 
         let withoutSurface = try await foundation(interactiveSurfaceAvailable: false)
         #expect(withoutSurface.questionCoordinator == nil)
         #expect(withoutSurface.planApprovalCoordinator == nil)
+        #expect(!withoutSurface.workingDirectoryCommandsAvailable)
+        #expect(
+            await LiveSessionWorkingDirectoryRegistry.shared.backend(
+                sessionID: withoutSurface.sessionID
+            ) == nil
+        )
         #expect(!Set(withoutSurface.toolExecutor.tools.map(\.name)).contains("ask_user_question"))
+        try await LiveSessionWorkingDirectoryRegistry.shared.unregister(
+            sessionID: withSurface.sessionID
+        )
+        await withSurface.toolExecutor.shutdown()
+        await withoutSurface.toolExecutor.shutdown()
     }
 
     @Test("a subagent executor does not advertise ask_user_question even with a broker")

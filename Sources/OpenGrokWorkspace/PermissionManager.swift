@@ -6,6 +6,7 @@
 
 import Foundation
 import OpenGrokConfig
+import OpenGrokShared
 
 /// Resolved once: `protectedEditPath` needs it on every edit request, and the
 /// answer cannot change within a process.
@@ -153,6 +154,82 @@ private func securityNormalizedShellCommand(_ command: String) -> String {
         .replacingOccurrences(of: "\r", with: "\n")
 }
 
+/// Trusted permission-prompt settings resolved once for one live session.
+///
+/// Requirement pins outrank inherited environment and effective configuration.
+/// Unknown cursor values select allow-once: this port has no separately
+/// authorized global always-approve row to safely preselect.
+public struct PermissionPromptSettings: Sendable, Equatable {
+    public var rememberToolApprovals: Bool
+    public var defaultSelectedPermission: String
+
+    public init(
+        rememberToolApprovals: Bool = false,
+        defaultSelectedPermission: String = "allow_once"
+    ) {
+        self.rememberToolApprovals = rememberToolApprovals
+        self.defaultSelectedPermission = Self.canonicalDefaultSelection(
+            defaultSelectedPermission
+        ) ?? "allow_once"
+    }
+
+    public static func resolve(
+        document: TOMLValue?,
+        requirements: [TOMLValue] = [],
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        remoteRememberToolApprovals: Bool? = nil
+    ) -> PermissionPromptSettings {
+        let rememberPath = ["ui", "remember_tool_approvals"]
+        let remember: Bool
+        if let requirement = requirements.lazy.compactMap({ $0[path: rememberPath] }).first {
+            remember = requirement.boolValue ?? false
+        } else if let configured = envBool(
+            "GROK_REMEMBER_TOOL_APPROVALS",
+            environment: environment
+        ) {
+            remember = configured
+        } else if let configured = document?[path: rememberPath] {
+            remember = configured.boolValue ?? false
+        } else {
+            remember = remoteRememberToolApprovals ?? false
+        }
+
+        let selectedPath = ["ui", "default_selected_permission"]
+        let selected: String
+        if let requirement = requirements.lazy.compactMap({ $0[path: selectedPath] }).first {
+            selected = requirement.stringValue.flatMap(canonicalDefaultSelection) ?? "allow_once"
+        } else if let override = environment["GROK_DEFAULT_SELECTED_PERMISSION"],
+                  let canonical = canonicalDefaultSelection(override) {
+            selected = canonical
+        } else {
+            selected = document?[path: selectedPath]?.stringValue
+                .flatMap(canonicalDefaultSelection) ?? "allow_once"
+        }
+
+        return PermissionPromptSettings(
+            rememberToolApprovals: remember,
+            defaultSelectedPermission: selected
+        )
+    }
+
+    private static func canonicalDefaultSelection(_ value: String) -> String? {
+        switch value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_") {
+        case "allow_once":
+            return "allow_once"
+        case "allow_command_always":
+            return "allow_command_always"
+        case "always_allow_all_sessions":
+            return "always_allow_all_sessions"
+        case "reject":
+            return "reject"
+        default:
+            return nil
+        }
+    }
+}
+
 /// Interactive prompter seam. Headless implementations return deny/cancel.
 public protocol PermissionPrompter: Sendable {
     func prompt(
@@ -219,9 +296,16 @@ public actor PermissionHandle {
     public private(set) var sessionGrants: [SessionGrant]
     public private(set) var bashPrefixGrants: [String]
     public private(set) var bashDisallows: [String]
+    private var sessionWorkingDirectoryRoots: [String: [URL]]
     public private(set) var allowAll: Bool
     public private(set) var allowEditsForSession: Bool
+    public private(set) var rememberToolApprovals: Bool
+    public private(set) var projectApprovalStateURL: URL?
+    public private(set) var lastProjectApprovalPersistenceError: String?
     public private(set) var editPolicy: EditPolicy
+    private var projectApprovalStore: ProjectPermissionApprovalStore?
+    private var projectApprovalState: ProjectPermissionApprovalState
+    private var projectAllowedMCPServers: Set<String>
     /// Workspace cwd used for shell file-access path resolution.
     public var shellCwd: String
     public var prompter: any PermissionPrompter
@@ -248,7 +332,8 @@ public actor PermissionHandle {
         /// Production default is the Rust heuristic classifier. Tests that need
         /// a fixed or absent classifier pass one explicitly (or `nil`).
         classifier: (any PermissionClassifier)? = HeuristicPermissionClassifier(),
-        sandboxAutoAllowBash: @Sendable @escaping () -> Bool = { false }
+        sandboxAutoAllowBash: @Sendable @escaping () -> Bool = { false },
+        rememberToolApprovals: Bool = false
     ) {
         var cfg = config
         if yoloPinReason != nil {
@@ -267,9 +352,16 @@ public actor PermissionHandle {
         self.sessionGrants = []
         self.bashPrefixGrants = []
         self.bashDisallows = []
+        self.sessionWorkingDirectoryRoots = [:]
         self.allowAll = yoloPinReason == nil && allowAll
         self.allowEditsForSession = false
+        self.rememberToolApprovals = rememberToolApprovals
+        self.projectApprovalStateURL = nil
+        self.lastProjectApprovalPersistenceError = nil
         self.editPolicy = .ask
+        self.projectApprovalStore = nil
+        self.projectApprovalState = ProjectPermissionApprovalState()
+        self.projectAllowedMCPServers = []
         self.shellCwd = shellCwd
         self.prompter = prompter
         self.classifier = classifier
@@ -294,6 +386,119 @@ public actor PermissionHandle {
     public func setAutoMode(_ enabled: Bool) {
         autoMode = enabled
         if enabled { yoloMode = false }
+    }
+
+    public func setRememberToolApprovals(_ enabled: Bool) {
+        guard rememberToolApprovals != enabled else { return }
+        rememberToolApprovals = enabled
+        if enabled {
+            guard let projectApprovalStore else { return }
+            do {
+                let state = try projectApprovalStore.load()
+                installProjectApprovalState(state)
+                lastProjectApprovalPersistenceError = nil
+            } catch {
+                rememberToolApprovals = false
+                lastProjectApprovalPersistenceError = String(describing: error)
+            }
+            return
+        }
+        sessionGrants.removeAll { grant in
+            switch grant.access {
+            case .bash, .mcpTool, .webFetch:
+                return grant.scope != .once
+            case .edit, .read, .grep, .webSearch:
+                return false
+            }
+        }
+        bashPrefixGrants.removeAll()
+        projectAllowedMCPServers.removeAll()
+    }
+
+    /// Install the trusted owner/project boundary before any remembered grant is consulted.
+    /// Loading is read-only: empty projects do not acquire state directories or documents.
+    public func configureProjectApprovalPersistence(
+        workingDirectory: URL,
+        openGrokHome: URL,
+        environment: [String: String],
+        clientIdentifier: String? = nil
+    ) throws {
+        guard canonicalWorkspacePathKey(workingDirectory.path)
+            == canonicalWorkspacePathKey(shellCwd)
+        else {
+            throw ProjectPermissionApprovalPersistenceError.invalidWorkspace(workingDirectory.path)
+        }
+
+        let store = try ProjectPermissionApprovalStore(
+            workingDirectory: workingDirectory,
+            openGrokHome: openGrokHome,
+            environment: environment,
+            clientIdentifier: clientIdentifier
+        )
+        if let existing = projectApprovalStore,
+           existing.fileURL.path != store.fileURL.path
+                || existing.openGrokHome.path != store.openGrokHome.path {
+            throw ProjectPermissionApprovalPersistenceError.insecureStorage(store.fileURL.path)
+        }
+
+        let state = try store.load()
+        projectApprovalStore = store
+        projectApprovalStateURL = store.fileURL
+        installProjectApprovalState(state)
+        lastProjectApprovalPersistenceError = nil
+    }
+
+    /// Recheck policy floors before a session-local prompter reuses a grant.
+    /// A shell-file ask is deliberately never satisfied by remembered approval.
+    public func canReuseRememberedApproval(_ access: AccessKind) -> Bool {
+        let editSession: Bool
+        if case .edit = access {
+            editSession = true
+        } else {
+            editSession = false
+        }
+        guard rememberToolApprovals || editSession else { return false }
+        if let matched = policy.evaluateWithSource(access) {
+            switch matched.decision {
+            case .policyDeny, .reject, .cancelled, .followupMessage:
+                return false
+            case .ask:
+                if Self.isManagedPolicySource(matched.ruleSource) { return false }
+                if !rememberToolApprovals && !editSession { return false }
+            case .allow:
+                break
+            }
+        }
+
+        switch access {
+        case .edit(let path):
+            return !protectedEditPath(path, userGrokHome: userGrokHomePath)
+        case .bash(let command):
+            guard matchesSessionBashGrant(command, grant: command) else { return false }
+            if let decision = policy.evaluateBashCommandPolicy(command) {
+                switch decision {
+                case .policyDeny, .reject, .cancelled, .followupMessage:
+                    return false
+                case .ask:
+                    if !rememberToolApprovals { return false }
+                case .allow:
+                    break
+                }
+            }
+            if let decision = policy.evaluateShellFileAccess(command, cwd: shellCwd),
+               decision != .allow {
+                return false
+            }
+            return evaluateBashSegments(
+                command,
+                grants: [],
+                disallows: bashDisallows
+            ).reason != "disallow"
+        case .mcpTool, .webFetch:
+            return rememberToolApprovals
+        case .read, .grep, .webSearch:
+            return false
+        }
     }
 
     public func setClassifier(_ classifier: (any PermissionClassifier)?) {
@@ -322,6 +527,153 @@ public actor PermissionHandle {
         return llm.hasSideQuery
     }
 
+    private static func isManagedPolicySource(_ source: PermissionRuleSource?) -> Bool {
+        switch source {
+        case .systemRequirements, .requirements, .managedSettings, .managedConfig:
+            return true
+        case .unknown, .config, .settings, .cli, .synthetic, nil:
+            return false
+        }
+    }
+
+    private func installProjectApprovalState(_ state: ProjectPermissionApprovalState) {
+        projectApprovalState = state
+        sessionGrants.removeAll { $0.scope == .project }
+        bashDisallows = Array(Set(bashDisallows).union(state.disallowedBashCommands)).sorted()
+        projectAllowedMCPServers.removeAll()
+
+        guard rememberToolApprovals else {
+            bashPrefixGrants = sessionGrants.compactMap { grant in
+                guard case .bash(let command) = grant.access,
+                      grant.scope != .once
+                else { return nil }
+                return grant.pattern ?? command
+            }
+            return
+        }
+
+        for command in state.allowedBashCommands.sorted() {
+            guard matchesSessionBashGrant(command, grant: command) else { continue }
+            sessionGrants.append(SessionGrant(
+                access: .bash(command),
+                scope: .project,
+                pattern: command
+            ))
+        }
+        for domain in state.allowedWebFetchDomains.sorted() {
+            guard Self.validatedWebFetchDomain(domain) == domain else { continue }
+            sessionGrants.append(SessionGrant(
+                access: .webFetch("https://" + domain),
+                scope: .project,
+                pattern: domain
+            ))
+        }
+        for tool in state.allowedMCPTools.sorted() {
+            guard Self.isValidMCPToolName(tool) else { continue }
+            sessionGrants.append(SessionGrant(
+                access: .mcpTool(name: tool, input: .null),
+                scope: .project,
+                pattern: tool
+            ))
+        }
+        projectAllowedMCPServers = Set(state.allowedMCPServers.filter(Self.isValidMCPServerName))
+        bashPrefixGrants = sessionGrants.compactMap { grant in
+            guard case .bash(let command) = grant.access,
+                  grant.scope != .once
+            else { return nil }
+            return grant.pattern ?? command
+        }
+    }
+
+    private func persistProjectGrant(_ grant: SessionGrant) -> Bool {
+        guard rememberToolApprovals, let store = projectApprovalStore else { return false }
+
+        var updated = projectApprovalState
+        switch grant.access {
+        case .bash(let command):
+            let approved = command.trimmingCharacters(in: .whitespaces)
+            guard !approved.isEmpty,
+                  approved.utf8.count <= ProjectPermissionApprovalState.maximumEntryBytes,
+                  grant.pattern == nil || grant.pattern == approved,
+                  matchesSessionBashGrant(approved, grant: approved)
+            else { return false }
+            updated.allowedBashCommands.insert(approved)
+
+        case .webFetch(let rawURL):
+            guard let components = URLComponents(string: rawURL),
+                  let host = components.host,
+                  let domain = Self.validatedWebFetchDomain(host),
+                  grant.pattern == nil
+                    || Self.validatedWebFetchDomain(grant.pattern ?? "") == domain
+            else { return false }
+            updated.allowedWebFetchDomains.insert(domain)
+
+        case .mcpTool(let name, _):
+            guard Self.isValidMCPToolName(name),
+                  grant.pattern == nil || grant.pattern == name
+            else { return false }
+            updated.allowedMCPTools.insert(name)
+
+        // "Allow edits during this session" is never a project grant.
+        case .edit, .read, .grep, .webSearch:
+            return false
+        }
+
+        do {
+            installProjectApprovalState(try store.save(updated, merging: true))
+            lastProjectApprovalPersistenceError = nil
+            return true
+        } catch {
+            lastProjectApprovalPersistenceError = String(describing: error)
+            return false
+        }
+    }
+
+    private static func validatedWebFetchDomain(_ raw: String) -> String? {
+        let normalized = normalizeDomain(raw)
+        guard !normalized.isEmpty,
+              normalized.utf8.count <= ProjectPermissionApprovalState.maximumEntryBytes,
+              !normalized.unicodeScalars.contains(where: { scalar in
+                  scalar.properties.generalCategory == .control
+                      || scalar == "/" || scalar == "\\" || scalar == "@"
+              }),
+              let components = URLComponents(string: "https://" + normalized),
+              components.host.map(normalizeDomain) == normalized,
+              components.user == nil,
+              components.password == nil,
+              components.port == nil,
+              components.path.isEmpty,
+              components.query == nil,
+              components.fragment == nil
+        else { return nil }
+        return normalized
+    }
+
+    private static func isValidMCPToolName(_ name: String) -> Bool {
+        !name.isEmpty
+            && name.utf8.count <= ProjectPermissionApprovalState.maximumEntryBytes
+            && !name.unicodeScalars.contains { scalar in
+                scalar.properties.generalCategory == .control
+            }
+    }
+
+    private static func isValidMCPServerName(_ name: String) -> Bool {
+        isValidMCPToolName(name) && !name.contains("__")
+    }
+
+    private static func qualifiedMCPServer(_ name: String) -> String? {
+        guard isValidMCPToolName(name) else { return nil }
+        let bytes = Array(name.utf8)
+        var boundary: Int?
+        for index in bytes.indices.dropLast() where bytes[index] == 95 && bytes[index + 1] == 95 {
+            guard boundary == nil else { return nil }
+            boundary = index
+        }
+        guard let boundary, boundary > 0, boundary + 2 < bytes.count else { return nil }
+        let server = String(decoding: bytes[..<boundary], as: UTF8.self)
+        return isValidMCPServerName(server) ? server : nil
+    }
+
     public func setAllowEditsForSession(_ enabled: Bool) {
         allowEditsForSession = enabled
     }
@@ -342,7 +694,12 @@ public actor PermissionHandle {
         )
     }
 
-    public func grant(_ grant: SessionGrant) {
+    @discardableResult
+    public func grant(_ grant: SessionGrant) -> Bool {
+        if grant.scope == .project {
+            return persistProjectGrant(grant)
+        }
+
         sessionGrants.append(grant)
         if case .bash(let cmd) = grant.access, grant.scope != .once {
             bashPrefixGrants.append(grant.pattern ?? cmd)
@@ -350,24 +707,81 @@ public actor PermissionHandle {
         if case .edit = grant.access, grant.scope == .session {
             allowEditsForSession = true
         }
+        return true
     }
 
     public func disallowBashPrefix(_ prefix: String) {
         bashDisallows.append(prefix)
+        guard let store = projectApprovalStore,
+              !prefix.isEmpty,
+              prefix.utf8.count <= ProjectPermissionApprovalState.maximumEntryBytes,
+              !prefix.unicodeScalars.contains("\0")
+        else { return }
+
+        var updated = projectApprovalState
+        updated.disallowedBashCommands.insert(prefix)
+        do {
+            installProjectApprovalState(try store.save(updated, merging: true))
+            lastProjectApprovalPersistenceError = nil
+        } catch {
+            lastProjectApprovalPersistenceError = String(describing: error)
+        }
+    }
+
+    /// Atomically replace one authenticated root session's extra directory grants.
+    /// An empty replacement revokes every previous root before this call returns.
+    public func replaceWorkingDirectoryRules(sessionID: String, roots: [URL]) {
+        guard !sessionID.isEmpty else { return }
+        var canonicalRoots: [URL] = []
+        var seen: Set<String> = []
+        for root in roots {
+            guard root.isFileURL else { continue }
+            let canonical = root.standardizedFileURL.resolvingSymlinksInPath()
+            guard canonical.path != "/" else { continue }
+            var isDirectory = ObjCBool(false)
+            guard FileManager.default.fileExists(
+                atPath: canonical.path,
+                isDirectory: &isDirectory
+            ), isDirectory.boolValue else {
+                continue
+            }
+            if seen.insert(canonical.path).inserted {
+                canonicalRoots.append(canonical)
+            }
+        }
+        if canonicalRoots.isEmpty {
+            sessionWorkingDirectoryRoots.removeValue(forKey: sessionID)
+        } else {
+            sessionWorkingDirectoryRoots[sessionID] = canonicalRoots
+        }
+    }
+
+    public func workingDirectoryRoots(sessionID: String) -> [URL] {
+        sessionWorkingDirectoryRoots[sessionID] ?? []
     }
 
     public func resetState() {
         sessionGrants.removeAll()
         bashPrefixGrants.removeAll()
+        sessionWorkingDirectoryRoots.removeAll()
         allowEditsForSession = false
-        // keep disallows / pin / config
+        projectAllowedMCPServers.removeAll()
+        guard let store = projectApprovalStore else { return }
+        do {
+            projectApprovalState = try store.save(ProjectPermissionApprovalState(), merging: false)
+            bashDisallows.removeAll()
+            lastProjectApprovalPersistenceError = nil
+        } catch {
+            lastProjectApprovalPersistenceError = String(describing: error)
+        }
     }
 
     /// Core request path matching the Rust permission actor order.
     public func request(
         access: AccessKind,
         toolName: String,
-        toolCallId: String
+        toolCallId: String,
+        sessionID: String? = nil
     ) async -> PermissionDecision {
         lastMatchedRuleSource = nil
         var policyForcedPrompt = false
@@ -494,21 +908,41 @@ public actor PermissionHandle {
 
         // 4. Session grants (before auto classifier). Shell-file forced asks
         // still prompt; protected edits still prompt.
-        if matchesSessionGrant(access), !shellFileForcedPrompt {
-            let blockProtected: Bool
-            if case .edit = access, protectedEdit {
-                blockProtected = true
-            } else {
-                blockProtected = false
-            }
-            if !blockProtected {
-                record(
-                    access: access, toolName: toolName, toolCallId: toolCallId,
-                    decision: .allow, autoApproved: true, userPrompted: false,
-                    reason: "session_grant"
-                )
-                return .allow
-            }
+        if !policyForcedPrompt,
+           !protectedEdit,
+           matchesWorkingDirectoryGrant(access, sessionID: sessionID) {
+            record(
+                access: access,
+                toolName: toolName,
+                toolCallId: toolCallId,
+                decision: .allow,
+                autoApproved: true,
+                userPrompted: false,
+                reason: "session_directory_grant"
+            )
+            return .allow
+        }
+
+        let grantMaySatisfyPrompt: Bool
+        if policyForcedPrompt, Self.isManagedPolicySource(lastMatchedRuleSource) {
+            grantMaySatisfyPrompt = false
+        } else if !policyForcedPrompt || rememberToolApprovals {
+            grantMaySatisfyPrompt = true
+        } else if case .edit = access {
+            grantMaySatisfyPrompt = true
+        } else {
+            grantMaySatisfyPrompt = false
+        }
+        if !shellFileForcedPrompt,
+           grantMaySatisfyPrompt,
+           !protectedEdit,
+           matchesSessionGrant(access) {
+            record(
+                access: access, toolName: toolName, toolCallId: toolCallId,
+                decision: .allow, autoApproved: true, userPrompted: false,
+                reason: "session_grant"
+            )
+            return .allow
         }
 
         // 5. Built-in auto-allows / bash safe classification.
@@ -702,38 +1136,109 @@ public actor PermissionHandle {
         return decision
     }
 
+    private func matchesWorkingDirectoryGrant(
+        _ access: AccessKind,
+        sessionID: String?
+    ) -> Bool {
+        guard let sessionID,
+              !sessionID.isEmpty,
+              let roots = sessionWorkingDirectoryRoots[sessionID],
+              !roots.isEmpty
+        else {
+            return false
+        }
+
+        let rawPath: String
+        let edit: Bool
+        switch access {
+        case .read(let path?):
+            rawPath = path
+            edit = false
+        case .edit(let path):
+            rawPath = path
+            edit = true
+        case .read(nil), .bash, .grep, .webSearch, .webFetch, .mcpTool:
+            return false
+        }
+
+        let base = URL(fileURLWithPath: shellCwd, isDirectory: true)
+        let candidate = URL(fileURLWithPath: rawPath, relativeTo: base)
+            .standardizedFileURL
+        let canonicalPath = canonicalWorkspacePathKey(candidate.path)
+        if edit, protectedEditPath(canonicalPath, userGrokHome: userGrokHomePath) {
+            return false
+        }
+        return roots.contains { root in
+            containsPath(root: root.path, candidate: canonicalPath)
+        }
+    }
+
     private func matchesSessionGrant(_ access: AccessKind) -> Bool {
         if case .bash(let command) = access,
            evaluateBashSegments(command, grants: [], disallows: bashDisallows).reason == "disallow" {
             return false
         }
 
-        for g in sessionGrants {
-            switch (g.access, access) {
-            case (.edit, .edit(let path)):
-                if let pat = g.pattern {
-                    if globMatches(text: path, pattern: pat, pathContext: true) { return true }
-                } else {
+        if rememberToolApprovals {
+            switch access {
+            case .mcpTool(let name, _):
+                if let server = Self.qualifiedMCPServer(name),
+                   projectAllowedMCPServers.contains(server) {
                     return true
+                }
+            case .bash(let command):
+                if matchesSessionBashGrant(command, grant: command),
+                   yoloPinReason == nil,
+                   projectApprovalState.allowBashExecute
+                    || projectApprovalState.allowedBashGlobs.contains(where: {
+                        globMatches(text: command, pattern: $0, pathContext: false)
+                    }) {
+                    return true
+                }
+            case .read, .grep, .edit, .webFetch, .webSearch:
+                break
+            }
+        }
+
+        for index in sessionGrants.indices {
+            let grant = sessionGrants[index]
+            let matches: Bool
+            switch (grant.access, access) {
+            case (.edit, .edit(let path)):
+                if let pattern = grant.pattern {
+                    matches = globMatches(text: path, pattern: pattern, pathContext: true)
+                } else {
+                    matches = true
                 }
             case (.read, .read(let path)):
-                if let pat = g.pattern, let path {
-                    if globMatches(text: path, pattern: pat, pathContext: true) { return true }
-                } else if g.pattern == nil {
-                    return true
+                if let pattern = grant.pattern, let path {
+                    matches = globMatches(text: path, pattern: pattern, pathContext: true)
+                } else {
+                    matches = grant.pattern == nil
                 }
-            case (.bash, .bash(let cmd)):
-                let prefix = g.pattern ?? {
-                    if case .bash(let c) = g.access { return c }
+            case (.bash, .bash(let command)):
+                let prefix = grant.pattern ?? {
+                    if case .bash(let approvedCommand) = grant.access { return approvedCommand }
                     return ""
                 }()
-                if matchesSessionBashGrant(cmd, grant: prefix) { return true }
-            case (.mcpTool(let n, _), .mcpTool(let name, _)):
-                if n == name { return true }
+                matches = matchesSessionBashGrant(command, grant: prefix)
+            case (.mcpTool(let approvedName, _), .mcpTool(let name, _)):
+                matches = approvedName == name
             case (.webFetch, .webFetch(let url)):
-                if let pat = g.pattern, domainMatches(pattern: pat, url: url) { return true }
+                if let pattern = grant.pattern {
+                    matches = domainMatches(pattern: pattern, url: url)
+                } else {
+                    matches = false
+                }
             default:
-                continue
+                matches = false
+            }
+
+            if matches {
+                if grant.scope == .once {
+                    sessionGrants.remove(at: index)
+                }
+                return true
             }
         }
         return false

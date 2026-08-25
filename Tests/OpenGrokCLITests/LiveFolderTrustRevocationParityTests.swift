@@ -404,10 +404,12 @@ struct LiveFolderTrustRevocationParityTests {
         try fixture.writeLSP(marker: marker, project: true)
         let executor = try await fixture.makeExecutor()
         #expect(executor.currentToolSpecs().contains { $0.name == "pull_diagnostics" })
+        #expect(executor.currentToolSpecs().contains { $0.name == "lsp" })
 
         #expect(await fixture.change(false, executor: executor).hasPrefix("Untrusted:"))
         #expect(executor.projectTrusted == false)
         #expect(executor.currentToolSpecs().contains { $0.name == "pull_diagnostics" } == false)
+        #expect(executor.currentToolSpecs().contains { $0.name == "lsp" } == false)
         let denied = await executor.invoke(
             sessionID: "live-folder-trust",
             workingDirectory: fixture.workspace,
@@ -420,6 +422,7 @@ struct LiveFolderTrustRevocationParityTests {
 
         #expect(await fixture.change(true, executor: executor).hasPrefix("Trusted:"))
         #expect(executor.currentToolSpecs().contains { $0.name == "pull_diagnostics" })
+        #expect(executor.currentToolSpecs().contains { $0.name == "lsp" })
         await executor.shutdown()
     }
 

@@ -12,6 +12,47 @@ private struct PromptRunOutcome: Sendable {
     var failure: AcpError?
 }
 
+private actor ACPQueuedPromptAdmission {
+    enum Resolution: Sendable {
+        case admitted(PromptRequest)
+        case cancelled
+    }
+
+    private var resolution: Resolution?
+    private var continuation: CheckedContinuation<Resolution, Never>?
+
+    func wait() async -> Resolution {
+        if let resolution {
+            return resolution
+        }
+        return await withCheckedContinuation { continuation in
+            if let resolution {
+                continuation.resume(returning: resolution)
+            } else {
+                self.continuation = continuation
+            }
+        }
+    }
+
+    func resolve(_ resolution: Resolution) {
+        guard self.resolution == nil else { return }
+        self.resolution = resolution
+        continuation?.resume(returning: resolution)
+        continuation = nil
+    }
+}
+
+private struct ACPQueuedPrompt: Sendable {
+    var request: PromptRequest
+    let id: String
+    let owner: String?
+    var lastEditor: String?
+    var version: UInt64
+    let kind: String
+    var text: String
+    let admission: ACPQueuedPromptAdmission
+}
+
 private actor ACPTransportWriter {
     private let transport: any ACPTransport
 
@@ -60,6 +101,15 @@ public actor ACPAgentRuntime {
     /// Durable prompt echoes suspend; reserve admission first so a peer cannot
     /// start a second turn while the ordinary prompt is recording its input.
     private var startingPrompts: Set<AcpSessionId> = []
+    private var pendingPromptQueues: [AcpSessionId: [ACPQueuedPrompt]] = [:]
+    private var queueEditingHolds: [AcpSessionId: Set<String>] = [:]
+    private var runningQueuePrompts: [AcpSessionId: (
+        id: String,
+        text: String,
+        kind: String,
+        combinedTexts: [String]?
+    )] = [:]
+    private var combineQueuedPrompts = false
     private var peerPromptGenerations: [AcpSessionId: UUID] = [:]
     private var pendingRosterInteractions: [AcpSessionId: Int] = [:]
     private var rosterMetadata: [AcpSessionId: RosterMetadata] = [:]
@@ -133,6 +183,14 @@ public actor ACPAgentRuntime {
 
     public func setSessionOwnerVerifier(_ verifier: SessionOwnerVerifier?) {
         sessionOwnerVerifier = verifier
+    }
+
+    /// Apply the effective `[ui].combine_queued_prompts` value to future turns.
+    ///
+    /// Queue promotion samples this actor-isolated flag only after the active
+    /// turn exits, so toggling it cannot rewrite a request already in flight.
+    public func setCombineQueuedPrompts(_ enabled: Bool) {
+        combineQueuedPrompts = enabled
     }
 
     public func hasConnectedReverseClient() -> Bool {
@@ -217,6 +275,13 @@ public actor ACPAgentRuntime {
         }
         activePrompts.removeAll()
         startingPrompts.removeAll()
+        let queuedPrompts = pendingPromptQueues.values.flatMap { $0 }
+        pendingPromptQueues.removeAll()
+        queueEditingHolds.removeAll()
+        runningQueuePrompts.removeAll()
+        for queued in queuedPrompts {
+            await queued.admission.resolve(.cancelled)
+        }
         peerPromptGenerations.removeAll()
         let sessions = openedLifecycleSessions
         openedLifecycleSessions.removeAll()
@@ -358,7 +423,9 @@ public actor ACPAgentRuntime {
                 // ignores the rest (acp_agent.rs:4481-4720). The ext-METHOD
                 // router never sees notifications — a method table entry
                 // must not be executable without a response channel.
-                await extensionNotifications?.dispatch(method: route.method, params: route.params)
+                if !(await handleQueueNotification(method: route.method, params: route.params)) {
+                    await extensionNotifications?.dispatch(method: route.method, params: route.params)
+                }
             }
             return []
         case .request(let id, let method, let params):
@@ -511,10 +578,15 @@ public actor ACPAgentRuntime {
             do {
                 try requireReady()
                 if await mayControlLeaderSession(from: args.request.params) {
-                    await extensionNotifications?.dispatch(
+                    if !(await handleQueueNotification(
                         method: args.request.method,
                         params: args.request.params
-                    )
+                    )) {
+                        await extensionNotifications?.dispatch(
+                            method: args.request.method,
+                            params: args.request.params
+                        )
+                    }
                 }
             } catch {}
             _ = args.respond(.success(EmptyAcpResponse()))
@@ -646,6 +718,9 @@ public actor ACPAgentRuntime {
         {
             guard !session.closed else { throw ACPRuntimeError.sessionClosed(request.sessionId) }
             await replay(session, leaderClientID: request.meta?[ACPLeaderCapabilityInjection.clientIDKey])
+            if pendingPromptQueues[session.sessionId] != nil {
+                await publishQueueChanged(sessionID: session.sessionId)
+            }
             return try encode(LoadSessionResponse(modes: configuration.modes, models: configuration.models))
         }
         session.cwd = try await validateWorkspace(request.cwd)
@@ -666,6 +741,9 @@ public actor ACPAgentRuntime {
         }
         updateRosterMetadata(sessionId: session.sessionId, meta: request.meta)
         await replay(session, leaderClientID: request.meta?[ACPLeaderCapabilityInjection.clientIDKey])
+        if pendingPromptQueues[session.sessionId] != nil {
+            await publishQueueChanged(sessionID: session.sessionId)
+        }
         await publishRosterUpsert(sessionId: session.sessionId)
         return try encode(LoadSessionResponse(modes: configuration.modes, models: configuration.models))
     }
@@ -682,6 +760,9 @@ public actor ACPAgentRuntime {
         {
             guard !session.closed else { throw ACPRuntimeError.sessionClosed(request.sessionId) }
             await replay(session, leaderClientID: request.meta?[ACPLeaderCapabilityInjection.clientIDKey])
+            if pendingPromptQueues[session.sessionId] != nil {
+                await publishQueueChanged(sessionID: session.sessionId)
+            }
             return try encode(ResumeSessionResponse(modes: configuration.modes, models: configuration.models))
         }
         if let cwd = request.cwd {
@@ -708,6 +789,9 @@ public actor ACPAgentRuntime {
         }
         updateRosterMetadata(sessionId: session.sessionId, meta: request.meta)
         await replay(session, leaderClientID: request.meta?[ACPLeaderCapabilityInjection.clientIDKey])
+        if pendingPromptQueues[session.sessionId] != nil {
+            await publishQueueChanged(sessionID: session.sessionId)
+        }
         await publishRosterUpsert(sessionId: session.sessionId)
         return try encode(ResumeSessionResponse(modes: configuration.modes, models: configuration.models))
     }
@@ -775,6 +859,8 @@ public actor ACPAgentRuntime {
         }
         startingPrompts.remove(request.sessionId)
         activePrompts[request.sessionId]?.cancel()
+        await cancelQueuedPrompts(sessionID: request.sessionId)
+        runningQueuePrompts.removeValue(forKey: request.sessionId)
         await promptDriver.cancel(sessionId: request.sessionId)
         session.closed = true
         session.updatedAt = timestamp()
@@ -805,21 +891,491 @@ public actor ACPAgentRuntime {
         await onSessionClosed?(sessionId)
     }
 
+    private static func promptQueueText(_ request: PromptRequest) -> String {
+        request.prompt.compactMap { block in
+            guard case .text(let content) = block else { return nil }
+            return content.text
+        }.joined(separator: "\n")
+    }
+
+    private func publishQueueChanged(sessionID: AcpSessionId) async {
+        let entries = pendingPromptQueues[sessionID, default: []].enumerated().map { position, entry in
+            var fields: [String: JSONValue] = [
+                "id": .string(entry.id),
+                "version": .number(.uint64(entry.version)),
+                "kind": .string(entry.kind),
+                "text": .string(entry.text),
+                "position": .number(.int64(Int64(position))),
+            ]
+            if let owner = entry.owner {
+                fields["owner"] = .string(owner)
+            }
+            if let lastEditor = entry.lastEditor {
+                fields["lastEditor"] = .string(lastEditor)
+            }
+            return JSONValue.object(fields)
+        }
+
+        var fields: [String: JSONValue] = [
+            "sessionId": .string(sessionID.rawValue),
+            "entries": .array(entries),
+        ]
+        if let running = runningQueuePrompts[sessionID] {
+            fields["runningPromptId"] = .string(running.id)
+            fields["runningText"] = .string(running.text)
+            fields["runningKind"] = .string(running.kind)
+            if let combinedTexts = running.combinedTexts, combinedTexts.count >= 2 {
+                fields["runningCombinedTexts"] = .array(combinedTexts.map(JSONValue.string))
+            }
+        }
+        await sendExtensionNotification(method: "x.ai/queue/changed", params: .object(fields))
+    }
+
+    private func cancelQueuedPrompts(sessionID: AcpSessionId) async {
+        let removed = pendingPromptQueues.removeValue(forKey: sessionID) ?? []
+        queueEditingHolds.removeValue(forKey: sessionID)
+        for entry in removed {
+            await entry.admission.resolve(.cancelled)
+        }
+    }
+
+    private func cancelQueuedPrompt(
+        sessionID: AcpSessionId,
+        id: String,
+        admission: ACPQueuedPromptAdmission
+    ) async {
+        guard let index = pendingPromptQueues[sessionID]?.firstIndex(where: {
+            $0.id == id && $0.admission === admission
+        }), let entry = pendingPromptQueues[sessionID]?.remove(at: index)
+        else { return }
+        queueEditingHolds[sessionID]?.remove(id)
+        await entry.admission.resolve(.cancelled)
+        await publishQueueChanged(sessionID: sessionID)
+    }
+
+    private func promoteNextQueuedPrompt(sessionID: AcpSessionId) async {
+        guard pendingPromptQueues[sessionID] != nil else { return }
+        guard state != .closed,
+              openedLifecycleSessions.contains(sessionID),
+              activePrompts[sessionID] == nil,
+              !startingPrompts.contains(sessionID)
+        else { return }
+
+        guard var entry = pendingPromptQueues[sessionID]?.first else {
+            pendingPromptQueues.removeValue(forKey: sessionID)
+            queueEditingHolds.removeValue(forKey: sessionID)
+            await publishQueueChanged(sessionID: sessionID)
+            return
+        }
+
+        guard queueEditingHolds[sessionID]?.contains(entry.id) != true else { return }
+
+        var mergedFollowers: [ACPQueuedPrompt] = []
+        var combinedTexts = [entry.text]
+        if combineQueuedPrompts, Self.isMergeableQueuedPrompt(entry, allowImages: true) {
+            let queue = pendingPromptQueues[sessionID, default: []]
+            var combinedUTF8Count = entry.text.utf8.count
+            for follower in queue.dropFirst() {
+                guard queueEditingHolds[sessionID]?.contains(follower.id) != true,
+                      Self.isMergeableQueuedPrompt(follower, allowImages: false),
+                      Self.canCombineQueuedPrompts(entry, follower),
+                      combinedUTF8Count + 2 + follower.text.utf8.count <= 131_072
+                else { break }
+                combinedUTF8Count += 2 + follower.text.utf8.count
+                combinedTexts.append(follower.text)
+                mergedFollowers.append(follower)
+            }
+        }
+
+        pendingPromptQueues[sessionID]?.removeFirst()
+        if !mergedFollowers.isEmpty {
+            pendingPromptQueues[sessionID]?.removeFirst(mergedFollowers.count)
+            Self.applyCombinedPromptTexts(combinedTexts, to: &entry)
+        }
+        queueEditingHolds[sessionID]?.remove(entry.id)
+        startingPrompts.insert(sessionID)
+        runningQueuePrompts[sessionID] = (
+            id: entry.id,
+            text: entry.text,
+            kind: entry.kind,
+            combinedTexts: mergedFollowers.isEmpty ? nil : combinedTexts
+        )
+        for follower in mergedFollowers {
+            await follower.admission.resolve(.cancelled)
+        }
+        await publishQueueChanged(sessionID: sessionID)
+        guard state != .closed,
+              openedLifecycleSessions.contains(sessionID),
+              startingPrompts.contains(sessionID)
+        else {
+            await entry.admission.resolve(.cancelled)
+            return
+        }
+        await entry.admission.resolve(.admitted(entry.request))
+    }
+
+    private static func isMergeableQueuedPrompt(
+        _ entry: ACPQueuedPrompt,
+        allowImages: Bool
+    ) -> Bool {
+        guard entry.kind == "prompt",
+              !entry.text.isEmpty,
+              entry.request.meta?["synthetic"]?.boolValue != true,
+              entry.request.meta?["isSynthetic"]?.boolValue != true,
+              entry.request.meta?["toolOverrides"] == nil,
+              entry.request.meta?["tool_overrides"] == nil
+        else { return false }
+
+        var hasText = false
+        for block in entry.request.prompt {
+            switch block {
+            case .text(let content):
+                guard content.meta?["bash_command"] == nil,
+                      content.meta?["bashCommand"] == nil,
+                      content.meta?["displayText"]?.stringValue?
+                          .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
+                else { return false }
+                if !content.text.isEmpty {
+                    hasText = true
+                }
+            case .image:
+                guard allowImages else { return false }
+            case .audio, .resourceLink, .resource:
+                return false
+            }
+        }
+        return hasText
+    }
+
+    private static func canCombineQueuedPrompts(
+        _ front: ACPQueuedPrompt,
+        _ follower: ACPQueuedPrompt
+    ) -> Bool {
+        guard front.request.sessionId == follower.request.sessionId,
+              front.owner == follower.owner
+        else { return false }
+
+        let identityKeys = [
+            "clientIdentifier",
+            "owner",
+            "provider",
+            "providerId",
+            "provider_id",
+            "modelProvider",
+            "model_provider",
+            "turnId",
+            "turn_id",
+        ]
+        return identityKeys.allSatisfy { key in
+            front.request.meta?[key] == follower.request.meta?[key]
+        }
+    }
+
+    private static func applyCombinedPromptTexts(
+        _ texts: [String],
+        to entry: inout ACPQueuedPrompt
+    ) {
+        guard texts.count >= 2,
+              let lastTextIndex = entry.request.prompt.lastIndex(where: { block in
+                  if case .text = block { return true }
+                  return false
+              }),
+              case .text(var lastText) = entry.request.prompt[lastTextIndex]
+        else { return }
+
+        for extra in texts.dropFirst() {
+            if !lastText.text.isEmpty {
+                lastText.text += "\n\n"
+            }
+            lastText.text += extra
+        }
+        entry.request.prompt[lastTextIndex] = .text(lastText)
+
+        guard let firstTextIndex = entry.request.prompt.firstIndex(where: { block in
+            if case .text = block { return true }
+            return false
+        }), case .text(var firstText) = entry.request.prompt[firstTextIndex] else { return }
+        var metadata = firstText.meta ?? [:]
+        metadata["combinedDisplayTexts"] = .array(texts.map(JSONValue.string))
+        firstText.meta = metadata
+        entry.request.prompt[firstTextIndex] = .text(firstText)
+        entry.text = promptQueueText(entry.request)
+    }
+
+    private static func combinedPromptDisplayTexts(_ request: PromptRequest) -> [String]? {
+        for block in request.prompt {
+            guard case .text(let content) = block else { continue }
+            guard let values = content.meta?["combinedDisplayTexts"]?.arrayValue,
+                  values.count >= 2,
+                  values.allSatisfy({ $0.stringValue != nil })
+            else { continue }
+            return values.compactMap(\.stringValue)
+        }
+        return nil
+    }
+
+    private static func editedQueuedPromptBlocks(
+        _ request: PromptRequest,
+        text: String
+    ) -> [ContentBlock] {
+        let isBash = request.prompt.contains { block in
+            guard case .text(let content) = block else { return false }
+            return content.meta?["bash_command"] != nil
+                || content.meta?["bashCommand"] != nil
+        }
+        let metadata: AcpMeta? = isBash ? ["bash_command": .string(text)] : nil
+        var blocks: [ContentBlock] = [.text(TextContent(text: text, meta: metadata))]
+        blocks.append(contentsOf: request.prompt.filter { block in
+            if case .image = block { return true }
+            return false
+        })
+        return blocks
+    }
+
+    private func handleQueueNotification(method: String, params: JSONValue) async -> Bool {
+        let supported: Set<String> = [
+            "x.ai/queue/remove",
+            "x.ai/queue/reorder",
+            "x.ai/queue/clear",
+            "x.ai/queue/edit",
+            "x.ai/queue/interject",
+            "x.ai/queue/hold_edit",
+            "x.ai/queue/release_edit",
+        ]
+        guard supported.contains(method) else { return false }
+        guard let rawSessionID = params["sessionId"]?.stringValue
+                ?? params["session_id"]?.stringValue,
+              !rawSessionID.isEmpty,
+              rawSessionID.utf8.count <= 128,
+              params["_meta"]?["x.ai/replayed"]?.boolValue != true
+        else { return true }
+
+        let sessionID = AcpSessionId(rawSessionID)
+        guard await ownsSession(sessionID) else { return true }
+        let owner = ACPLeaderRequestAuthority.clientID
+            ?? params["owner"]?.stringValue
+            ?? params["clientIdentifier"]?.stringValue
+        let id = params["id"]?.stringValue
+        if let id, id.utf8.count > 128 {
+            return true
+        }
+
+        switch method {
+        case "x.ai/queue/remove":
+            guard let id else { return true }
+            let version = params["expectedVersion"]?.uint64Value ?? 0
+            if let index = pendingPromptQueues[sessionID]?.firstIndex(where: {
+                $0.id == id && $0.version == version && (owner == nil || $0.owner == owner)
+            }), let entry = pendingPromptQueues[sessionID]?.remove(at: index) {
+                queueEditingHolds[sessionID]?.remove(id)
+                await entry.admission.resolve(.cancelled)
+            }
+            await publishQueueChanged(sessionID: sessionID)
+
+        case "x.ai/queue/reorder":
+            let orderedIDs = (params["orderedIds"]?.arrayValue ?? []).compactMap(\.stringValue)
+            guard orderedIDs.count <= 256,
+                  orderedIDs.allSatisfy({ $0.utf8.count <= 128 })
+            else { return true }
+            var ranks: [String: Int] = [:]
+            for (index, orderedID) in orderedIDs.enumerated() where ranks[orderedID] == nil {
+                ranks[orderedID] = index
+            }
+            let queue = pendingPromptQueues[sessionID, default: []]
+            pendingPromptQueues[sessionID] = queue.enumerated().sorted { lhs, rhs in
+                let leftRank = ranks[lhs.element.id] ?? Int.max
+                let rightRank = ranks[rhs.element.id] ?? Int.max
+                return leftRank == rightRank ? lhs.offset < rhs.offset : leftRank < rightRank
+            }.map(\.element)
+            await publishQueueChanged(sessionID: sessionID)
+
+        case "x.ai/queue/clear":
+            let queue = pendingPromptQueues[sessionID, default: []]
+            let removed = queue.filter { owner == nil || $0.owner == owner }
+            pendingPromptQueues[sessionID] = queue.filter { entry in
+                owner != nil && entry.owner != owner
+            }
+            for entry in removed {
+                queueEditingHolds[sessionID]?.remove(entry.id)
+                await entry.admission.resolve(.cancelled)
+            }
+            await publishQueueChanged(sessionID: sessionID)
+
+        case "x.ai/queue/edit":
+            guard let id,
+                  let newText = params["newText"]?.stringValue,
+                  !newText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  newText.utf8.count <= 131_072,
+                  let index = pendingPromptQueues[sessionID]?.firstIndex(where: { $0.id == id })
+            else { return true }
+            if let request = pendingPromptQueues[sessionID]?[index].request {
+                pendingPromptQueues[sessionID]?[index].request.prompt = Self.editedQueuedPromptBlocks(
+                    request,
+                    text: newText
+                )
+            }
+            pendingPromptQueues[sessionID]?[index].text = newText
+            pendingPromptQueues[sessionID]?[index].version &+= 1
+            pendingPromptQueues[sessionID]?[index].lastEditor = owner
+            queueEditingHolds[sessionID]?.remove(id)
+            if activePrompts[sessionID] == nil, !startingPrompts.contains(sessionID) {
+                await promoteNextQueuedPrompt(sessionID: sessionID)
+                return true
+            }
+            await publishQueueChanged(sessionID: sessionID)
+
+        case "x.ai/queue/interject":
+            guard let id else { return true }
+            let version = params["expectedVersion"]?.uint64Value ?? 0
+            guard let index = pendingPromptQueues[sessionID]?.firstIndex(where: {
+                $0.id == id && $0.version == version && (owner == nil || $0.owner == owner)
+            }), var entry = pendingPromptQueues[sessionID]?.remove(at: index)
+            else {
+                await publishQueueChanged(sessionID: sessionID)
+                return true
+            }
+            if let newText = params["newText"]?.stringValue,
+               !newText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               newText.utf8.count <= 131_072 {
+                entry.request.prompt = Self.editedQueuedPromptBlocks(entry.request, text: newText)
+                entry.text = newText
+                entry.version &+= 1
+                entry.lastEditor = owner
+            }
+            queueEditingHolds[sessionID]?.remove(id)
+
+            if activePrompts[sessionID] != nil,
+               let extensionRouter,
+               extensionRouter.hasExactRoute("x.ai/interject"),
+               let content = try? JSONValue.encode(entry.request.prompt) {
+                let payload: JSONValue = .object([
+                    "sessionId": .string(rawSessionID),
+                    "text": .string(entry.text),
+                    "interjectionId": .string(entry.id),
+                    "content": content,
+                ])
+                do {
+                    _ = try await extensionRouter.dispatch(method: "x.ai/interject", params: payload)
+                    await entry.admission.resolve(.cancelled)
+                } catch {
+                    let count = pendingPromptQueues[sessionID, default: []].count
+                    pendingPromptQueues[sessionID, default: []].insert(entry, at: min(index, count))
+                }
+            } else {
+                pendingPromptQueues[sessionID, default: []].insert(entry, at: 0)
+                if activePrompts[sessionID] == nil, !startingPrompts.contains(sessionID) {
+                    await promoteNextQueuedPrompt(sessionID: sessionID)
+                    return true
+                }
+            }
+            await publishQueueChanged(sessionID: sessionID)
+
+        case "x.ai/queue/hold_edit":
+            guard let id,
+                  pendingPromptQueues[sessionID]?.contains(where: { $0.id == id }) == true
+            else { return true }
+            queueEditingHolds[sessionID, default: []].insert(id)
+
+        case "x.ai/queue/release_edit":
+            guard let id else { return true }
+            queueEditingHolds[sessionID]?.remove(id)
+            if activePrompts[sessionID] == nil, !startingPrompts.contains(sessionID) {
+                await promoteNextQueuedPrompt(sessionID: sessionID)
+            }
+
+        default:
+            return false
+        }
+        return true
+    }
+
     private func prompt(_ params: JSONValue) async throws -> JSONValue {
         try requireReady()
-        let request = try decode(PromptRequest.self, from: params, method: AgentMethodNames.sessionPrompt)
-        guard let session = try await store.read(request.sessionId) else {
-            throw ACPRuntimeError.sessionNotFound(request.sessionId)
+        var pendingRequest = try decode(
+            PromptRequest.self,
+            from: params,
+            method: AgentMethodNames.sessionPrompt
+        )
+        guard let session = try await store.read(pendingRequest.sessionId) else {
+            throw ACPRuntimeError.sessionNotFound(pendingRequest.sessionId)
         }
         guard !session.closed else {
-            throw ACPRuntimeError.sessionClosed(request.sessionId)
+            throw ACPRuntimeError.sessionClosed(pendingRequest.sessionId)
         }
-        guard activePrompts[request.sessionId] == nil,
-              !startingPrompts.contains(request.sessionId)
-        else {
-            throw ACPRuntimeError.sessionBusy(request.sessionId)
+        if activePrompts[pendingRequest.sessionId] != nil
+            || startingPrompts.contains(pendingRequest.sessionId) {
+            guard pendingPromptQueues[pendingRequest.sessionId, default: []].count < 256 else {
+                throw ACPRuntimeError.sessionBusy(pendingRequest.sessionId)
+            }
+            let promptID = pendingRequest.meta?["promptId"]?.stringValue
+                ?? pendingRequest.messageId
+                ?? makeSessionId()
+            guard !promptID.isEmpty, promptID.utf8.count <= 128 else {
+                throw ACPRuntimeError.invalidParams("queued prompt id exceeds its maximum size")
+            }
+            guard runningQueuePrompts[pendingRequest.sessionId]?.id != promptID,
+                  pendingPromptQueues[pendingRequest.sessionId, default: []]
+                    .allSatisfy({ $0.id != promptID })
+            else {
+                throw ACPRuntimeError.invalidParams("queued prompt id is already active")
+            }
+            let text = Self.promptQueueText(pendingRequest)
+            guard text.utf8.count <= 131_072 else {
+                throw ACPRuntimeError.invalidParams("queued prompt text exceeds its maximum size")
+            }
+            var meta = pendingRequest.meta ?? [:]
+            meta["promptId"] = .string(promptID)
+            pendingRequest.meta = meta
+            let owner = ACPLeaderRequestAuthority.clientID
+                ?? meta["clientIdentifier"]?.stringValue
+                ?? meta["owner"]?.stringValue
+            let admission = ACPQueuedPromptAdmission()
+            pendingPromptQueues[pendingRequest.sessionId, default: []].append(ACPQueuedPrompt(
+                request: pendingRequest,
+                id: promptID,
+                owner: owner,
+                lastEditor: nil,
+                version: 0,
+                kind: meta["kind"]?.stringValue ?? "prompt",
+                text: text,
+                admission: admission
+            ))
+            await publishQueueChanged(sessionID: pendingRequest.sessionId)
+
+            let runtime = self
+            let sessionID = pendingRequest.sessionId
+            let resolution = await withTaskCancellationHandler {
+                await admission.wait()
+            } onCancel: {
+                Task {
+                    await runtime.cancelQueuedPrompt(
+                        sessionID: sessionID,
+                        id: promptID,
+                        admission: admission
+                    )
+                }
+            }
+            switch resolution {
+            case .cancelled:
+                return try encode(PromptResponse(
+                    stopReason: .cancelled,
+                    userMessageId: pendingRequest.messageId
+                ))
+            case .admitted(let admitted):
+                pendingRequest = admitted
+            }
         }
+        let request = pendingRequest
         startingPrompts.insert(request.sessionId)
+        let runningID = request.meta?["promptId"]?.stringValue
+            ?? request.messageId
+            ?? makeSessionId()
+        runningQueuePrompts[request.sessionId] = (
+            id: runningID,
+            text: Self.promptQueueText(request),
+            kind: request.meta?["kind"]?.stringValue ?? "prompt",
+            combinedTexts: Self.combinedPromptDisplayTexts(request)
+        )
 
         for block in request.prompt {
             await emit(
@@ -871,8 +1427,10 @@ public actor ACPAgentRuntime {
         await publishRosterUpsert(sessionId: request.sessionId, activity: .working)
         let outcome = await task.value
         activePrompts.removeValue(forKey: request.sessionId)
+        runningQueuePrompts.removeValue(forKey: request.sessionId)
         await emitPromptComplete(request: request, outcome: outcome)
         await publishRosterUpsert(sessionId: request.sessionId)
+        await promoteNextQueuedPrompt(sessionID: request.sessionId)
         return try encode(outcome.response)
     }
 
@@ -949,6 +1507,12 @@ public actor ACPAgentRuntime {
             }
         }
         activePrompts[sessionId] = task
+        runningQueuePrompts[sessionId] = (
+            id: promptID,
+            text: text,
+            kind: "prompt",
+            combinedTexts: nil
+        )
         peerPromptGenerations[sessionId] = generation
         Task { [weak runtime] in
             let outcome = await task.value
@@ -1028,6 +1592,12 @@ public actor ACPAgentRuntime {
             }
         }
         activePrompts[sessionId] = task
+        runningQueuePrompts[sessionId] = (
+            id: promptID,
+            text: text,
+            kind: "prompt",
+            combinedTexts: nil
+        )
         peerPromptGenerations[sessionId] = generation
         Task { [weak runtime] in
             let outcome = await task.value
@@ -1048,11 +1618,13 @@ public actor ACPAgentRuntime {
         guard peerPromptGenerations[request.sessionId] == generation else { return }
         peerPromptGenerations.removeValue(forKey: request.sessionId)
         activePrompts.removeValue(forKey: request.sessionId)
+        runningQueuePrompts.removeValue(forKey: request.sessionId)
         guard state != .closed,
               openedLifecycleSessions.contains(request.sessionId)
         else { return }
         await emitPromptComplete(request: request, outcome: outcome)
         await publishRosterUpsert(sessionId: request.sessionId)
+        await promoteNextQueuedPrompt(sessionID: request.sessionId)
     }
 
     /// The `x.ai/session/prompt_complete` fire-and-forget broadcast the

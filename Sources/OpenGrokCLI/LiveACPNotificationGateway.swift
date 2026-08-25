@@ -62,11 +62,9 @@ import OpenGrokWorkspace
 
 enum LiveACPInboundNotifications {
     /// The router the live ACP/serve compositions hand the runtime. The
-    /// registered names are exactly the three Wave 15 item 5 arms; everything
-    /// else upstream's `ext_notification` matches (`x.ai/toggle_plan_mode`,
-    /// the `x.ai/queue/*` family, `x.ai/terminal/pty/input`,
-    /// `_x.ai/session/update`, the leader-internal names) has no port surface
-    /// at this seam and is ignored silently, upstream's own fall-through.
+    /// Queue controls are handled by the runtime's authoritative prompt
+    /// queue before this router; follow-up suggestions and live composition
+    /// controls land here after the same authenticated dispatch.
     static func build(
         permissionMode: LiveSessionPermissionMode?,
         permissions: PermissionHandle?,
@@ -93,6 +91,79 @@ enum LiveACPInboundNotifications {
                     prompter: permissionPrompter
                 )
             )
+            .register(
+                exact: LiveACPFollowUpSuggestionsHandler.method,
+                handler: LiveACPFollowUpSuggestionsHandler(gateway: gateway)
+            )
+    }
+}
+
+struct LiveACPFollowUpSuggestionsHandler: ACPAgentExtensionNotificationHandler {
+    static let method = "x.ai/follow_ups"
+
+    let gateway: ACPNotificationGateway
+
+    func handle(method: String, params: JSONValue) async {
+        guard method == Self.method,
+              let fields = params.objectValue,
+              fields["_meta"]?["x.ai/replayed"]?.boolValue != true,
+              let responseID = fields["response_id"]?.stringValue,
+              !responseID.isEmpty,
+              responseID.utf8.count <= 128
+        else { return }
+
+        let sessionID: String
+        if let explicit = fields["sessionId"]?.stringValue
+            ?? fields["session_id"]?.stringValue {
+            sessionID = explicit
+        } else {
+            guard fields["sessionId"] == nil,
+                  fields["session_id"] == nil,
+                  let registered = await LiveFollowUpSuggestionRelay.shared
+                    .uniquelyRegisteredSessionID()
+            else { return }
+            sessionID = registered
+        }
+
+        guard !sessionID.isEmpty,
+              sessionID.utf8.count <= 128,
+              await gateway.ownsSession(AcpSessionId(sessionID))
+        else { return }
+
+        if fields["suggestions"] != nil, fields["suggestions"]?.arrayValue == nil {
+            return
+        }
+        let rawSuggestions = fields["suggestions"]?.arrayValue ?? []
+        var boundedSuggestions: [JSONValue] = []
+        for suggestion in rawSuggestions.prefix(6) {
+            guard let suggestionFields = suggestion.objectValue else { return }
+            if suggestionFields["label"] != nil,
+               suggestionFields["label"]?.stringValue == nil {
+                return
+            }
+            let label = suggestionFields["label"]?.stringValue ?? ""
+            guard label.utf8.count <= 16_384 else { return }
+            boundedSuggestions.append(.object([
+                "label": .string(label),
+            ]))
+        }
+
+        var boundedFields: [String: JSONValue] = [
+            "response_id": .string(responseID),
+            "suggestions": .array(boundedSuggestions),
+            "sessionId": .string(sessionID),
+        ]
+        if fields["promptId"] != nil, fields["promptId"]?.stringValue == nil {
+            return
+        }
+        if let promptID = fields["promptId"]?.stringValue {
+            guard promptID.utf8.count <= 128 else { return }
+            boundedFields["promptId"] = .string(promptID)
+        }
+        await LiveFollowUpSuggestionRelay.shared.publish(
+            sessionID: sessionID,
+            params: .object(boundedFields)
+        )
     }
 }
 

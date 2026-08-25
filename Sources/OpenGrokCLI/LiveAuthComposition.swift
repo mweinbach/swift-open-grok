@@ -662,12 +662,13 @@ public enum LiveAuthComposition {
             policy: config.forceLoginTeamUUID,
             actual: peekAccessTokenPrincipalID(auth.key)
         )
-        try await loginXAIWithSession(
+        return try await loginXAIWithSession(
             manager: manager,
             auth: auth,
-            policy: config.forceLoginTeamUUID
+            policy: config.forceLoginTeamUUID,
+            environment: environment,
+            transport: transport
         )
-        return auth
     }
 
     /// Positional argument, then environment, then an interactive prompt.

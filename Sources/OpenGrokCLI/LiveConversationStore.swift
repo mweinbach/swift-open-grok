@@ -1271,6 +1271,7 @@ struct LiveAgentToolPolicy: Sendable, Equatable {
             // starts an arbitrary command, so it is exactly as execute-
             // shaped as `run_terminal_cmd`.
             return liveToolName != "run_terminal_cmd"
+                && liveToolName != "run_terminal_command"
                 && liveToolName != LiveMonitorTools.toolName
         case .execute, .all:
             return true
@@ -1278,8 +1279,8 @@ struct LiveAgentToolPolicy: Sendable, Equatable {
     }
 
     private static func aliases(for liveToolName: String) -> Set<String> {
-        if liveToolName == "run_terminal_cmd" {
-            return [liveToolName, "run_terminal_command"]
+        if liveToolName == "run_terminal_cmd" || liveToolName == "run_terminal_command" {
+            return ["run_terminal_cmd", "run_terminal_command"]
         }
         // The live surface advertises upstream's production names
         // (`xai-grok-agent/src/config.rs:161-173`); permission rules may still
@@ -1883,7 +1884,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             yoloMode = false
         }
         await conversationHistory.beginEventTurn(modelID: context.modelID, yoloMode: yoloMode)
-        await interjections.beginTurn()
+        await interjections.beginTurn(sessionID: context.sessionID)
         do {
             let result = try await sampleTurn(context: context, request: request, emit: emit)
             if result.stopReason == "max_turns_reached" {
@@ -2331,6 +2332,29 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
 
                 guard !response.toolCalls.isEmpty else {
                     try Task.checkCancellation()
+                    if let goal = toolExecutor.sessionServices?.goal {
+                        let usage = await conversationHistory.usageSnapshot
+                        let tokens = Int64(exactly: usage?.totals.totalTokens ?? 0) ?? .max
+                        switch await goal.runGoalRoundEnd(
+                            assistantText: response.output,
+                            promptID: request.promptID,
+                            currentTokens: tokens,
+                            assistantMadeToolCall: false,
+                            backingTaskCount: 0
+                        ) {
+                        case .continuePursuit(let directive):
+                            items.append(.autoContinue(directive))
+                            try await conversationHistory.commit(
+                                sessionID: context.sessionID,
+                                items: items
+                            )
+                            continue
+                        case .failed(let message):
+                            throw CLIApplicationError.failed(message)
+                        case .completed, .paused, .budgetLimited, .idle:
+                            break
+                        }
+                    }
                     if stopHookContinuations < 8 {
                         let stopResult = await toolExecutor.runStop(
                             promptID: request.promptID,
@@ -2535,16 +2559,11 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
     /// `syntheticReason: .interjection` so compaction, replay, and analytics
     /// see the steering text as its own user turn.
     ///
-    /// Deliberately narrower than upstream, both recorded divergences:
-    /// upstream's image-placeholder sanitizer (interjection.rs:304-305) has
-    /// nothing to strip here — this port's interjection path carries no
-    /// image placeholders — and the `<skill_information>` expansion for
-    /// `/skill` interjections (interjection.rs:239-279) is unported, so a
-    /// slash-prefixed interjection reaches the model as bare text.
+    /// Image blocks remain attached to their originating interjection and
+    /// pass through the current model's multimodal capability gate. Skill
+    /// expansion for `/skill` interjections remains unported.
     private func drainPendingInterjections() async -> [ConversationItem] {
-        await interjections.drainAll().map { entry in
-            .interjection(formatInterjection(entry.text))
-        }
+        await interjections.drainConversationItems(modelID: await modelSwitch.snapshot().modelID)
     }
 
     /// Keep the prompt under the model's context window, reporting what it did.

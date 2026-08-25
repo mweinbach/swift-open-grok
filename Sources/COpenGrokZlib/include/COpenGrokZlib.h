@@ -20,6 +20,19 @@ int open_grok_zlib_uncompress(
     const uint8_t *source,
     size_t source_length
 );
+int open_grok_zlib_inflater_is_available(void);
+void *open_grok_zlib_inflater_create(
+    const uint8_t *source,
+    size_t source_length,
+    int raw
+);
+int open_grok_zlib_inflater_step(
+    void *inflater,
+    uint8_t *destination,
+    size_t *destination_length
+);
+size_t open_grok_zlib_inflater_remaining_input(void *inflater);
+void open_grok_zlib_inflater_destroy(void *inflater);
 #else
 #include <zlib.h>
 #endif

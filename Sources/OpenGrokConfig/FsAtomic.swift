@@ -80,7 +80,34 @@ public func writeAtomically(
 
     // Rename temp → final (atomic on the same filesystem).
     do {
+        #if canImport(Darwin)
+        if mode != nil {
+            // Foundation's replacement preserves the old destination mode,
+            // which would publish new private contents through an existing
+            // world-readable config. Same-directory rename keeps the secured
+            // temporary inode and its explicit mode as one atomic operation.
+            let status = tmp.path.withCString { source in
+                finalPath.path.withCString { destination in
+                    rename(source, destination)
+                }
+            }
+            guard status == 0 else {
+                let code = errno
+                throw NSError(
+                    domain: NSPOSIXErrorDomain,
+                    code: Int(code),
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "rename failed: " + String(cString: strerror(code)),
+                    ]
+                )
+            }
+        } else {
+            try atomicallyReplaceItem(at: finalPath, with: tmp)
+        }
+        #else
         try atomicallyReplaceItem(at: finalPath, with: tmp)
+        #endif
     } catch {
         try? FileManager.default.removeItem(at: tmp)
         throw error

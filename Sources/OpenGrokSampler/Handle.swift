@@ -148,6 +148,24 @@ public final class SamplerHandle: @unchecked Sendable {
         ))
     }
 
+    /// Submit with the session-owned sticky-routing cell for this logical turn.
+    ///
+    /// A fresh actor per request must not silently replace the cell shared by
+    /// compaction and later tool-follow-up requests in the same Codex turn.
+    public func submit(
+        requestId: RequestId,
+        request: ConversationRequest,
+        codexTurnState: CodexTurnStateCell
+    ) {
+        commandBox.send(.submit(
+            requestId: requestId,
+            request: request,
+            config: nil,
+            codexTurnState: codexTurnState,
+            completion: nil
+        ))
+    }
+
     /// Submit with an explicit per-request config override.
     public func submitWithConfig(
         requestId: RequestId,
@@ -166,6 +184,11 @@ public final class SamplerHandle: @unchecked Sendable {
     /// Cancel an in-flight request. No-op if unknown.
     public func cancel(requestId: RequestId) {
         commandBox.send(.cancel(requestId: requestId))
+    }
+
+    /// Cancel active requests and finish the actor's sole event stream.
+    public func shutdown() {
+        commandBox.send(.shutdown)
     }
 
     /// Update the default sampling config.
@@ -197,6 +220,19 @@ public final class SamplerHandle: @unchecked Sendable {
         requestId: RequestId,
         request: ConversationRequest
     ) async -> Result<(ConversationResponse, InferenceLatencyStats), SamplingError> {
+        await submitAndCollect(
+            requestId: requestId,
+            request: request,
+            codexTurnState: codexTurnState.snapshot()
+        )
+    }
+
+    /// Collect a request while preserving an explicitly session-owned turn cell.
+    public func submitAndCollect(
+        requestId: RequestId,
+        request: ConversationRequest,
+        codexTurnState: CodexTurnStateCell
+    ) async -> Result<(ConversationResponse, InferenceLatencyStats), SamplingError> {
         let box = CompletionBox()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { cont in
@@ -205,7 +241,7 @@ public final class SamplerHandle: @unchecked Sendable {
                     requestId: requestId,
                     request: request,
                     config: nil,
-                    codexTurnState: codexTurnState.snapshot(),
+                    codexTurnState: codexTurnState,
                     completion: box
                 ))
             }

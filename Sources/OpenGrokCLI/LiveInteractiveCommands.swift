@@ -204,7 +204,8 @@ extension LiveInteractiveControllerRenderer {
         host: LiveTUISuspendHost,
         program: String,
         arguments: [String],
-        suspendFailPrefix: String
+        suspendFailPrefix: String,
+        childRunner: (@Sendable (String, [String], [String: String]) async -> (any Error)?)? = nil
     ) async throws -> SuspendedChildOutcome {
         localMotionHold = true
         // Suspend clears scrollbar drag the same way it cancels the scroll
@@ -254,11 +255,16 @@ extension LiveInteractiveControllerRenderer {
             return .suspendFailed
         }
 
-        let launchError = await LiveTUISuspendHost.runChild(
-            program: program,
-            arguments: arguments,
-            environment: host.environment
-        )
+        let launchError: (any Error)?
+        if let childRunner {
+            launchError = await childRunner(program, arguments, host.environment)
+        } else {
+            launchError = await LiveTUISuspendHost.runChild(
+                program: program,
+                arguments: arguments,
+                environment: host.environment
+            )
+        }
         do {
             try frontendResumeFromChild()
             try await suspension.end()

@@ -74,9 +74,11 @@ struct LiveUnhonoredLaunchFlagTests {
         #expect(!policy.allows(liveToolName: "ask_user_question"))
     }
 
-    @Test("--todo-gate is refused before launch")
+    @Test("--todo-gate reaches its live runtime rather than unsupported-flag refusal")
     func todoGate() async {
-        await expectRefusal(extraArguments: ["--todo-gate"], flag: "--todo-gate")
+        let (code, _, error) = await run(["--todo-gate"])
+        #expect(code != CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(!error.contains("nothing in this composition honors yet"))
     }
 
     @Test("--compaction-mode is refused before launch")

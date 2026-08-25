@@ -105,6 +105,11 @@ enum LiveStandaloneWebSearchComposition {
             codexMultiAgentV2: configuration.tuning.codexMultiAgentV2,
             codexPermissions: configuration.codexPermissions,
             doomLoopRecovery: configuration.doomLoopRecovery,
+            attributionCallback: configuration.attributionCallback
+                ?? LiveSamplingAuth401Attribution(
+                    resolver: resolver,
+                    staticBearer: configuration.apiKey
+                ),
             bearerResolver: resolver
         )
         return try SamplerStandaloneWebSearchBackend(

@@ -136,6 +136,13 @@ public final class FinalizedToolset: @unchecked Sendable {
             return .failure(toolNotFound(clientName, detail: "tool not nested-callable: \(clientName)"))
         }
 
+        let toolCallID: ToolCallId
+        do {
+            toolCallID = try ToolCallId(callId)
+        } catch {
+            return .failure(.invalidArguments("invalid tool call identifier: \(error)"))
+        }
+
         // MCP historically accepts null/bare arguments and wraps them into a
         // request object; normalize that compatibility shape before parsing.
         let clientArguments = normalizeClientArguments(args, for: tool)
@@ -172,7 +179,8 @@ public final class FinalizedToolset: @unchecked Sendable {
                 access: access,
                 toolName: clientName,
                 toolCallId: callId,
-                applyPatchLabel: applyPatchLabel
+                applyPatchLabel: applyPatchLabel,
+                sessionID: resources.authorizationSessionID
             )
         )
         if !prepared.mayDispatch {
@@ -195,7 +203,7 @@ public final class FinalizedToolset: @unchecked Sendable {
             return .failure(.notImplemented("no handler registered for \(tool.qualifiedId)"))
         }
 
-        var ctx = ToolCallContext()
+        var ctx = ToolCallContext(callId: toolCallID)
         ctx.insert(Cwd(resources.cwd))
         if let version = tool.contractVersion {
             ctx.insert(BehaviorVersion(version))

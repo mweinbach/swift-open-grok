@@ -38,6 +38,8 @@ public final class PagerTerminalRenderer {
 
     public var isStarted: Bool { started }
     public var isRestored: Bool { restorationAttempted }
+    /// Screen cells from the last successful terminal paint, never a folded frame.
+    public private(set) var lastFollowUpSuggestionChips: [PagerFollowUpSuggestionChip] = []
 
     public func start() throws {
         guard !started else { return }
@@ -147,6 +149,7 @@ public final class PagerTerminalRenderer {
         // must be a full repaint rather than a diff against a screen state we
         // can no longer vouch for (event_loop.rs:717-721).
         previousFrame = nil
+        lastFollowUpSuggestionChips.removeAll(keepingCapacity: false)
     }
 
     /// Re-enter the modes `suspendToChild` recorded, in `start()`'s order —
@@ -322,9 +325,17 @@ public final class PagerTerminalRenderer {
                 synchronized: synchronized
             )
             previousFrame = projected
+            lastFollowUpSuggestionChips = result.layout.followUpSuggestionChips.filter { chip in
+                projected.buffer.area.contains(x: chip.frame.x, y: chip.frame.y)
+                    && projected.buffer.area.contains(
+                        x: chip.frame.right - 1,
+                        y: chip.frame.y
+                    )
+            }
             pendingResize = false
         } catch {
             previousFrame = nil
+            lastFollowUpSuggestionChips.removeAll(keepingCapacity: false)
             throw error
         }
 
@@ -369,6 +380,7 @@ public final class PagerTerminalRenderer {
     public func restore() throws {
         guard !restorationAttempted else { return }
         restorationAttempted = true
+        lastFollowUpSuggestionChips.removeAll(keepingCapacity: false)
         guard started else { return }
         // Restoring mid-suspension still latches; the mode flags are already
         // false (suspendToChild undid them), so the writes below skip the

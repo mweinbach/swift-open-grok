@@ -195,6 +195,12 @@ extension LiveInteractiveControllerRenderer {
                 contextBarHovered = overContext
                 try renderState()
             }
+            let hoveredFollowUp = overlays.isActive
+                ? nil
+                : followUpSuggestionChip(atX: event.x, y: event.y)?.index
+            if liveFollowUpSuggestions.updateHover(hoveredFollowUp) {
+                try renderState()
+            }
             // Hover moves the welcome menu highlight — upstream's
             // `MouseEventKind::Moved` arm (`app/app_view.rs:4428-4443` at pin
             // 650c1db7): the selection becomes the row under the pointer, or
@@ -335,6 +341,20 @@ extension LiveInteractiveControllerRenderer {
             pendingLinkClick = nil
             clearTextSelectionLatches()
             pendingScrollbackClick = nil
+        }
+        if hit == nil, !overlays.isActive,
+           let chip = followUpSuggestionChip(atX: event.x, y: event.y),
+           let suggestion = liveFollowUpSuggestions.takePrompt(
+               for: chip,
+               activeSessionID: sessionID
+           )
+        {
+            pendingScrollbackClick = nil
+            pendingLinkClick = nil
+            clearScrollbarDragLatch()
+            clearTextSelectionLatches()
+            try renderState()
+            return .dispatchPrompt(sessionID: sessionID, prompt: suggestion)
         }
         // Toast slot is a frame occluder (`layout.toastOccluder`): swallow
         // before transcript/composer so a click cannot select or focus

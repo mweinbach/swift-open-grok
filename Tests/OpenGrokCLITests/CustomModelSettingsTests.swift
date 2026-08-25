@@ -123,7 +123,7 @@ struct CustomModelSettingsTests {
         }
     }
 
-    @Test("Save custom model writes to custom_models.json and clears draft")
+    @Test("Save custom model writes canonical config.toml and clears draft")
     func saveCustomModelPersistence() throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(
             "custom-models-save-test-\(UUID().uuidString)",
@@ -158,6 +158,14 @@ struct CustomModelSettingsTests {
         #expect(loaded.count == 1)
         #expect(loaded.first?.key == "wafer:custom-model")
         #expect(loaded.first?.modelId == "wafer-v1")
+        let configuration = try String(
+            contentsOf: tempDir.appendingPathComponent("config.toml"),
+            encoding: .utf8
+        )
+        #expect(configuration.contains("wafer:custom-model"))
+        #expect(!FileManager.default.fileExists(
+            atPath: tempDir.appendingPathComponent("custom_models.json").path
+        ))
 
         // Saving another model appends to the list
         store.updateDraft(key: "custom_model_id", value: .string("zai:extra"))
@@ -170,7 +178,7 @@ struct CustomModelSettingsTests {
         #expect(updatedList.map(\.key).sorted() == ["wafer:custom-model", "zai:extra"])
     }
 
-    @Test("Delete custom model removes from custom_models.json")
+    @Test("Delete custom model removes its canonical config.toml entry")
     func deleteCustomModel() throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(
             "custom-models-delete-test-\(UUID().uuidString)",
