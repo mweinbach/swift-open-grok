@@ -65,6 +65,24 @@ private struct MCPOAuthCredentialPollSnapshot: Sendable {
     }
 }
 
+private enum MCPOAuthBlockingWorker {
+    static func run<Value: Sendable>(
+        _ operation: @escaping @Sendable () throws -> Value
+    ) async throws -> Value {
+        try await withCheckedThrowingContinuation { continuation in
+            let worker = Thread {
+                do {
+                    continuation.resume(returning: try operation())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+            worker.name = "opengrok-mcp-oauth"
+            worker.start()
+        }
+    }
+}
+
 func mcpParseOAuthCallbackParams(
     _ params: [String: String]
 ) -> Result<MCPOAuthCallbackPayload, MCPOAuthFlowError> {
@@ -159,12 +177,8 @@ final class MCPOAuthLoopbackListener: @unchecked Sendable {
             throw MCPOAuthFlowError("Failed to bind loopback port 0: listener is closed")
         }
         let timeout = timeoutSeconds
-        return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(with: Result {
-                    try Self.serveUntilCallback(fd: sFd, timeoutSeconds: timeout)
-                })
-            }
+        return try await MCPOAuthBlockingWorker.run {
+            try Self.serveUntilCallback(fd: sFd, timeoutSeconds: timeout)
         }
     }
 
@@ -183,20 +197,13 @@ final class MCPOAuthLoopbackListener: @unchecked Sendable {
         }
         let timeout = timeoutSeconds
         let interval = max(0.001, credentialPollIntervalSeconds)
-        return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    let completion = try Self.serveUntilCallbackOrCredential(
-                        fd: sFd,
-                        timeoutSeconds: timeout,
-                        credentialPollIntervalSeconds: interval,
-                        credentialPollSnapshot: credentialPollSnapshot
-                    )
-                    continuation.resume(returning: completion)
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
+        return try await MCPOAuthBlockingWorker.run {
+            try Self.serveUntilCallbackOrCredential(
+                fd: sFd,
+                timeoutSeconds: timeout,
+                credentialPollIntervalSeconds: interval,
+                credentialPollSnapshot: credentialPollSnapshot
+            )
         }
     }
 

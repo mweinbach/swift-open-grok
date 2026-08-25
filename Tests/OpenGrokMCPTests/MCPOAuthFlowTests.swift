@@ -727,6 +727,59 @@ struct MCPOAuthBrowserFlowTests {
         #expect(stored?.tokenResponse?.refreshToken == "rt-disk-flow")
     }
 
+    @Test("independent credential-store pollers finish on dedicated blocking workers")
+    func concurrentCredentialPollingWorkers() async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for index in 0..<6 {
+                group.addTask {
+                    let serverName = "concurrent-disk-flow-\(index)"
+                    let expectedToken = "at-\(serverName)"
+                    let home = try makeHome()
+                    defer { try? FileManager.default.removeItem(at: home) }
+                    let writeFailure = LockedBox<String?>(nil)
+
+                    try await mcpAuthenticateServer(
+                        serverName: serverName,
+                        serverURL: serverURL,
+                        home: home,
+                        transport: scriptedAuthServer { _ in emptyResponse(500) },
+                        byoConfig: nil,
+                        force: true,
+                        openBrowser: { _ in
+                            do {
+                                try MCPCredentialStore.insertAndSave(
+                                    home: home,
+                                    serverName: serverName,
+                                    serverURL: serverURL,
+                                    credentials: MCPStoredCredentials(
+                                        clientId: "dcr-client-1",
+                                        tokenResponse: MCPOAuthTokenResponse(
+                                            accessToken: expectedToken
+                                        )
+                                    )
+                                )
+                            } catch {
+                                writeFailure.mutate { $0 = String(describing: error) }
+                            }
+                        },
+                        timeoutSeconds: 2,
+                        credentialPollIntervalSeconds: 0.01,
+                        singleFlight: MCPOAuthSingleFlight()
+                    )
+
+                    #expect(writeFailure.value == nil)
+                    let stored = try MCPFileCredentialStorage(
+                        home: home,
+                        serverName: serverName,
+                        serverURL: serverURL
+                    ).load()
+                    #expect(stored?.tokenResponse?.accessToken == expectedToken)
+                }
+            }
+            try await group.waitForAll()
+        }
+    }
+
     @Test("a stray probe does not consume the wait; POST /callback is decisive")
     func listenerRouting() async throws {
         let listener = try MCPOAuthLoopbackListener(port: 0)
