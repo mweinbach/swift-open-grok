@@ -27,7 +27,16 @@ enum WindowsSessionDirectoryTraversal {
             guard let metadata = try WindowsSecurePath.metadata(at: ancestor) else {
                 return false
             }
-            guard metadata.isDirectory, !metadata.isReparsePoint else {
+            guard !metadata.isReparsePoint else {
+                throw failure(path: ancestor, reason: "session storage requires a real private directory")
+            }
+            guard metadata.isDirectory else {
+                // Legacy JSON descriptors share sessions/ with workspace
+                // directories; enumeration must skip the former, while a file
+                // replacing the state root or an ancestor still fails closed.
+                if pathsMatch(ancestor, target), !pathsMatch(target, root) {
+                    return false
+                }
                 throw failure(path: ancestor, reason: "session storage requires a real private directory")
             }
             let native = try WindowsSecurePath.extendedLengthPath(ancestor.path)

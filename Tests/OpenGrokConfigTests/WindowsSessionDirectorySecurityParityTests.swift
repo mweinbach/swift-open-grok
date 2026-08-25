@@ -68,7 +68,11 @@ struct WindowsSessionDirectorySecurityParityTests {
 
         let resolved = grokHome(environment: ["OPENGROK_HOME": state.path])
 
-        #expect(resolved.standardizedFileURL == state.standardizedFileURL)
+        #expect(
+            resolved.standardizedFileURL.path.caseInsensitiveCompare(
+                state.standardizedFileURL.path
+            ) == .orderedSame
+        )
         #expect(fixture.isPrivateDirectory(state))
         let inherited = state.appendingPathComponent("config.toml")
         try Data("private = true\n".utf8).write(to: inherited)
@@ -205,7 +209,11 @@ struct WindowsSessionDirectorySecurityParityTests {
             environment: ["OPENGROK_HOME": state.path]
         )
 
-        #expect(resolved.standardizedFileURL == state.standardizedFileURL)
+        #expect(
+            resolved.standardizedFileURL.path.caseInsensitiveCompare(
+                state.standardizedFileURL.path
+            ) == .orderedSame
+        )
         #expect(fixture.isPrivateDirectory(state))
         #expect(fixture.isPrivateDirectory(session))
         #expect(try fixture.directoryDACL(confusingAncestor) == ancestorBefore)
