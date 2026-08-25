@@ -65,7 +65,7 @@ struct WindowsWebSocketParityTests {
         }
     }
 
-    @Test("native upgrade preserves relay headers and exchanges text and binary", .timeLimit(.minutes(1)))
+    @Test("native upgrade applies set-only keepalive and exchanges authenticated text and binary", .timeLimit(.minutes(1)))
     func nativeClientExchangesTextAndBinary() async throws {
         let server = WebSocketServer(
             configuration: WebSocketServerConfiguration(
