@@ -619,8 +619,26 @@ public func revalidateHookWriteDenyPlan(_ plan: HookWriteDenyPlan) throws {
 func verifyHookWriteDenyEnforced(_ sources: [HookWriteDenySource]) throws {
     let plan = try buildHookWriteDenyPlan(sources: sources, writableRoots: [])
     for identity in plan.leaves {
+        let flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+            | (identity.isDirectory ? O_DIRECTORY : 0)
+        let descriptor = identity.path.path.withCString { open($0, flags) }
+        guard descriptor >= 0 else { throw hookIOError(identity.path) }
+        defer { _ = close(descriptor) }
+
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0 else {
+            throw hookIOError(identity.path)
+        }
+        guard UInt64(metadata.st_dev) == identity.device,
+              UInt64(metadata.st_ino) == identity.inode,
+              (hookFileType(metadata) == mode_t(S_IFDIR)) == identity.isDirectory,
+              identity.isDirectory || UInt64(metadata.st_nlink) == identity.linkCount
+        else {
+            throw HookWriteDenyError.identityChanged(identity.path)
+        }
+
         var information = statvfs()
-        guard identity.path.path.withCString({ Glibc.statvfs($0, &information) }) == 0 else {
+        guard fstatvfs(descriptor, &information) == 0 else {
             throw hookIOError(identity.path)
         }
         // Linux ST_RDONLY is the POSIX bit 0x1. An inode mode check cannot
