@@ -150,11 +150,8 @@ public actor WindowsWebSocketClient: WebSocketClient {
                 reason: "WebSocket maximum message size is outside the supported range"
             )
         }
-        guard !url.isSecure || extraRootCertificates.isEmpty else {
-            throw WebSocketDialError.unsupportedPlatform(
-                "WinHTTP cannot safely install configured additional TLS trust roots"
-            )
-        }
+        // Rust applies enterprise roots to HTTP clients, not WebSocket dialers
+        // (relay.rs:433); Schannel must retain its unmodified system trust.
         guard !url.host.isEmpty,
               url.host.utf8.allSatisfy({ (33...126).contains($0) }),
               url.target.hasPrefix("/"),

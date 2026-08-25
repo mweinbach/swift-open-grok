@@ -46,22 +46,25 @@ struct WindowsWebSocketParityTests {
         }
     }
 
-    @Test("unsupported enterprise TLS roots fail closed")
-    func unsupportedEnterpriseRootsAreRejected() async throws {
+    @Test("enterprise HTTP roots do not disable strict native WebSocket dialing", .timeLimit(.minutes(1)))
+    func enterpriseHTTPRootsDoNotDisableNativeDialing() async throws {
         let endpoint = try WebSocketURL.parse("wss://127.0.0.1:1/ws")
-        do {
-            _ = try await WindowsWebSocketClient.connect(
-                to: endpoint,
-                options: WebSocketDialOptions(connectTimeoutSeconds: 1),
-                extraRootCertificates: [Data([0x30, 0x01, 0x00])]
-            )
-            Issue.record("configured TLS roots unexpectedly bypassed the Windows trust boundary")
-        } catch let error as WebSocketDialError {
-            guard case .unsupportedPlatform(let detail) = error else {
-                Issue.record("expected unsupportedPlatform, got \(error)")
-                return
+        for root in [Data([0x30, 0x01, 0x00]), Data("not-a-certificate".utf8)] {
+            do {
+                _ = try await WindowsWebSocketClient.connect(
+                    to: endpoint,
+                    options: WebSocketDialOptions(connectTimeoutSeconds: 1),
+                    extraRootCertificates: [root]
+                )
+                Issue.record("an unreachable secure WebSocket unexpectedly connected")
+            } catch let error as WebSocketDialError {
+                switch error {
+                case .connectionFailed(let url, _), .connectTimeout(_, let url):
+                    #expect(url == endpoint.absoluteString)
+                case .unsupportedPlatform(let detail):
+                    Issue.record("enterprise HTTP roots incorrectly disabled native dialing: \(detail)")
+                }
             }
-            #expect(detail.contains("additional TLS trust roots"))
         }
     }
 
@@ -119,7 +122,7 @@ struct WindowsWebSocketParityTests {
                 ],
                 connectTimeoutSeconds: 5
             ),
-            extraRootCertificates: []
+            extraRootCertificates: [Data([0x30, 0x01, 0x00])]
         )
 
         try await client.send(.text("hello"))
@@ -228,7 +231,7 @@ struct WindowsWebSocketParityTests {
             _ = try await WindowsWebSocketClient.connect(
                 to: endpoint,
                 options: WebSocketDialOptions(connectTimeoutSeconds: 2),
-                extraRootCertificates: []
+                extraRootCertificates: [Data("not-a-certificate".utf8)]
             )
         }
     }
