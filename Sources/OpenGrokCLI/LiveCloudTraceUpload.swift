@@ -1,5 +1,6 @@
 import Foundation
 import OpenGrokConfig
+import OpenGrokFileUtils
 import OpenGrokHTTP
 import OpenGrokShared
 
@@ -32,9 +33,9 @@ enum LiveCloudTraceUpload {
         var message: String {
             switch self {
             case .unsupportedCredentialSource:
-                return "Direct S3 trace upload cannot safely use configured inline or file AWS credentials."
+                return "Direct S3 trace upload only supports environment or private static AWS shared-profile credentials."
             case .missingCredentials:
-                return "Direct S3 trace upload requires scoped AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY credentials."
+                return "Direct S3 trace upload requires scoped AWS credentials from the environment or a private shared profile."
             case .invalidCredentials:
                 return "Direct S3 trace upload rejected malformed AWS credentials."
             case .invalidBucket:
@@ -53,8 +54,31 @@ enum LiveCloudTraceUpload {
 
     static let maximumArchiveBytes = 8 * 1024 * 1024
 
+    private static let maximumCredentialFileBytes = 64 * 1024
     private static let requestTimeout: TimeInterval = 60
     private static let hexadecimalDigits = Array("0123456789ABCDEF".utf8)
+    private static let unsupportedCredentialEnvironmentKeys: Set<String> = [
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+        "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+        "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE",
+    ]
+    private static let unsupportedCredentialProfileKeys: Set<String> = [
+        "credential_process",
+        "credential_source",
+        "role_arn",
+        "source_profile",
+        "web_identity_token_file",
+        "sso_session",
+        "sso_start_url",
+        "sso_region",
+        "sso_account_id",
+        "sso_role_name",
+    ]
 
     static func authorize(
         sessionID: String,
@@ -76,13 +100,10 @@ enum LiveCloudTraceUpload {
             throw Failure.unsupportedCredentialSource
         }
 
-        guard let accessKeyID = environment["AWS_ACCESS_KEY_ID"], !accessKeyID.isEmpty,
-              let secretAccessKey = environment["AWS_SECRET_ACCESS_KEY"], !secretAccessKey.isEmpty
-        else {
-            throw Failure.missingCredentials
-        }
-
-        let sessionToken = environment["AWS_SESSION_TOKEN"]
+        let credentials = try resolveCredentials(environment: environment)
+        let accessKeyID = credentials.accessKeyID
+        let secretAccessKey = credentials.secretAccessKey
+        let sessionToken = credentials.sessionToken
         guard isValidAccessKeyID(accessKeyID),
               isValidCredential(secretAccessKey),
               sessionToken.map(isValidCredential) ?? true
@@ -133,6 +154,258 @@ enum LiveCloudTraceUpload {
             secretAccessKey: secretAccessKey,
             sessionToken: sessionToken
         )
+    }
+
+    /// The pinned AWS SDK tries environment credentials before shared static
+    /// profiles. Later providers execute commands or contact metadata services;
+    /// stopping at the shared-file boundary keeps their authority unavailable.
+    private static func resolveCredentials(
+        environment: [String: String]
+    ) throws -> (accessKeyID: String, secretAccessKey: String, sessionToken: String?) {
+        let environmentKey = environment["AWS_ACCESS_KEY_ID"]
+        let environmentSecret = environment["AWS_SECRET_ACCESS_KEY"]
+        if environmentKey != nil || environmentSecret != nil || environment["AWS_SESSION_TOKEN"] != nil {
+            guard let environmentKey, !environmentKey.isEmpty,
+                  let environmentSecret, !environmentSecret.isEmpty
+            else {
+                throw Failure.missingCredentials
+            }
+            return (environmentKey, environmentSecret, environment["AWS_SESSION_TOKEN"])
+        }
+
+        if unsupportedCredentialEnvironmentKeys.contains(where: {
+            configured(environment[$0]) != nil
+        }) {
+            throw Failure.unsupportedCredentialSource
+        }
+
+        let profile = configured(environment["AWS_PROFILE"])
+            ?? configured(environment["AWS_DEFAULT_PROFILE"])
+            ?? "default"
+        guard isValidProfile(profile) else {
+            throw Failure.invalidCredentials
+        }
+        try rejectDynamicSharedConfiguration(profile: profile, environment: environment)
+
+        let credentialPath: String
+        if let configuredPath = configured(environment["AWS_SHARED_CREDENTIALS_FILE"]) {
+            if configuredPath.hasPrefix("~/") || configuredPath.hasPrefix("~\\") {
+                let home = try sharedCredentialHome(environment: environment)
+                let relativePath = String(configuredPath.dropFirst(2))
+                do {
+                    try PathSecurity.rejectHostileLexical(relativePath)
+                } catch {
+                    throw Failure.invalidCredentials
+                }
+                credentialPath = URL(fileURLWithPath: home, isDirectory: true)
+                    .appendingPathComponent(relativePath, isDirectory: false)
+                    .path
+            } else {
+                credentialPath = configuredPath
+            }
+        } else if let home = configured(environment["HOME"])
+            ?? configured(environment["USERPROFILE"])
+        {
+            guard (home as NSString).isAbsolutePath else {
+                throw Failure.invalidCredentials
+            }
+            do {
+                try PathSecurity.rejectHostileLexical(home)
+            } catch {
+                throw Failure.invalidCredentials
+            }
+            credentialPath = URL(fileURLWithPath: home, isDirectory: true)
+                .appendingPathComponent(".aws", isDirectory: true)
+                .appendingPathComponent("credentials", isDirectory: false)
+                .path
+        } else {
+            throw Failure.missingCredentials
+        }
+
+        guard (credentialPath as NSString).isAbsolutePath else {
+            throw Failure.invalidCredentials
+        }
+
+        let bytes: Data
+        do {
+            try PathSecurity.rejectHostileLexical(credentialPath)
+            bytes = try PathSecurity.readNoFollow(
+                URL(fileURLWithPath: credentialPath),
+                maximumBytes: maximumCredentialFileBytes,
+                requireOwnerOnly: true
+            )
+        } catch let error as FileUtilsError {
+            if case .notFound = error {
+                throw Failure.missingCredentials
+            }
+            throw Failure.invalidCredentials
+        } catch {
+            throw Failure.invalidCredentials
+        }
+
+        guard let content = String(data: bytes, encoding: .utf8) else {
+            throw Failure.invalidCredentials
+        }
+        return try parseSharedCredentials(content, profile: profile)
+    }
+
+    private static func sharedCredentialHome(environment: [String: String]) throws -> String {
+        guard let home = configured(environment["HOME"])
+            ?? configured(environment["USERPROFILE"]),
+            (home as NSString).isAbsolutePath
+        else {
+            throw Failure.invalidCredentials
+        }
+        do {
+            try PathSecurity.rejectHostileLexical(home)
+        } catch {
+            throw Failure.invalidCredentials
+        }
+        return home
+    }
+
+    private static func rejectDynamicSharedConfiguration(
+        profile: String,
+        environment: [String: String]
+    ) throws {
+        let path: String
+        if let configuredPath = configured(environment["AWS_CONFIG_FILE"]) {
+            if configuredPath.hasPrefix("~/") || configuredPath.hasPrefix("~\\") {
+                let relativePath = String(configuredPath.dropFirst(2))
+                do {
+                    try PathSecurity.rejectHostileLexical(relativePath)
+                } catch {
+                    throw Failure.invalidCredentials
+                }
+                path = URL(fileURLWithPath: try sharedCredentialHome(environment: environment), isDirectory: true)
+                    .appendingPathComponent(relativePath, isDirectory: false)
+                    .path
+            } else {
+                path = configuredPath
+            }
+        } else if configured(environment["HOME"]) != nil
+            || configured(environment["USERPROFILE"]) != nil
+        {
+            path = URL(fileURLWithPath: try sharedCredentialHome(environment: environment), isDirectory: true)
+                .appendingPathComponent(".aws", isDirectory: true)
+                .appendingPathComponent("config", isDirectory: false)
+                .path
+        } else {
+            return
+        }
+
+        guard (path as NSString).isAbsolutePath else {
+            throw Failure.invalidCredentials
+        }
+        let bytes: Data
+        do {
+            try PathSecurity.rejectHostileLexical(path)
+            bytes = try PathSecurity.readNoFollow(
+                URL(fileURLWithPath: path),
+                maximumBytes: maximumCredentialFileBytes
+            )
+        } catch let error as FileUtilsError {
+            if case .notFound = error { return }
+            throw Failure.invalidCredentials
+        } catch {
+            throw Failure.invalidCredentials
+        }
+        guard let content = String(data: bytes, encoding: .utf8) else {
+            throw Failure.invalidCredentials
+        }
+
+        var selected = false
+        for rawLine in content.split(whereSeparator: \.isNewline) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty, !line.hasPrefix("#"), !line.hasPrefix(";") else { continue }
+            if line.hasPrefix("[") {
+                guard line.hasSuffix("]") else { throw Failure.invalidCredentials }
+                let section = String(line.dropFirst().dropLast())
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                selected = section == profile || section == "profile \(profile)"
+                continue
+            }
+            guard selected, let separator = line.firstIndex(of: "=") else { continue }
+            let key = line[..<separator].trimmingCharacters(in: .whitespacesAndNewlines)
+            if unsupportedCredentialProfileKeys.contains(key) {
+                throw Failure.unsupportedCredentialSource
+            }
+        }
+    }
+
+    private static func parseSharedCredentials(
+        _ content: String,
+        profile: String
+    ) throws -> (accessKeyID: String, secretAccessKey: String, sessionToken: String?) {
+        var currentProfile: String?
+        var values: [String: String] = [:]
+        var selectedProfileFound = false
+
+        for rawLine in content.split(whereSeparator: \.isNewline) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty, !line.hasPrefix("#"), !line.hasPrefix(";") else {
+                continue
+            }
+
+            if line.hasPrefix("[") {
+                guard line.hasSuffix("]") else {
+                    throw Failure.invalidCredentials
+                }
+                currentProfile = String(line.dropFirst().dropLast())
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if currentProfile == profile {
+                    selectedProfileFound = true
+                }
+                continue
+            }
+
+            guard currentProfile == profile else { continue }
+            guard let separator = line.firstIndex(of: "=") else {
+                throw Failure.invalidCredentials
+            }
+
+            let key = line[..<separator].trimmingCharacters(in: .whitespacesAndNewlines)
+            if unsupportedCredentialProfileKeys.contains(key) {
+                throw Failure.unsupportedCredentialSource
+            }
+            guard key == "aws_access_key_id"
+                || key == "aws_secret_access_key"
+                || key == "aws_session_token"
+            else {
+                continue
+            }
+
+            let rawValue = line[line.index(after: separator)...]
+            let value = rawValue.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
+                .first?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !value.isEmpty, values.updateValue(value, forKey: key) == nil else {
+                throw Failure.invalidCredentials
+            }
+        }
+
+        guard selectedProfileFound,
+              let accessKeyID = values["aws_access_key_id"],
+              let secretAccessKey = values["aws_secret_access_key"]
+        else {
+            throw Failure.missingCredentials
+        }
+        return (accessKeyID, secretAccessKey, values["aws_session_token"])
+    }
+
+    private static func isValidProfile(_ value: String) -> Bool {
+        let bytes = Array(value.utf8)
+        guard !bytes.isEmpty, bytes.count <= 128 else { return false }
+        return bytes.allSatisfy {
+            isASCIIAlphanumeric($0)
+                || $0 == 0x2d
+                || $0 == 0x2e
+                || $0 == 0x5f
+                || $0 == 0x40
+                || $0 == 0x2b
+                || $0 == 0x3d
+                || $0 == 0x2c
+        }
     }
 
     static func request(

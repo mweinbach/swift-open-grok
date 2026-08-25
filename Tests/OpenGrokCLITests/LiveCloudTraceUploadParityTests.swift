@@ -78,6 +78,31 @@ private struct CloudTraceUploadFixture {
         return environment
     }
 
+    func sharedCredentialEnvironment(
+        overrides: [String: String] = [:]
+    ) throws -> [String: String] {
+        var environment = try self.environment()
+        environment.removeValue(forKey: "AWS_ACCESS_KEY_ID")
+        environment.removeValue(forKey: "AWS_SECRET_ACCESS_KEY")
+        environment.removeValue(forKey: "AWS_SESSION_TOKEN")
+        environment.merge(overrides) { _, override in override }
+        return environment
+    }
+
+    @discardableResult
+    func writeSharedCredentials(_ content: String, at path: URL? = nil) throws -> URL {
+        let location = path ?? root
+            .appendingPathComponent(".aws", isDirectory: true)
+            .appendingPathComponent("credentials", isDirectory: false)
+        try FileManager.default.createDirectory(
+            at: location.deletingLastPathComponent(),
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try SecureFile.write(at: location, contents: content)
+        return location
+    }
+
     @discardableResult
     func seed(
         _ sessionID: String,
@@ -230,6 +255,398 @@ struct LiveCloudTraceUploadParityTests {
         #expect(!signed.contains("PRIVATE_AWS_SECRET"))
         #expect(!signed.contains("PRIVATE_AWS_SESSION_TOKEN"))
         #expect(request.headers[xaiTokenAuthHeader] == nil)
+    }
+
+    @Test("a private default AWS profile drives a real signed upload with its temporary token")
+    func privateDefaultProfileReachesTheLiveSignedTransport() async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("shared-profile-live")
+        try fixture.writeSharedCredentials("""
+        [default]
+        aws_access_key_id = PROFILEACCESS123
+        aws_secret_access_key = PRIVATE_PROFILE_SECRET
+        aws_session_token = PRIVATE_PROFILE_SESSION_TOKEN
+        """)
+        let handler = CloudTraceRequestHandler()
+        let server = HttpServer(handler: handler, basePath: "")
+        try server.start()
+        defer { server.stop() }
+
+        let result = await fixture.run(
+            "shared-profile-live",
+            environment: try fixture.sharedCredentialEnvironment(overrides: [
+                "GROK_TRACE_UPLOAD_ENDPOINT_URL": server.baseURL,
+            ])
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.success.rawValue)
+        #expect(result.errors.isEmpty)
+        #expect(try fixture.json(result.output)["url"] as? String
+            == "s3://trace-private-bucket/shared-profile-live/trace_export.tar.gz")
+        let request = try #require(handler.requests.first)
+        #expect(handler.requests.count == 1)
+        #expect(request.authorization?.contains("Credential=PROFILEACCESS123/") == true)
+        #expect(request.header("x-amz-security-token") == "PRIVATE_PROFILE_SESSION_TOKEN")
+        #expect(request.header(xaiTokenAuthHeader) == nil)
+        for secret in ["PRIVATE_PROFILE_SECRET", "PRIVATE_PROFILE_SESSION_TOKEN"] {
+            #expect(!result.output.contains(secret))
+            #expect(!result.errors.contains(secret))
+        }
+    }
+
+    @Test(
+        "AWS_PROFILE overrides AWS_DEFAULT_PROFILE and both isolate named shared profiles",
+        arguments: ["explicit", "fallback", "explicit-wins"]
+    )
+    func sharedCredentialProfileSelectionHonorsPrecedence(_ scenario: String) throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        try fixture.writeSharedCredentials("""
+        [default]
+        aws_access_key_id = DEFAULTKEY
+        aws_secret_access_key = PRIVATE_DEFAULT_SECRET
+
+        [engineering]
+        aws_access_key_id = ENGINEERINGKEY # safe inline comment
+        aws_secret_access_key = PRIVATE_ENGINEERING_SECRET
+        aws_session_token = PRIVATE_ENGINEERING_TOKEN
+
+        [deployment]
+        aws_access_key_id = DEPLOYMENTKEY
+        aws_secret_access_key = PRIVATE_DEPLOYMENT_SECRET
+
+        [unrelated]
+        credential_process = /must/never/run
+        """)
+
+        let overrides: [String: String]
+        let expectedKey: String
+        switch scenario {
+        case "explicit":
+            overrides = ["AWS_PROFILE": "engineering"]
+            expectedKey = "ENGINEERINGKEY"
+        case "fallback":
+            overrides = ["AWS_DEFAULT_PROFILE": "deployment"]
+            expectedKey = "DEPLOYMENTKEY"
+        default:
+            overrides = ["AWS_PROFILE": "engineering", "AWS_DEFAULT_PROFILE": "deployment"]
+            expectedKey = "ENGINEERINGKEY"
+        }
+
+        let environment = try fixture.sharedCredentialEnvironment(overrides: overrides)
+        let authorization = try LiveCloudTraceUpload.authorize(
+            sessionID: "profile-selection",
+            bucketURL: "s3://trace-private-bucket",
+            document: LiveManagedSetupComposition.trustedConfigDocument(environment: environment),
+            environment: environment
+        )
+
+        #expect(authorization.accessKeyID == expectedKey)
+        #expect(authorization.sessionToken
+            == (expectedKey == "ENGINEERINGKEY" ? "PRIVATE_ENGINEERING_TOKEN" : nil))
+    }
+
+    @Test("complete environment AWS credentials take precedence over hostile shared-provider configuration")
+    func environmentCredentialsPrecedeEverySharedProvider() throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let environment = try fixture.environment(overrides: [
+            "AWS_SHARED_CREDENTIALS_FILE": "../../must-not-be-opened",
+            "AWS_PROFILE": "../must-not-be-selected",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://169.254.169.254/private",
+        ])
+
+        let authorization = try LiveCloudTraceUpload.authorize(
+            sessionID: "environment-precedence",
+            bucketURL: "s3://trace-private-bucket",
+            document: LiveManagedSetupComposition.trustedConfigDocument(environment: environment),
+            environment: environment
+        )
+
+        #expect(authorization.accessKeyID == "AKIDEXAMPLE")
+        #expect(authorization.secretAccessKey == "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+    }
+
+    @Test(
+        "AWS_SHARED_CREDENTIALS_FILE resolves absolute and tilde paths against the injected home",
+        arguments: ["absolute", "tilde"]
+    )
+    func explicitlySelectedPrivateCredentialFileIsSupported(_ scenario: String) throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let location = scenario == "absolute"
+            ? fixture.workspace.appendingPathComponent("private-cloud-credentials")
+            : fixture.root
+                .appendingPathComponent(".aws", isDirectory: true)
+                .appendingPathComponent("credentials", isDirectory: false)
+        try fixture.writeSharedCredentials("""
+        [custom]
+        aws_access_key_id = CUSTOMPROFILEKEY
+        aws_secret_access_key = PRIVATE_CUSTOM_SECRET
+        """, at: location)
+        try SecureFile.write(
+            at: fixture.root
+                .appendingPathComponent(".aws", isDirectory: true)
+                .appendingPathComponent("config", isDirectory: false),
+            contents: "[profile custom]\nregion = us-west-2\n"
+        )
+        let environment = try fixture.sharedCredentialEnvironment(overrides: [
+            "AWS_PROFILE": "custom",
+            "AWS_SHARED_CREDENTIALS_FILE": scenario == "absolute" ? location.path : "~/.aws/credentials",
+        ])
+
+        let authorization = try LiveCloudTraceUpload.authorize(
+            sessionID: "custom-profile-location",
+            bucketURL: "s3://trace-private-bucket",
+            document: LiveManagedSetupComposition.trustedConfigDocument(environment: environment),
+            environment: environment
+        )
+
+        #expect(authorization.accessKeyID == "CUSTOMPROFILEKEY")
+        #expect(authorization.secretAccessKey == "PRIVATE_CUSTOM_SECRET")
+    }
+
+    @Test("shared AWS profile parsing handles CRLF without crossing section boundaries")
+    func sharedCredentialProfilesHonorCRLFLines() throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        try fixture.writeSharedCredentials(
+            "[foreign]\r\naws_access_key_id = FOREIGNKEY\r\n"
+                + "aws_secret_access_key = PRIVATE_FOREIGN_SECRET\r\n"
+                + "[default]\r\naws_access_key_id = CRLFPROFILEKEY\r\n"
+                + "aws_secret_access_key = PRIVATE_CRLF_SECRET\r\n"
+        )
+        let environment = try fixture.sharedCredentialEnvironment()
+
+        let authorization = try LiveCloudTraceUpload.authorize(
+            sessionID: "crlf-profile",
+            bucketURL: "s3://trace-private-bucket",
+            document: LiveManagedSetupComposition.trustedConfigDocument(environment: environment),
+            environment: environment
+        )
+
+        #expect(authorization.accessKeyID == "CRLFPROFILEKEY")
+        #expect(authorization.secretAccessKey == "PRIVATE_CRLF_SECRET")
+    }
+
+    @Test(
+        "partial environment AWS credentials never mix with or downgrade to a shared profile",
+        arguments: ["access-only", "secret-only", "token-only"]
+    )
+    func partialEnvironmentCredentialsNeverFallThrough(_ scenario: String) throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        try fixture.writeSharedCredentials("""
+        [default]
+        aws_access_key_id = VALIDPROFILEKEY
+        aws_secret_access_key = PRIVATE_VALID_SECRET
+        """)
+        var environment = try fixture.sharedCredentialEnvironment()
+        switch scenario {
+        case "access-only": environment["AWS_ACCESS_KEY_ID"] = "PARTIALKEY"
+        case "secret-only": environment["AWS_SECRET_ACCESS_KEY"] = "PRIVATE_PARTIAL_SECRET"
+        default: environment["AWS_SESSION_TOKEN"] = "PRIVATE_PARTIAL_TOKEN"
+        }
+
+        #expect(throws: LiveCloudTraceUpload.Failure.missingCredentials) {
+            try LiveCloudTraceUpload.authorize(
+                sessionID: "partial-profile",
+                bucketURL: "s3://trace-private-bucket",
+                document: LiveManagedSetupComposition.trustedConfigDocument(environment: environment),
+                environment: environment
+            )
+        }
+    }
+
+    @Test(
+        "relative, traversing, oversized and invalid UTF-8 shared AWS files fail before network I/O",
+        arguments: ["relative", "traversal", "oversized", "invalid-utf8"]
+    )
+    func unsafeSharedCredentialFilesNeverReachTransport(_ scenario: String) async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("unsafe-shared-file")
+        let location = fixture.workspace.appendingPathComponent("unsafe-credentials")
+        let configuredPath: String
+        switch scenario {
+        case "relative":
+            configuredPath = "relative-credentials"
+        case "traversal":
+            configuredPath = fixture.root.path + "/../private-outside-credentials"
+        case "oversized":
+            try SecureFile.write(at: location, contents: Data(repeating: UInt8(ascii: "a"), count: 65_537))
+            configuredPath = location.path
+        default:
+            try SecureFile.write(at: location, contents: Data([0xFF, 0xFE]))
+            configuredPath = location.path
+        }
+        let transport = MockHTTPTransport()
+
+        let result = await fixture.run(
+            "unsafe-shared-file",
+            environment: try fixture.sharedCredentialEnvironment(overrides: [
+                "AWS_SHARED_CREDENTIALS_FILE": configuredPath,
+            ]),
+            services: fixture.services(transport)
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
+        #expect(result.output.isEmpty)
+        #expect(result.errors.contains("AWS"))
+        #expect(transport.recordedRequests.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fixture.archiveDirectory.path))
+    }
+
+    #if !os(Windows)
+    @Test(
+        "symlinked and group-readable shared AWS files are rejected against their pinned descriptors",
+        arguments: ["symlink", "group-readable"]
+    )
+    func sharedCredentialSymlinksAndBroadPermissionsFailClosed(_ scenario: String) async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("unsafe-profile-mode")
+        let target = fixture.workspace.appendingPathComponent("private-profile-target")
+        try fixture.writeSharedCredentials("""
+        [default]
+        aws_access_key_id = UNSAFEPROFILEKEY
+        aws_secret_access_key = PRIVATE_UNSAFE_SECRET
+        """, at: target)
+        let configuredPath: String
+        if scenario == "symlink" {
+            let link = fixture.workspace.appendingPathComponent("profile-link")
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+            configuredPath = link.path
+        } else {
+            try FileManager.default.setAttributes([.posixPermissions: 0o640], ofItemAtPath: target.path)
+            configuredPath = target.path
+        }
+        let transport = MockHTTPTransport()
+
+        let result = await fixture.run(
+            "unsafe-profile-mode",
+            environment: try fixture.sharedCredentialEnvironment(overrides: [
+                "AWS_SHARED_CREDENTIALS_FILE": configuredPath,
+            ]),
+            services: fixture.services(transport)
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
+        #expect(result.output.isEmpty)
+        #expect(!result.errors.contains("PRIVATE_UNSAFE_SECRET"))
+        #expect(transport.recordedRequests.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fixture.archiveDirectory.path))
+    }
+    #endif
+
+    @Test(
+        "AWS web identity, container and metadata providers are refused without opening their endpoints",
+        arguments: [
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_ROLE_ARN",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+        ]
+    )
+    func dynamicCredentialProvidersNeverReachTheNetwork(_ provider: String) async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("dynamic-provider")
+        try fixture.writeSharedCredentials("""
+        [default]
+        aws_access_key_id = STATICPROFILEKEY
+        aws_secret_access_key = PRIVATE_STATIC_SECRET
+        """)
+        let transport = MockHTTPTransport()
+
+        let result = await fixture.run(
+            "dynamic-provider",
+            environment: try fixture.sharedCredentialEnvironment(overrides: [
+                provider: "http://169.254.169.254/PRIVATE_METADATA_TOKEN",
+            ]),
+            services: fixture.services(transport)
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
+        #expect(result.output.isEmpty)
+        #expect(!result.errors.contains("PRIVATE_METADATA_TOKEN"))
+        #expect(transport.recordedRequests.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fixture.archiveDirectory.path))
+    }
+
+    @Test(
+        "selected AWS profiles cannot execute commands, assume roles or start SSO",
+        arguments: ["credential_process", "credential_source", "role_arn", "source_profile", "web_identity_token_file", "sso_session", "sso_start_url"]
+    )
+    func dynamicSelectedProfileProvidersFailClosed(_ provider: String) async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("dynamic-profile")
+        try fixture.writeSharedCredentials("""
+        [default]
+        aws_access_key_id = STATICPROFILEKEY
+        aws_secret_access_key = PRIVATE_STATIC_SECRET
+        \(provider) = /must/never/run/PRIVATE_PROFILE_COMMAND
+        """)
+        let transport = MockHTTPTransport()
+
+        let result = await fixture.run(
+            "dynamic-profile",
+            environment: try fixture.sharedCredentialEnvironment(),
+            services: fixture.services(transport)
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
+        #expect(result.output.isEmpty)
+        #expect(!result.errors.contains("PRIVATE_PROFILE_COMMAND"))
+        #expect(transport.recordedRequests.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fixture.archiveDirectory.path))
+    }
+
+    @Test(
+        "merged default and explicitly selected AWS config files cannot introduce hidden role providers",
+        arguments: ["default-config", "custom-config"]
+    )
+    func mergedAWSConfigCannotChangeStaticCredentialAuthority(_ scenario: String) async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("merged-dynamic-profile")
+        try fixture.writeSharedCredentials("""
+        [engineering]
+        aws_access_key_id = ENGINEERINGKEY
+        aws_secret_access_key = PRIVATE_ENGINEERING_SECRET
+        """)
+        let configuration = scenario == "default-config"
+            ? fixture.root
+                .appendingPathComponent(".aws", isDirectory: true)
+                .appendingPathComponent("config", isDirectory: false)
+            : fixture.workspace.appendingPathComponent("private-aws-config")
+        try SecureFile.write(at: configuration, contents: """
+        [profile unrelated]
+        role_arn = arn:aws:iam::111111111111:role/unrelated
+
+        [profile engineering]
+        credential_process = /must/never/run/PRIVATE_MERGED_COMMAND
+        """)
+        var overrides = ["AWS_PROFILE": "engineering"]
+        if scenario == "custom-config" {
+            overrides["AWS_CONFIG_FILE"] = configuration.path
+        }
+        let transport = MockHTTPTransport()
+
+        let result = await fixture.run(
+            "merged-dynamic-profile",
+            environment: try fixture.sharedCredentialEnvironment(overrides: overrides),
+            services: fixture.services(transport)
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
+        #expect(result.output.isEmpty)
+        #expect(!result.errors.contains("PRIVATE_MERGED_COMMAND"))
+        #expect(transport.recordedRequests.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fixture.archiveDirectory.path))
     }
 
     @Test("the real executable sends one signed path-style PUT to a real loopback listener")
