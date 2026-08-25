@@ -283,8 +283,18 @@ public struct DefaultExternalAuthProcessRunner: ExternalAuthProcessRunner, Senda
             posix_spawn_file_actions_addclose(&actions, stdoutPipe.fileHandleForWriting.fileDescriptor),
             posix_spawn_file_actions_addclose(&actions, stderrPipe.fileHandleForWriting.fileDescriptor),
         ]
+        var unblockedSignals = sigset_t()
+        var defaultSignals = sigset_t()
+        let spawnFlags = Int16(
+            POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF
+        )
         guard actionResults.allSatisfy({ $0 == 0 }),
-              posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP)) == 0,
+              sigemptyset(&unblockedSignals) == 0,
+              sigemptyset(&defaultSignals) == 0,
+              sigaddset(&defaultSignals, SIGCHLD) == 0,
+              posix_spawnattr_setsigmask(&attributes, &unblockedSignals) == 0,
+              posix_spawnattr_setsigdefault(&attributes, &defaultSignals) == 0,
+              posix_spawnattr_setflags(&attributes, spawnFlags) == 0,
               posix_spawnattr_setpgroup(&attributes, 0) == 0 else {
             return nil
         }
@@ -464,6 +474,7 @@ private final class ExternalAuthBoundedPipeCapture: @unchecked Sendable {
     private let finished = DispatchSemaphore(value: 0)
     private var buffer = Data()
     private var didOverflow = false
+    private var didFail = false
     private var reachedEnd = false
 
     init(
@@ -477,6 +488,35 @@ private final class ExternalAuthBoundedPipeCapture: @unchecked Sendable {
     }
 
     func install(on handle: FileHandle) {
+        #if canImport(Glibc)
+        // Linux Foundation can omit readabilityHandler's EOF callback. Each
+        // blocking pipe read also needs its own thread: sharing a bounded
+        // dispatch pool lets an idle stdout reader starve a full stderr pipe.
+        let reader = Thread { [self, handle] in
+            let descriptor = handle.fileDescriptor
+            var chunk = [UInt8](repeating: 0, count: 16 << 10)
+            while true {
+                let count = chunk.withUnsafeMutableBytes { bytes in
+                    Glibc.read(descriptor, bytes.baseAddress, bytes.count)
+                }
+                if count > 0 {
+                    append(Data(chunk.prefix(count)))
+                    continue
+                }
+                if count == 0 {
+                    markFinished()
+                    return
+                }
+                if errno == EINTR {
+                    continue
+                }
+                markFinished(failed: true)
+                return
+            }
+        }
+        reader.name = "opengrok-auth-pipe"
+        reader.start()
+        #else
         handle.readabilityHandler = { [self] readable in
             let chunk = readable.availableData
             guard !chunk.isEmpty else {
@@ -486,6 +526,7 @@ private final class ExternalAuthBoundedPipeCapture: @unchecked Sendable {
             }
             append(chunk)
         }
+        #endif
     }
 
     private func append(_ chunk: Data) {
@@ -505,9 +546,10 @@ private final class ExternalAuthBoundedPipeCapture: @unchecked Sendable {
         }
     }
 
-    private func markFinished() {
+    private func markFinished(failed: Bool = false) {
         lock.lock()
         let shouldSignal = !reachedEnd
+        didFail = didFail || failed
         reachedEnd = true
         lock.unlock()
         if shouldSignal {
@@ -518,8 +560,15 @@ private final class ExternalAuthBoundedPipeCapture: @unchecked Sendable {
     func waitUntilFinished(_ deadline: DispatchTime) -> Bool {
         lock.lock()
         let alreadyFinished = reachedEnd
+        let alreadyFailed = didFail
         lock.unlock()
-        return alreadyFinished || finished.wait(timeout: deadline) == .success
+        if alreadyFinished {
+            return !alreadyFailed
+        }
+        guard finished.wait(timeout: deadline) == .success else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        return !didFail
     }
 
     var overflowed: Bool {
