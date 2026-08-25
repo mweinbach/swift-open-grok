@@ -22,6 +22,11 @@ private struct CloudTraceUploadFixture {
         )
         home = root.appendingPathComponent("state", isDirectory: true)
         workspace = root.appendingPathComponent("workspace", isDirectory: true)
+        #if os(Windows)
+        try OpenGrokConfig.createDirAllOwnerOnly(root, stateRoot: root)
+        try OpenGrokConfig.createDirAllOwnerOnly(home, stateRoot: home)
+        try OpenGrokConfig.createDirAllOwnerOnly(workspace, stateRoot: root)
+        #else
         for directory in [root, home, workspace] {
             try FileManager.default.createDirectory(
                 at: directory,
@@ -29,6 +34,7 @@ private struct CloudTraceUploadFixture {
                 attributes: [.posixPermissions: 0o700]
             )
         }
+        #endif
         try ("[telemetry]\ntrace_upload = true\n" + configuration).write(
             to: home.appendingPathComponent("config.toml"),
             atomically: true,
@@ -94,11 +100,18 @@ private struct CloudTraceUploadFixture {
         let location = path ?? root
             .appendingPathComponent(".aws", isDirectory: true)
             .appendingPathComponent("credentials", isDirectory: false)
+        #if os(Windows)
+        try OpenGrokConfig.createDirAllOwnerOnly(
+            location.deletingLastPathComponent(),
+            stateRoot: root
+        )
+        #else
         try FileManager.default.createDirectory(
             at: location.deletingLastPathComponent(),
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
+        #endif
         try SecureFile.write(at: location, contents: content)
         return location
     }
