@@ -19,17 +19,22 @@ final class LiveSessionSearchSQLite {
     private var handle: OpaquePointer?
 
     init(path: URL) throws {
-        if FileManager.default.fileExists(atPath: path.path) {
-            try SecureFile.ensureOwnerOnlyPermissions(at: path)
+        // Foundation preserves macOS's /var alias even when asked to resolve
+        // symlinks; SQLite no-follow requires realpath for every parent.
+        let parent = try PathSecurity.canonicalize(path.deletingLastPathComponent())
+        let databasePath = parent.appendingPathComponent(path.lastPathComponent)
+
+        if FileManager.default.fileExists(atPath: databasePath.path) {
+            try SecureFile.ensureOwnerOnlyPermissions(at: databasePath)
         } else {
-            try SecureFile.write(at: path, contents: Data())
+            try SecureFile.write(at: databasePath, contents: Data())
         }
 
         var opened: OpaquePointer?
         // SQLITE_OPEN_NOFOLLOW is 0x01000000 in SQLite's stable C ABI. Spell
         // the value directly because older SDK module maps omit the macro.
         let noFollow: Int32 = 0x01000000
-        let status = path.path.withCString {
+        let status = databasePath.path.withCString {
             sqlite3_open_v2(
                 $0,
                 &opened,
@@ -44,8 +49,8 @@ final class LiveSessionSearchSQLite {
         }
         handle = opened
         do {
-            try SecureFile.ensureOwnerOnlyPermissions(at: path)
-            guard try SecureFile.isOwnerOnly(at: path) else {
+            try SecureFile.ensureOwnerOnlyPermissions(at: databasePath)
+            guard try SecureFile.isOwnerOnly(at: databasePath) else {
                 throw LiveSessionSearchIndexError.insecure("database is not owner-private")
             }
             sqlite3_busy_timeout(opened, 5_000)

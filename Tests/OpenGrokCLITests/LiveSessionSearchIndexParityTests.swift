@@ -360,6 +360,44 @@ struct LiveSessionSearchIndexParityTests {
     }
 
     #if !os(Windows)
+    @Test("a trusted home ancestor alias opens the owner-private database without following its filename")
+    func trustedAncestorSymlinkPreservesSecureSQLiteOpen() throws {
+        let fixture = try SessionSearchIndexFixture()
+        defer { fixture.cleanup() }
+        let alias = fixture.root.appendingPathComponent("trusted-state-alias", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: fixture.home)
+        let document = fixture.document(id: "aliased-session", content: "trustedparentneedle")
+
+        let result = try LiveSessionSearchIndex.search(
+            openGrokHome: alias,
+            environment: fixture.environment,
+            query: "trustedparentneedle",
+            limit: 20,
+            gate: fixture.gate,
+            sources: { [LiveSessionSearchIndexSource(document: document)] }
+        )
+
+        #expect(result.hits.map(\.sessionID) == ["aliased-session"])
+        #expect(try SecureFile.isOwnerOnly(at: fixture.indexPath))
+    }
+
+    @Test("a symlinked sessions directory remains untrusted and never receives a database")
+    func sessionsDirectorySymlinkFailsClosed() throws {
+        let fixture = try SessionSearchIndexFixture()
+        defer { fixture.cleanup() }
+        let sessions = fixture.home.appendingPathComponent("sessions", isDirectory: true)
+        let outside = fixture.root.appendingPathComponent("foreign-sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: sessions, withDestinationURL: outside)
+
+        #expect(throws: (any Error).self) {
+            try fixture.search("private", sources: { [] })
+        }
+        #expect(!FileManager.default.fileExists(
+            atPath: outside.appendingPathComponent("session_search.sqlite").path
+        ))
+    }
+
     @Test("a symlinked SQLite destination is refused without modifying its target")
     func databaseSymlinkFailsClosed() throws {
         let fixture = try SessionSearchIndexFixture()
