@@ -39,10 +39,13 @@ import JavaScriptCore
 /// The runtime is inert until commands arrive. It is safe to call `send`,
 /// `sendControl`, and `beginTermination` from any task or thread.
 public final class JavaScriptCellRuntime: @unchecked Sendable {
-    private let commands = JavaScriptRuntimeMailbox<JavaScriptRuntimeCommand>()
-    private let controls = JavaScriptRuntimeMailbox<JavaScriptRuntimeControlCommand>()
+    let commands = JavaScriptRuntimeMailbox<JavaScriptRuntimeCommand>()
+    let controls = JavaScriptRuntimeMailbox<JavaScriptRuntimeControlCommand>()
     private let watchdogLock = NSLock()
     private var watchdog: JavaScriptExecutionWatchdog?
+    #if !canImport(JavaScriptCore) && canImport(COpenGrokQuickJS)
+    private var quickJSInterrupt: QuickJSInterruptHandle?
+    #endif
     private var eventContinuation: AsyncStream<JavaScriptRuntimeEvent>.Continuation?
     private var terminationRequested = false
     private var subprocess: JavaScriptRuntimeSubprocess?
@@ -51,15 +54,23 @@ public final class JavaScriptCellRuntime: @unchecked Sendable {
     /// `beginTermination` still stops an idle or awaiting cell, but a cell
     /// spinning inside JavaScript runs until it returns to the host.
     public static var supportsExecutionCeiling: Bool {
+        #if !canImport(JavaScriptCore) && canImport(COpenGrokQuickJS)
+        return true
+        #else
         JavaScriptRuntimeSubprocess.workerExecutable() != nil
             || JavaScriptExecutionWatchdog.supportsExecutionCeiling
+        #endif
     }
 
     /// Whether production can stop a busy JavaScript entry immediately by
     /// killing its isolated worker process rather than waiting for JSC's
     /// per-entry time limit.
     public static var supportsHardInterrupt: Bool {
+        #if !canImport(JavaScriptCore) && canImport(COpenGrokQuickJS)
+        return true
+        #else
         JavaScriptRuntimeSubprocess.workerExecutable() != nil
+        #endif
     }
 
     private init() {}
@@ -74,7 +85,7 @@ public final class JavaScriptCellRuntime: @unchecked Sendable {
         configuration: JavaScriptCellConfiguration,
         pendingMode: JavaScriptPendingMode = .pauseUntilResumed
     ) throws -> (runtime: JavaScriptCellRuntime, events: AsyncStream<JavaScriptRuntimeEvent>) {
-        #if canImport(JavaScriptCore)
+        #if canImport(JavaScriptCore) || canImport(COpenGrokQuickJS)
         if let executable = JavaScriptRuntimeSubprocess.workerExecutable() {
             let runtime = JavaScriptCellRuntime()
             let (stream, continuation) = AsyncStream<JavaScriptRuntimeEvent>.makeStream(
@@ -98,7 +109,7 @@ public final class JavaScriptCellRuntime: @unchecked Sendable {
         configuration: JavaScriptCellConfiguration,
         pendingMode: JavaScriptPendingMode = .pauseUntilResumed
     ) throws -> (runtime: JavaScriptCellRuntime, events: AsyncStream<JavaScriptRuntimeEvent>) {
-        #if canImport(JavaScriptCore)
+        #if canImport(JavaScriptCore) || canImport(COpenGrokQuickJS)
         let runtime = JavaScriptCellRuntime()
         let (stream, continuation) = AsyncStream<JavaScriptRuntimeEvent>.makeStream(
             bufferingPolicy: .unbounded
@@ -107,6 +118,7 @@ public final class JavaScriptCellRuntime: @unchecked Sendable {
         let startup = StartupResult()
 
         let thread = Thread {
+            #if canImport(JavaScriptCore)
             runtime.run(
                 configuration: configuration,
                 pendingMode: pendingMode,
@@ -114,6 +126,15 @@ public final class JavaScriptCellRuntime: @unchecked Sendable {
                 startup: startup,
                 ready: ready
             )
+            #else
+            runtime.runQuickJS(
+                configuration: configuration,
+                pendingMode: pendingMode,
+                continuation: continuation,
+                startup: startup,
+                ready: ready
+            )
+            #endif
         }
         thread.name = "open-grok.code-mode.cell"
         // Deep recursion in user JavaScript should hit JavaScriptCore's own
@@ -166,6 +187,9 @@ public final class JavaScriptCellRuntime: @unchecked Sendable {
         terminationRequested = true
         let watchdog = self.watchdog
         let subprocess = self.subprocess
+        #if !canImport(JavaScriptCore) && canImport(COpenGrokQuickJS)
+        let quickJSInterrupt = self.quickJSInterrupt
+        #endif
         watchdogLock.unlock()
 
         guard !alreadyRequested else { return }
@@ -174,6 +198,9 @@ public final class JavaScriptCellRuntime: @unchecked Sendable {
             return
         }
         watchdog?.requestTermination()
+        #if !canImport(JavaScriptCore) && canImport(COpenGrokQuickJS)
+        quickJSInterrupt?.requestTermination()
+        #endif
         commands.send(.terminate)
         controls.send(.terminate)
         // Close the event stream now rather than waiting for the thread to
@@ -203,13 +230,30 @@ public final class JavaScriptCellRuntime: @unchecked Sendable {
         }
     }
 
-    fileprivate func closeMailboxes() {
+    #if !canImport(JavaScriptCore) && canImport(COpenGrokQuickJS)
+    func adoptQuickJSInterrupt(
+        _ interrupt: QuickJSInterruptHandle,
+        continuation: AsyncStream<JavaScriptRuntimeEvent>.Continuation
+    ) {
+        watchdogLock.lock()
+        quickJSInterrupt = interrupt
+        eventContinuation = continuation
+        let alreadyRequested = terminationRequested
+        watchdogLock.unlock()
+        if alreadyRequested {
+            interrupt.requestTermination()
+            continuation.finish()
+        }
+    }
+    #endif
+
+    func closeMailboxes() {
         commands.close()
         controls.close()
     }
 
     /// Carries a startup failure back to `start` across the thread boundary.
-    fileprivate final class StartupResult: @unchecked Sendable {
+    final class StartupResult: @unchecked Sendable {
         private let lock = NSLock()
         private var stored: JavaScriptRuntimeError?
 

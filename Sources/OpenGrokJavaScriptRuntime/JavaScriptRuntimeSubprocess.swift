@@ -48,21 +48,36 @@ final class JavaScriptRuntimeSubprocess: @unchecked Sendable {
         arguments: [String] = CommandLine.arguments
     ) -> URL? {
         if let override = environment[executableOverrideEnvironmentKey], !override.isEmpty,
-           FileManager.default.isExecutableFile(atPath: override)
+           isExecutable(atPath: override)
         {
             return URL(fileURLWithPath: override)
         }
         guard let first = arguments.first, !first.isEmpty else { return nil }
         let rawURL = URL(fileURLWithPath: first)
-        let executable = rawURL.path.hasPrefix("/")
+        let normalized = first.replacingOccurrences(of: "\\", with: "/")
+        let windowsAbsolute = normalized.range(
+            of: "^[A-Za-z]:/",
+            options: .regularExpression
+        ) != nil
+        let executable = rawURL.path.hasPrefix("/") || windowsAbsolute
             ? rawURL.standardizedFileURL
             : URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
                 .appendingPathComponent(first).standardizedFileURL
         let name = executable.lastPathComponent.lowercased()
-        guard name == "open-grok" || name == "opengrokexecutable",
-              FileManager.default.isExecutableFile(atPath: executable.path)
+        guard ["open-grok", "open-grok.exe", "opengrokexecutable", "opengrokexecutable.exe"]
+                .contains(name),
+              isExecutable(atPath: executable.path)
         else { return nil }
         return executable
+    }
+
+    private static func isExecutable(atPath path: String) -> Bool {
+        #if os(Windows)
+        return path.lowercased().hasSuffix(".exe")
+            && FileManager.default.fileExists(atPath: path)
+        #else
+        return FileManager.default.isExecutableFile(atPath: path)
+        #endif
     }
 
     static func start(
@@ -84,6 +99,17 @@ final class JavaScriptRuntimeSubprocess: @unchecked Sendable {
             input: inputPipe.fileHandleForWriting,
             continuation: continuation
         )
+        #if os(Linux) || os(Windows)
+        let output = outputPipe.fileHandleForReading
+        // swift-corelibs Foundation's readabilityHandler can miss EOF or
+        // suppress the final pipe bytes. A dedicated blocking reader keeps
+        // the worker protocol ordered and makes exit a deterministic EOF.
+        process.terminationHandler = { _ in
+            DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(250)) {
+                worker.finish()
+            }
+        }
+        #else
         outputPipe.fileHandleForReading.readabilityHandler = { handle in
             worker.consume(handle.availableData)
         }
@@ -91,15 +117,33 @@ final class JavaScriptRuntimeSubprocess: @unchecked Sendable {
             outputPipe.fileHandleForReading.readabilityHandler = nil
             worker.finish()
         }
+        #endif
         do {
             try process.run()
         } catch {
+            #if !os(Linux) && !os(Windows)
             outputPipe.fileHandleForReading.readabilityHandler = nil
+            #endif
             continuation.finish()
             throw JavaScriptRuntimeError.initializationFailed(
                 "failed to launch isolated code mode worker: \(error)"
             )
         }
+        #if os(Linux) || os(Windows)
+        DispatchQueue.global(qos: .utility).async {
+            while true {
+                do {
+                    guard let data = try output.read(upToCount: 64 << 10), !data.isEmpty else {
+                        break
+                    }
+                    worker.consume(data)
+                } catch {
+                    break
+                }
+            }
+            worker.finish()
+        }
+        #endif
         worker.send(.start(configuration: configuration, pendingMode: pendingMode))
         guard worker.ready.wait(timeout: .now() + 5) == .success else {
             worker.terminate()

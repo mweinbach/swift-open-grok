@@ -1,5 +1,3 @@
-#if canImport(JavaScriptCore)
-
 import Foundation
 import OpenGrokCodeModeProtocol
 import OpenGrokShared
@@ -291,5 +289,3 @@ struct JavaScriptNestedToolProgressTests {
         #expect(decodedProgress == progress)
     }
 }
-
-#endif

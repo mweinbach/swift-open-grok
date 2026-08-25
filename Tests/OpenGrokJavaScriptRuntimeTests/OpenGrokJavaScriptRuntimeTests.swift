@@ -11,8 +11,6 @@ import Testing
 
 @testable import OpenGrokJavaScriptRuntime
 
-#if canImport(JavaScriptCore)
-
 // MARK: - Harness
 
 /// Drains a runtime's event stream, with a deadline so a wedged runtime
@@ -714,33 +712,9 @@ struct JavaScriptModuleLoaderIntegrationTests {
 
 @Suite("JavaScript runtime capability")
 struct JavaScriptRuntimeCapabilityTests {
-    @Test("JavaScriptCore hosts report an available runtime")
+    @Test("every supported host reports an available embedded runtime")
     func available() {
         #expect(JavaScriptRuntimeCapability.current == .available)
         #expect(JavaScriptRuntimeCapability.current.unavailableError == nil)
     }
 }
-
-#else
-
-@Suite("JavaScript runtime platform support")
-struct JavaScriptRuntimeUnsupportedPlatformTests {
-    @Test("starting a cell reports the unsupported platform")
-    func unsupported() {
-        #expect(JavaScriptRuntimeCapability.current == .unavailable)
-        #expect(JavaScriptRuntimeCapability.current.unavailableError == .unsupportedPlatform)
-        do {
-            _ = try JavaScriptCellRuntime.start(
-                configuration: JavaScriptCellConfiguration(toolCallId: "call_1", source: "text('x')")
-            )
-            Issue.record("expected JavaScriptCellRuntime.start to fail")
-        } catch let error as JavaScriptRuntimeError {
-            #expect(error == .unsupportedPlatform)
-            #expect(error.kind == .unsupportedPlatform)
-        } catch {
-            Issue.record("expected JavaScriptRuntimeError, got \(error)")
-        }
-    }
-}
-
-#endif

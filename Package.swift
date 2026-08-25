@@ -323,7 +323,28 @@ private func targets() -> [Target] {
 
     // ---- Wave 6 ----
     // W6-S1: JavaScriptRuntime base; CodeMode -> JavaScriptRuntime.
-    t.append(.target(name: "OpenGrokJavaScriptRuntime", dependencies: dep(w0s2, w1s1, w1s3, w1s4, w2s1)))
+    t.append(.target(
+        name: "COpenGrokQuickJS",
+        path: "Sources/COpenGrokQuickJS",
+        exclude: ["LICENSE"],
+        publicHeadersPath: "include",
+        cSettings: [
+            .define("_GNU_SOURCE", .when(platforms: [.linux])),
+            .define("WIN32_LEAN_AND_MEAN", .when(platforms: [.windows])),
+        ],
+        linkerSettings: [
+            .linkedLibrary("m", .when(platforms: [.linux])),
+        ]
+    ))
+    t.append(.target(
+        name: "OpenGrokJavaScriptRuntime",
+        dependencies: dep(w0s2, w1s1, w1s3, w1s4, w2s1) + [
+            .target(
+                name: "COpenGrokQuickJS",
+                condition: .when(platforms: [.linux, .windows])
+            ),
+        ]
+    ))
     t.append(.target(name: "OpenGrokCodeMode", dependencies: dep(w0s2, w1s1, w1s3, w1s4, w2s1, w5s1, w5s2, w5s3, ["OpenGrokJavaScriptRuntime"])))
     t.append(contentsOf: libs(w6s2, dep(w0s2, w1s3, w2s1, w3s2, w3s3)))
     t.append(contentsOf: libs(w6s3, dep(w0s2, w0s3, w0s4, w1s3, w1s5, w2s2, w2s3, w3s3)))

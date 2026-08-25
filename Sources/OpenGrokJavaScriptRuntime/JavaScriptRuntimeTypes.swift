@@ -104,7 +104,7 @@ public enum JavaScriptRuntimeEvent: Sendable, Codable {
 /// Failures raised while starting or driving the embedded runtime.
 public struct JavaScriptRuntimeError: Error, Hashable, Sendable, CustomStringConvertible {
     public enum Kind: Hashable, Sendable {
-        /// JavaScriptCore is not available for this platform.
+        /// Neither supported embedded JavaScript engine is available.
         case unsupportedPlatform
         /// The engine could not be created.
         case initializationFailed
@@ -122,7 +122,7 @@ public struct JavaScriptRuntimeError: Error, Hashable, Sendable, CustomStringCon
 
     public static let unsupportedPlatform = JavaScriptRuntimeError(
         kind: .unsupportedPlatform,
-        message: "code mode requires JavaScriptCore, which is unavailable on this platform"
+        message: "code mode requires an embedded JavaScript engine, which is unavailable on this platform"
     )
 
     public static func initializationFailed(_ message: String) -> JavaScriptRuntimeError {
@@ -156,7 +156,7 @@ public struct JavaScriptRuntimeCapability: Sendable, Equatable {
     )
 
     public static var current: JavaScriptRuntimeCapability {
-        #if canImport(JavaScriptCore)
+        #if canImport(JavaScriptCore) || canImport(COpenGrokQuickJS)
         return .available
         #else
         return .unavailable
