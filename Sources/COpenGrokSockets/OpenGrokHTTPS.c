@@ -40,7 +40,6 @@ const char *og_https_last_error_message(void) {
 #include <math.h>
 #include <openssl/err.h>
 #include <openssl/x509.h>
-#include <openssl/x509v3.h>
 #include <stdatomic.h>
 #include <strings.h>
 
@@ -986,9 +985,7 @@ int og_https_add_root_der(OGHTTPSHandle handle, const void *certificate, size_t 
     const unsigned char *cursor = begin;
     ERR_clear_error();
     X509 *parsed = d2i_X509(NULL, &cursor, (long)length);
-    int valid = parsed != NULL
-        && cursor == begin + length
-        && X509_check_ca(parsed) > 0;
+    int valid = parsed != NULL && cursor == begin + length;
     X509_free(parsed);
     ERR_clear_error();
 

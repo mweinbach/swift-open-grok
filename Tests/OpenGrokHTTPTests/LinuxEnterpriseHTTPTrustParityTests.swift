@@ -77,6 +77,26 @@ struct LinuxEnterpriseHTTPTrustParityTests {
     }
 
     @Test(
+        "an explicitly trusted self-signed HTTPS certificate need not be a certificate authority",
+        .timeLimit(.minutes(1))
+    )
+    func explicitlyTrustedNonCAAnchorAuthorizesHTTPS() async throws {
+        let fixture = try LinuxEnterpriseHTTPFixture(reply: .ok, certificateAuthority: false)
+        defer { fixture.stop() }
+        try await fixture.waitUntilListening()
+
+        let response = try await fixture.trustedTransport().send(
+            HTTPRequest(method: .get, url: try fixture.url(path: "/trusted-leaf"))
+        )
+        let recorded = try await fixture.recordedRequest()
+
+        #expect(response.metadata.statusCode == 200)
+        #expect(response.body == Data("ok".utf8))
+        #expect(recorded.method == "GET")
+        #expect(recorded.path == "/trusted-leaf")
+    }
+
+    @Test(
         "private CA SSE delivers its first complete event while the HTTPS response remains open",
         .timeLimit(.minutes(1)),
         arguments: ["\n\n", "\r\n\r\n"]
@@ -632,7 +652,7 @@ private final class LinuxEnterpriseHTTPFixture: @unchecked Sendable {
         capture.responseFinished
     }
 
-    init(reply: LinuxEnterpriseHTTPReply) throws {
+    init(reply: LinuxEnterpriseHTTPReply, certificateAuthority: Bool = true) throws {
         let manager = FileManager.default
         guard manager.isExecutableFile(atPath: Self.openssl) else {
             throw LinuxEnterpriseHTTPFixtureError.unavailable(
@@ -656,7 +676,8 @@ private final class LinuxEnterpriseHTTPFixture: @unchecked Sendable {
             let certificateDER = try Self.generateCertificate(
                 commonName: "localhost",
                 certificate: certificate,
-                key: key
+                key: key,
+                certificateAuthority: certificateAuthority
             )
 
             let reservation = try PortableSocketListener.tcp(host: "127.0.0.1", port: 0)
@@ -891,8 +912,13 @@ private final class LinuxEnterpriseHTTPFixture: @unchecked Sendable {
     private static func generateCertificate(
         commonName: String,
         certificate: URL,
-        key: URL
+        key: URL,
+        certificateAuthority: Bool = true
     ) throws -> Data {
+        let basicConstraints = certificateAuthority
+            ? "basicConstraints=critical,CA:TRUE"
+            : "basicConstraints=critical,CA:FALSE"
+
         try runOpenSSL([
             "req",
             "-x509",
@@ -901,7 +927,7 @@ private final class LinuxEnterpriseHTTPFixture: @unchecked Sendable {
             "-days", "1",
             "-subj", "/CN=\(commonName)",
             "-addext", "subjectAltName=DNS:\(commonName)",
-            "-addext", "basicConstraints=critical,CA:TRUE",
+            "-addext", basicConstraints,
             "-keyout", key.path,
             "-out", certificate.path,
         ])
