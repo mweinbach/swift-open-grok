@@ -116,6 +116,41 @@ private struct CloudTraceUploadFixture {
         return location
     }
 
+    static func managedCredentials(
+        format: String,
+        accessKeyID: String = "MANAGEDACCESS123",
+        secretAccessKey: String = "PRIVATE_MANAGED_SECRET",
+        sessionToken: String? = "PRIVATE_MANAGED_SESSION_TOKEN"
+    ) -> String {
+        if format == "json" {
+            var fields = [
+                "\"aws_access_key_id\":\"\(accessKeyID)\"",
+                "\"aws_secret_access_key\":\"\(secretAccessKey)\"",
+            ]
+            if let sessionToken {
+                fields.append("\"aws_session_token\":\"\(sessionToken)\"")
+            }
+            return "{" + fields.joined(separator: ",") + "}"
+        }
+
+        var lines = [
+            "[default]",
+            "aws_access_key_id = \(accessKeyID)",
+            "aws_secret_access_key = \(secretAccessKey)",
+        ]
+        if let sessionToken {
+            lines.append("aws_session_token = \(sessionToken)")
+        }
+        return lines.joined(separator: "\r\n")
+    }
+
+    @discardableResult
+    func writeManagedCredentials(_ content: String, at path: URL? = nil) throws -> URL {
+        let location = path ?? workspace.appendingPathComponent("private-managed-s3-credentials")
+        try SecureFile.write(at: location, contents: content)
+        return location
+    }
+
     @discardableResult
     func seed(
         _ sessionID: String,
@@ -309,6 +344,439 @@ struct LiveCloudTraceUploadParityTests {
         #expect(!signed.contains("PRIVATE_AWS_SESSION_TOKEN"))
         #expect(request.headers[xaiTokenAuthHeader] == nil)
     }
+
+    @Test(
+        "managed inline AWS JSON and INI credentials perform isolated signed loopback uploads",
+        arguments: ["json", "ini"]
+    )
+    func managedInlineCredentialsReachTheRealSignedTransport(_ format: String) async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let sessionID = "managed-inline-\(format)"
+        try await fixture.seed(sessionID)
+        let handler = CloudTraceRequestHandler()
+        let server = HttpServer(handler: handler, basePath: "")
+        try server.start()
+        defer { server.stop() }
+
+        let result = await fixture.run(
+            sessionID,
+            environment: try fixture.environment(overrides: [
+                "GROK_TRACE_UPLOAD_CREDENTIALS": CloudTraceUploadFixture.managedCredentials(format: format),
+                "GROK_TRACE_UPLOAD_CREDENTIALS_FILE": "../../must-not-open-managed-file",
+                "AWS_ACCESS_KEY_ID": "IGNOREDAMBIENTKEY",
+                "AWS_SECRET_ACCESS_KEY": "PRIVATE_IGNORED_AMBIENT_SECRET",
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://169.254.169.254/must-not-open",
+                "GROK_TRACE_UPLOAD_ENDPOINT_URL": server.baseURL,
+            ])
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.success.rawValue)
+        #expect(result.errors.isEmpty)
+        #expect(try fixture.json(result.output)["url"] as? String
+            == "s3://trace-private-bucket/\(sessionID)/trace_export.tar.gz")
+        #expect(handler.requests.count == 1)
+        let request = try #require(handler.requests.first)
+        #expect(request.authorization?.contains("Credential=MANAGEDACCESS123/") == true)
+        #expect(request.header("x-amz-security-token") == "PRIVATE_MANAGED_SESSION_TOKEN")
+        #expect(request.header(xaiTokenAuthHeader) == nil)
+        for secret in ["PRIVATE_MANAGED_SECRET", "PRIVATE_MANAGED_SESSION_TOKEN", "PRIVATE_IGNORED_AMBIENT_SECRET"] {
+            #expect(!result.output.contains(secret))
+            #expect(!result.errors.contains(secret))
+            #expect(request.authorization?.contains(secret) == false)
+        }
+    }
+
+    @Test("managed config inline AWS credentials override private files and ambient credentials")
+    func managedConfigInlineCredentialsPrecedeFilesAndAmbientAuthority() throws {
+        let fixture = try CloudTraceUploadFixture(configuration: """
+        [endpoints]
+        trace_upload_credentials = '{"aws_access_key_id":"MANAGEDCONFIGKEY","aws_secret_access_key":"PRIVATE_CONFIG_SECRET"}'
+        """)
+        defer { fixture.clean() }
+        let environment = try fixture.environment(overrides: [
+            "GROK_TRACE_UPLOAD_CREDENTIALS_FILE": "../../must-not-open-configured-file",
+            "AWS_SHARED_CREDENTIALS_FILE": "../../must-not-open-ambient-file",
+            "AWS_ACCESS_KEY_ID": "IGNOREDAMBIENTKEY",
+            "AWS_SECRET_ACCESS_KEY": "PRIVATE_IGNORED_AMBIENT_SECRET",
+        ])
+
+        let authorization = try LiveCloudTraceUpload.authorize(
+            sessionID: "managed-inline-config",
+            bucketURL: "s3://trace-private-bucket",
+            document: LiveManagedSetupComposition.trustedConfigDocument(environment: environment),
+            environment: environment
+        )
+
+        #expect(authorization.accessKeyID == "MANAGEDCONFIGKEY")
+        #expect(authorization.secretAccessKey == "PRIVATE_CONFIG_SECRET")
+        #expect(authorization.sessionToken == nil)
+    }
+
+    @Test("explicit inline AWS credentials override managed inline configuration")
+    func environmentManagedInlineCredentialsPrecedeManagedConfiguration() throws {
+        let fixture = try CloudTraceUploadFixture(configuration: """
+        [endpoints]
+        trace_upload_credentials = '{"aws_access_key_id":"IGNOREDMANAGEDKEY","aws_secret_access_key":"PRIVATE_IGNORED_MANAGED_SECRET"}'
+        """)
+        defer { fixture.clean() }
+        let environment = try fixture.environment(overrides: [
+            "GROK_TRACE_UPLOAD_CREDENTIALS": CloudTraceUploadFixture.managedCredentials(
+                format: "json",
+                accessKeyID: "EXPLICITMANAGEDKEY"
+            ),
+        ])
+
+        let authorization = try LiveCloudTraceUpload.authorize(
+            sessionID: "managed-inline-environment",
+            bucketURL: "s3://trace-private-bucket",
+            document: LiveManagedSetupComposition.trustedConfigDocument(environment: environment),
+            environment: environment
+        )
+
+        #expect(authorization.accessKeyID == "EXPLICITMANAGEDKEY")
+        #expect(authorization.secretAccessKey == "PRIVATE_MANAGED_SECRET")
+    }
+
+    @Test(
+        "owner-private managed AWS JSON and INI files precede ambient keys in real signed uploads",
+        arguments: ["json", "ini"]
+    )
+    func privateManagedCredentialFilesReachTheRealSignedTransport(_ format: String) async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let sessionID = "managed-file-\(format)"
+        try await fixture.seed(sessionID)
+        let credentialFile = try fixture.writeManagedCredentials(
+            CloudTraceUploadFixture.managedCredentials(format: format, accessKeyID: "PRIVATEFILEKEY")
+        )
+        let handler = CloudTraceRequestHandler()
+        let server = HttpServer(handler: handler, basePath: "")
+        try server.start()
+        defer { server.stop() }
+
+        let result = await fixture.run(
+            sessionID,
+            environment: try fixture.environment(overrides: [
+                "GROK_TRACE_UPLOAD_CREDENTIALS_FILE": credentialFile.path,
+                "AWS_ACCESS_KEY_ID": "IGNOREDAMBIENTKEY",
+                "AWS_SECRET_ACCESS_KEY": "PRIVATE_IGNORED_AMBIENT_SECRET",
+                "GROK_TRACE_UPLOAD_ENDPOINT_URL": server.baseURL,
+            ])
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.success.rawValue)
+        #expect(result.errors.isEmpty)
+        #expect(handler.requests.count == 1)
+        let request = try #require(handler.requests.first)
+        #expect(request.authorization?.contains("Credential=PRIVATEFILEKEY/") == true)
+        #expect(request.header("x-amz-security-token") == "PRIVATE_MANAGED_SESSION_TOKEN")
+        for secret in ["PRIVATE_MANAGED_SECRET", "PRIVATE_MANAGED_SESSION_TOKEN", "PRIVATE_IGNORED_AMBIENT_SECRET"] {
+            #expect(!result.output.contains(secret))
+            #expect(!result.errors.contains(secret))
+        }
+    }
+
+    @Test("managed configuration credential files resolve tilde against the injected private home")
+    func managedConfigurationFilesResolvePrivateInjectedHomes() throws {
+        let fixture = try CloudTraceUploadFixture(configuration: """
+        [endpoints]
+        trace_upload_credentials_file = '~/private-managed-credentials.ini'
+        """)
+        defer { fixture.clean() }
+        let location = fixture.root.appendingPathComponent("private-managed-credentials.ini")
+        try fixture.writeManagedCredentials(
+            CloudTraceUploadFixture.managedCredentials(format: "ini", accessKeyID: "CONFIGFILEKEY"),
+            at: location
+        )
+        let environment = try fixture.environment()
+
+        let authorization = try LiveCloudTraceUpload.authorize(
+            sessionID: "managed-config-file",
+            bucketURL: "s3://trace-private-bucket",
+            document: LiveManagedSetupComposition.trustedConfigDocument(environment: environment),
+            environment: environment
+        )
+
+        #expect(authorization.accessKeyID == "CONFIGFILEKEY")
+        #expect(authorization.sessionToken == "PRIVATE_MANAGED_SESSION_TOKEN")
+    }
+
+    @Test("managed static AWS credentials never replace required first-party session authorization")
+    func managedCredentialsCannotBypassFirstPartyAuthorization() async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("managed-missing-xai")
+        var environment = try fixture.environment(overrides: [
+            "GROK_TRACE_UPLOAD_CREDENTIALS": CloudTraceUploadFixture.managedCredentials(format: "json"),
+        ])
+        environment.removeValue(forKey: "OPENGROK_AUTH")
+        let transport = MockHTTPTransport()
+
+        let result = await fixture.run(
+            "managed-missing-xai",
+            environment: environment,
+            services: fixture.services(transport)
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
+        #expect(result.output.isEmpty)
+        #expect(!result.errors.contains("PRIVATE_MANAGED_SECRET"))
+        #expect(transport.recordedRequests.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fixture.archiveDirectory.path))
+    }
+
+    @Test("managed AWS credential rotation between retries fails closed before a second signed request")
+    func managedCredentialFileRotationClosesRetryAuthorization() async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("managed-credential-rotation")
+        let location = try fixture.writeManagedCredentials(
+            CloudTraceUploadFixture.managedCredentials(format: "json", accessKeyID: "ORIGINALMANAGEDKEY")
+        )
+        let transport = MockHTTPTransport(responses: [
+            .init(metadata: HTTPResponseMetadata(statusCode: 503)),
+            .init(metadata: HTTPResponseMetadata(statusCode: 200)),
+        ])
+
+        let result = await fixture.run(
+            "managed-credential-rotation",
+            environment: try fixture.environment(overrides: [
+                "GROK_TRACE_UPLOAD_CREDENTIALS_FILE": location.path,
+            ]),
+            services: fixture.services(transport, sleep: { _ in
+                try SecureFile.write(
+                    at: location,
+                    contents: CloudTraceUploadFixture.managedCredentials(
+                        format: "json",
+                        accessKeyID: "ROTATEDMANAGEDKEY",
+                        secretAccessKey: "PRIVATE_ROTATED_SECRET"
+                    )
+                )
+            })
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
+        #expect(transport.recordedRequests.count == 1)
+        #expect(transport.recordedRequests.first?.headers["Authorization"]?
+            .contains("Credential=ORIGINALMANAGEDKEY/") == true)
+        #expect(!result.output.contains("PRIVATE_ROTATED_SECRET"))
+        #expect(!result.errors.contains("PRIVATE_ROTATED_SECRET"))
+    }
+
+    @Test(
+        "malformed, partial and duplicate managed AWS credentials never downgrade to ambient authority",
+        arguments: [
+            "missing-access", "missing-secret", "token-only", "duplicate-json-key", "duplicate-ini-key",
+            "duplicate-ini-section", "unknown-json-key", "unknown-ini-key", "malformed-json",
+            "malformed-ini", "non-string-json", "invalid-access", "injected-secret", "empty-token",
+            "oversized", "trailing-json",
+        ]
+    )
+    func malformedManagedCredentialsFailBeforeArchiveOrNetwork(_ scenario: String) async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("invalid-managed-document")
+        let document: String
+        switch scenario {
+        case "missing-access":
+            document = #"{"aws_secret_access_key":"PRIVATE_INVALID_SECRET"}"#
+        case "missing-secret":
+            document = #"{"aws_access_key_id":"PARTIALKEY"}"#
+        case "token-only":
+            document = #"{"aws_session_token":"PRIVATE_INVALID_TOKEN"}"#
+        case "duplicate-json-key":
+            document = #"{"aws_access_key_id":"FIRSTKEY","aws_access_key_id":"SECONDKEY","aws_secret_access_key":"PRIVATE_INVALID_SECRET"}"#
+        case "duplicate-ini-key":
+            document = "aws_access_key_id=FIRSTKEY\naws_access_key_id=SECONDKEY\n"
+                + "aws_secret_access_key=PRIVATE_INVALID_SECRET"
+        case "duplicate-ini-section":
+            document = "[default]\naws_access_key_id=FIRSTKEY\n"
+                + "[foreign]\naws_secret_access_key=PRIVATE_INVALID_SECRET"
+        case "unknown-json-key":
+            document = #"{"aws_access_key_id":"STATICKEY","aws_secret_access_key":"PRIVATE_INVALID_SECRET","unknown":"PRIVATE_UNKNOWN"}"#
+        case "unknown-ini-key":
+            document = "aws_access_key_id=STATICKEY\naws_secret_access_key=PRIVATE_INVALID_SECRET\n"
+                + "unknown=PRIVATE_UNKNOWN"
+        case "malformed-json":
+            document = #"{"aws_access_key_id":"STATICKEY","aws_secret_access_key":"PRIVATE_INVALID_SECRET",}"#
+        case "malformed-ini":
+            document = "aws_access_key_id=STATICKEY\nPRIVATE_INVALID_SECRET"
+        case "non-string-json":
+            document = #"{"aws_access_key_id":"STATICKEY","aws_secret_access_key":123}"#
+        case "invalid-access":
+            document = #"{"aws_access_key_id":"INVALID:KEY","aws_secret_access_key":"PRIVATE_INVALID_SECRET"}"#
+        case "injected-secret":
+            document = #"{"aws_access_key_id":"STATICKEY","aws_secret_access_key":"PRIVATE_INVALID\nHEADER"}"#
+        case "empty-token":
+            document = #"{"aws_access_key_id":"STATICKEY","aws_secret_access_key":"PRIVATE_INVALID_SECRET","aws_session_token":""}"#
+        case "oversized":
+            document = String(repeating: "a", count: 65_537)
+        default:
+            document = CloudTraceUploadFixture.managedCredentials(format: "json") + " PRIVATE_TRAILING_SECRET"
+        }
+        let transport = MockHTTPTransport()
+
+        let result = await fixture.run(
+            "invalid-managed-document",
+            environment: try fixture.environment(overrides: [
+                "GROK_TRACE_UPLOAD_CREDENTIALS": document,
+            ]),
+            services: fixture.services(transport)
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
+        #expect(result.output.isEmpty)
+        #expect(!result.errors.contains("PRIVATE_"))
+        #expect(transport.recordedRequests.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fixture.archiveDirectory.path))
+    }
+
+    @Test(
+        "managed AWS JSON and INI documents cannot invoke dynamic credential or role providers",
+        arguments: [
+            "credential_process", "credential_source", "role_arn", "source_profile",
+            "web_identity_token_file", "sso_session", "sso_start_url",
+        ]
+    )
+    func managedCredentialsCannotActivateDynamicProviders(_ provider: String) async throws {
+        for format in ["json", "ini"] {
+            let fixture = try CloudTraceUploadFixture()
+            defer { fixture.clean() }
+            try await fixture.seed("dynamic-managed-provider")
+            let document: String
+            if format == "json" {
+                document = #"{"aws_access_key_id":"STATICKEY","aws_secret_access_key":"PRIVATE_MANAGED_SECRET","\#(provider)":"PRIVATE_PROVIDER_COMMAND"}"#
+            } else {
+                document = "aws_access_key_id=STATICKEY\naws_secret_access_key=PRIVATE_MANAGED_SECRET\n"
+                    + "\(provider)=PRIVATE_PROVIDER_COMMAND"
+            }
+            let transport = MockHTTPTransport()
+
+            let result = await fixture.run(
+                "dynamic-managed-provider",
+                environment: try fixture.environment(overrides: [
+                    "GROK_TRACE_UPLOAD_CREDENTIALS": document,
+                ]),
+                services: fixture.services(transport)
+            )
+
+            #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
+            #expect(result.output.isEmpty)
+            #expect(!result.errors.contains("PRIVATE_PROVIDER_COMMAND"))
+            #expect(transport.recordedRequests.isEmpty)
+            #expect(!FileManager.default.fileExists(atPath: fixture.archiveDirectory.path))
+        }
+    }
+
+    @Test(
+        "relative, traversing, missing, oversized and invalid managed AWS files fail before transport",
+        arguments: ["relative", "traversal", "missing", "oversized", "invalid-utf8"]
+    )
+    func unsafeManagedCredentialFilesNeverFallBackToAmbientAuthority(_ scenario: String) async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("unsafe-managed-file")
+        let location = fixture.workspace.appendingPathComponent("unsafe-managed-credentials")
+        let configuredPath: String
+        switch scenario {
+        case "relative":
+            configuredPath = "relative-managed-credentials"
+        case "traversal":
+            configuredPath = fixture.root.path + "/../outside-managed-credentials"
+        case "missing":
+            configuredPath = location.path
+        case "oversized":
+            try SecureFile.write(at: location, contents: Data(repeating: UInt8(ascii: "a"), count: 65_537))
+            configuredPath = location.path
+        default:
+            try SecureFile.write(at: location, contents: Data([0xFF, 0xFE]))
+            configuredPath = location.path
+        }
+        let transport = MockHTTPTransport()
+
+        let result = await fixture.run(
+            "unsafe-managed-file",
+            environment: try fixture.environment(overrides: [
+                "GROK_TRACE_UPLOAD_CREDENTIALS_FILE": configuredPath,
+            ]),
+            services: fixture.services(transport)
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
+        #expect(result.output.isEmpty)
+        #expect(transport.recordedRequests.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fixture.archiveDirectory.path))
+    }
+
+    #if !os(Windows)
+    @Test(
+        "managed AWS credential symlinks and group-readable files fail against pinned private descriptors",
+        arguments: ["symlink", "group-readable"]
+    )
+    func managedCredentialSymlinksAndBroadPermissionsFailClosed(_ scenario: String) async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("unsafe-managed-mode")
+        let target = try fixture.writeManagedCredentials(
+            CloudTraceUploadFixture.managedCredentials(format: "json")
+        )
+        let path: String
+        if scenario == "symlink" {
+            let link = fixture.workspace.appendingPathComponent("managed-credentials-link")
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+            path = link.path
+        } else {
+            try FileManager.default.setAttributes([.posixPermissions: 0o640], ofItemAtPath: target.path)
+            path = target.path
+        }
+        let transport = MockHTTPTransport()
+
+        let result = await fixture.run(
+            "unsafe-managed-mode",
+            environment: try fixture.environment(overrides: [
+                "GROK_TRACE_UPLOAD_CREDENTIALS_FILE": path,
+            ]),
+            services: fixture.services(transport)
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
+        #expect(result.output.isEmpty)
+        #expect(!result.errors.contains("PRIVATE_MANAGED_SECRET"))
+        #expect(transport.recordedRequests.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fixture.archiveDirectory.path))
+    }
+    #endif
+
+    #if os(Linux) || os(Windows)
+    @Test("production cloud transport fails closed before network access when extra trust roots cannot apply")
+    func productionCloudTransportRetainsAdditionalTrustRootAuthority() async throws {
+        let handler = CloudTraceRequestHandler()
+        let server = HttpServer(handler: handler, basePath: "")
+        try server.start()
+        defer { server.stop() }
+        let roots = [Data([0x30, 0x00])]
+        let configuration = HTTPTransportConfiguration(
+            tls: HTTPTLSConfiguration(extraRootCertificates: roots)
+        )
+        let transport = try #require(
+            LiveCloudTraceUpload.makeProductionTransport(configuration: configuration)
+                as? URLSessionHTTPTransport
+        )
+        let request = HTTPRequest(
+            method: .post,
+            url: try #require(URL(string: server.baseURL)),
+            headers: ["Authorization": "Bearer PRIVATE_ENTERPRISE_TOKEN"],
+            body: Data("PRIVATE_ENTERPRISE_ARCHIVE".utf8)
+        )
+
+        #expect(transport.configuration.tls.extraRootCertificates == roots)
+        await #expect(throws: (any Error).self) {
+            try await transport.send(request)
+        }
+        #expect(handler.requests.isEmpty)
+    }
+    #endif
 
     @Test("a private default AWS profile drives a real signed upload with its temporary token")
     func privateDefaultProfileReachesTheLiveSignedTransport() async throws {

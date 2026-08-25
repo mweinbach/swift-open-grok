@@ -40,9 +40,9 @@ enum LiveCloudTraceUpload {
         var message: String {
             switch self {
             case .unsupportedCredentialSource:
-                return "Direct S3 trace upload only supports environment or private static AWS shared-profile credentials."
+                return "Direct S3 trace upload only supports managed static, environment, or private AWS shared-profile credentials."
             case .missingCredentials:
-                return "Direct S3 trace upload requires scoped AWS credentials from the environment or a private shared profile."
+                return "Direct S3 trace upload requires scoped managed, environment, or private shared-profile AWS credentials."
             case .invalidCredentials:
                 return "Direct S3 trace upload rejected malformed AWS credentials."
             case .invalidBucket:
@@ -113,15 +113,7 @@ enum LiveCloudTraceUpload {
 
         let bucket = try bucketName(from: bucketURL)
 
-        if configured(environment["GROK_TRACE_UPLOAD_CREDENTIALS"]) != nil
-            || configured(environment["GROK_TRACE_UPLOAD_CREDENTIALS_FILE"]) != nil
-            || configured(document[path: ["endpoints", "trace_upload_credentials"]]?.stringValue) != nil
-            || configured(document[path: ["endpoints", "trace_upload_credentials_file"]]?.stringValue) != nil
-        {
-            throw Failure.unsupportedCredentialSource
-        }
-
-        let credentials = try resolveCredentials(environment: environment)
+        let credentials = try resolveCredentials(document: document, environment: environment)
         let accessKeyID = credentials.accessKeyID
         let secretAccessKey = credentials.secretAccessKey
         let sessionToken = credentials.sessionToken
@@ -177,12 +169,30 @@ enum LiveCloudTraceUpload {
         )
     }
 
-    /// The pinned AWS SDK tries environment credentials before shared static
-    /// profiles. Later providers execute commands or contact metadata services;
-    /// stopping at the shared-file boundary keeps their authority unavailable.
+    /// Rust `agent/config.rs:507-550` supplies managed inline credentials before
+    /// managed files; `xai-file-utils/src/s3.rs:39-90,121-147` selects those
+    /// static JSON/INI credentials before the ambient AWS provider chain.
     private static func resolveCredentials(
+        document: TOMLValue,
         environment: [String: String]
     ) throws -> (accessKeyID: String, secretAccessKey: String, sessionToken: String?) {
+        if let inline = configured(environment["GROK_TRACE_UPLOAD_CREDENTIALS"])
+            ?? configured(document[path: ["endpoints", "trace_upload_credentials"]]?.stringValue)
+        {
+            guard !inline.isEmpty, inline.utf8.count <= maximumCredentialFileBytes else {
+                throw Failure.invalidCredentials
+            }
+            return try parseManagedCredentials(Data(inline.utf8))
+        }
+
+        if let path = configured(environment["GROK_TRACE_UPLOAD_CREDENTIALS_FILE"])
+            ?? configured(document[path: ["endpoints", "trace_upload_credentials_file"]]?.stringValue)
+        {
+            return try parseManagedCredentials(
+                managedCredentialData(at: path, environment: environment)
+            )
+        }
+
         let environmentKey = environment["AWS_ACCESS_KEY_ID"]
         let environmentSecret = environment["AWS_SECRET_ACCESS_KEY"]
         if environmentKey != nil || environmentSecret != nil || environment["AWS_SESSION_TOKEN"] != nil {
@@ -268,6 +278,199 @@ enum LiveCloudTraceUpload {
             throw Failure.invalidCredentials
         }
         return try parseSharedCredentials(content, profile: profile)
+    }
+
+    private static func managedCredentialData(
+        at configuredPath: String,
+        environment: [String: String]
+    ) throws -> Data {
+        var path = configuredPath
+        if path.hasPrefix("~/") || path.hasPrefix("~\\") {
+            let suffix = String(path.dropFirst(2))
+            do {
+                try PathSecurity.rejectHostileLexical(suffix)
+            } catch {
+                throw Failure.invalidCredentials
+            }
+            path = URL(fileURLWithPath: try sharedCredentialHome(environment: environment), isDirectory: true)
+                .appendingPathComponent(suffix, isDirectory: false)
+                .path
+        }
+
+        guard (path as NSString).isAbsolutePath else {
+            throw Failure.invalidCredentials
+        }
+        do {
+            try PathSecurity.rejectHostileLexical(path)
+            return try PathSecurity.readNoFollow(
+                URL(fileURLWithPath: path),
+                maximumBytes: maximumCredentialFileBytes,
+                requireOwnerOnly: true
+            )
+        } catch let error as FileUtilsError {
+            if case .notFound = error { throw Failure.missingCredentials }
+            throw Failure.invalidCredentials
+        } catch {
+            throw Failure.invalidCredentials
+        }
+    }
+
+    private static func parseManagedCredentials(
+        _ data: Data
+    ) throws -> (accessKeyID: String, secretAccessKey: String, sessionToken: String?) {
+        guard !data.isEmpty,
+              data.count <= maximumCredentialFileBytes,
+              let content = String(data: data, encoding: .utf8)
+        else {
+            throw Failure.invalidCredentials
+        }
+
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw Failure.invalidCredentials }
+
+        let values: [String: String]
+        if trimmed.hasPrefix("{") {
+            values = try parseManagedJSONCredentials(Array(trimmed.utf8))
+        } else {
+            values = try parseManagedINICredentials(trimmed)
+        }
+
+        guard let accessKeyID = values["aws_access_key_id"],
+              let secretAccessKey = values["aws_secret_access_key"]
+        else {
+            throw Failure.missingCredentials
+        }
+        return (accessKeyID, secretAccessKey, values["aws_session_token"])
+    }
+
+    private static func parseManagedJSONCredentials(_ bytes: [UInt8]) throws -> [String: String] {
+        var offset = 0
+        skipJSONWhitespace(bytes, offset: &offset)
+        guard offset < bytes.count, bytes[offset] == 0x7B else {
+            throw Failure.invalidCredentials
+        }
+        offset += 1
+
+        var values: [String: String] = [:]
+        skipJSONWhitespace(bytes, offset: &offset)
+        if offset < bytes.count, bytes[offset] == 0x7D {
+            offset += 1
+        } else {
+            while true {
+                let key = try managedJSONString(bytes, offset: &offset)
+                skipJSONWhitespace(bytes, offset: &offset)
+                guard offset < bytes.count, bytes[offset] == 0x3A else {
+                    throw Failure.invalidCredentials
+                }
+                offset += 1
+                skipJSONWhitespace(bytes, offset: &offset)
+                let value = try managedJSONString(bytes, offset: &offset)
+                try insertManagedCredential(key, value: value, into: &values)
+                skipJSONWhitespace(bytes, offset: &offset)
+                guard offset < bytes.count else { throw Failure.invalidCredentials }
+                if bytes[offset] == 0x7D {
+                    offset += 1
+                    break
+                }
+                guard bytes[offset] == 0x2C else { throw Failure.invalidCredentials }
+                offset += 1
+                skipJSONWhitespace(bytes, offset: &offset)
+            }
+        }
+
+        skipJSONWhitespace(bytes, offset: &offset)
+        guard offset == bytes.count else { throw Failure.invalidCredentials }
+        return values
+    }
+
+    private static func managedJSONString(_ bytes: [UInt8], offset: inout Int) throws -> String {
+        guard offset < bytes.count, bytes[offset] == 0x22 else {
+            throw Failure.invalidCredentials
+        }
+        let start = offset
+        offset += 1
+        var escaped = false
+        while offset < bytes.count {
+            let byte = bytes[offset]
+            offset += 1
+            if escaped {
+                escaped = false
+            } else if byte == 0x5C {
+                escaped = true
+            } else if byte == 0x22 {
+                do {
+                    return try JSONDecoder().decode(String.self, from: Data(bytes[start..<offset]))
+                } catch {
+                    throw Failure.invalidCredentials
+                }
+            }
+        }
+        throw Failure.invalidCredentials
+    }
+
+    private static func skipJSONWhitespace(_ bytes: [UInt8], offset: inout Int) {
+        while offset < bytes.count {
+            switch bytes[offset] {
+            case 0x09, 0x0A, 0x0D, 0x20:
+                offset += 1
+            default:
+                return
+            }
+        }
+    }
+
+    private static func parseManagedINICredentials(_ content: String) throws -> [String: String] {
+        var values: [String: String] = [:]
+        var foundSection = false
+
+        for rawLine in content.split(whereSeparator: \.isNewline) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty, !line.hasPrefix("#"), !line.hasPrefix(";") else {
+                continue
+            }
+
+            if line.hasPrefix("[") {
+                guard line.hasSuffix("]"), !foundSection, values.isEmpty else {
+                    throw Failure.invalidCredentials
+                }
+                let section = String(line.dropFirst().dropLast())
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard isValidProfile(section) else { throw Failure.invalidCredentials }
+                foundSection = true
+                continue
+            }
+
+            guard let separator = line.firstIndex(of: "=") else {
+                throw Failure.invalidCredentials
+            }
+            let key = line[..<separator].trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawValue = line[line.index(after: separator)...]
+            let value = rawValue.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
+                .first?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            try insertManagedCredential(key, value: value, into: &values)
+        }
+
+        return values
+    }
+
+    private static func insertManagedCredential(
+        _ key: String,
+        value: String,
+        into values: inout [String: String]
+    ) throws {
+        guard !unsupportedCredentialProfileKeys.contains(key) else {
+            throw Failure.unsupportedCredentialSource
+        }
+        guard key == "aws_access_key_id"
+            || key == "aws_secret_access_key"
+            || key == "aws_session_token"
+        else {
+            throw Failure.invalidCredentials
+        }
+        guard !value.isEmpty, values.updateValue(value, forKey: key) == nil else {
+            throw Failure.invalidCredentials
+        }
     }
 
     private static func sharedCredentialHome(environment: [String: String]) throws -> String {
@@ -660,8 +863,14 @@ enum LiveCloudTraceUpload {
         "s3://\(authorization.bucket)/\(sessionID)/trace_export.tar.gz"
     }
 
-    static func makeProductionTransport() -> any HTTPTransport {
-        let configuration = HTTPTransportConfiguration()
+    static func makeProductionTransport(
+        configuration: HTTPTransportConfiguration = HTTPTransportConfiguration()
+    ) -> any HTTPTransport {
+        #if os(Linux) || os(Windows)
+        if !configuration.tls.extraRootCertificates.isEmpty {
+            return URLSessionHTTPTransport(configuration: configuration)
+        }
+        #endif
         let session = URLSession(
             configuration: HTTPSessionConfigurationBuilder.makeEphemeral(configuration),
             delegate: LiveCloudTraceUploadSessionDelegate(configuration: configuration),
