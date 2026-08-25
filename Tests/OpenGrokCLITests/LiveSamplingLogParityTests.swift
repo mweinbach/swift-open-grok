@@ -4,6 +4,11 @@ import OpenGrokSampler
 import OpenGrokSamplingTypes
 import Testing
 
+#if os(Windows)
+import COpenGrokSockets
+import OpenGrokFileUtils
+#endif
+
 @testable import OpenGrokCLI
 
 private struct LiveSamplingLogFixture {
@@ -214,10 +219,22 @@ struct LiveSamplingLogParityTests {
             #expect(!contents.contains(secret), "sampling log leaked \(secret)")
         }
 
+        #if os(Windows)
+        for (path, isDirectory) in [
+            (fixture.home, Int32(1)),
+            (fixture.directory, Int32(1)),
+            (fixture.file, Int32(0)),
+            (fixture.directory.appendingPathComponent("sampling.jsonl.lock"), Int32(0)),
+        ] {
+            let native = try WindowsSecurePath.extendedLengthPath(path.path)
+            #expect(native.withCString { og_path_is_private_to_current_user($0, isDirectory) } == 1)
+        }
+        #else
         let directoryAttributes = try FileManager.default.attributesOfItem(atPath: fixture.directory.path)
         let fileAttributes = try FileManager.default.attributesOfItem(atPath: fixture.file.path)
         #expect((directoryAttributes[.posixPermissions] as? NSNumber)?.intValue == 0o700)
         #expect((fileAttributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+        #endif
     }
 
     @Test("provider records remain isolated and short credentials are never logged in full")
@@ -269,7 +286,9 @@ struct LiveSamplingLogParityTests {
         )
         let victim = fixture.root.appendingPathComponent("private-victim")
         try Data("VICTIM_CONTENT_MUST_SURVIVE".utf8).write(to: victim)
+        #if !os(Windows)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: victim.path)
+        #endif
         try FileManager.default.createSymbolicLink(at: fixture.file, withDestinationURL: victim)
 
         #expect(throws: (any Error).self) { try fixture.logger() }
@@ -366,4 +385,34 @@ struct LiveSamplingLogParityTests {
         #expect(!contents.contains("CLI_PRIVATE_OUTPUT"))
         #expect(!contents.contains("CLI_PRIVATE_CREDENTIAL_ABCDEFGHIJKL"))
     }
+
+    #if os(Windows)
+    @Test("native Windows diagnostics pin owner-private files against replacement")
+    func windowsFileIdentityRemainsPinned() throws {
+        let fixture = try LiveSamplingLogFixture()
+        defer { fixture.cleanup() }
+        let logger = try fixture.logger()
+        let replacement = fixture.directory.appendingPathComponent("sampling-replaced.jsonl")
+
+        #expect(throws: (any Error).self) {
+            try FileManager.default.moveItem(at: fixture.file, to: replacement)
+        }
+
+        let scope = try logger.begin(
+            config: SamplerConfig(
+                apiKey: "WINDOWS_PRIVATE_CREDENTIAL_123456789ABC",
+                baseURL: "https://example.invalid",
+                model: "safe-model"
+            ),
+            request: ConversationRequest(items: [.user("WINDOWS_PRIVATE_PROMPT")]),
+            requestID: RequestId("WINDOWS_PRIVATE_REQUEST_12345678")
+        )
+        try scope.record(.completed)
+
+        let contents = try String(contentsOf: fixture.file, encoding: .utf8)
+        #expect(!contents.contains("WINDOWS_PRIVATE_PROMPT"))
+        #expect(!contents.contains("WINDOWS_PRIVATE_CREDENTIAL_123456789ABC"))
+        #expect(!FileManager.default.fileExists(atPath: replacement.path))
+    }
+    #endif
 }

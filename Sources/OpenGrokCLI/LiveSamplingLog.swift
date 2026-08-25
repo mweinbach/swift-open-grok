@@ -6,6 +6,11 @@ import OpenGrokSamplingTypes
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif os(Windows)
+import COpenGrokSockets
+import OpenGrokConfig
+import OpenGrokFileUtils
+import WinSDK
 #endif
 
 /// Explicitly enabled, owner-private operational diagnostics for one session.
@@ -23,6 +28,8 @@ public final class LiveSamplingLog: @unchecked Sendable {
     private let homeDescriptor: Int32
     private let directoryDescriptor: Int32
     private let fileDescriptor: Int32
+    #elseif os(Windows)
+    private let windowsHandles: WindowsHandles
     #endif
 
     /// Resolve only the supplied session environment; process-global values
@@ -68,6 +75,8 @@ public final class LiveSamplingLog: @unchecked Sendable {
         self.homeDescriptor = descriptors.home
         self.directoryDescriptor = descriptors.directory
         self.fileDescriptor = descriptors.file
+        #elseif os(Windows)
+        self.windowsHandles = try Self.openWindowsHandles(openGrokHome: openGrokHome)
         #else
         throw CLIApplicationError.failed(
             "secure owner-private sampling logging is unavailable on this platform"
@@ -80,6 +89,11 @@ public final class LiveSamplingLog: @unchecked Sendable {
         close(fileDescriptor)
         close(directoryDescriptor)
         close(homeDescriptor)
+        #elseif os(Windows)
+        let fileClosed = og_file_handle_close(windowsHandles.rawFile)
+        let directoryClosed = CloseHandle(windowsHandles.directory)
+        let homeClosed = CloseHandle(windowsHandles.home)
+        assert(fileClosed == 0 && directoryClosed && homeClosed)
         #endif
     }
 
@@ -141,6 +155,14 @@ public final class LiveSamplingLog: @unchecked Sendable {
             try validateDescriptors()
             try compactIfNeeded(pendingBytes: encoded.count)
             try Self.writeAll(encoded, descriptor: fileDescriptor)
+            #elseif os(Windows)
+            try withWindowsFileLock {
+                try compactWindowsFileIfNeeded(pendingBytes: encoded.count)
+                try Self.writeWindowsFile(encoded, handle: windowsHandles.rawFile)
+                guard og_file_handle_flush(windowsHandles.rawFile) == 0 else {
+                    throw Self.failure("sampling log cannot flush its private Windows file")
+                }
+            }
             #else
             throw Self.failure("secure sampling logging is unavailable on this platform")
             #endif
@@ -156,6 +178,13 @@ public final class LiveSamplingLog: @unchecked Sendable {
             defer { flock(fileDescriptor, LOCK_UN) }
             try validateDescriptors()
             try compactIfNeeded(pendingBytes: pendingBytes)
+            #elseif os(Windows)
+            try withWindowsFileLock {
+                try compactWindowsFileIfNeeded(pendingBytes: pendingBytes)
+                guard og_file_handle_flush(windowsHandles.rawFile) == 0 else {
+                    throw Self.failure("sampling log cannot flush its bounded Windows file")
+                }
+            }
             #endif
         }
     }
@@ -184,6 +213,231 @@ public final class LiveSamplingLog: @unchecked Sendable {
     private static func failure(_ message: String) -> CLIApplicationError {
         .failed(message)
     }
+
+    #if os(Windows)
+    private struct WindowsHandles {
+        let home: HANDLE
+        let directory: HANDLE
+        let file: HANDLE
+        let rawFile: OGSocketHandle
+        let homeURL: URL
+        let directoryURL: URL
+        let fileURL: URL
+        let lockURL: URL
+    }
+
+    private static func openWindowsHandles(openGrokHome: URL) throws -> WindowsHandles {
+        guard openGrokHome.isFileURL else {
+            throw failure("sampling log requires an absolute owner-controlled state directory")
+        }
+        let homeURL = openGrokHome.standardizedFileURL
+        let homeNative = try WindowsSecurePath.extendedLengthPath(homeURL.path)
+        try OpenGrokConfig.createDirAllOwnerOnly(homeURL, stateRoot: homeURL)
+        guard homeNative.withCString({ og_path_is_private_to_current_user($0, 1) }) == 1 else {
+            throw failure("sampling log owner state directory lacks an owner-private DACL")
+        }
+        let home = try openWindowsPath(homeURL, directory: true)
+
+        do {
+            let directoryURL = homeURL.appendingPathComponent("logs", isDirectory: true)
+            try OpenGrokConfig.createDirAllOwnerOnly(directoryURL, stateRoot: homeURL)
+            let directory = try openWindowsPath(directoryURL, directory: true)
+
+            do {
+                let fileURL = directoryURL.appendingPathComponent("sampling.jsonl")
+                try validateExistingWindowsFile(fileURL)
+                let native = try WindowsSecurePath.extendedLengthPath(fileURL.path)
+                var rawFile: OGSocketHandle = -1
+                guard native.withCString({ og_file_open_owner_only_lock($0, 1, &rawFile) }) == 0,
+                      let file = HANDLE(bitPattern: Int(rawFile)),
+                      file != INVALID_HANDLE_VALUE
+                else {
+                    if rawFile != -1 { og_file_handle_close(rawFile) }
+                    throw failure("sampling log file cannot be opened with an owner-private DACL")
+                }
+
+                do {
+                    try windowsInformation(file, directory: false)
+                    return WindowsHandles(
+                        home: home,
+                        directory: directory,
+                        file: file,
+                        rawFile: rawFile,
+                        homeURL: homeURL,
+                        directoryURL: directoryURL,
+                        fileURL: fileURL,
+                        lockURL: directoryURL.appendingPathComponent("sampling.jsonl.lock")
+                    )
+                } catch {
+                    og_file_handle_close(rawFile)
+                    throw error
+                }
+            } catch {
+                CloseHandle(directory)
+                throw error
+            }
+        } catch {
+            CloseHandle(home)
+            throw error
+        }
+    }
+
+    private static func openWindowsPath(_ url: URL, directory: Bool) throws -> HANDLE {
+        let native = try WindowsSecurePath.extendedLengthPath(url.path)
+        var flags = DWORD(FILE_FLAG_OPEN_REPARSE_POINT)
+        if directory { flags |= DWORD(FILE_FLAG_BACKUP_SEMANTICS) }
+        let raw = native.withCString(encodedAs: UTF16.self) { path in
+            CreateFileW(
+                path,
+                DWORD(FILE_READ_ATTRIBUTES) | DWORD(READ_CONTROL),
+                DWORD(FILE_SHARE_READ) | DWORD(FILE_SHARE_WRITE),
+                nil,
+                DWORD(OPEN_EXISTING),
+                flags,
+                nil
+            )
+        }
+        guard let handle = raw, handle != INVALID_HANDLE_VALUE else {
+            throw failure("sampling log cannot open its owner-private Windows path without following reparse points")
+        }
+        do {
+            try windowsInformation(handle, directory: directory)
+            return handle
+        } catch {
+            CloseHandle(handle)
+            throw error
+        }
+    }
+
+    @discardableResult
+    private static func windowsInformation(
+        _ handle: HANDLE,
+        directory: Bool
+    ) throws -> BY_HANDLE_FILE_INFORMATION {
+        var information = BY_HANDLE_FILE_INFORMATION()
+        guard GetFileInformationByHandle(handle, &information) else {
+            throw failure("sampling log cannot inspect its pinned Windows file identity")
+        }
+        let attributes = information.dwFileAttributes
+        guard attributes & DWORD(FILE_ATTRIBUTE_REPARSE_POINT) == 0,
+              (attributes & DWORD(FILE_ATTRIBUTE_DIRECTORY) != 0) == directory,
+              information.nFileIndexHigh != 0 || information.nFileIndexLow != 0,
+              directory || information.nNumberOfLinks == 1
+        else {
+            throw failure("sampling log contains a reparse point, hard link, or unverifiable file identity")
+        }
+        let raw = OGSocketHandle(Int(bitPattern: handle))
+        guard og_file_handle_is_private_to_current_user(raw, directory ? 1 : 0) == 1 else {
+            throw failure("sampling log object is not private to the current Windows user")
+        }
+        return information
+    }
+
+    private static func validateExistingWindowsFile(_ url: URL) throws {
+        guard try WindowsSecurePath.metadata(at: url) != nil else { return }
+        let handle = try openWindowsPath(url, directory: false)
+        defer { CloseHandle(handle) }
+    }
+
+    private func withWindowsFileLock(_ operation: () throws -> Void) throws {
+        try Self.validateExistingWindowsFile(windowsHandles.lockURL)
+        let held = try AdvisoryFileLock.acquire(
+            at: windowsHandles.lockURL,
+            options: AdvisoryLockOptions(nonBlocking: false, create: true, mode: 0o600)
+        )
+        defer { held.release() }
+        try Self.validateExistingWindowsFile(windowsHandles.lockURL)
+        try validateWindowsHandles()
+        try operation()
+    }
+
+    private func validateWindowsHandles() throws {
+        for (path, pinned, directory) in [
+            (windowsHandles.homeURL, windowsHandles.home, true),
+            (windowsHandles.directoryURL, windowsHandles.directory, true),
+            (windowsHandles.fileURL, windowsHandles.file, false),
+        ] {
+            let attached = try Self.openWindowsPath(path, directory: directory)
+            defer { CloseHandle(attached) }
+            let original = try Self.windowsInformation(pinned, directory: directory)
+            let current = try Self.windowsInformation(attached, directory: directory)
+            guard original.dwVolumeSerialNumber == current.dwVolumeSerialNumber,
+                  original.nFileIndexHigh == current.nFileIndexHigh,
+                  original.nFileIndexLow == current.nFileIndexLow
+            else {
+                throw Self.failure("sampling log owner state, directory, or file changed after secure initialization")
+            }
+        }
+    }
+
+    private func compactWindowsFileIfNeeded(pendingBytes: Int) throws {
+        let information = try Self.windowsInformation(windowsHandles.file, directory: false)
+        let currentSize = (UInt64(information.nFileSizeHigh) << 32)
+            | UInt64(information.nFileSizeLow)
+        let maximum = UInt64(byteLimit - pendingBytes)
+        guard currentSize > maximum else {
+            try Self.seekWindowsFile(windowsHandles.file, offset: currentSize)
+            return
+        }
+
+        let desiredTail = min(currentSize, UInt64(max(0, byteLimit / 2 - pendingBytes)))
+        var retained = Data(count: Int(desiredTail))
+        if desiredTail > 0 {
+            try Self.seekWindowsFile(windowsHandles.file, offset: currentSize - desiredTail)
+            var bytesRead: DWORD = 0
+            let read = retained.withUnsafeMutableBytes { buffer in
+                ReadFile(
+                    windowsHandles.file,
+                    buffer.baseAddress,
+                    DWORD(buffer.count),
+                    &bytesRead,
+                    nil
+                )
+            }
+            guard read else {
+                throw Self.failure("sampling log cannot read its bounded private Windows tail")
+            }
+            retained.count = Int(bytesRead)
+            if currentSize > desiredTail {
+                if let newline = retained.firstIndex(of: 0x0A) {
+                    retained.removeSubrange(...newline)
+                } else {
+                    retained.removeAll(keepingCapacity: false)
+                }
+            }
+        }
+
+        try Self.seekWindowsFile(windowsHandles.file, offset: 0)
+        guard SetEndOfFile(windowsHandles.file) else {
+            throw Self.failure("sampling log cannot enforce its private Windows size limit")
+        }
+        if !retained.isEmpty {
+            try Self.writeWindowsFile(retained, handle: windowsHandles.rawFile)
+        }
+    }
+
+    private static func seekWindowsFile(_ handle: HANDLE, offset: UInt64) throws {
+        guard offset <= UInt64(Int64.max) else {
+            throw failure("sampling log Windows file offset exceeds its supported range")
+        }
+        var high = LONG(truncatingIfNeeded: offset >> 32)
+        let low = LONG(bitPattern: UInt32(truncatingIfNeeded: offset))
+        SetLastError(DWORD(ERROR_SUCCESS))
+        let position = SetFilePointer(handle, low, &high, DWORD(FILE_BEGIN))
+        guard position != DWORD.max || GetLastError() == DWORD(ERROR_SUCCESS) else {
+            throw failure("sampling log cannot seek its pinned private Windows file")
+        }
+    }
+
+    private static func writeWindowsFile(_ data: Data, handle: OGSocketHandle) throws {
+        let written = data.withUnsafeBytes { bytes in
+            og_file_handle_write_all(handle, bytes.baseAddress, bytes.count)
+        }
+        guard written == Int64(data.count) else {
+            throw failure("sampling log could not append to its private Windows file")
+        }
+    }
+    #endif
 
     #if canImport(Darwin) || canImport(Glibc)
     private struct Descriptors {
