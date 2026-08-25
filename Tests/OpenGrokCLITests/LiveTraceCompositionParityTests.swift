@@ -266,12 +266,144 @@ struct LiveTraceCompositionParityTests {
         #expect(snapshot["telemetry_trace_upload"] as? Bool == true)
         #expect(snapshot["has_deployment_key"] as? Bool == true)
         #expect(snapshot["has_bucket_configured"] as? Bool == true)
+        #expect(snapshot["direct_upload_configured"] as? Bool == false)
         #expect(snapshot["has_inline_credentials"] as? Bool == true)
         #expect(snapshot["custom_upload_url"] as? Bool == true)
         #expect(!text.contains("DEPLOYMENT_PRIVATE_SECRET"))
         #expect(!text.contains("PRIVATE_BUCKET_NAME"))
         #expect(!text.contains("INLINE_CREDENTIAL_SECRET"))
         #expect(!text.contains("secret-endpoint.example"))
+    }
+
+    @Test(
+        "gs and s3 endpoint buckets support direct uploads with ambient credentials",
+        arguments: [
+            "gs://private-ambient-google-bucket",
+            "s3://private-ambient-aws-bucket",
+        ]
+    )
+    func validEndpointBucketsSupportAmbientCredentials(_ bucket: String) async throws {
+        let fixture = try LiveTraceFixture()
+        defer { fixture.clean() }
+        let sessionID = bucket.hasPrefix("gs://") ? "ambient-google" : "ambient-aws"
+        try await fixture.seed(sessionID)
+        try "[endpoints]\ntrace_upload_bucket = \"\(bucket)\"\n".write(
+            to: fixture.home.appendingPathComponent("config.toml"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let result = await fixture.run(["trace", sessionID, "--local", "--json"])
+        #expect(result.status == CLIRunner.ExitCode.success.rawValue)
+        let path = try #require(liveTraceJSON(result.output)["local_path"] as? String)
+        let entry = try #require(liveTraceArchiveEntries(at: URL(fileURLWithPath: path)).first {
+            $0.path == "\(sessionID)/trace_config.json"
+        })
+        let text = String(decoding: entry.data, as: UTF8.self)
+        let snapshot = try liveTraceJSON(text)
+
+        #expect(snapshot["bucket_url_source"] as? String == "config")
+        #expect(snapshot["has_bucket_configured"] as? Bool == true)
+        #expect(snapshot["direct_upload_configured"] as? Bool == true)
+        #expect(snapshot["has_credentials_file"] as? Bool == false)
+        #expect(snapshot["has_inline_credentials"] as? Bool == false)
+        #expect(!text.contains(bucket))
+    }
+
+    @Test(
+        "unsupported endpoint bucket schemes never become direct-upload methods",
+        arguments: [
+            "https://private-invalid.example/trace-bucket",
+            "file:///private/invalid-trace-bucket",
+            "GS://case-sensitive-private-bucket",
+        ]
+    )
+    func unsupportedBucketSchemesRejectCredentialedDirectUploads(_ bucket: String) async throws {
+        let fixture = try LiveTraceFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("unsupported-bucket")
+        let credential = "PRIVATE_INLINE_CREDENTIAL_MUST_NOT_APPEAR"
+        try """
+        [endpoints]
+        trace_upload_bucket = "\(bucket)"
+        trace_upload_credentials = "\(credential)"
+        """.write(
+            to: fixture.home.appendingPathComponent("config.toml"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let result = await fixture.run(["trace", "unsupported-bucket", "--local", "--json"])
+        #expect(result.status == CLIRunner.ExitCode.success.rawValue)
+        let path = try #require(liveTraceJSON(result.output)["local_path"] as? String)
+        let entry = try #require(liveTraceArchiveEntries(at: URL(fileURLWithPath: path)).first {
+            $0.path == "unsupported-bucket/trace_config.json"
+        })
+        let text = String(decoding: entry.data, as: UTF8.self)
+        let snapshot = try liveTraceJSON(text)
+
+        #expect(snapshot["bucket_url_source"] as? String == "config")
+        #expect(snapshot["has_bucket_configured"] as? Bool == true)
+        #expect(snapshot["has_inline_credentials"] as? Bool == true)
+        #expect(snapshot["direct_upload_configured"] as? Bool == false)
+        #expect(!text.contains(bucket))
+        #expect(!text.contains(credential))
+    }
+
+    @Test("telemetry bucket precedence never invents endpoint direct-upload authority")
+    func telemetryAndEndpointBucketAuthoritiesRemainDistinct() async throws {
+        let fixture = try LiveTraceFixture()
+        defer { fixture.clean() }
+        let endpointBucket = "s3://private-endpoint-environment-bucket"
+        let telemetryBucket = "gs://private-telemetry-environment-bucket"
+        let cases: [(name: String, environment: [String: String], hasBucket: Bool, direct: Bool, source: String)] = [
+            (
+                name: "endpoint",
+                environment: ["GROK_TRACE_UPLOAD_BUCKET": endpointBucket],
+                hasBucket: true,
+                direct: true,
+                source: "config"
+            ),
+            (
+                name: "telemetry",
+                environment: ["GROK_TELEMETRY_GCS_BUCKET": telemetryBucket],
+                hasBucket: false,
+                direct: false,
+                source: "env"
+            ),
+            (
+                name: "both",
+                environment: [
+                    "GROK_TRACE_UPLOAD_BUCKET": endpointBucket,
+                    "GROK_TELEMETRY_GCS_BUCKET": telemetryBucket,
+                ],
+                hasBucket: true,
+                direct: true,
+                source: "env"
+            ),
+        ]
+
+        for testCase in cases {
+            let sessionID = "bucket-authority-\(testCase.name)"
+            try await fixture.seed(sessionID)
+            let result = await fixture.run(
+                ["trace", sessionID, "--local", "--json"],
+                environment: testCase.environment
+            )
+            #expect(result.status == CLIRunner.ExitCode.success.rawValue)
+            let path = try #require(liveTraceJSON(result.output)["local_path"] as? String)
+            let entry = try #require(liveTraceArchiveEntries(at: URL(fileURLWithPath: path)).first {
+                $0.path == "\(sessionID)/trace_config.json"
+            })
+            let text = String(decoding: entry.data, as: UTF8.self)
+            let snapshot = try liveTraceJSON(text)
+
+            #expect(snapshot["bucket_url_source"] as? String == testCase.source)
+            #expect(snapshot["has_bucket_configured"] as? Bool == testCase.hasBucket)
+            #expect(snapshot["direct_upload_configured"] as? Bool == testCase.direct)
+            #expect(!text.contains(endpointBucket))
+            #expect(!text.contains(telemetryBucket))
+        }
     }
 
     @Test("memory traces use upstream process ordering and ignore unrelated files")

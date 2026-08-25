@@ -416,7 +416,22 @@ public enum LiveTraceComposition {
 
         let telemetryBucket = environment["GROK_TELEMETRY_GCS_BUCKET"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let bucket = configured("trace_upload_bucket", environmentVariable: "GROK_TRACE_UPLOAD_BUCKET")
+        let environmentBucket = environment["GROK_TRACE_UPLOAD_BUCKET"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let configuredBucket = document[path: ["endpoints", "trace_upload_bucket"]]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let endpointBucket: String?
+        if let environmentBucket, !environmentBucket.isEmpty {
+            endpointBucket = environmentBucket
+        } else if let configuredBucket, !configuredBucket.isEmpty {
+            endpointBucket = configuredBucket
+        } else {
+            endpointBucket = nil
+        }
+        let bucket = endpointBucket != nil
+        let directUploadConfigured = endpointBucket.map {
+            $0.hasPrefix("gs://") || $0.hasPrefix("s3://")
+        } ?? false
         let source: String
         if telemetryBucket?.isEmpty == false {
             source = "env"
@@ -435,7 +450,7 @@ public enum LiveTraceComposition {
             telemetryTraceUpload: document[path: ["telemetry", "trace_upload"]]?.boolValue,
             customUploadURL: configured("trace_upload_url", environmentVariable: "GROK_TRACE_UPLOAD_URL"),
             bucketURLSource: source,
-            directUploadConfigured: bucket && (credentialsFile || inlineCredentials),
+            directUploadConfigured: directUploadConfigured,
             hasBucketConfigured: bucket,
             hasRegionConfigured: configured(
                 "trace_upload_region",
