@@ -5,6 +5,9 @@
 
 import Foundation
 import OpenGrokShared
+#if canImport(COpenGrokZlib)
+import COpenGrokZlib
+#endif
 #if canImport(Compression)
 import Compression
 #endif
@@ -58,9 +61,12 @@ public enum BundleArchiveExtractor: Sendable {
 
     /// Decompress a gzip archive payload into raw tar bytes.
     public static func decompressGzip(_ data: Data, maxSize: Int = BundleArchiveLimits.maxDecompressedSize) throws -> Data {
+        guard maxSize > 0 else {
+            throw BundleError.archiveExtractionFailed("archive exceeds maximum decompressed size (\(maxSize) bytes)")
+        }
         guard data.count >= 18 else {
             // If it's too short for gzip or not gzip at all, check if it's already raw tar
-            if data.count >= 512 && isTarHeader(data) {
+            if data.count <= maxSize && data.count >= 512 && isTarHeader(data) {
                 return data
             }
             throw BundleError.archiveExtractionFailed("archive data too short or not gzip")
@@ -69,6 +75,9 @@ public enum BundleArchiveExtractor: Sendable {
         // Check Gzip magic: 0x1f, 0x8b
         if data[0] != 0x1f || data[1] != 0x8b {
             if isTarHeader(data) {
+                guard data.count <= maxSize else {
+                    throw BundleError.archiveExtractionFailed("archive exceeds maximum decompressed size (\(maxSize) bytes)")
+                }
                 return data
             }
             throw BundleError.archiveExtractionFailed("not a valid gzip archive")
@@ -116,7 +125,23 @@ public enum BundleArchiveExtractor: Sendable {
         }
 
         let deflateData = data.subdata(in: offset..<(data.count - 8))
-        return try inflateRawDeflate(deflateData, maxSize: maxSize)
+        let decompressed = try inflateRawDeflate(deflateData, maxSize: maxSize)
+        let trailer = data.count - 8
+        let checksum = UInt32(data[trailer])
+            | UInt32(data[trailer + 1]) << 8
+            | UInt32(data[trailer + 2]) << 16
+            | UInt32(data[trailer + 3]) << 24
+        let declaredSize = UInt32(data[trailer + 4])
+            | UInt32(data[trailer + 5]) << 8
+            | UInt32(data[trailer + 6]) << 16
+            | UInt32(data[trailer + 7]) << 24
+        guard CRC32.checksum(decompressed) == checksum else {
+            throw BundleError.archiveExtractionFailed("gzip archive checksum does not match its contents")
+        }
+        guard UInt32(truncatingIfNeeded: decompressed.count) == declaredSize else {
+            throw BundleError.archiveExtractionFailed("gzip archive declared size does not match its contents")
+        }
+        return decompressed
     }
 
     /// Parse tar entries from raw uncompressed tar bytes.
@@ -227,9 +252,102 @@ public enum BundleArchiveExtractor: Sendable {
     }
 
     private static func inflateRawDeflate(_ data: Data, maxSize: Int) throws -> Data {
-        guard !data.isEmpty else { return Data() }
+        guard !data.isEmpty else {
+            throw BundleError.archiveExtractionFailed("gzip archive contains an empty DEFLATE stream")
+        }
 
-        #if canImport(Compression)
+        #if os(Windows) && canImport(COpenGrokZlib)
+        guard open_grok_zlib_is_available() != 0,
+              open_grok_zlib_inflater_is_available() != 0
+        else {
+            throw BundleError.archiveExtractionFailed("Windows DEFLATE provider is unavailable")
+        }
+
+        return try data.withUnsafeBytes { source in
+            guard let inflater = open_grok_zlib_inflater_create(
+                source.bindMemory(to: UInt8.self).baseAddress,
+                data.count,
+                1
+            ) else {
+                throw BundleError.archiveExtractionFailed("failed to initialize archive decompression")
+            }
+            defer { open_grok_zlib_inflater_destroy(inflater) }
+
+            var output = Data()
+            output.reserveCapacity(min(max(data.count, 1_024), maxSize))
+            var buffer = [UInt8](repeating: 0, count: min(32 * 1_024, maxSize))
+            while true {
+                let remainingBefore = open_grok_zlib_inflater_remaining_input(inflater)
+                var written = buffer.count
+                let status = buffer.withUnsafeMutableBufferPointer {
+                    open_grok_zlib_inflater_step(inflater, $0.baseAddress, &written)
+                }
+                guard written <= maxSize - output.count else {
+                    throw BundleError.archiveExtractionFailed("archive exceeds maximum decompressed size (\(maxSize) bytes)")
+                }
+                if written > 0 {
+                    output.append(contentsOf: buffer.prefix(written))
+                }
+                if status == 1 { break }
+
+                let remainingAfter = open_grok_zlib_inflater_remaining_input(inflater)
+                guard status == 0, written > 0 || remainingAfter < remainingBefore else {
+                    throw BundleError.archiveExtractionFailed("invalid or truncated archive DEFLATE stream")
+                }
+            }
+            guard open_grok_zlib_inflater_remaining_input(inflater) == 0 else {
+                throw BundleError.archiveExtractionFailed("archive DEFLATE stream contains trailing bytes")
+            }
+            return output
+        }
+        #elseif canImport(COpenGrokZlib)
+        guard data.count <= Int(uInt.max) else {
+            throw BundleError.archiveExtractionFailed("archive compressed stream exceeds the supported size")
+        }
+        var stream = z_stream()
+        guard inflateInit2_(
+            &stream,
+            -MAX_WBITS,
+            ZLIB_VERSION,
+            Int32(MemoryLayout<z_stream>.size)
+        ) == Z_OK else {
+            throw BundleError.archiveExtractionFailed("failed to initialize archive decompression")
+        }
+        defer { _ = inflateEnd(&stream) }
+
+        var input = data
+        var output = Data()
+        output.reserveCapacity(min(max(data.count, 1_024), maxSize))
+        try input.withUnsafeMutableBytes { source in
+            stream.next_in = source.bindMemory(to: Bytef.self).baseAddress
+            stream.avail_in = uInt(data.count)
+            var buffer = [UInt8](repeating: 0, count: min(32 * 1_024, maxSize))
+            while true {
+                let remainingBefore = stream.avail_in
+                let (status, written) = buffer.withUnsafeMutableBufferPointer {
+                    destination -> (Int32, Int) in
+                    stream.next_out = destination.baseAddress
+                    stream.avail_out = uInt(destination.count)
+                    let result = COpenGrokZlib.inflate(&stream, Z_NO_FLUSH)
+                    return (result, destination.count - Int(stream.avail_out))
+                }
+                guard written <= maxSize - output.count else {
+                    throw BundleError.archiveExtractionFailed("archive exceeds maximum decompressed size (\(maxSize) bytes)")
+                }
+                if written > 0 {
+                    output.append(contentsOf: buffer.prefix(written))
+                }
+                if status == Z_STREAM_END { break }
+                guard status == Z_OK, written > 0 || stream.avail_in < remainingBefore else {
+                    throw BundleError.archiveExtractionFailed("invalid or truncated archive DEFLATE stream")
+                }
+            }
+        }
+        guard stream.avail_in == 0 else {
+            throw BundleError.archiveExtractionFailed("archive DEFLATE stream contains trailing bytes")
+        }
+        return output
+        #elseif canImport(Compression)
         return try data.withUnsafeBytes { (src: UnsafeRawBufferPointer) -> Data in
             guard let base = src.baseAddress else { return Data() }
             var dstCapacity = min(max(data.count * 4, 65536), maxSize)
@@ -387,7 +505,7 @@ public enum TestArchiveBuilder: Sendable {
 
         return result
         #else
-        return data
+        return LiveTraceArchive.gzipStored(data)
         #endif
     }
 }

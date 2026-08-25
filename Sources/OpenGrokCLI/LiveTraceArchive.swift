@@ -108,7 +108,7 @@ enum LiveTraceArchive {
         header[offset + width - 1] = 0
     }
 
-    private static func gzipStored(_ uncompressed: Data) -> Data {
+    static func gzipStored(_ uncompressed: Data) -> Data {
         var compressed = Data([
             0x1F, 0x8B, 0x08, 0x00,
             0x00, 0x00, 0x00, 0x00,
