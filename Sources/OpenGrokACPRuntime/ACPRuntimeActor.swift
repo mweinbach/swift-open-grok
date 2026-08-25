@@ -426,12 +426,52 @@ public actor ACPAgentRuntime {
                 throw ACPRuntimeError.methodNotFound(route.method)
             }
             if await !mayControlLeaderSession(from: route.params) {
+                if extensionRouter.hasExactRoute(route.method),
+                   let hidden = Self.hiddenDeniedLeaderExtensionResponse(
+                    method: route.method,
+                    params: route.params
+                   )
+                {
+                    return hidden
+                }
                 if let sessionID = Self.sessionID(in: route.params) {
                     throw ACPRuntimeError.sessionNotFound(sessionID)
                 }
                 throw ACPRuntimeError.authenticationRequired
             }
             return try await extensionRouter.dispatch(method: route.method, params: route.params)
+        }
+    }
+
+    /// These two upstream endpoints hide an inaccessible child as missing.
+    /// Build that inert wire response only after authority has already been
+    /// denied; invoking the registered handler here would reopen its mutation
+    /// path before the owner-scoped checks can safely defend it.
+    private static func hiddenDeniedLeaderExtensionResponse(
+        method: String,
+        params: JSONValue
+    ) -> JSONValue? {
+        guard case .object(let fields) = params,
+              case .string(let subagentID)? = fields["subagentId"]
+        else {
+            return nil
+        }
+
+        switch method {
+        case "x.ai/subagent/cancel":
+            return .object([
+                "result": .object([
+                    "subagentId": .string(subagentID),
+                    "cancelled": .bool(false),
+                    "outcome": .object(["kind": .string("not_found")]),
+                ])
+            ])
+        case "x.ai/subagent/get":
+            return .object([
+                "result": .object(["snapshot": .null])
+            ])
+        default:
+            return nil
         }
     }
 
@@ -1464,6 +1504,13 @@ public struct ACPExtensionMethodRouter: ACPAgentExtensionHandler, Sendable {
         catchAll handler: any ACPAgentExtensionHandler
     ) -> ACPExtensionMethodRouter {
         ACPExtensionMethodRouter(routes: routes + [.catchAll(handler)])
+    }
+
+    fileprivate func hasExactRoute(_ method: String) -> Bool {
+        routes.contains { route in
+            guard case .exact(let registered, _) = route else { return false }
+            return registered == method
+        }
     }
 
     public func dispatch(method: String, params: JSONValue) async throws -> JSONValue {

@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import OpenGrokWorkspace
 @testable import OpenGrokCLI
 
 private struct LeaderSandboxParityFixture {

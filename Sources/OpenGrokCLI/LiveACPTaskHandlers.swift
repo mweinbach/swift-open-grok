@@ -323,7 +323,7 @@ struct LiveACPTaskControlHandler: ACPAgentExtensionHandler, Sendable {
         guard await sessions.contains(sessionID, clientID: clientID) else {
             return false
         }
-        return await gateway.ownsSession(sessionID)
+        return await gateway.ownsConnectedSession(sessionID)
     }
 
     private func authorizedOptionalSession(
@@ -336,7 +336,7 @@ struct LiveACPTaskControlHandler: ACPAgentExtensionHandler, Sendable {
         let clientID = ACPLeaderRequestAuthority.clientID
         let candidates = await sessions.ownedSessions(clientID: clientID)
         for sessionID in candidates {
-            if await gateway.ownsSession(sessionID) {
+            if await gateway.ownsConnectedSession(sessionID) {
                 return true
             }
         }

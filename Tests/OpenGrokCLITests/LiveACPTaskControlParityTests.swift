@@ -42,7 +42,7 @@ private final class ACPTaskControlSessionIDs: @unchecked Sendable {
     func next() -> String {
         lock.lock()
         defer { lock.unlock() }
-        values.isEmpty ? "unexpected-wire-session" : values.removeFirst()
+        return values.isEmpty ? "unexpected-wire-session" : values.removeFirst()
     }
 }
 
@@ -151,7 +151,7 @@ private struct ACPTaskControlFixture: Sendable {
             }
         }
 
-        let initialized = await ACPLeaderRequestAuthority.$clientID.withValue(leaderOwner) {
+        let initialized = try await ACPLeaderRequestAuthority.$clientID.withValue(leaderOwner) {
             await runtime.handle(.request(
                 id: .string("initialize-task-control"),
                 method: AgentMethodNames.initialize,
@@ -677,7 +677,7 @@ struct LiveACPTaskControlParityTests {
                 }
             }
 
-            let initialized = await ACPLeaderRequestAuthority.$clientID.withValue("owner-driver") {
+            let initialized = try await ACPLeaderRequestAuthority.$clientID.withValue("owner-driver") {
                 await runtime.handle(.request(
                     id: .string("pin-initialize"),
                     method: AgentMethodNames.initialize,

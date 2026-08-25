@@ -242,6 +242,21 @@ public actor ACPNotificationGateway {
         return true
     }
 
+    /// Mutation-bearing controls require the exact owning carrier to remain
+    /// connected on both sides of the session-ownership check. Direct,
+    /// in-process query clients intentionally keep the weaker `ownsSession`
+    /// contract, so tightening that method would break non-carrier surfaces.
+    public func ownsConnectedSession(_ sessionId: AcpSessionId) async -> Bool {
+        guard let runtime,
+              await isCurrentConnectedRuntime(runtime),
+              await runtime.ownsSession(sessionId),
+              await isCurrentConnectedRuntime(runtime)
+        else {
+            return false
+        }
+        return true
+    }
+
     public func submitUserInterjection(
         sessionId: AcpSessionId,
         promptID: String,
