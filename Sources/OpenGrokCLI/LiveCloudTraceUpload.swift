@@ -603,13 +603,22 @@ enum LiveCloudTraceUpload {
             }
         }
 
-        return query
-            .map { (percentEncodeQueryComponent($0.name), percentEncodeQueryComponent($0.value)) }
-            .sorted { lhs, rhs in
-                lhs.0 == rhs.0 ? lhs.1 < rhs.1 : lhs.0 < rhs.0
+        let encoded: [(name: String, value: String)] = query.map { item in
+            (
+                name: percentEncodeQueryComponent(item.name),
+                value: percentEncodeQueryComponent(item.value)
+            )
+        }
+        let sorted = encoded.sorted { lhs, rhs in
+            if lhs.name == rhs.name {
+                return lhs.value < rhs.value
             }
-            .map { "\($0.0)=\($0.1)" }
-            .joined(separator: "&")
+            return lhs.name < rhs.name
+        }
+        let parameters = sorted.map { item in
+            "\(item.name)=\(item.value)"
+        }
+        return parameters.joined(separator: "&")
     }
 
     static func validMultipartUploadID(_ value: String) -> Bool {
