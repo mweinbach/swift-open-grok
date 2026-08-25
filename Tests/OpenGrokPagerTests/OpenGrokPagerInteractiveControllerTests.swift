@@ -465,6 +465,101 @@ struct OpenGrokPagerInteractiveControllerTests {
         #expect(states.last?.completions.isEmpty == true)
     }
 
+    @Test("@-completion preserves Unicode token bounds, image chips, and atomic undo/redo")
+    func atFileCompletionPreservesAtomicComposerState() async throws {
+        let image = Data([0x89, 0x50, 0x4E, 0x47])
+        var events: [InputEvent] = [
+            .paste(encodeWrapImagePayload(data: image, mimeType: "image/png")),
+            .paste("😀 @fo after"),
+        ]
+        events.append(contentsOf: (0..<" after".count).map { _ in
+            .key(KeyEvent(key: .left))
+        })
+        events.append(contentsOf: [
+            .key(KeyEvent(key: .tab)),
+            .key(KeyEvent(key: .char("z"), modifiers: [.control])),
+            .key(KeyEvent(key: .char("Z"), modifiers: [.control, .shift])),
+            .key(KeyEvent(key: .backspace)),
+            .key(KeyEvent(key: .backspace)),
+        ])
+
+        let renderer = RecordingInteractiveRenderer()
+        let controller = OpenGrokPagerInteractiveController(
+            input: makeInputStream(events),
+            runtime: TestInteractiveRuntime(sessions: []),
+            renderer: renderer,
+            output: RecordingInteractiveOutput()
+        )
+        await controller.setFileSearchSuggestions { query, _, _ in
+            guard query == "fo" else { return [] }
+            return [OpenGrokPagerCommandSuggestion(
+                name: "@données/名.swift",
+                summary: "",
+                insertText: "données/名.swift"
+            )]
+        }
+
+        let result = try await controller.run(.init(prompt: "", mode: .inline))
+        let states = await renderer.promptStates
+        let completed = states.filter {
+            $0.text == "[Image #1]😀 @données/名.swift  after"
+        }
+
+        #expect(result.lifecycle == .eof)
+        #expect(completed.count == 2)
+        #expect(completed.allSatisfy {
+            $0.cursorOffset == "[Image #1]😀 @données/名.swift ".count
+                && $0.pastedImages.count == 1
+                && $0.pastedImages[0].encodedBytes == image
+        })
+        #expect(states.contains {
+            $0.text == "[Image #1]😀 @fo after"
+                && $0.cursorOffset == "[Image #1]😀 @fo".count
+                && $0.pastedImages.count == 1
+        })
+        #expect(states.last?.text == "[Image #1]😀  after")
+        #expect(states.last?.pastedImages.count == 1)
+        #expect(states.last?.pastedImages.first?.encodedBytes == image)
+    }
+
+    @Test("directory completion remains plain text and preserves the suffix cursor")
+    func atDirectoryCompletionPreservesSuffix() async throws {
+        var events: [InputEvent] = [.paste("😀 @so tail")]
+        events.append(contentsOf: (0..<" tail".count).map { _ in
+            .key(KeyEvent(key: .left))
+        })
+        events.append(contentsOf: [
+            .key(KeyEvent(key: .tab)),
+            .key(KeyEvent(key: .backspace)),
+        ])
+
+        let renderer = RecordingInteractiveRenderer()
+        let controller = OpenGrokPagerInteractiveController(
+            input: makeInputStream(events),
+            runtime: TestInteractiveRuntime(sessions: []),
+            renderer: renderer,
+            output: RecordingInteractiveOutput()
+        )
+        await controller.setFileSearchSuggestions { query, _, _ in
+            guard query == "so" else { return [] }
+            return [OpenGrokPagerCommandSuggestion(
+                name: "@Sources",
+                summary: "dir",
+                insertText: "Sources"
+            )]
+        }
+
+        let result = try await controller.run(.init(prompt: "", mode: .inline))
+        let states = await renderer.promptStates
+
+        #expect(result.lifecycle == .eof)
+        #expect(states.contains {
+            $0.text == "😀 @Sources tail" && $0.cursorOffset == "😀 @Sources".count
+        })
+        #expect(states.last?.text == "😀 @Source tail")
+        #expect(states.last?.cursorOffset == "😀 @Source".count)
+    }
+
     @Test("/help opens the shortcuts modal and /quit ends the run without a session")
     func slashCommandsRunLocally() async throws {
         let runtime = TestInteractiveRuntime(sessions: [])

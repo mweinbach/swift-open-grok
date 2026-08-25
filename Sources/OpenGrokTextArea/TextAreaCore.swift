@@ -327,7 +327,10 @@ public final class TextArea {
     @discardableResult
     public func deleteSelection() -> Bool {
         guard let r = selectionRange, !r.isEmpty else { return false }
-        applyEditReplacement(r, "", .delete)
+        let start = r.lowerBound
+        applyEditReplacement(r, "", .replace)
+        buffer.setCursorByte(min(start, buffer.count))
+        postMutate()
         selection = nil
         return true
     }
@@ -750,15 +753,27 @@ public final class TextArea {
 
     @discardableResult
     public func insertElement(kind: ElementKind, text: String, displayText: String? = nil) -> ElementId {
+        replaceRangeWithElement(cursor..<cursor, kind: kind, text: text, displayText: displayText)
+    }
+
+    @discardableResult
+    public func replaceRangeWithElement(
+        _ range: Range<Int>,
+        kind: ElementKind,
+        text: String,
+        displayText: String? = nil
+    ) -> ElementId {
         let expanded = expandTabs(text, tabWidth: tabWidth)
-        let start = cursor
+        let plan = buffer.planReplaceByteRange(range, replacement: expanded, atomic: elementRanges())
+        let start = plan.replacedByteRange.lowerBound
         preMutate(.element)
-        let plan = buffer.planReplaceByteRange(start..<start, replacement: expanded, atomic: elementRanges())
-        _ = buffer.applyValidatedPlan(plan)
+        applyEditPlan(plan, nil)
         let id = ElementId(raw: nextElementId)
         nextElementId += 1
-        let range = start..<(start + expanded.utf8Count)
-        elements.append(TextElement(id: id, range: range, kind: kind, displayText: displayText))
+        let elementRange = start..<(start + expanded.utf8Count)
+        elements.append(TextElement(id: id, range: elementRange, kind: kind, displayText: displayText))
+        elements.sort { $0.range.lowerBound < $1.range.lowerBound }
+        setCursor(elementRange.upperBound)
         wrapCache = nil
         preferredColStorage = nil
         postMutate()
@@ -769,17 +784,32 @@ public final class TextArea {
         elements.first { cursor >= $0.range.lowerBound && cursor < $0.range.upperBound }
     }
 
+    public func elementText(_ id: ElementId) -> String? {
+        guard let element = elements.first(where: { $0.id == id }) else { return nil }
+        return buffer.text.substring(utf8Range: element.range)
+    }
+
+    @discardableResult
+    public func inlineElement(_ id: ElementId) -> Bool {
+        guard let index = elements.firstIndex(where: { $0.id == id }) else { return false }
+        let end = elements[index].range.upperBound
+        preMutate(.element)
+        elements.remove(at: index)
+        buffer.setCursorByte(end)
+        preferredColStorage = nil
+        wrapCache = nil
+        undoState.lastKind = nil
+        undoState.lastCursor = cursor
+        return true
+    }
+
     /// Inline/expand raw pasted text for `[Paste]` chips at or adjacent to cursor.
     @discardableResult
     public func expandPasteElementAtCursor() -> Bool {
         guard let elem = elementAtCursor() ?? elements.first(where: { elem in
             elem.kind == .paste && cursor >= elem.range.lowerBound && cursor <= elem.range.upperBound + 1
         }), elem.kind == .paste else { return false }
-        elements.removeAll { $0.id == elem.id }
-        wrapCache = nil
-        preferredColStorage = nil
-        postMutate()
-        return true
+        return inlineElement(elem.id)
     }
 
     /// Locate and parse `@path:line` or `@path:start-end` file reference element at or adjacent to cursor.
@@ -845,23 +875,28 @@ public final class TextArea {
         undoState.stack.removeAll()
         undoState.redo.removeAll()
         undoState.lastKind = nil
+        undoState.lastCursor = cursor
     }
 
     @discardableResult
     public func undo() -> Bool {
         guard let entry = undoState.stack.popLast() else { return false }
+        scrollOverrideStorage = nil
         undoState.redo.append(snapshot())
         restore(entry)
         undoState.lastKind = nil
+        undoState.lastCursor = cursor
         return true
     }
 
     @discardableResult
     public func redo() -> Bool {
         guard let entry = undoState.redo.popLast() else { return false }
+        scrollOverrideStorage = nil
         undoState.stack.append(snapshot())
         restore(entry)
         undoState.lastKind = nil
+        undoState.lastCursor = cursor
         return true
     }
 
@@ -879,9 +914,14 @@ public final class TextArea {
         guard undoState.groupDepth > 0 else { return }
         undoState.groupDepth -= 1
         if undoState.groupDepth == 0, let cp = undoState.groupCheckpoint {
-            pushUndo(cp)
+            let changed = cp.text != buffer.text || cp.cursor != cursor || cp.elements != elements
+            if changed {
+                pushUndo(cp)
+                undoState.redo.removeAll()
+            }
             undoState.groupCheckpoint = nil
-            undoState.redo.removeAll()
+            undoState.lastKind = nil
+            undoState.lastCursor = cursor
         }
     }
 
@@ -892,6 +932,8 @@ public final class TextArea {
             restore(cp)
             undoState.groupCheckpoint = nil
         }
+        undoState.lastKind = nil
+        undoState.lastCursor = cursor
     }
 
     // MARK: Private edit plumbing

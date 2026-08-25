@@ -288,6 +288,30 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             loadBuffer(value)
         }
 
+        func acceptFileCompletion(in characterRange: Range<Int>, path: String, isDirectory: Bool) {
+            let text = area.text
+            let lowerBound = utf8Offset(fromCharacter: characterRange.lowerBound, in: text)
+            let upperBound = utf8Offset(fromCharacter: characterRange.upperBound, in: text)
+            let replacement = "@\(path)"
+
+            if isDirectory {
+                area.replaceRange(lowerBound..<upperBound, with: replacement)
+                area.setCursor(lowerBound + replacement.utf8.count)
+            } else {
+                area.beginUndoGroup()
+                area.replaceRangeWithElement(
+                    lowerBound..<upperBound,
+                    kind: .fileRef,
+                    text: replacement,
+                    displayText: replacement
+                )
+                area.insertStr(" ")
+                area.endUndoGroup()
+            }
+
+            completionsDismissed = false
+        }
+
         /// Place the cursor at a Character / grapheme offset from composer
         /// mouse hit mapping. Clamped — never traps past the draft ends.
         func placeCursor(at offset: Int) {
@@ -3045,14 +3069,11 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
               editor.completions.indices.contains(index) else { return nil }
         let suggestion = editor.completions[index]
         if let atContext = AtContext.detect(text: editor.text, cursor: editor.cursor) {
-            var text = editor.text
-            let lowerBound = min(text.count, atContext.range.lowerBound)
-            let upperBound = min(text.count, atContext.range.upperBound)
-            let lower = text.index(text.startIndex, offsetBy: lowerBound)
-            let upper = text.index(text.startIndex, offsetBy: upperBound)
-            let suffix = suggestion.summary == "dir" || suggestion.insertText.hasSuffix("/") ? "" : " "
-            text.replaceSubrange(lower..<upper, with: "@\(suggestion.insertText)\(suffix)")
-            editor.replace(with: text)
+            editor.acceptFileCompletion(
+                in: atContext.range,
+                path: suggestion.insertText,
+                isDirectory: suggestion.summary == "dir" || suggestion.insertText.hasSuffix("/")
+            )
             return suggestion
         }
         // Accepting a *command* row records MRU; an argument row does

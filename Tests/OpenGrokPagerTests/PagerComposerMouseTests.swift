@@ -122,6 +122,38 @@ struct PagerComposerMouseTests {
         #expect(await renderer.clipboard.last == "😀")
     }
 
+    @Test("double-clicking a completed file chip opens the real line-viewer overlay")
+    func doubleClickCompletedFileChipOpensLineViewer() async throws {
+        let renderer = ComposerMouseRenderer(content: content)
+        let controller = OpenGrokPagerInteractiveController(
+            input: closedComposerMouseStream([
+                .paste("inspect @foo"),
+                .key(KeyEvent(key: .tab)),
+                .mouse(MouseEvent(kind: .down, x: 9, y: 0, button: .left)),
+                .mouse(MouseEvent(kind: .down, x: 9, y: 0, button: .left)),
+            ]),
+            runtime: ComposerMouseRuntime(sessions: []),
+            renderer: renderer,
+            output: SilentComposerMouseOutput()
+        )
+        await controller.setFileSearchSuggestions { query, _, _ in
+            guard query == "foo" else { return [] }
+            return [OpenGrokPagerCommandSuggestion(
+                name: "@Sources/Foo.swift:12-14",
+                summary: "",
+                insertText: "Sources/Foo.swift:12-14"
+            )]
+        }
+
+        let result = try await controller.run(.init(prompt: "", mode: .inline))
+
+        #expect(result.lifecycle == .eof)
+        #expect(await renderer.lastPrompt?.text == "inspect @Sources/Foo.swift:12-14 ")
+        #expect(await renderer.overlayRequests == [
+            .openLineViewer(path: "Sources/Foo.swift", lineRange: 12..<15)
+        ])
+    }
+
     @Test("double-click on a wrapped word selects the whole word")
     func doubleClickSelectsWrappedWord() async throws {
         let narrow = TextAreaRect(x: 0, y: 0, width: 8, height: 4)

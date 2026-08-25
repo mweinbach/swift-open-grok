@@ -352,6 +352,27 @@ struct TextAreaTests {
         #expect(area.text == "aef")
     }
 
+    @Test("deleting a stale Unicode selection moves an unrelated cursor to its normalized start")
+    func selectionDeletionMovesCursorToNormalizedStart() {
+        let cluster = "👩🏽\u{200D}💻"
+        let text = "a\(cluster)z"
+
+        for initialCursor in [0, text.utf8.count] {
+            let area = TextArea()
+            area.setText(text)
+            area.setCursor(initialCursor)
+            area.setSelection(anchor: 5, head: 3)
+
+            #expect(area.deleteSelection())
+            #expect(area.text == "az")
+            #expect(area.cursor == 1)
+            #expect(area.selectionRange == nil)
+
+            area.insertStr("x")
+            #expect(area.text == "axz")
+        }
+    }
+
     @Test("elements are atomic for motion")
     func elements() {
         let area = TextArea()
@@ -363,6 +384,135 @@ struct TextAreaTests {
         area.setCursor(6) // after TOKEN
         area.moveCursorLeft()
         #expect(area.cursor == 1) // jumps over TOKEN
+    }
+
+    @Test("inserting an element before existing chips shifts and sorts their byte ranges")
+    func insertingElementShiftsExistingChips() {
+        let area = TextArea()
+        let image = area.insertElement(kind: .image, text: "[Image #1]")
+        area.insertStr(" ")
+        let paste = area.insertElement(kind: .paste, text: "[paste]")
+        area.setCursor(0)
+
+        let reference = area.insertElement(kind: .fileRef, text: "@données/名.swift")
+        let insertedBytes = "@données/名.swift".utf8.count
+
+        #expect(area.text == "@données/名.swift[Image #1] [paste]")
+        #expect(area.allElements.map(\.id) == [reference, image, paste])
+        #expect(area.allElements[0].range == 0..<insertedBytes)
+        #expect(area.allElements[1].range == insertedBytes..<(insertedBytes + "[Image #1]".utf8.count))
+        #expect(area.elementText(image) == "[Image #1]")
+        #expect(area.elementText(paste) == "[paste]")
+        #expect(area.cursor == insertedBytes)
+    }
+
+    @Test("atomic Unicode replacement preserves neighboring chips and grouped undo/redo")
+    func replacingRangeWithElementPreservesExistingChips() {
+        let area = TextArea()
+        area.insertStr("😀 ")
+        let image = area.insertElement(kind: .image, text: "[Image #1]")
+        area.insertStr(" @fo ")
+        let paste = area.insertElement(kind: .paste, text: "[paste]")
+        area.insertStr(" café")
+        let originalText = area.text
+        let tokenStart = "😀 [Image #1] ".utf8.count
+        area.setCursor(0)
+        area.clearHistory()
+
+        area.beginUndoGroup()
+        let reference = area.replaceRangeWithElement(
+            tokenStart..<(tokenStart + "@fo".utf8.count),
+            kind: .fileRef,
+            text: "@données/名.swift",
+            displayText: "@données/名.swift"
+        )
+        area.insertStr(" ")
+        area.endUndoGroup()
+
+        #expect(area.text == "😀 [Image #1] @données/名.swift  [paste] café")
+        #expect(area.allElements.map(\.id) == [image, reference, paste])
+        #expect(area.elementText(image) == "[Image #1]")
+        #expect(area.elementText(reference) == "@données/名.swift")
+        #expect(area.elementText(paste) == "[paste]")
+        #expect(area.cursor == tokenStart + "@données/名.swift ".utf8.count)
+
+        #expect(area.undo())
+        #expect(area.text == originalText)
+        #expect(area.cursor == 0)
+        #expect(area.allElements.map(\.id) == [image, paste])
+        #expect(area.elementText(paste) == "[paste]")
+        #expect(!area.canUndo)
+
+        #expect(area.redo())
+        #expect(area.text == "😀 [Image #1] @données/名.swift  [paste] café")
+        #expect(area.allElements.map(\.id) == [image, reference, paste])
+        #expect(area.elementText(paste) == "[paste]")
+        #expect(area.cursor == tokenStart + "@données/名.swift ".utf8.count)
+    }
+
+    @Test("replacement consumes overlapping atomic chips and restores them on undo")
+    func replacementConsumesOverlappingChip() {
+        let area = TextArea()
+        area.insertStr("before ")
+        let image = area.insertElement(kind: .image, text: "[Image #1]")
+        area.insertStr(" after")
+        area.clearHistory()
+
+        let reference = area.replaceRangeWithElement(
+            8..<10,
+            kind: .fileRef,
+            text: "@file.swift"
+        )
+
+        #expect(area.text == "before @file.swift after")
+        #expect(area.allElements.map(\.id) == [reference])
+        #expect(area.elementText(image) == nil)
+
+        #expect(area.undo())
+        #expect(area.text == "before [Image #1] after")
+        #expect(area.allElements.map(\.id) == [image])
+        #expect(area.elementText(image) == "[Image #1]")
+    }
+
+    @Test("inlining a paste chip is one undoable metadata-preserving operation")
+    func inliningPasteChipIsUndoable() {
+        let area = TextArea()
+        area.insertStr("before ")
+        let paste = area.insertElement(kind: .paste, text: "multi\nline", displayText: "[paste]")
+        area.insertStr(" after")
+        area.clearHistory()
+        area.setCursor("before ".utf8.count)
+
+        #expect(area.expandPasteElementAtCursor())
+        #expect(area.text == "before multi\nline after")
+        #expect(area.allElements.isEmpty)
+        #expect(area.cursor == "before multi\nline".utf8.count)
+
+        #expect(area.undo())
+        #expect(area.allElements.map(\.id) == [paste])
+        #expect(area.elementText(paste) == "multi\nline")
+        #expect(area.allElements.first?.displayText == "[paste]")
+        #expect(area.cursor == "before ".utf8.count)
+
+        #expect(area.redo())
+        #expect(area.allElements.isEmpty)
+        #expect(area.cursor == "before multi\nline".utf8.count)
+    }
+
+    @Test("an unchanged undo group preserves redo without creating a checkpoint")
+    func unchangedUndoGroupPreservesRedo() {
+        let area = TextArea()
+        area.insertStr("hello")
+        #expect(area.undo())
+        #expect(area.canRedo)
+
+        area.beginUndoGroup()
+        area.endUndoGroup()
+
+        #expect(!area.canUndo)
+        #expect(area.canRedo)
+        #expect(area.redo())
+        #expect(area.text == "hello")
     }
 
     @Test("wrapping produces multiple lines")
