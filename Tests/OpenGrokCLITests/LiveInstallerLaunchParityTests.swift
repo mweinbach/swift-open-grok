@@ -366,9 +366,14 @@ struct LiveInstallerLaunchParityTests {
         )
 
         #expect(exitCode != CLIRunner.ExitCode.success.rawValue)
-        #expect(errors.contents.contains("no verified Open Grok release backend"))
         let counts = await recorder.counts()
-        #expect(counts.fetches == 1)
+        if ReleasePlatform.current.isSupportedForRelease {
+            #expect(errors.contents.contains("no verified Open Grok release backend"))
+            #expect(counts.fetches == 1)
+        } else {
+            #expect(errors.contents.contains(ReleasePlatform.unsupportedPlatformMessage))
+            #expect(counts.fetches == 0)
+        }
         #expect(counts.installs == 0)
     }
 

@@ -615,6 +615,7 @@ struct LiveClaudeSettingsImportParityTests {
         #expect(await renderer.testingFocusedOverlayID() == PagerClaudeImportOverlay.overlayID)
         let initial = try #require(await renderer.claudeImportPlan)
         #expect(initial.overlay.selectedCount == 2)
+        try await renderer.testingForcePaint()
         #expect(sink.visibleText.contains("Import Claude settings"))
         #expect(!sink.text.contains("never-display-this-secret"))
 
