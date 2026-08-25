@@ -45,9 +45,23 @@ divergences, and still-unverified platforms. `CRATE_MAP.md` now enumerates all
 - **LIVE — connection-bound ACP task authority.** Task-control requests must
   retain their original connected carrier; foreign child inspection and
   cancellation produce inert upstream-shaped hidden results without executing
-  the handler, and disconnected carriers cannot mutate durable tasks
+  the handler, and disconnected carriers cannot mutate durable tasks. Shared
+  leader hosts initialize the underlying agent exactly once, reuse only a
+  protocol-validated response for newly connected clients, preserve existing
+  authentication, and bind private replay to the actual carrier rather than
+  client-supplied identity
   (`xai-grok-shell/src/extensions/task.rs:431-474`;
-  `agent/mvp_agent/acp_agent.rs:3343-3353`).
+  `agent/mvp_agent/acp_agent.rs:300-309,3343-3353`;
+  `agent/mvp_agent/replay.rs:118-152,186-191`).
+- **LIVE — private durable session search through canonical host paths.** CLI
+  and ACP search share a real owner-private SQLite FTS5 index, including exact
+  totals, workspace isolation, content snippets, and deployment-authoritative
+  kill switches. The previously verified sessions directory is canonicalized
+  using actual POSIX `realpath`, not Foundation's `/var`-preserving resolver;
+  the final database filename remains unresolved and SQLite's no-follow flag,
+  owner-only permissions, and hostile parent/final-link rejection stay active
+  (`xai-grok-shell/src/session/storage/search_db.rs:11-23`;
+  `session/storage/search_fts.rs:86-144`).
 - **LIVE — bounded startup worktree cleanup.** Empty registries, missing
   worktrees, recent worktrees, and manually managed entries preserve the same
   cleanup/throttle results without spawning a machine-wide process-working-
@@ -56,10 +70,19 @@ divergences, and still-unverified platforms. `CRATE_MAP.md` now enumerates all
   (`xai-fast-worktree/src/auto_gc.rs:15-35`;
   `api.rs:1838-1865`).
 
-The focused serialized verification matrix passed **226 tests in 24 suites
-across 8 nonempty test-product summaries**, exit 0. The complete package gate,
-cross-platform execution, remote CI, and release certification are separate
-evidence; this focused result does not claim them.
+**Verified local macOS gate (2026-08-24):** `build-tests` exited 0, and the
+authoritative `test --no-parallel` passed **9,318 tests in 1,325 suites across
+106 nonempty test-product summaries**, exit 0, in approximately **458 seconds**
+under the unchanged 600-second watchdog. The real-executable product passed
+**231 tests in 37 suites** in 125.180 seconds, and the complete CLI product
+passed **2,465 tests in 324 suites** in 153.189 seconds. Focused live-seam
+matrices separately passed **226 tests / 24 suites / 8 products**,
+**133 tests / 15 suites / 3 products**, and **111 tests / 9 suites /
+2 products**. Isolated real-binary smoke verified release version
+`1.0.0-open-grok.82`, owner-private `0600` session-search SQLite creation
+through a `/tmp` alias, empty session search/list results, model discovery,
+and the live trace route's authentic missing-session refusal. Cross-platform
+execution, remote CI, and release certification remain separate evidence.
 
 **Produced:** 2026-08-06, from a seven-domain read-only audit swarm against reference pin
 `70002584da34e4c37ea14a3bce35341b7d04f9a7` (v0.1.220-open-grok.57), on the tree at the
