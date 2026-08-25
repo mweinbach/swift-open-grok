@@ -97,6 +97,8 @@ public enum LiveCredentialError: Error, Sendable, Equatable, CustomStringConvert
     case codexRefreshFailed(String)
     /// An xAI account session could not renew an expired access token.
     case xaiRefreshFailed(String)
+    /// Administrator policy rejected the available xAI credential or principal.
+    case xaiManagedPolicyViolation(String)
     /// Built-in account credentials must never leave their provider's hosts.
     case untrustedCredentialEndpoint(provider: ModelProvider, baseURL: String)
 
@@ -110,6 +112,8 @@ public enum LiveCredentialError: Error, Sendable, Equatable, CustomStringConvert
             return "Codex credentials could not be refreshed: \(detail)"
         case .xaiRefreshFailed(let detail):
             return "xAI credentials could not be refreshed: \(detail)"
+        case .xaiManagedPolicyViolation(let detail):
+            return detail
         case .untrustedCredentialEndpoint(let provider, let baseURL):
             return "refusing to send \(provider.asString) account credentials to untrusted endpoint \(baseURL)"
         }
@@ -120,6 +124,9 @@ public enum LiveCredentialError: Error, Sendable, Equatable, CustomStringConvert
 public struct LiveCredentialResolver: Sendable {
     public let environment: [String: String]
     public let openGrokHome: URL
+    /// Trusted effective policy supplied by the composition that loaded the
+    /// managed and requirements tiers; environment defaults cannot recover it.
+    public let grokComConfig: GrokComConfig
     public let codexAuthFile: URL
     public let codexRefreshService: CodexTokenRefreshService
     public let xaiTokenRefresher: (any TokenRefresher)?
@@ -127,12 +134,14 @@ public struct LiveCredentialResolver: Sendable {
     public init(
         environment: [String: String],
         openGrokHome: URL,
+        grokComConfig: GrokComConfig? = nil,
         codexAuthFile: URL? = nil,
         codexRefreshService: CodexTokenRefreshService = .storeOnly,
         xaiTokenRefresher: (any TokenRefresher)? = nil
     ) {
         self.environment = environment
         self.openGrokHome = openGrokHome
+        self.grokComConfig = grokComConfig ?? .default(environment: environment)
         self.codexAuthFile = codexAuthFile
             ?? OpenGrokAuthPaths.codexAuthFileURL(environment: environment)
         self.codexRefreshService = codexRefreshService
@@ -167,7 +176,14 @@ public struct LiveCredentialResolver: Sendable {
         let explicit = Self.trimmed(explicitAPIKey)
 
         if provider == .xai {
-            let credential = try await resolveXAI(explicitAPIKey: explicit, scope: scope)
+            let enforceFirstPartyPolicy = baseURL.map {
+                trustedBuiltInSessionEndpoint(provider: .xai, baseURL: $0)
+            } ?? true
+            let credential = try await resolveXAI(
+                explicitAPIKey: explicit,
+                scope: scope,
+                enforceFirstPartyPolicy: enforceFirstPartyPolicy
+            )
             if credential.source != .explicitAPIKey,
                let baseURL,
                !trustedBuiltInSessionEndpoint(provider: provider, baseURL: baseURL)
@@ -257,12 +273,25 @@ public struct LiveCredentialResolver: Sendable {
         }
         switch provider {
         case .xai:
-            if xaiAPIKeyFromEnvironment(environment) != nil { return true }
+            let apiKeysDisabled = grokComConfig.apiKeyAuthDisabled(environment: environment)
+            if !apiKeysDisabled, xaiAPIKeyFromEnvironment(environment) != nil { return true }
             let path = OpenGrokAuthPaths.authFileURL(environment: environment)
             guard let store = try? readAuthJSONOrEmpty(at: path) else { return false }
-            let config = GrokComConfig.default(environment: environment)
-            return lookupAuth(store, scope: config.authScope) != nil
-                || store[apiKeyScope] != nil
+            if let auth = lookupAuth(store, scope: grokComConfig.authScope) {
+                if auth.authMode == .apiKey {
+                    return !apiKeysDisabled
+                }
+                do {
+                    try enforceLoginPrincipal(
+                        policy: grokComConfig.forceLoginTeamUUID,
+                        actual: Self.principalID(for: auth)
+                    )
+                    return true
+                } catch {
+                    return false
+                }
+            }
+            return !apiKeysDisabled && store[apiKeyScope] != nil
         case .codex:
             return isCodexLoggedIn(at: codexAuthFile)
         case .kimi, .fireworks, .deepseek, .meta, .openCodeGo, .wafer, .zai,
@@ -281,9 +310,12 @@ public struct LiveCredentialResolver: Sendable {
 
     private func resolveXAI(
         explicitAPIKey: String?,
-        scope: String
+        scope: String,
+        enforceFirstPartyPolicy: Bool
     ) async throws -> LiveResolvedCredential {
-        let config = GrokComConfig.default(environment: environment)
+        let config = grokComConfig
+        let apiKeysDisabled = enforceFirstPartyPolicy
+            && config.apiKeyAuthDisabled(environment: environment)
         let manager = AuthManager(
             grokHome: openGrokHome,
             config: config,
@@ -295,7 +327,7 @@ public struct LiveCredentialResolver: Sendable {
         {
             await manager.configureRefresher(refresher)
         }
-        let resolvedExplicitAPIKey = config.apiKeyAuthDisabled(environment: environment)
+        let resolvedExplicitAPIKey = apiKeysDisabled
             ? nil
             : explicitAPIKey
         var precedence = await resolveCredentialPrecedence(
@@ -303,6 +335,29 @@ public struct LiveCredentialResolver: Sendable {
             environment: environment,
             explicitAPIKey: resolvedExplicitAPIKey
         )
+        if apiKeysDisabled {
+            // `resolveCredentialPrecedence` independently reads XAI_API_KEY;
+            // clearing only its explicit rung still exports the forbidden key.
+            precedence.envAPIKey = nil
+            if precedence.session?.authMode == .apiKey {
+                precedence.session = nil
+            }
+        }
+
+        if precedence.deploymentKey == nil,
+           enforceFirstPartyPolicy,
+           let session = precedence.session,
+           session.authMode != .apiKey
+        {
+            do {
+                try enforceLoginPrincipal(
+                    policy: config.forceLoginTeamUUID,
+                    actual: Self.principalID(for: session)
+                )
+            } catch {
+                throw LiveCredentialError.xaiManagedPolicyViolation(Self.describe(error))
+            }
+        }
 
         if precedence.deploymentKey == nil,
            resolvedExplicitAPIKey == nil,
@@ -320,6 +375,22 @@ public struct LiveCredentialResolver: Sendable {
                 environment: environment,
                 explicitAPIKey: resolvedExplicitAPIKey
             )
+            if apiKeysDisabled {
+                precedence.envAPIKey = nil
+                if precedence.session?.authMode == .apiKey {
+                    precedence.session = nil
+                }
+            }
+            if enforceFirstPartyPolicy, let session = precedence.session {
+                do {
+                    try enforceLoginPrincipal(
+                        policy: config.forceLoginTeamUUID,
+                        actual: Self.principalID(for: session)
+                    )
+                } catch {
+                    throw LiveCredentialError.xaiManagedPolicyViolation(Self.describe(error))
+                }
+            }
         }
         let credentials = precedence.resolved
 
@@ -335,6 +406,11 @@ public struct LiveCredentialResolver: Sendable {
         }
 
         guard let bearer = credentials.userToken else {
+            if apiKeysDisabled {
+                throw LiveCredentialError.xaiManagedPolicyViolation(
+                    AuthError.apiKeyAuthDisabled.description
+                )
+            }
             throw LiveCredentialError.missingCredential(
                 provider: .xai,
                 hint: Self.credentialHint(.xai)
@@ -487,6 +563,12 @@ public struct LiveCredentialResolver: Sendable {
               !value.isEmpty
         else { return nil }
         return value
+    }
+
+    private static func principalID(for auth: GrokAuth) -> String? {
+        // auth.json profile fields are not authenticated; the issuer-signed
+        // bearer principal is the only identity administrator pins can trust.
+        peekAccessTokenPrincipalID(auth.key)
     }
 
     private static func describe(_ error: Error) -> String {

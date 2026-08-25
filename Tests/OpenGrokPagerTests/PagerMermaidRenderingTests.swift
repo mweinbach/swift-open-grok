@@ -51,8 +51,8 @@ struct PagerMermaidRenderingTests {
         #expect(closedText.contains("A"))
         #expect(closedText.contains("B"))
         #expect(closed.filter { $0.text.contains("◇ mermaid") }.count == 1)
-        #expect(closedText.contains("[Open Image]"))
-        #expect(closedText.contains("[Copy Source]"))
+        #expect(!closedText.contains("[Open Image]"))
+        #expect(!closedText.contains("[Copy Source]"))
         #expect(!closedText.contains("flowchart TD"))
     }
 

@@ -99,7 +99,20 @@ public struct AllowlistedRemoteSettings: Sendable, Equatable {
     public var compactionMode: String?
     public var compactionDetail: String?
 
+    // -- Network and media egress (LiveWebTools / LiveImageTools / LiveVideoComposition) --
+
+    public var webFetchEnabled: Bool?
+    public var webFetchProxy: String?
+    public var webFetchAllowedDomains: [String]?
+    public var imageGenEnabled: Bool?
+    public var videoGenEnabled: Bool?
+    public var imagineToolsDisabled: [String]?
+
     public init() {}
+
+    public func imagineToolDisabled(_ tool: String) -> Bool {
+        imagineToolsDisabled?.contains(tool) == true
+    }
 }
 
 // MARK: - Projection
@@ -131,6 +144,12 @@ extension AllowlistedRemoteSettings {
         self.cancelRewindEnabled = remote.cancelRewindEnabled
         self.compactionMode = remote.compactionMode
         self.compactionDetail = remote.compactionDetail
+        self.webFetchEnabled = remote.webFetchEnabled
+        self.webFetchProxy = remote.webFetchProxy
+        self.webFetchAllowedDomains = remote.webFetchAllowedDomains
+        self.imageGenEnabled = remote.imageGenEnabled
+        self.videoGenEnabled = remote.videoGenEnabled
+        self.imagineToolsDisabled = remote.imagineToolsDisabled
     }
 }
 
@@ -161,4 +180,10 @@ public let remoteSettingsAllowlistedWireNames: Set<String> = [
     "cancel_rewind_enabled",
     "compaction_mode",
     "compaction_detail",
+    "web_fetch_enabled",
+    "web_fetch_proxy",
+    "web_fetch_allowed_domains",
+    "image_gen_enabled",
+    "video_gen_enabled",
+    "imagine_tools_disabled",
 ]

@@ -1,6 +1,12 @@
 import Foundation
 import OpenGrokHTTP
 
+#if canImport(Darwin)
+import Darwin
+#elseif os(Linux)
+import Glibc
+#endif
+
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
@@ -210,17 +216,13 @@ public struct SystemClipboardCommandRunner: ClipboardCommandRunner {
         }
 
         let fileManager = FileManager.default
-        let root = fileManager.temporaryDirectory
-            .appendingPathComponent("open-grok-clipboard-\(UUID().uuidString)", isDirectory: true)
-        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        let root = try Self.makePrivateTemporaryDirectory(prefix: "open-grok-clipboard-")
         defer { try? fileManager.removeItem(at: root) }
 
         let outputURL = root.appendingPathComponent("stdout")
         let errorURL = root.appendingPathComponent("stderr")
-        fileManager.createFile(atPath: outputURL.path, contents: nil)
-        fileManager.createFile(atPath: errorURL.path, contents: nil)
-        let outputHandle = try FileHandle(forWritingTo: outputURL)
-        let errorHandle = try FileHandle(forWritingTo: errorURL)
+        let outputHandle = try Self.makePrivateFile(at: outputURL)
+        let errorHandle = try Self.makePrivateFile(at: errorURL)
         defer {
             try? outputHandle.close()
             try? errorHandle.close()
@@ -229,8 +231,18 @@ public struct SystemClipboardCommandRunner: ClipboardCommandRunner {
         var inputHandle: FileHandle?
         if let input {
             let inputURL = root.appendingPathComponent("stdin")
-            try input.write(to: inputURL, options: .atomic)
-            inputHandle = try FileHandle(forReadingFrom: inputURL)
+            let handle = try Self.makePrivateFile(at: inputURL)
+            do {
+                try handle.write(contentsOf: input)
+                try handle.seek(toOffset: 0)
+                #if !os(Windows)
+                try fileManager.removeItem(at: inputURL)
+                #endif
+                inputHandle = handle
+            } catch {
+                try? handle.close()
+                throw error
+            }
         }
 
         let process = Process()
@@ -270,6 +282,47 @@ public struct SystemClipboardCommandRunner: ClipboardCommandRunner {
             standardOutput: output,
             standardError: error
         )
+    }
+
+    static func makePrivateTemporaryDirectory(prefix: String) throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(prefix)\(UUID().uuidString)", isDirectory: true)
+
+        #if canImport(Darwin) || os(Linux)
+        let result = root.path.withCString { mkdir($0, mode_t(0o700)) }
+        guard result == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        #else
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: NSNumber(value: 0o700)]
+        )
+        #endif
+
+        return root
+    }
+
+    static func makePrivateFile(at url: URL) throws -> FileHandle {
+        #if canImport(Darwin) || os(Linux)
+        let descriptor = url.path.withCString {
+            open($0, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, mode_t(0o600))
+        }
+        guard descriptor >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        #else
+        guard FileManager.default.createFile(
+            atPath: url.path,
+            contents: nil,
+            attributes: [.posixPermissions: NSNumber(value: 0o600)]
+        ) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        return try FileHandle(forUpdating: url)
+        #endif
     }
 
     private func resolveExecutable(_ executable: String) -> String? {
@@ -321,12 +374,13 @@ public struct SystemClipboardProvider: ClipboardMediaProvider {
     public init(
         platform: WebMediaPlatform = .current,
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        commandRunner: any ClipboardCommandRunner = SystemClipboardCommandRunner(),
+        commandRunner: (any ClipboardCommandRunner)? = nil,
         commandTimeout: TimeInterval = 2
     ) {
         self.platform = platform
         self.environment = environment
         self.commandRunner = commandRunner
+            ?? SystemClipboardCommandRunner(environment: environment, platform: platform)
         self.commandTimeout = commandTimeout
     }
 
@@ -490,7 +544,10 @@ public struct SystemClipboardProvider: ClipboardMediaProvider {
         let specs = textWriteSpecs()
         guard !specs.isEmpty else { throw ClipboardError.unsupported("no clipboard writer for \(platform.rawValue)") }
         var lastFailure: ClipboardError?
+        var succeeded = false
+        var wroteX11 = false
         for spec in specs {
+            if wroteX11 && spec.executable == "xsel" { continue }
             do {
                 let result = try commandRunner.run(
                     executable: spec.executable,
@@ -498,21 +555,37 @@ public struct SystemClipboardProvider: ClipboardMediaProvider {
                     input: Data(text.utf8),
                     timeout: commandTimeout
                 )
-                if result.succeeded { return }
+                if result.succeeded {
+                    succeeded = true
+                    if platform != .linux { return }
+                    if spec.executable == "xclip" || spec.executable == "xsel" {
+                        wroteX11 = true
+                    }
+                    continue
+                }
                 lastFailure = .commandFailed(spec.executable)
             } catch let error as ClipboardError {
                 lastFailure = error
             }
         }
+        if succeeded { return }
         throw lastFailure ?? ClipboardError.unsupported("no clipboard writer succeeded")
     }
 
     private func writeMacOSImage(_ image: ClipboardImage) throws {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("open-grok-image-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let root = try SystemClipboardCommandRunner.makePrivateTemporaryDirectory(
+            prefix: "open-grok-image-"
+        )
         defer { try? FileManager.default.removeItem(at: root) }
         let file = root.appendingPathComponent("clipboard.\(extensionForMime(image.mimeType))")
-        try image.data.write(to: file, options: .atomic)
+        let handle = try SystemClipboardCommandRunner.makePrivateFile(at: file)
+        do {
+            try handle.write(contentsOf: image.data)
+            try handle.close()
+        } catch {
+            try? handle.close()
+            throw error
+        }
         let escaped = file.path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let script = "set the clipboard to (read (POSIX file \"\(escaped)\") as \u{00AB}class \(appleScriptClass(for: image.mimeType))\u{00BB})"
         let result = try commandRunner.run(executable: "osascript", arguments: ["-e", script], input: nil, timeout: commandTimeout)
@@ -523,15 +596,20 @@ public struct SystemClipboardProvider: ClipboardMediaProvider {
         let specs = imageWriteSpecs(mimeType: image.mimeType)
         guard !specs.isEmpty else { throw ClipboardError.unsupported("no Linux image clipboard writer") }
         var lastFailure: ClipboardError?
+        var succeeded = false
         for spec in specs {
             do {
                 let result = try commandRunner.run(executable: spec.executable, arguments: spec.arguments, input: image.data, timeout: commandTimeout)
-                if result.succeeded { return }
+                if result.succeeded {
+                    succeeded = true
+                    continue
+                }
                 lastFailure = .commandFailed(spec.executable)
             } catch let error as ClipboardError {
                 lastFailure = error
             }
         }
+        if succeeded { return }
         throw lastFailure ?? ClipboardError.unsupported("no Linux image clipboard writer succeeded")
     }
 

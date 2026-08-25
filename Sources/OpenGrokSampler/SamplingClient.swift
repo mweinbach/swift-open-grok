@@ -39,6 +39,8 @@ public final class SamplingClient: @unchecked Sendable {
     /// Kept provider-local even if an incorrectly assembled config carries it.
     private let configuredCodexPermissions: CodexPermissions?
     private let forceHTTP1: Bool
+    private let maxRetries: UInt32
+    public let supportsStandaloneWebSearch: Bool
     /// The Fireworks pacing gate (client.rs:1706-1708 reads the process
     /// global). Internal-and-settable is a port-added test seam upstream does
     /// not need: its boundedness test exercises only the free function, but
@@ -79,6 +81,12 @@ public final class SamplingClient: @unchecked Sendable {
             headers[name] = value
         }
 
+        Self.applyEnvironmentHTTPHeaders(
+            config.envHTTPHeaders,
+            environment: ProcessInfo.processInfo.environment,
+            into: &headers
+        )
+
         if let resolver = config.bearerResolver {
             for name in resolver.reservedHeaders {
                 headers = headers.filter { $0.key.lowercased() != name.lowercased() }
@@ -107,6 +115,8 @@ public final class SamplingClient: @unchecked Sendable {
         self.codexTurnState = turnState
         self.configuredCodexPermissions = config.provider == .codex ? config.codexPermissions : nil
         self.forceHTTP1 = config.forceHTTP1
+        self.maxRetries = resolveMaxRetries(modelMaxRetries: config.maxRetries)
+        self.supportsStandaloneWebSearch = config.supportsStandaloneWebSearch
     }
 
     /// Replace a live bearer resolver without rebuilding model/endpoint defaults.
@@ -118,6 +128,100 @@ public final class SamplingClient: @unchecked Sendable {
         }
         bearerResolver = resolver
         return true
+    }
+
+    /// Execute the provider-local Codex search endpoint using inference auth.
+    public func standaloneWebSearch(
+        _ request: StandaloneSearchRequest
+    ) async throws -> StandaloneSearchResponse {
+        guard supportsStandaloneWebSearch,
+              defaults.provider == .codex,
+              defaults.apiBackend == .responses
+        else {
+            throw SamplingError.invalidConfiguration(
+                "standalone web search is unavailable for this provider route"
+            )
+        }
+
+        var retryCount: UInt32 = 0
+        while true {
+            try Task.checkCancellation()
+            do {
+                return try await standaloneWebSearchOnce(request)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as SamplingError {
+                let decision = classifyError(
+                    error,
+                    retryCount: retryCount,
+                    maxRetries: maxRetries,
+                    rateLimitThreshold: RATE_LIMIT_RETRY_THRESHOLD
+                )
+                let backoff: MonotonicDuration
+                switch decision {
+                case .retry(let delay), .retryWithClientRebuild(let delay):
+                    backoff = delay
+                case .retryWithBackoff(let delay, _):
+                    backoff = delay
+                case .retryWithImageStrip:
+                    throw error
+                case .emitToSession(let failure), .fatal(let failure):
+                    throw failure
+                }
+                retryCount = retryCount == .max ? .max : retryCount + 1
+                try await backoff.sleep()
+            } catch {
+                throw SamplingError.http(String(describing: error))
+            }
+        }
+    }
+
+    private func standaloneWebSearchOnce(
+        _ search: StandaloneSearchRequest
+    ) async throws -> StandaloneSearchResponse {
+        let body: Data
+        do {
+            body = try WireJSONEncoder.make().encode(search)
+        } catch {
+            throw SamplingError.serialization(String(describing: error))
+        }
+
+        let request = HTTPRequest(
+            method: .post,
+            url: try makeURL(path: "/alpha/search"),
+            headers: buildHeaders(requestHeaders: nil),
+            body: body,
+            idempotency: .nonIdempotent
+        )
+        let sentBearerFragment = sentBearerFragment(from: request.headers)
+
+        let response: HTTPResponse
+        do {
+            response = try await transport.send(request)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch HTTPError.cancelled {
+            throw CancellationError()
+        } catch {
+            throw SamplingError.http(String(describing: error))
+        }
+        try Task.checkCancellation()
+
+        guard (200..<300).contains(response.metadata.statusCode) else {
+            throw mapHTTPError(
+                status: response.metadata.statusCode,
+                body: response.body,
+                headers: response.metadata.headers,
+                consumer: .standaloneWebSearch,
+                sentBearerFragment: sentBearerFragment
+            )
+        }
+
+        do {
+            return try JSONDecoder().decode(StandaloneSearchResponse.self, from: response.body)
+        } catch {
+            throw SamplingError.serialization(String(describing: error))
+        }
     }
 
     // MARK: - Conversation streaming
@@ -380,6 +484,7 @@ public final class SamplingClient: @unchecked Sendable {
             body: bodyData,
             idempotency: .nonIdempotent
         )
+        let sentBearerFragment = sentBearerFragment(from: request.headers)
 
         let httpStream = transport.stream(request)
         let iterator = AsyncThrowingStreamIteratorRelay(httpStream)
@@ -420,7 +525,8 @@ public final class SamplingClient: @unchecked Sendable {
                 status: statusCode,
                 body: errBody,
                 headers: responseHeaders,
-                consumer: consumer
+                consumer: consumer,
+                sentBearerFragment: sentBearerFragment
             )
         }
 
@@ -629,26 +735,72 @@ public final class SamplingClient: @unchecked Sendable {
     }
 
     private func makeURL(path: String) throws -> URL {
-        let base = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
+        guard var components = URLComponents(string: baseURL),
+              components.scheme != nil,
+              components.host != nil
+        else {
+            throw SamplingError.invalidConfiguration("invalid base URL: \(baseURL)")
+        }
+        let existingItems = components.queryItems ?? []
+        components.query = nil
+        let basePath = components.path
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let p = path.hasPrefix("/") ? path : "/" + path
-        let basePath = URL(string: base)?.path
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? ""
         let endpointPath = !basePath.isEmpty && p.hasPrefix("/v1/")
             ? String(p.dropFirst(3))
             : p
-        guard var url = URL(string: base + endpointPath) else {
+        let currentPath = components.path.hasSuffix("/")
+            ? String(components.path.dropLast())
+            : components.path
+        components.path = currentPath + endpointPath
+
+        let overriddenKeys = Set(queryParams.keys)
+        var items = existingItems.filter { !overriddenKeys.contains($0.name) }
+        items.append(contentsOf: queryParams.keys.sorted().compactMap { key in
+            queryParams[key].map { URLQueryItem(name: key, value: $0) }
+        })
+        if !items.isEmpty {
+            components.queryItems = items
+        }
+
+        guard let url = components.url else {
             throw SamplingError.invalidConfiguration("invalid base URL: \(baseURL)")
         }
-        if !queryParams.isEmpty {
-            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-            var items = components?.queryItems ?? []
-            items.append(contentsOf: queryParams.keys.sorted().compactMap { key in
-                queryParams[key].map { URLQueryItem(name: key, value: $0) }
-            })
-            components?.queryItems = items
-            if let updated = components?.url { url = updated }
-        }
         return url
+    }
+
+    static func applyEnvironmentHTTPHeaders(
+        _ mappings: [String: String],
+        environment: [String: String],
+        into headers: inout [String: String]
+    ) {
+        for (name, environmentName) in mappings {
+            guard let rawValue = environment[environmentName] else { continue }
+            let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty,
+                  isValidHTTPHeaderName(name),
+                  isValidHTTPHeaderValue(value)
+            else { continue }
+            headers = headers.filter { $0.key.lowercased() != name.lowercased() }
+            headers[name] = value
+        }
+    }
+
+    private static func isValidHTTPHeaderName(_ name: String) -> Bool {
+        guard !name.isEmpty else { return false }
+        let punctuation = Array("!#$%&'*+-.^_`|~".utf8)
+        return name.utf8.allSatisfy { byte in
+            (48...57).contains(byte)
+                || (65...90).contains(byte)
+                || (97...122).contains(byte)
+                || punctuation.contains(byte)
+        }
+    }
+
+    private static func isValidHTTPHeaderValue(_ value: String) -> Bool {
+        value.utf8.allSatisfy { byte in
+            byte == 9 || ((32...126).contains(byte)) || byte >= 128
+        }
     }
 
     private func providerRequestHeaders(from req: ConversationRequest) -> ProviderRequestHeaders? {
@@ -758,7 +910,8 @@ public final class SamplingClient: @unchecked Sendable {
         status: Int,
         body: Data,
         headers: [String: String],
-        consumer: SamplingConsumer
+        consumer: SamplingConsumer,
+        sentBearerFragment: String?
     ) -> SamplingError {
         let message = userFacingAPIMessage(status: HTTPStatus(status), bytes: body)
         let retryAfter = parseRetryAfterSecs(headers)
@@ -766,9 +919,14 @@ public final class SamplingClient: @unchecked Sendable {
         let meta = extractModelMetadata(from: headers)
 
         if status == 401 {
-            let prefix = currentSentBearerPrefix()
-            attributionCallback?.record401(consumer: consumer, sentBearerPrefix: prefix)
-            return .auth(message, credential: SentCredential.fromSentFragment(prefix))
+            attributionCallback?.record401(
+                consumer: consumer,
+                sentBearerPrefix: sentBearerFragment
+            )
+            return .auth(
+                message,
+                credential: SentCredential.fromSentFragment(sentBearerFragment)
+            )
         }
 
         let errorCode = parseAPIErrorCode(bytes: body)
@@ -782,30 +940,19 @@ public final class SamplingClient: @unchecked Sendable {
         )
     }
 
-    private func currentSentBearerPrefix() -> String? {
-        let bearer: String?
-        if let resolver = bearerResolver {
-            if let live = resolver.currentBearer() {
-                bearer = live
-            } else if resolver.failClosedOnMissing {
-                bearer = nil
-            } else {
-                bearer = extractStaticBearer()
-            }
-        } else {
-            bearer = extractStaticBearer()
+    private func sentBearerFragment(from headers: [String: String]) -> String? {
+        switch defaults.authScheme {
+        case .xApiKey:
+            return headers.first { $0.key.lowercased() == "x-api-key" }
+                .map { scrubbedBearerSuffix($0.value) }
+        case .bearer:
+            guard let authorization = headers.first(where: {
+                $0.key.lowercased() == "authorization"
+            })?.value,
+            authorization.hasPrefix("Bearer ")
+            else { return nil }
+            return scrubbedBearerSuffix(String(authorization.dropFirst(7)))
         }
-        return bearer.map { scrubbedBearerPrefix($0) }
-    }
-
-    private func extractStaticBearer() -> String? {
-        if let auth = defaultHeaders.first(where: { $0.key.lowercased() == "authorization" })?.value {
-            if auth.lowercased().hasPrefix("bearer ") {
-                return String(auth.dropFirst(7))
-            }
-            return auth
-        }
-        return defaultHeaders.first { $0.key.lowercased() == "x-api-key" }?.value
     }
 
     private func parseRetryAfterSecs(_ headers: [String: String]) -> UInt64? {

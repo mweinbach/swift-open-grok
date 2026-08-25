@@ -14,14 +14,14 @@ public enum MermaidDiagramFamily {
     /// Leading tokens this port renders.
     public static let supported: Set<String> = [
         "graph", "flowchart", "stateDiagram", "stateDiagram-v2",
+        "classDiagram", "classDiagram-v2", "erDiagram", "sequenceDiagram",
     ]
 
     /// Leading tokens Mermaid recognizes that this port does not render. The
     /// dispatcher reports these as `unsupportedDiagramType` rather than trying
     /// to parse them as a flowchart.
     public static let knownButUnsupported: Set<String> = [
-        "sequenceDiagram", "classDiagram", "classDiagram-v2", "erDiagram", "journey",
-        "gantt", "pie", "mindmap", "timeline", "info", "kanban", "gitGraph",
+        "journey", "gantt", "pie", "mindmap", "timeline", "info", "kanban", "gitGraph",
         "requirementDiagram", "C4Context", "C4Container", "C4Component", "C4Dynamic",
         "C4Deployment", "sankey-beta", "packet-beta", "xychart-beta", "radar-beta",
         "block-beta", "flowchart-elk", "quadrantChart",
@@ -32,7 +32,7 @@ public enum MermaidDiagramFamily {
         for rawLine in splitIntoLines(source) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             if line.isEmpty || line.hasPrefix("%%") { continue }
-            return line.split(whereSeparator: \.isWhitespace).first.map(String.init)
+            return line.split(whereSeparator: { $0.isWhitespace || $0 == ";" }).first.map(String.init)
         }
         return nil
     }
@@ -42,7 +42,8 @@ public enum MermaidDiagramFamily {
 public func parseFlowchart(_ input: String) throws -> FlowchartGraph {
     if let token = MermaidDiagramFamily.firstToken(of: input),
        token != "graph", token != "flowchart",
-       MermaidDiagramFamily.knownButUnsupported.contains(token) {
+       MermaidDiagramFamily.supported.contains(token)
+           || MermaidDiagramFamily.knownButUnsupported.contains(token) {
         throw MermaidError.unsupportedDiagramType(token)
     }
 
@@ -438,14 +439,15 @@ private struct FlowchartParser {
     }
 }
 
-/// Splits `text` the way Rust's `str::lines` does: an empty string has no
-/// lines, a trailing newline does not add an empty one, and `\r\n` is handled.
-/// Line numbers in `MermaidError.parse` are indices into this.
+/// Splits LF, CRLF, and isolated CR into logical lines. An empty string has no
+/// lines, and a trailing newline does not add an empty one. Line numbers in
+/// `MermaidError.parse` are indices into this.
 func splitIntoLines(_ text: String) -> [String] {
     guard !text.isEmpty else { return [] }
-    var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+    var lines = text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+        .map(String.init)
     if lines.last == "" { lines.removeLast() }
-    return lines.map { $0.hasSuffix("\r") ? String($0.dropLast()) : $0 }
+    return lines
 }
 
 /// Strips wrapping quotes, decodes the HTML entities Mermaid accepts, and turns

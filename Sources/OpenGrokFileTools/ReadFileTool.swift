@@ -52,6 +52,7 @@ public enum ReadFileTool {
             let input = try Input.parse(args)
             let absolute = SessionFS.resolve(cwd: resources.cwd, path: input.path)
             try SessionFS.enforceRoots(absolute, roots: resources.allowedRoots)
+            try GitIgnoreAccessPolicy.enforce(path: absolute, resources: resources, operation: "read")
 
             if let mime = SessionFS.imageMIME(for: absolute), SessionFS.fileExists(absolute) {
                 let data = try SessionFS.readBytes(at: absolute)

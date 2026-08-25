@@ -5,6 +5,7 @@
 // single entry without failing the whole list.
 
 import Foundation
+import OpenGrokConfigTypes
 import OpenGrokSamplingTypes
 
 /// Credential for `/v1/models` fetching.
@@ -146,6 +147,15 @@ public func parseRemoteModelValue(
         toolMode = nil
     }
 
+    let subagentContextValue = firstNonNull(
+        value["subagentContextDefault"],
+        value["subagent_context_default"],
+        meta?["subagentContextDefault"],
+        meta?["subagent_context_default"]
+    )
+    let subagentContextDefault = (subagentContextValue as? String)
+        .flatMap(ModelSubagentContextMode.init(wireValue:))
+
     let envKey = envKeysField(value, "envKey") ?? envKeysField(value, "env_key")
     let hidden = boolField(value, "hidden")
         ?? meta.flatMap({ boolField($0, "hidden") })
@@ -154,6 +164,35 @@ public func parseRemoteModelValue(
         ?? boolField(value, "supported_in_api")
         ?? meta.flatMap({ boolField($0, "supportedInApi") })
         ?? true
+    let reasoningEffort = WireCodec.reasoningEffort(
+        stringField(value, "reasoningEffort")
+            ?? stringField(value, "reasoning_effort")
+            ?? meta.flatMap({ stringField($0, "reasoningEffort") })
+    )
+    let reasoningEfforts = reasoningEffortOptionsField(firstPresent(
+        value["reasoningEfforts"],
+        value["reasoning_efforts"],
+        meta?["reasoningEfforts"]
+    ))
+    let compactionsRemaining = compactionsRemainingField(firstPresent(
+        value["compactionsRemaining"],
+        value["compactions_remaining"],
+        meta?["compactionsRemaining"]
+    )) ?? jsonBoolean(firstPresent(
+        value["sendCompactionsRemaining"],
+        value["send_compactions_remaining"],
+        meta?["sendCompactionsRemaining"]
+    )).map(CompactionsRemaining.dynamic)
+    let compactionAtTokens = compactionAtTokensField(firstPresent(
+        value["compactionAtTokens"],
+        value["compaction_at_tokens"],
+        meta?["compactionAtTokens"]
+    ))
+    let lazinessDetector = lazinessDetectorField(
+        objectField(value, "lazinessDetector")
+            ?? objectField(value, "laziness_detector")
+            ?? meta.flatMap({ objectField($0, "lazinessDetector") })
+    )
 
     return ModelEntryConfig(
         id: id,
@@ -172,24 +211,40 @@ public func parseRemoteModelValue(
         envKey: envKey,
         apiKey: stringField(value, "apiKey") ?? stringField(value, "api_key"),
         toolMode: toolMode,
+        subagentContextDefault: subagentContextDefault,
         agentType: agentType,
         inferenceIdleTimeoutSecs: u64Field(value, "inferenceIdleTimeoutSecs")
             ?? u64Field(value, "inference_idle_timeout_secs"),
         maxRetries: u32Field(value, "maxRetries") ?? u32Field(value, "max_retries"),
         hidden: hidden,
         supportedInApi: supportedInApi,
-        reasoningEffort: WireCodec.reasoningEffort(
-            stringField(value, "reasoningEffort") ?? stringField(value, "reasoning_effort")
-        ),
-        supportsReasoningEffort: boolField(value, "supportsReasoningEffort")
-            ?? boolField(value, "supports_reasoning_effort")
-            ?? false,
-        supportsBackendSearch: boolField(value, "supportsBackendSearch")
-            ?? boolField(value, "supports_backend_search")
-            ?? false,
-        showModelFingerprint: boolField(value, "showModelFingerprint")
-            ?? boolField(value, "show_model_fingerprint")
-            ?? false,
+        reasoningEffort: reasoningEffort,
+        supportsReasoningEffort: jsonBoolean(firstPresent(
+            value["supportsReasoningEffort"],
+            value["supports_reasoning_effort"],
+            meta?["supportsReasoningEffort"]
+        )) ?? false,
+        reasoningEfforts: reasoningEfforts,
+        supportsReasoningSummaryParameter: false,
+        defaultReasoningSummary: .none,
+        supportsBackendSearch: jsonBoolean(firstPresent(
+            value["supportsBackendSearch"],
+            value["supports_backend_search"],
+            meta?["supportsBackendSearch"]
+        )) ?? false,
+        supportsStandaloneWebSearch: jsonBoolean(firstPresent(
+            value["supportsStandaloneWebSearch"],
+            value["supports_standalone_web_search"],
+            meta?["supportsStandaloneWebSearch"],
+            meta?["supports_standalone_web_search"]
+        )),
+        compactionsRemaining: compactionsRemaining,
+        compactionAtTokens: compactionAtTokens,
+        showModelFingerprint: jsonBoolean(firstPresent(
+            value["showModelFingerprint"],
+            value["show_model_fingerprint"],
+            meta?["showModelFingerprint"]
+        )) ?? false,
         autoCompactThresholdPercent: u8Field(value, "autoCompactThresholdPercent")
             ?? u8Field(value, "auto_compact_threshold_percent"),
         systemPromptLabel: stringField(value, "systemPromptLabel")
@@ -201,7 +256,8 @@ public func parseRemoteModelValue(
             ?? false,
         extraHeaders: stringMapField(value, "extraHeaders")
             ?? stringMapField(value, "extra_headers")
-            ?? []
+            ?? [],
+        lazinessDetector: lazinessDetector
     )
 }
 
@@ -246,6 +302,75 @@ private func envKeysField(_ obj: [String: Any], _ key: String) -> EnvKeys? {
 private func stringMapField(_ obj: [String: Any], _ key: String) -> [(String, String)]? {
     guard let map = obj[key] as? [String: String] else { return nil }
     return map.sorted { $0.key < $1.key }.map { ($0.key, $0.value) }
+}
+
+private func objectField(_ obj: [String: Any], _ key: String) -> [String: Any]? {
+    obj[key] as? [String: Any]
+}
+
+private func reasoningEffortOptionsField(_ value: Any?) -> [ReasoningEffortOption] {
+    guard let values = value as? [Any] else { return [] }
+    return values.compactMap { value in
+        if let raw = value as? String, let effort = WireCodec.reasoningEffort(raw) {
+            let id = effort.asString
+            return ReasoningEffortOption(
+                id: id,
+                value: effort,
+                label: id.prefix(1).uppercased() + id.dropFirst(),
+                description: nil,
+                isDefault: false
+            )
+        }
+        guard let object = value as? [String: Any],
+              JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object)
+        else { return nil }
+        return try? JSONDecoder().decode(ReasoningEffortOption.self, from: data)
+    }
+}
+
+private func compactionsRemainingField(_ value: Any?) -> CompactionsRemaining? {
+    guard let value else { return nil }
+    if let enabled = jsonBoolean(value) { return .dynamic(enabled) }
+    guard let count = unsignedJSONInteger(value), let bounded = UInt8(exactly: count) else {
+        return nil
+    }
+    return .fixed(bounded)
+}
+
+private func compactionAtTokensField(_ value: Any?) -> CompactionAtTokens? {
+    guard let value else { return nil }
+    if let enabled = jsonBoolean(value) { return .enabled(enabled) }
+    guard let count = unsignedJSONInteger(value) else { return nil }
+    return .fixed(count)
+}
+
+private func jsonBoolean(_ value: Any?) -> Bool? {
+    guard let number = value as? NSNumber else { return nil }
+    let typeEncoding = String(cString: number.objCType)
+    guard typeEncoding == "B" || typeEncoding == "c" else { return nil }
+    return number.boolValue
+}
+
+private func unsignedJSONInteger(_ value: Any) -> UInt64? {
+    guard let number = value as? NSNumber, jsonBoolean(number) == nil else { return nil }
+    return UInt64(number.stringValue)
+}
+
+private func lazinessDetectorField(_ object: [String: Any]?) -> LazinessDetectorPerModelConfig {
+    guard let object,
+          JSONSerialization.isValidJSONObject(object),
+          let data = try? JSONSerialization.data(withJSONObject: object),
+          let config = try? JSONDecoder().decode(LazinessDetectorPerModelConfig.self, from: data)
+    else { return LazinessDetectorPerModelConfig() }
+    return config
+}
+
+private func firstPresent(_ values: Any?...) -> Any? {
+    for value in values {
+        if let value { return value }
+    }
+    return nil
 }
 
 private func firstNonNull(_ values: Any?...) -> Any? {

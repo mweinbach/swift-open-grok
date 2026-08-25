@@ -34,11 +34,11 @@ struct WrapClipboardImageTests {
         #expect(encodeWrapImagePayload(data: oversized, mimeType: "image/png") == MAGIC_NONE)
     }
 
-    @Test("Decode GROK_WRAP_NONE returns .noImage")
+    @Test("Only exact GROK_WRAP_NONE returns .noImage")
     func decodeNoneMagic() {
         #expect(decodeWrapImagePaste(payload: MAGIC_NONE) == .noImage)
-        #expect(decodeWrapImagePaste(payload: "\(MAGIC_NONE)\n") == .noImage)
-        #expect(decodeWrapImagePaste(payload: "\(MAGIC_NONE)\r\n") == .noImage)
+        #expect(decodeWrapImagePaste(payload: "\(MAGIC_NONE)\n") == nil)
+        #expect(decodeWrapImagePaste(payload: "\(MAGIC_NONE)\r\n") == nil)
     }
 
     @Test("Non-wrap text returns nil (caller treats as plain text)")
@@ -68,14 +68,14 @@ struct WrapClipboardImageTests {
         #expect(decodeWrapImagePaste(payload: payload) == .noImage)
     }
 
-    @Test("CRLF line breaks are supported in payload decoding")
-    func crlfSupport() {
+    @Test("CRLF line breaks do not satisfy exact image-frame separators")
+    func crlfRejected() {
         let rawData = tinyPngData()
         let mime = "image/png"
         let b64 = rawData.base64EncodedString()
         let payload = "\(MAGIC_IMG)\r\n\(mime)\r\n\(b64)"
 
-        #expect(decodeWrapImagePaste(payload: payload) == .image(data: rawData, mimeType: mime))
+        #expect(decodeWrapImagePaste(payload: payload) == .noImage)
     }
 
     @Test("OSC byte formatting matches ESC ] REQUEST_BODY BEL")

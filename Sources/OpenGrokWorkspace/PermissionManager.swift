@@ -11,6 +11,148 @@ import OpenGrokConfig
 /// answer cannot change within a process.
 let userGrokHomePath: String? = userGrokHome()?.path
 
+private let sessionShellExecVehicleHeads: Set<String> = [
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "pwsh", "powershell", "cmd",
+    "deno", "bun", "julia", "rscript", "awk", "gawk", "mawk", "nawk",
+    "nodejs", "luajit", "phpdbg", "php-cgi", "pythonw",
+    "npx", "bunx", "pipx", "uvx", "uv",
+    "xargs", "find", "sudo", "doas", "su", "ssh", "watch", "setsid",
+    "flock", "chroot", "nsenter", "docker", "podman",
+    "env", "timeout", "nice", "ionice", "chrt", "stdbuf", "nohup",
+    "command", "builtin", "exec", "eval", "source", ".", "busybox",
+    "export", "set", "unset", "declare", "typeset", "readonly",
+    "script", "setpriv", "unshare", "systemd-run", "taskset", "prlimit",
+]
+
+private func sessionShellProgramHead(_ word: String) -> String {
+    let component = word.split(whereSeparator: { $0 == "/" || $0 == "\\" }).last
+    let lowered = component.map(String.init)?.lowercased() ?? word.lowercased()
+    return lowered.hasSuffix(".exe") ? String(lowered.dropLast(4)) : lowered
+}
+
+private func sessionShellHeadExecutesCode(_ head: String) -> Bool {
+    if sessionShellExecVehicleHeads.contains(head) { return true }
+    for family in ["python", "node", "ruby", "perl", "php", "lua"] {
+        guard head.hasPrefix(family) else { continue }
+        let suffix = String(head.dropFirst(family.count))
+        let version = suffix.hasSuffix("t") ? String(suffix.dropLast()) : suffix
+        if version.allSatisfy({ $0 == "." || $0.wholeNumberValue != nil }) {
+            return true
+        }
+    }
+    return false
+}
+
+private func sessionShellGrantWords(_ script: String) -> [String]? {
+    let normalized = script.trimmingCharacters(in: .whitespaces)
+    guard !normalized.isEmpty,
+          let segments = allCommandsFromScript(normalized),
+          segments.count == 1
+    else {
+        return nil
+    }
+
+    var words: [String] = []
+    var current = ""
+    var startedWord = false
+    var inSingleQuote = false
+    var inDoubleQuote = false
+    var escaped = false
+
+    for character in normalized {
+        if character.isNewline { return nil }
+        if escaped {
+            current.append(character)
+            startedWord = true
+            escaped = false
+            continue
+        }
+        if character == "\\" && !inSingleQuote {
+            startedWord = true
+            escaped = true
+            continue
+        }
+        if character == "'" && !inDoubleQuote {
+            startedWord = true
+            inSingleQuote.toggle()
+            continue
+        }
+        if character == "\"" && !inSingleQuote {
+            startedWord = true
+            inDoubleQuote.toggle()
+            continue
+        }
+        if character == "$" && !inSingleQuote { return nil }
+        if character == "`" { return nil }
+        if !inSingleQuote && !inDoubleQuote {
+            if ";|&<>()*?[]{}".contains(character) { return nil }
+            if character.isWhitespace {
+                if startedWord {
+                    words.append(current)
+                    current = ""
+                    startedWord = false
+                }
+                continue
+            }
+        }
+        current.append(character)
+        startedWord = true
+    }
+
+    guard !escaped, !inSingleQuote, !inDoubleQuote else { return nil }
+    if startedWord { words.append(current) }
+    guard let program = words.first,
+          !program.isEmpty,
+          !isEnvAssignment(program),
+          words.filter({ !$0.isEmpty }) == segments[0]
+    else {
+        return nil
+    }
+
+    let head = sessionShellProgramHead(program)
+    var normalizedWords = words
+    normalizedWords[0] = head
+    guard !isDangerousCommandWords(normalizedWords),
+          !sessionShellHeadExecutesCode(head),
+          !(head == "rg" && rgHasPreFlag(words)),
+          !(head == "git" && words.dropFirst().first?.hasPrefix("-") == true)
+    else {
+        return nil
+    }
+    return words
+}
+
+/// Replay only a benign, single-command shell approval without widening argv.
+///
+/// Rust bash_grants.rs:38-65 and 78-101 permits exact dangerous-script replay;
+/// this live seam is deliberately stricter: dangerous commands, executable
+/// wrappers, redirects, expansions, assignments, and chains always prompt again.
+public func matchesSessionBashGrant(_ command: String, grant: String) -> Bool {
+    guard let commandWords = sessionShellGrantWords(command),
+          let grantWords = sessionShellGrantWords(grant)
+    else {
+        return false
+    }
+
+    let normalizedCommand = command.trimmingCharacters(in: .whitespaces)
+    let normalizedGrant = grant.trimmingCharacters(in: .whitespaces)
+    if normalizedCommand == normalizedGrant { return true }
+
+    let joinedGrant = grantWords.joined(separator: " ")
+    guard sessionShellGrantWords(joinedGrant) == grantWords,
+          commandWords.starts(with: grantWords)
+    else {
+        return false
+    }
+    return matchesCommandPrefix(commandWords.joined(separator: " "), pattern: joinedGrant)
+}
+
+private func securityNormalizedShellCommand(_ command: String) -> String {
+    command
+        .replacingOccurrences(of: "\r\n", with: "\n")
+        .replacingOccurrences(of: "\r", with: "\n")
+}
+
 /// Interactive prompter seam. Headless implementations return deny/cancel.
 public protocol PermissionPrompter: Sendable {
     func prompt(
@@ -232,9 +374,20 @@ public actor PermissionHandle {
         var policyAllowed = false
         var shellFileForcedPrompt = false
         var autoForcedPrompt = false
+        let safeBashPrefixGrants: [String]
+        let policyAccess: AccessKind
+        if case .bash(let command) = access {
+            policyAccess = .bash(securityNormalizedShellCommand(command))
+            safeBashPrefixGrants = bashPrefixGrants.filter {
+                matchesSessionBashGrant(command, grant: $0)
+            }
+        } else {
+            policyAccess = access
+            safeBashPrefixGrants = []
+        }
 
         // 1. Compiled policy direct evaluate (deny > ask > allow).
-        if let matched = policy.evaluateWithSource(access) {
+        if let matched = policy.evaluateWithSource(policyAccess) {
             lastMatchedRuleSource = matched.ruleSource
             switch matched.decision {
             case .policyDeny(let reason), .reject(let reason):
@@ -262,7 +415,8 @@ public actor PermissionHandle {
         }
 
         // 2. Bash segment policy + shell file-access escalation (never Allow).
-        if case .bash(let cmd) = access {
+        if case .bash(let rawCommand) = access {
+            let cmd = securityNormalizedShellCommand(rawCommand)
             if let bashDecision = policy.evaluateBashCommandPolicy(cmd) {
                 switch bashDecision {
                 case .policyDeny, .reject:
@@ -386,9 +540,10 @@ public actor PermissionHandle {
                     return d
                 }
             case .bash(let cmd):
+                let securityCommand = securityNormalizedShellCommand(cmd)
                 let seg = evaluateBashSegments(
-                    cmd,
-                    grants: bashPrefixGrants,
+                    securityCommand,
+                    grants: safeBashPrefixGrants,
                     disallows: bashDisallows
                 )
                 if let reason = seg.reason, reason == "disallow" {
@@ -401,7 +556,7 @@ public actor PermissionHandle {
                     return d
                 }
                 if seg.autoAllow && !seg.needsPrompt,
-                   bashSandboxAutoAllow(cmd, exactGrants: bashPrefixGrants) {
+                   bashSandboxAutoAllow(securityCommand, exactGrants: safeBashPrefixGrants) {
                     record(
                         access: access, toolName: toolName, toolCallId: toolCallId,
                         decision: .allow, autoApproved: true, userPrompted: false,
@@ -415,8 +570,8 @@ public actor PermissionHandle {
         } else if case .bash(let cmd) = access {
             // Still honor hard disallow under ask floor.
             let seg = evaluateBashSegments(
-                cmd,
-                grants: bashPrefixGrants,
+                securityNormalizedShellCommand(cmd),
+                grants: safeBashPrefixGrants,
                 disallows: bashDisallows
             )
             if let reason = seg.reason, reason == "disallow" {
@@ -493,7 +648,10 @@ public actor PermissionHandle {
            !policyForcedPrompt,
            !autoForcedPrompt,
            sandboxAutoAllowBash(),
-           bashSandboxAutoAllow(cmd, exactGrants: bashPrefixGrants) {
+           bashSandboxAutoAllow(
+                securityNormalizedShellCommand(cmd),
+                exactGrants: safeBashPrefixGrants
+           ) {
             record(
                 access: access, toolName: toolName, toolCallId: toolCallId,
                 decision: .allow, autoApproved: true, userPrompted: false,
@@ -545,6 +703,11 @@ public actor PermissionHandle {
     }
 
     private func matchesSessionGrant(_ access: AccessKind) -> Bool {
+        if case .bash(let command) = access,
+           evaluateBashSegments(command, grants: [], disallows: bashDisallows).reason == "disallow" {
+            return false
+        }
+
         for g in sessionGrants {
             switch (g.access, access) {
             case (.edit, .edit(let path)):
@@ -564,7 +727,7 @@ public actor PermissionHandle {
                     if case .bash(let c) = g.access { return c }
                     return ""
                 }()
-                if cmd.trimmingCharacters(in: .whitespaces).hasPrefix(prefix) { return true }
+                if matchesSessionBashGrant(cmd, grant: prefix) { return true }
             case (.mcpTool(let n, _), .mcpTool(let name, _)):
                 if n == name { return true }
             case (.webFetch, .webFetch(let url)):

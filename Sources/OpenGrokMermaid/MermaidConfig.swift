@@ -175,7 +175,9 @@ private func frontmatterBounds(
 }
 
 private func nextLineEnd(_ source: String, from start: String.Index) -> String.Index {
-    guard let newline = source[start...].firstIndex(of: "\n") else { return source.endIndex }
+    guard let newline = source[start...].firstIndex(where: \.isNewline) else {
+        return source.endIndex
+    }
     return source.index(after: newline)
 }
 
@@ -213,8 +215,7 @@ enum MiniYAML {
     /// Parses a block mapping. Later duplicate keys win, matching YAML.
     static func parseMapping(_ yaml: String) -> [String: Node] {
         var lines: [(indent: Int, key: String, value: String)] = []
-        for rawLine in yaml.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = String(rawLine)
+        for line in splitIntoLines(yaml) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             // Sequences, comments, and document markers are outside the subset.
             if trimmed.isEmpty || trimmed.hasPrefix("#") || trimmed.hasPrefix("-") { continue }

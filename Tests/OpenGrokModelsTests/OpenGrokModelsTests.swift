@@ -15,19 +15,19 @@ import OpenGrokSamplingTypes
 @Suite("Embedded default models")
 struct EmbeddedDefaultModelsTests {
     @Test func defaultIDsMatchRustCorpus() {
-        #expect(defaultModel() == "grok-4.5")
-        #expect(defaultWebSearchModel() == "grok-4.5")
-        #expect(defaultImageDescriptionModel() == "grok-4.5")
-        #expect(defaultSessionSummaryModel() == "grok-4.5")
-        #expect(defaultModel(for: .webSearch) == "grok-4.5")
+        #expect(defaultModel() == "grok-4.6")
+        #expect(defaultWebSearchModel() == "grok-4.6")
+        #expect(defaultImageDescriptionModel() == "grok-4.6")
+        #expect(defaultSessionSummaryModel() == "grok-4.6")
+        #expect(defaultModel(for: .webSearch) == "grok-4.6")
     }
 
     @Test func embeddedJSONParsesAndContainsDefault() throws {
         let embedded = try parseEmbeddedDefaultModels(DEFAULT_MODELS_JSON)
-        #expect(embedded.default == "grok-4.5")
-        #expect(embedded.models.map(\.model).contains("grok-4.5"))
-        // The corpus at the pinned reference carries exactly 20 models.
-        #expect(embedded.models.count == 20)
+        #expect(embedded.default == "grok-4.6")
+        #expect(embedded.models.map(\.model).contains("grok-4.6"))
+        // The corpus at the pinned reference carries exactly 21 models.
+        #expect(embedded.models.count == 21)
         // Multi-provider corpus.
         let providers = Set(embedded.models.map(\.provider))
         #expect(providers.contains(.xai))
@@ -124,14 +124,14 @@ struct EmbeddedDefaultModelsTests {
 
     @Test func defaultEntriesPreserveStableKeysAndCapabilities() {
         let map = defaultModelEntries()
-        #expect(map["grok-4.5"] != nil)
-        let grok = map["grok-4.5"]!
+        #expect(map["grok-4.6"] != nil)
+        let grok = map["grok-4.6"]!
         #expect(grok.info.provider == .xai)
         #expect(grok.info.apiBackend == .responses)
         #expect(grok.info.supportsReasoningEffort == true)
         #expect(grok.info.contextWindow == 500_000)
         #expect(grok.info.showModelFingerprint == true)
-        #expect(grok.info.reasoningEfforts.count == 3)
+        #expect(grok.info.reasoningEfforts.count == 4)
 
         // Fireworks curated key differs from routing slug.
         let glm = map["glm-5.2"]!
@@ -960,8 +960,8 @@ struct ModelsManagerTests {
     @Test func managerAssemblesEmbeddedCatalog() {
         let mgr = ModelsManager()
         let snap = mgr.catalogSnapshot()
-        #expect(snap["grok-4.5"] != nil)
-        #expect(mgr.currentModel().id == "grok-4.5")
+        #expect(snap["grok-4.6"] != nil)
+        #expect(mgr.currentModel().id == "grok-4.6")
     }
 
     @Test func refreshUsesTransportAndCache() async throws {
@@ -1326,7 +1326,7 @@ struct AuxiliaryModelRoutingTests {
             sessionKey: "session-bearer"
         )
         #expect(webAux != nil)
-        #expect(webAux?.routingModel == "grok-4.5")
+        #expect(webAux?.routingModel == "grok-4.6")
 
         let summaryAux = resolveAuxiliaryModelSamplingConfig(
             modelID: defaultSessionSummaryModel(),
@@ -1334,7 +1334,7 @@ struct AuxiliaryModelRoutingTests {
             sessionKey: "session-bearer"
         )
         #expect(summaryAux != nil)
-        #expect(summaryAux?.routingModel == "grok-4.5")
+        #expect(summaryAux?.routingModel == "grok-4.6")
     }
 }
 

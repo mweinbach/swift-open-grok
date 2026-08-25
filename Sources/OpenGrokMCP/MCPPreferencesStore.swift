@@ -12,10 +12,9 @@
 //
 // This port persists both in `config.toml` using the same TOML shape as
 // upstream so `mcp list`/`mcp inspect` (and any external reader) sees
-// consistent state. The `mcp_preferences.json` file upstream also uses for
-// setup-schema values is NOT ported here because setup is deferred (no
-// setup-schema surface); its server entries are unrelated to the toggle
-// disabled lists.
+// consistent state. Setup selections live separately in the upstream-shaped,
+// owner-private `$OPENGROK_HOME/mcp_preferences.json`; corrupt preferences
+// must never be replaced with an empty snapshot.
 //
 // Writes use the same atomic-replace path as `upsert`/`delete`
 // (`writeConfigFile`), and a store write failure means the toggle did NOT
@@ -23,6 +22,153 @@
 
 import Foundation
 import OpenGrokConfig
+import OpenGrokConfigTypes
+import OpenGrokFileUtils
+
+// MARK: - Setup preferences
+
+/// Missing preferences are safe to initialize; unreadable or corrupt existing
+/// preferences are readable as empty for discovery but never writable.
+///
+/// Mirrors `McpPreferencesLoad` in `util/config/mcp.rs:400-440`.
+public enum MCPSetupPreferencesLoad: Sendable, Equatable {
+    case loaded(McpPreferencesFile)
+    case missing
+    case corrupt
+
+    public var file: McpPreferencesFile {
+        switch self {
+        case .loaded(let preferences):
+            preferences
+        case .missing, .corrupt:
+            McpPreferencesFile()
+        }
+    }
+
+    public var isWritable: Bool {
+        if case .corrupt = self { return false }
+        return true
+    }
+}
+
+public enum MCPSetupPreferencesError: Error, Sendable, Equatable, CustomStringConvertible {
+    case unreadable
+
+    public var description: String {
+        switch self {
+        case .unreadable:
+            "MCP preferences file is unreadable; fix or remove mcp_preferences.json before saving"
+        }
+    }
+}
+
+/// The setup-selection store, independent from OAuth credentials and the
+/// enable/disable lists in `config.toml`.
+public enum MCPSetupPreferencesStore: Sendable {
+    public static let fileName = "mcp_preferences.json"
+    private static let lockFileName = "mcp_preferences.lock"
+
+    public static func path(home: URL) -> URL {
+        home.appendingPathComponent(fileName)
+    }
+
+    public static func load(home: URL) -> MCPSetupPreferencesLoad {
+        load(from: path(home: home))
+    }
+
+    public static func load(from path: URL) -> MCPSetupPreferencesLoad {
+        guard FileManager.default.fileExists(atPath: path.path) else {
+            return .missing
+        }
+        do {
+            let data = try Data(contentsOf: path)
+            let preferences = try JSONDecoder().decode(McpPreferencesFile.self, from: data)
+            return .loaded(preferences)
+        } catch {
+            return .corrupt
+        }
+    }
+
+    public static func save(_ preferences: McpPreferencesFile, home: URL) throws {
+        try save(preferences, to: path(home: home))
+    }
+
+    public static func save(_ preferences: McpPreferencesFile, to path: URL) throws {
+        guard load(from: path).isWritable else {
+            throw MCPSetupPreferencesError.unreadable
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        let data = try encoder.encode(preferences)
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(),
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try AtomicFile.write(path, data: data, options: .ownerOnly)
+        try SecureFile.ensureOwnerOnlyPermissions(at: path)
+    }
+
+    /// Reload under an owner-private cross-process lock so simultaneous ACP
+    /// sessions cannot erase each other's unrelated server selections.
+    @discardableResult
+    public static func updateServer(
+        named name: String,
+        preferences: McpServerPreferences,
+        home: URL
+    ) throws -> McpServerPreferences? {
+        try withLockedPreferences(home: home) { file in
+            file.servers.updateValue(preferences, forKey: name)
+        }
+    }
+
+    /// Roll back only the exact pending selection. A later successful writer
+    /// must not be erased by an earlier request whose reconnect finishes late.
+    @discardableResult
+    public static func restoreServer(
+        named name: String,
+        previous: McpServerPreferences?,
+        ifCurrentIs pending: McpServerPreferences,
+        home: URL
+    ) throws -> Bool {
+        try withLockedPreferences(home: home) { file in
+            guard file.servers[name] == pending else { return false }
+            if let previous {
+                file.servers[name] = previous
+            } else {
+                file.servers.removeValue(forKey: name)
+            }
+            return true
+        }
+    }
+
+    private static func withLockedPreferences<Result>(
+        home: URL,
+        _ mutation: (inout McpPreferencesFile) throws -> Result
+    ) throws -> Result {
+        try FileManager.default.createDirectory(
+            at: home,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let lockPath = home.appendingPathComponent(lockFileName)
+        let lock = try AdvisoryFileLock.acquire(
+            at: lockPath,
+            options: AdvisoryLockOptions(nonBlocking: false, create: true, mode: 0o600)
+        )
+        defer { lock.release() }
+        try SecureFile.ensureOwnerOnlyPermissions(at: lockPath)
+
+        let loaded = load(home: home)
+        guard loaded.isWritable else {
+            throw MCPSetupPreferencesError.unreadable
+        }
+        var file = loaded.file
+        let result = try mutation(&file)
+        try save(file, home: home)
+        return result
+    }
+}
 
 // MARK: - Disabled-server persistence
 

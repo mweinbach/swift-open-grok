@@ -50,6 +50,9 @@ public struct ResolvedSandboxProfile: Sendable, Equatable {
     public var deny: [URL]
     /// Exact deny strings (may include globs for Seatbelt regex expansion).
     public var denyEntries: [String]
+    /// Owner-global hook slots and configured sources remain readable but
+    /// override every writable root, including `OPENGROK_HOME` itself.
+    public var writeDeny: [HookWriteDenySource]
     public var defaultRead: Bool
     public var restrictNetwork: Bool
 
@@ -59,6 +62,7 @@ public struct ResolvedSandboxProfile: Sendable, Equatable {
         readWrite: [URL],
         deny: [URL],
         denyEntries: [String] = [],
+        writeDeny: [HookWriteDenySource] = [],
         defaultRead: Bool,
         restrictNetwork: Bool
     ) {
@@ -67,6 +71,7 @@ public struct ResolvedSandboxProfile: Sendable, Equatable {
         self.readWrite = readWrite
         self.deny = deny
         self.denyEntries = denyEntries
+        self.writeDeny = writeDeny
         self.defaultRead = defaultRead
         self.restrictNetwork = restrictNetwork
     }
@@ -128,6 +133,7 @@ public enum ProfileName: Sendable, Equatable, Hashable, CustomStringConvertible 
                 readOnly: [],
                 readWrite: essentialWritablePaths(workspace: workspace, environment: environment),
                 deny: [],
+                writeDeny: try resolveHookWriteDenySources(environment: environment),
                 defaultRead: true,
                 restrictNetwork: false
             )
@@ -166,6 +172,7 @@ public enum ProfileName: Sendable, Equatable, Hashable, CustomStringConvertible 
                 readOnly: [],
                 readWrite: essentialWritablePathsMinimal(environment: environment),
                 deny: [],
+                writeDeny: try resolveHookWriteDenySources(environment: environment),
                 defaultRead: true,
                 restrictNetwork: true
             )
@@ -194,6 +201,7 @@ public enum ProfileName: Sendable, Equatable, Hashable, CustomStringConvertible 
                 readOnly: systemRead,
                 readWrite: essentialWritablePaths(workspace: workspace, environment: environment),
                 deny: [],
+                writeDeny: try resolveHookWriteDenySources(environment: environment),
                 defaultRead: false,
                 restrictNetwork: true
             )

@@ -290,7 +290,7 @@ public struct StreamingMarkdownRenderer: Sendable {
             )
             let tailSource = String(sourceStorage[tailStart...])
             let sourceLineOffset = sourceStorage[..<tailStart]
-                .split(separator: "\n", omittingEmptySubsequences: false)
+                .split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
                 .count - 1
             let needsSeparator = !frozen.lines.isEmpty
                 && !tailSource.isEmpty
@@ -385,7 +385,7 @@ public struct StreamingMarkdownRenderer: Sendable {
         let frozenSource = String(sourceStorage[..<boundary])
         let byteCount = frozenSource.utf8.count
         let tailSourceLine = max(0, frozenSource
-            .split(separator: "\n", omittingEmptySubsequences: false)
+            .split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
             .count - 1)
         let lineCount = outputStorage.lines.lastIndex(where: {
             $0.sourceLine < tailSourceLine
@@ -413,7 +413,12 @@ private extension String {
         var lastBoundary: String.Index?
         var lineStart = startIndex
         while lineStart < endIndex {
-            let lineEnd = self[lineStart...].firstIndex(of: "\n") ?? endIndex
+            let lineEnd = self[lineStart...].firstIndex(where: \.isNewline) ?? endIndex
+            if lineEnd < endIndex,
+               self[lineEnd] == "\r",
+               index(after: lineEnd) == endIndex {
+                break
+            }
             let line = self[lineStart..<lineEnd]
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("```") {
@@ -439,7 +444,9 @@ private extension String {
     }
 
     func lastMarkdownCheckpointKind() -> MarkdownCheckpointKind {
-        let blocks = components(separatedBy: "\n\n")
+        let normalized = replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let blocks = normalized.components(separatedBy: "\n\n")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         guard let last = blocks.last else { return .paragraph }

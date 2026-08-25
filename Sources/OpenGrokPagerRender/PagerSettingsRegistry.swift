@@ -1389,7 +1389,9 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             description: "Model used for memory generation and consolidation. Automatic chooses an economical model for the active provider.",
             keywords: ["memory", "model"],
             kind: .dynamicEnum(default: "", source: .auxiliaryModelCatalog, supportsPreview: false),
-            storage: .config(path: "models.memory_model")
+            // The UI key includes `_model`, but the upstream model pin is
+            // `[models] memory` (`settings_writes.rs:495-502`).
+            storage: .config(path: "models.memory")
         ),
         PagerSettingMeta(
             key: "fork_secondary_model",
@@ -1398,7 +1400,9 @@ public let pagerDefaultSettings: [PagerSettingMeta] = {
             description: "Model used for the secondary agent when forking. Pick `(no override)` to clear.",
             keywords: ["fork", "model"],
             kind: .dynamicEnum(default: "", source: .activeModelCatalog, supportsPreview: false),
-            storage: .config(path: "models.fork_secondary_model")
+            // Fork selection belongs to the UI config, not the model-pin
+            // table (`settings_writes.rs:513-530`).
+            storage: .config(path: "ui.fork_secondary_model")
         )
     ]
 

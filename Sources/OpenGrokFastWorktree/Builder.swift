@@ -754,7 +754,14 @@ public func removeWorktreeAt(
         }
         return try worktreeRemove(source: source, dest: dest, force: force)
     }
-    // Standalone / unknown: just delete the directory.
+    guard force else {
+        throw FastWorktreeError.gitFailed(
+            "refusing non-forced removal of an unknown or unregistered worktree: \(dest.path)"
+        )
+    }
+
+    // An unverified directory may only use this destructive fallback when the
+    // caller explicitly requested force.
     let recovered = readPartialMarker(at: dest) != nil
     if FileManager.default.fileExists(atPath: dest.path) {
         try FileManager.default.removeItem(at: dest)

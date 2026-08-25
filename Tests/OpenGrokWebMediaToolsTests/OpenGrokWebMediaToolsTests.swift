@@ -171,7 +171,7 @@ struct OpenGrokWebMediaToolsTests {
         let payload = try #require(JSONSerialization.jsonObject(with: requestBody) as? [String: Any])
         #expect(payload["model"] as? String == "grok-search")
         #expect((payload["input"] as? String) == "Swift")
-        #expect((payload["tools"] as? [[String: Any]])?.first?["type"] as? String == "web_search_preview")
+        #expect((payload["tools"] as? [[String: Any]])?.first?["type"] as? String == "web_search")
     }
 
     @Test("web and media clients classify authentication, rate, and malformed responses")

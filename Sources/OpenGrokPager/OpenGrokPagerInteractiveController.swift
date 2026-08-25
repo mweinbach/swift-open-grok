@@ -21,6 +21,99 @@ public enum PagerLocalCommandOutcome: Sendable, Equatable {
     case submit(String)
 }
 
+/// The image-capable extension of the ordinary pager runtime. Attachment
+/// bytes stay on this typed, in-memory seam instead of entering prompt
+/// metadata, queue notifications, or path-based clipboard fallbacks.
+public protocol OpenGrokPagerImageAttachmentRuntimeAdapter: OpenGrokPagerRuntimeAdapter {
+    func validateImageAttachments(_ attachments: [PastedImage]) async throws
+
+    func makeSession(
+        for request: OpenGrokPagerRequest,
+        attachments: [PastedImage]
+    ) async throws -> any OpenGrokPagerSessionAdapter
+}
+
+public enum OpenGrokPagerImageAttachmentError: Error, Sendable, Equatable,
+    CustomStringConvertible {
+    case unsupportedRuntime
+    case unsupportedMIMEType(String)
+    case missingImageData
+    case invalidImageData
+    case inconsistentImageSize
+    case imageExceedsByteLimit
+    case imageDimensionsTooSmall
+    case imageDimensionsTooLarge
+
+    public var description: String {
+        switch self {
+        case .unsupportedRuntime:
+            return "This session cannot deliver image attachments."
+        case .unsupportedMIMEType(let mimeType):
+            return "Unsupported image attachment type: \(mimeType)."
+        case .missingImageData:
+            return "Image attachment data is missing."
+        case .invalidImageData:
+            return "Image attachment data is not a supported image."
+        case .inconsistentImageSize:
+            return "Image attachment size does not match its data."
+        case .imageExceedsByteLimit:
+            return "Image attachment exceeds the 1.5 MB delivery limit."
+        case .imageDimensionsTooSmall:
+            return "Image attachment is too small for model vision input."
+        case .imageDimensionsTooLarge:
+            return "Image attachment exceeds the supported pixel limit."
+        }
+    }
+}
+
+public enum OpenGrokPagerImageAttachmentValidator {
+    public static let maximumBytes = 1_500_000
+    public static let minimumSidePixels: UInt32 = 8
+    public static let minimumTotalPixels: UInt64 = 512
+    public static let maximumTotalPixels: UInt64 = 178_956_970
+
+    public static func validate(_ attachments: [PastedImage]) throws {
+        for attachment in attachments {
+            guard ["image/png", "image/jpeg", "image/webp", "image/gif"]
+                .contains(attachment.mimeType.lowercased()) else {
+                throw OpenGrokPagerImageAttachmentError.unsupportedMIMEType(
+                    attachment.mimeType
+                )
+            }
+            guard let bytes = attachment.encodedBytes, !bytes.isEmpty else {
+                throw OpenGrokPagerImageAttachmentError.missingImageData
+            }
+            guard attachment.byteLen == bytes.count else {
+                throw OpenGrokPagerImageAttachmentError.inconsistentImageSize
+            }
+            guard bytes.count <= maximumBytes else {
+                throw OpenGrokPagerImageAttachmentError.imageExceedsByteLimit
+            }
+            if let dimensions = attachment.dimensions {
+                try validateDimensions(width: dimensions.width, height: dimensions.height)
+            }
+        }
+    }
+
+    public static func validateDimensions(width: UInt32, height: UInt32) throws {
+        let pixels = UInt64(width) * UInt64(height)
+        guard width >= minimumSidePixels,
+              height >= minimumSidePixels,
+              pixels >= minimumTotalPixels else {
+            throw OpenGrokPagerImageAttachmentError.imageDimensionsTooSmall
+        }
+        guard pixels <= maximumTotalPixels else {
+            throw OpenGrokPagerImageAttachmentError.imageDimensionsTooLarge
+        }
+    }
+}
+
+public extension OpenGrokPagerImageAttachmentRuntimeAdapter {
+    func validateImageAttachments(_ attachments: [PastedImage]) async throws {
+        try OpenGrokPagerImageAttachmentValidator.validate(attachments)
+    }
+}
+
 /// The single-process stand-in for upstream's `x.ai/interject` wire hop: the
 /// composition installs closures that reach the live session actor directly.
 ///
@@ -895,6 +988,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// drains in the same breath, so there is a single ordering authority and
     /// the drain path is not a second, subtly different code path.
     private let promptQueue = PromptQueue(sessionId: "interactive")
+    /// Queue wire rows intentionally contain text alone; their matching image
+    /// bytes never leave this actor until the typed runtime accepts the turn.
+    private var queuedPromptImages: [String: [PastedImage]] = [:]
     private var nextPromptSequence = 0
     /// Cross-tab dashboard dispatches that arrived while a turn was active.
     /// They run in arrival order after the active turn settles; the runtime
@@ -1081,7 +1177,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 )
             }
         )
-        self.paletteRows = builtinCommands
+        self.paletteRows = self.commands.commands
             .filter { !$0.isHidden }
             .map { command in
                 OpenGrokPagerCommandSuggestion(
@@ -1800,6 +1896,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                 await inputPumpGate.resume()
                                 continue
                             }
+                            guard try await validateEditorImageAttachments() else {
+                                await inputPumpGate.resume()
+                                continue
+                            }
                             if try await runBashCommand(prompt) {
                                 recordHistory(prompt)
                                 editor.reset()
@@ -2135,6 +2235,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                                         turnOutcome = .turnPreempted
                                     }
                                 } else {
+                                    guard try await validateEditorImageAttachments() else {
+                                        await inputPumpGate.resume()
+                                        continue
+                                    }
                                     if try await runBashCommand(prompt) {
                                         recordHistory(prompt)
                                         editor.reset()
@@ -2357,6 +2461,24 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         case tail
     }
 
+    private func validateEditorImageAttachments() async throws -> Bool {
+        let attachments = editor.state().pastedImages
+        guard !attachments.isEmpty else { return true }
+        guard let imageRuntime = runtime as? any OpenGrokPagerImageAttachmentRuntimeAdapter else {
+            try await emit(.notice(
+                OpenGrokPagerImageAttachmentError.unsupportedRuntime.description
+            ))
+            return false
+        }
+        do {
+            try await imageRuntime.validateImageAttachments(attachments)
+            return true
+        } catch {
+            try await emit(.notice(String(describing: error)))
+            return false
+        }
+    }
+
     /// Put a prompt in the queue and clear the composer.
     ///
     /// Normal follow-ups use the tail. Send-now uses the front, then cancels the
@@ -2366,8 +2488,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         historyText: String? = nil,
         insertion: QueueInsertion = .tail,
         promptKind: PagerPromptKind = .standard,
-        queueKind: String? = nil
+        queueKind: String? = nil,
+        images: [PastedImage]? = nil
     ) async throws {
+        let attachments = images ?? editor.state().pastedImages
         nextPromptSequence += 1
         let entry = QueueEntryMeta(
             id: "prompt-\(nextPromptSequence)",
@@ -2379,6 +2503,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             await promptQueue.enqueueFront(entry)
         case .tail:
             await promptQueue.enqueue(entry)
+        }
+        if !attachments.isEmpty {
+            queuedPromptImages[entry.id] = attachments
         }
         recordHistory(historyText ?? prompt)
         editor.reset()
@@ -2492,6 +2619,9 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
     /// here: the reference keeps follow-ups across an interrupt.
     private func discardQueue(reason: String) async throws {
         let discarded = await promptQueue.removeAll()
+        for entry in discarded {
+            queuedPromptImages.removeValue(forKey: entry.id)
+        }
         guard !discarded.isEmpty else { return }
         let plural = discarded.count == 1 ? "prompt" : "prompts"
         try await emit(.notice("discarded \(discarded.count) queued \(plural) — \(reason)"))
@@ -2552,19 +2682,22 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                entry.kind != Self.monitorQueueEntryKind,
                entry.kind != Self.passThroughQueueEntryKind,
                case .command = PagerCommandParser.parse(entry.text) {
+                let entryImages = queuedPromptImages.removeValue(forKey: entry.id) ?? []
                 await promptQueue.completeRunning()
                 switch try await runSlashCommand(entry.text) {
                 case .submit(let generatedPrompt, let promptKind):
                     try await enqueue(
                         generatedPrompt,
                         historyText: entry.text,
-                        promptKind: promptKind
+                        promptKind: promptKind,
+                        images: entryImages
                     )
                 case .passThrough(let generatedPrompt):
                     try await enqueue(
                         generatedPrompt,
                         historyText: entry.text,
-                        queueKind: Self.passThroughQueueEntryKind
+                        queueKind: Self.passThroughQueueEntryKind,
+                        images: entryImages
                     )
                 case .drain, .quit, .handled, .notACommand:
                     // `.drain`: the fallback prompt is already at the front;
@@ -2585,16 +2718,18 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
             // prefix and stops at the first Cron row, and a Cron front runs
             // alone. Monitor entries share the rule — upstream's notification
             // prompts never enter the pager queue at all, so they can never
-            // have merged.
+            // have merged. The front may carry images, but an image-bearing
+            // follower is a hard boundary (`combine.rs:23-36`).
             var promptText = entry.text
+            let attachments = queuedPromptImages.removeValue(forKey: entry.id) ?? []
             var foldedBacklog = false
-            if modes.combineQueuedPrompts,
-               entry.kind != Self.cronQueueEntryKind,
-               entry.kind != Self.monitorQueueEntryKind {
+            if modes.combineQueuedPrompts, entry.kind == "prompt" {
                 var rest: [String] = []
                 for waiting in await promptQueue.entries {
-                    if waiting.kind == Self.cronQueueEntryKind
-                        || waiting.kind == Self.monitorQueueEntryKind { break }
+                    guard waiting.kind == "prompt",
+                          queuedPromptImages[waiting.id]?.isEmpty ?? true else {
+                        break
+                    }
                     guard let removed = try? await promptQueue.remove(id: waiting.id) else {
                         continue
                     }
@@ -2656,7 +2791,17 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
                 sessionID: lastSessionID ?? request.sessionID,
                 metadata: turnMetadata
             )
-            let session = try await runtime.makeSession(for: turnRequest)
+            let session: any OpenGrokPagerSessionAdapter
+            if attachments.isEmpty {
+                session = try await runtime.makeSession(for: turnRequest)
+            } else if let imageRuntime = runtime as? any OpenGrokPagerImageAttachmentRuntimeAdapter {
+                session = try await imageRuntime.makeSession(
+                    for: turnRequest,
+                    attachments: attachments
+                )
+            } else {
+                throw OpenGrokPagerImageAttachmentError.unsupportedRuntime
+            }
             submittedPrompts.append(promptText)
             if entry.kind == Self.cronQueueEntryKind {
                 runningCronTaskID = entry.taskID
@@ -4695,6 +4840,7 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         activeSessionID = nil
         editor.reset()
         await promptQueue.removeAll()
+        queuedPromptImages.removeAll()
         try await emit(.sessionReplaced(sessionID: sessionID))
     }
 
@@ -4730,7 +4876,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         lastSessionID = newSessionID
         activeSessionID = nil
         editor.reset()
-        if clearQueue { await promptQueue.removeAll() }
+        if clearQueue {
+            await promptQueue.removeAll()
+            queuedPromptImages.removeAll()
+        }
         try await emit(.sessionReplaced(sessionID: newSessionID))
         return true
     }
@@ -4752,7 +4901,10 @@ public actor OpenGrokPagerInteractiveController: OpenGrokPagerInteractiveFronten
         lastSessionID = resumedID
         activeSessionID = nil
         editor.reset()
-        if clearQueue { await promptQueue.removeAll() }
+        if clearQueue {
+            await promptQueue.removeAll()
+            queuedPromptImages.removeAll()
+        }
         try await emit(.sessionResumed(sessionID: resumedID))
         if let directive = try await runtime.claimPendingFirstPrompt(sessionID: resumedID) {
             do {

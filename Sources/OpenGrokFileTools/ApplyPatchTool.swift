@@ -15,10 +15,19 @@
 // - scrollback/blocks/tool/edit.rs EditToolCallBlock + summary_untrusted
 
 import Foundation
+import OpenGrokFileUtils
 import OpenGrokShared
 import OpenGrokToolProtocol
 import OpenGrokToolRegistry
 import OpenGrokToolRuntime
+
+#if os(Windows)
+import WinSDK
+#elseif canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 // MARK: - AST
 
@@ -247,6 +256,19 @@ public enum ApplyPatchParser {
 // MARK: - Apply
 
 public enum ApplyPatchTool {
+    enum MutationCheckpoint: Sendable {
+        case acquiredLock
+        case beforeSourceDeletion
+    }
+
+    struct MutationInterlock: Sendable {
+        let handler: @Sendable (MutationCheckpoint, String) async throws -> Void
+    }
+
+    private struct MutationFailure: Error, Sendable, CustomStringConvertible {
+        let description: String
+    }
+
     public static func run(
         args: JSONValue,
         resources: ToolResources
@@ -561,16 +583,26 @@ public enum ApplyPatchTool {
                 absolute: result.path, content: result.newContent, resources: resources, previousContent: prev
             )
         case .deleted:
-            try SessionFS.enforceRoots(result.path, roots: resources.allowedRoots)
             let lock = await resources.locks.acquirePath(result.path)
             defer { Task { await lock.release() } }
-            try FileManager.default.removeItem(atPath: result.path)
-            if let tracker = resources.hunkTracker, let prev = result.oldContent {
+            try await checkpoint(.acquiredLock, path: result.path, resources: resources)
+            try SessionFS.enforceRoots(result.path, roots: resources.allowedRoots)
+            guard let previous = result.oldContent else {
+                throw MutationFailure(description: "Cannot delete a file without its original contents: \(result.path)")
+            }
+            let source = try PinnedDeletionTarget(
+                path: result.path,
+                expectedContent: previous,
+                roots: resources.allowedRoots
+            )
+            try await checkpoint(.beforeSourceDeletion, path: result.path, resources: resources)
+            try source.remove(roots: resources.allowedRoots)
+            if let tracker = resources.hunkTracker {
                 await tracker.recordAgentWrite(
                     path: result.path,
                     content: "",
                     promptIndex: resources.promptIndex,
-                    previousContent: prev,
+                    previousContent: previous,
                     agentId: resources.agentId,
                     writeSucceeded: true
                 )
@@ -580,17 +612,385 @@ public enum ApplyPatchTool {
                 absolute: result.path, content: result.newContent, resources: resources, previousContent: result.oldContent
             )
         case .moved:
-            guard let dest = result.moveTo else { return }
-            try await SessionFS.writeText(
-                absolute: dest, content: result.newContent, resources: resources, previousContent: nil
-            )
-            let lock = await resources.locks.acquirePath(result.path)
+            guard let destination = result.moveTo else {
+                throw MutationFailure(description: "Patch move is missing its destination: \(result.path)")
+            }
+            guard destination != result.path else {
+                throw MutationFailure(description: "Patch move source and destination must differ: \(result.path)")
+            }
+
+            // SessionFS.writeText acquires its own path lock, so calling it
+            // beneath an exclusive lock would deadlock. Write directly through
+            // the same no-follow atomic primitive and attribute both mutations
+            // only after their complete, rollback-protected transaction.
+            let lock = await resources.locks.acquireExclusive()
             defer { Task { await lock.release() } }
-            try? FileManager.default.removeItem(atPath: result.path)
-            // Record the move as a write to the destination; the deletion's
-            // prior content is still `result.oldContent` for hunk diff context.
-            _ = result.path
+            try await checkpoint(.acquiredLock, path: result.path, resources: resources)
+            try SessionFS.enforceRoots(result.path, roots: resources.allowedRoots)
+            try SessionFS.enforceRoots(destination, roots: resources.allowedRoots)
+            guard let previousSource = result.oldContent else {
+                throw MutationFailure(description: "Cannot move a file without its original contents: \(result.path)")
+            }
+            let source = try PinnedDeletionTarget(
+                path: result.path,
+                expectedContent: previousSource,
+                roots: resources.allowedRoots
+            )
+
+            let previousDestination: String?
+            if SessionFS.fileExists(destination) {
+                if try PathSecurity.isSymlink(URL(fileURLWithPath: destination)) {
+                    throw SessionFSError.symlinkEscape(destination)
+                }
+                previousDestination = try SessionFS.readText(at: destination)
+            } else {
+                previousDestination = nil
+            }
+
+            try AtomicFile.write(
+                URL(fileURLWithPath: destination),
+                contents: result.newContent,
+                options: AtomicWriteOptions(syncFile: true, noFollowFinal: true)
+            )
+
+            do {
+                try await checkpoint(.beforeSourceDeletion, path: result.path, resources: resources)
+                try source.remove(roots: resources.allowedRoots)
+            } catch {
+                do {
+                    try restoreMoveDestination(
+                        path: destination,
+                        previousContent: previousDestination,
+                        writtenContent: result.newContent,
+                        roots: resources.allowedRoots
+                    )
+                } catch let rollbackError {
+                    throw MutationFailure(description:
+                        "Failed to delete move source \(result.path): \(error); "
+                            + "destination rollback failed for \(destination): \(rollbackError)"
+                    )
+                }
+                throw MutationFailure(description:
+                    "Failed to delete move source \(result.path): \(error)"
+                )
+            }
+
+            if let tracker = resources.hunkTracker {
+                await tracker.recordAgentWrite(
+                    path: destination,
+                    content: result.newContent,
+                    promptIndex: resources.promptIndex,
+                    previousContent: previousDestination,
+                    agentId: resources.agentId,
+                    writeSucceeded: true
+                )
+                await tracker.recordAgentWrite(
+                    path: result.path,
+                    content: "",
+                    promptIndex: resources.promptIndex,
+                    previousContent: previousSource,
+                    agentId: resources.agentId,
+                    writeSucceeded: true
+                )
+            }
         }
+    }
+
+    private static func checkpoint(
+        _ checkpoint: MutationCheckpoint,
+        path: String,
+        resources: ToolResources
+    ) async throws {
+        guard let interlock = resources.extras.get(MutationInterlock.self) else { return }
+        try await interlock.handler(checkpoint, path)
+    }
+
+    private static func restoreMoveDestination(
+        path: String,
+        previousContent: String?,
+        writtenContent: String,
+        roots: [String]
+    ) throws {
+        try SessionFS.enforceRoots(path, roots: roots)
+        if let previousContent {
+            try AtomicFile.write(
+                URL(fileURLWithPath: path),
+                contents: previousContent,
+                options: AtomicWriteOptions(syncFile: true, noFollowFinal: true)
+            )
+        } else {
+            let destination = try PinnedDeletionTarget(
+                path: path,
+                expectedContent: writtenContent,
+                roots: roots
+            )
+            try destination.remove(roots: roots)
+        }
+    }
+
+    private final class PinnedDeletionTarget: @unchecked Sendable {
+        private let path: String
+        private let expectedContent: String
+        private let rootPath: String
+        private let parentPath: String
+        private let leafName: String
+
+        #if os(Windows)
+        private var directoryHandles: [HANDLE] = []
+        private var directoryPaths: [String] = []
+        #else
+        private var directoryDescriptors: [Int32] = []
+        private var fileDescriptor: Int32 = -1
+        private static var directoryFlags: Int32 {
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        }
+        #endif
+
+        init(path: String, expectedContent: String, roots: [String]) throws {
+            let absolute = URL(fileURLWithPath: path).standardizedFileURL.path
+            let anchor = try Self.anchor(for: absolute, roots: roots)
+            guard let leaf = anchor.components.last else {
+                throw MutationFailure(description: "Cannot delete an authorized workspace root: \(absolute)")
+            }
+
+            self.path = absolute
+            self.expectedContent = expectedContent
+            self.rootPath = anchor.root
+            self.parentPath = URL(fileURLWithPath: absolute).deletingLastPathComponent().path
+            self.leafName = leaf
+
+            #if os(Windows)
+            var directory = URL(fileURLWithPath: anchor.root)
+            try openWindowsDirectory(directory.path)
+            for component in anchor.components.dropLast() {
+                directory.appendPathComponent(component, isDirectory: true)
+                try openWindowsDirectory(directory.path)
+            }
+            let sourceData = try PathSecurity.readNoFollow(URL(fileURLWithPath: absolute))
+            guard String(data: sourceData, encoding: .utf8) == expectedContent else {
+                throw MutationFailure(description: "Patch source changed after it was read: \(absolute)")
+            }
+            #else
+            let rootDescriptor = anchor.root.withCString { open($0, Self.directoryFlags) }
+            guard rootDescriptor >= 0 else {
+                throw Self.posixFailure(path: anchor.root, operation: "open authorized root")
+            }
+            directoryDescriptors.append(rootDescriptor)
+
+            var directory = URL(fileURLWithPath: anchor.root)
+            for component in anchor.components.dropLast() {
+                directory.appendPathComponent(component, isDirectory: true)
+                guard let parent = directoryDescriptors.last else {
+                    throw MutationFailure(description: "Patch deletion lost its authorized parent descriptor")
+                }
+                let descriptor = component.withCString { openat(parent, $0, Self.directoryFlags) }
+                guard descriptor >= 0 else {
+                    throw Self.posixFailure(path: directory.path, operation: "open no-follow parent")
+                }
+                directoryDescriptors.append(descriptor)
+            }
+
+            guard let parent = directoryDescriptors.last else {
+                throw MutationFailure(description: "Patch deletion lost its authorized parent descriptor")
+            }
+            fileDescriptor = leaf.withCString {
+                openat(parent, $0, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+            }
+            guard fileDescriptor >= 0 else {
+                throw Self.posixFailure(path: absolute, operation: "open no-follow patch source")
+            }
+
+            let handle = FileHandle(fileDescriptor: fileDescriptor, closeOnDealloc: false)
+            let sourceData = try handle.readToEnd() ?? Data()
+            guard String(data: sourceData, encoding: .utf8) == expectedContent else {
+                throw MutationFailure(description: "Patch source changed after it was read: \(absolute)")
+            }
+            #endif
+
+            try revalidate(roots: roots)
+        }
+
+        deinit {
+            #if os(Windows)
+            for handle in directoryHandles.reversed() {
+                CloseHandle(handle)
+            }
+            #else
+            if fileDescriptor >= 0 {
+                close(fileDescriptor)
+            }
+            for descriptor in directoryDescriptors.reversed() {
+                close(descriptor)
+            }
+            #endif
+        }
+
+        func remove(roots: [String]) throws {
+            try revalidate(roots: roots)
+
+            #if os(Windows)
+            let native = try WindowsSecurePath.extendedLengthPath(path)
+            let removed = native.withCString(encodedAs: UTF16.self) { DeleteFileW($0) }
+            guard removed else {
+                throw MutationFailure(description:
+                    "Failed to delete file \(path): Windows error \(GetLastError())"
+                )
+            }
+            #else
+            guard let parent = directoryDescriptors.last else {
+                throw MutationFailure(description: "Patch deletion lost its authorized parent descriptor")
+            }
+            let removed = leafName.withCString { unlinkat(parent, $0, 0) }
+            guard removed == 0 else {
+                throw Self.posixFailure(path: path, operation: "delete file")
+            }
+            #endif
+        }
+
+        private func revalidate(roots: [String]) throws {
+            try SessionFS.enforceRoots(path, roots: roots)
+
+            #if os(Windows)
+            for directory in directoryPaths {
+                guard let metadata = try WindowsSecurePath.metadata(at: URL(fileURLWithPath: directory)),
+                      metadata.isDirectory,
+                      !metadata.isReparsePoint
+                else {
+                    throw SessionFSError.symlinkEscape(directory)
+                }
+            }
+            guard let metadata = try WindowsSecurePath.metadata(at: URL(fileURLWithPath: path)),
+                  !metadata.isDirectory,
+                  !metadata.isReparsePoint
+            else {
+                throw MutationFailure(description: "Patch source disappeared or became unsafe: \(path)")
+            }
+            #else
+            guard let root = directoryDescriptors.first,
+                  let parent = directoryDescriptors.last
+            else {
+                throw MutationFailure(description: "Patch deletion lost its authorized root descriptor")
+            }
+            try verifyDirectory(root, stillRepresents: rootPath)
+            try verifyDirectory(parent, stillRepresents: parentPath)
+
+            var descriptorInformation = stat()
+            var pathInformation = stat()
+            guard fstat(fileDescriptor, &descriptorInformation) == 0 else {
+                throw Self.posixFailure(path: path, operation: "inspect pinned source")
+            }
+            let inspected = leafName.withCString {
+                fstatat(parent, $0, &pathInformation, AT_SYMLINK_NOFOLLOW)
+            }
+            guard inspected == 0 else {
+                throw Self.posixFailure(path: path, operation: "revalidate patch source")
+            }
+            guard pathInformation.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+                  descriptorInformation.st_dev == pathInformation.st_dev,
+                  descriptorInformation.st_ino == pathInformation.st_ino
+            else {
+                throw MutationFailure(description: "Patch source changed after its descriptor was pinned: \(path)")
+            }
+            #endif
+        }
+
+        private static func anchor(
+            for path: String,
+            roots: [String]
+        ) throws -> (root: String, components: [String]) {
+            guard !path.contains("\0") else {
+                throw SessionFSError.outsideWorkspace(path)
+            }
+
+            let candidates: [String]
+            if roots.isEmpty {
+                candidates = [URL(fileURLWithPath: path).deletingLastPathComponent().path]
+            } else {
+                candidates = roots.flatMap { root in
+                    let standardized = URL(fileURLWithPath: root).standardizedFileURL
+                    let resolved = standardized.resolvingSymlinksInPath().path
+                    return standardized.path == resolved
+                        ? [standardized.path]
+                        : [standardized.path, resolved]
+                }.sorted { $0.count > $1.count }
+            }
+
+            for root in candidates {
+                let prefix = root.hasSuffix("/") ? root : root + "/"
+                #if os(Windows)
+                guard path.lowercased().hasPrefix(prefix.lowercased()) else { continue }
+                #else
+                guard path.hasPrefix(prefix) else { continue }
+                #endif
+                let components = path.dropFirst(prefix.count).split(separator: "/").map(String.init)
+                guard !components.isEmpty,
+                      components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." })
+                else {
+                    continue
+                }
+                return (root, components)
+            }
+
+            throw SessionFSError.outsideWorkspace(path)
+        }
+
+        #if os(Windows)
+        private func openWindowsDirectory(_ path: String) throws {
+            let native = try WindowsSecurePath.extendedLengthPath(path)
+            let raw = native.withCString(encodedAs: UTF16.self) { pointer in
+                CreateFileW(
+                    pointer,
+                    DWORD(FILE_READ_ATTRIBUTES),
+                    DWORD(FILE_SHARE_READ | FILE_SHARE_WRITE),
+                    nil,
+                    DWORD(OPEN_EXISTING),
+                    DWORD(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT),
+                    nil
+                )
+            }
+            guard let handle = raw, handle != INVALID_HANDLE_VALUE else {
+                throw MutationFailure(description:
+                    "Failed to open no-follow patch parent \(path): Windows error \(GetLastError())"
+                )
+            }
+
+            var information = BY_HANDLE_FILE_INFORMATION()
+            guard GetFileInformationByHandle(handle, &information),
+                  information.dwFileAttributes & DWORD(FILE_ATTRIBUTE_DIRECTORY) != 0,
+                  information.dwFileAttributes & DWORD(FILE_ATTRIBUTE_REPARSE_POINT) == 0
+            else {
+                CloseHandle(handle)
+                throw SessionFSError.symlinkEscape(path)
+            }
+            directoryHandles.append(handle)
+            directoryPaths.append(path)
+        }
+        #else
+        private func verifyDirectory(_ descriptor: Int32, stillRepresents path: String) throws {
+            let observed = path.withCString { open($0, Self.directoryFlags) }
+            guard observed >= 0 else {
+                throw Self.posixFailure(path: path, operation: "revalidate no-follow parent")
+            }
+            defer { close(observed) }
+
+            var originalInformation = stat()
+            var observedInformation = stat()
+            guard fstat(descriptor, &originalInformation) == 0,
+                  fstat(observed, &observedInformation) == 0,
+                  originalInformation.st_dev == observedInformation.st_dev,
+                  originalInformation.st_ino == observedInformation.st_ino
+            else {
+                throw MutationFailure(description: "Patch parent changed after its descriptor was pinned: \(path)")
+            }
+        }
+
+        private static func posixFailure(path: String, operation: String) -> MutationFailure {
+            let code = errno
+            return MutationFailure(description:
+                "Failed to \(operation) \(path): \(String(cString: strerror(code)))"
+            )
+        }
+        #endif
     }
 
     private static func applyChunk(_ chunk: UpdateChunk, to text: String) throws -> String {

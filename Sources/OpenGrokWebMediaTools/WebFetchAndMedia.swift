@@ -1,5 +1,16 @@
 import Foundation
+import Dispatch
 import OpenGrokHTTP
+
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 public struct WebFetchParams: Codable, Sendable, Equatable, Hashable {
     public var cacheTTLSeconds: UInt64?
@@ -143,6 +154,236 @@ public struct WebFetchArtifact: Sendable, Equatable, Hashable, Codable {
     }
 }
 
+public enum WebFetchIPAddress: Sendable, Equatable, Hashable, CustomStringConvertible {
+    case ipv4(UInt32)
+    case ipv6(high: UInt64, low: UInt64)
+
+    public init?(literal: String) {
+        #if canImport(Darwin) || canImport(Glibc)
+        let host = literal.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        var ipv4 = in_addr()
+        if host.withCString({ inet_pton(AF_INET, $0, &ipv4) }) == 1 {
+            self = .ipv4(UInt32(bigEndian: ipv4.s_addr))
+            return
+        }
+
+        var ipv6 = in6_addr()
+        guard host.withCString({ inet_pton(AF_INET6, $0, &ipv6) }) == 1 else {
+            return nil
+        }
+        self.init(ipv6Address: ipv6)
+        #else
+        return nil
+        #endif
+    }
+
+    #if canImport(Darwin) || canImport(Glibc)
+    fileprivate init(ipv6Address: in6_addr) {
+        let bytes = withUnsafeBytes(of: ipv6Address) { Array($0) }
+        let high = bytes.prefix(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        let low = bytes.suffix(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        self = .ipv6(high: high, low: low)
+    }
+    #endif
+
+    public var description: String {
+        switch self {
+        case .ipv4(let value):
+            return [24, 16, 8, 0]
+                .map { String((value >> $0) & 0xff) }
+                .joined(separator: ".")
+        case .ipv6(let high, let low):
+            let groups = [
+                (high >> 48) & 0xffff, (high >> 32) & 0xffff,
+                (high >> 16) & 0xffff, high & 0xffff,
+                (low >> 48) & 0xffff, (low >> 32) & 0xffff,
+                (low >> 16) & 0xffff, low & 0xffff
+            ]
+            return groups.map { String($0, radix: 16) }.joined(separator: ":")
+        }
+    }
+
+    public var isLoopback: Bool {
+        switch self {
+        case .ipv4(let value):
+            return value >> 24 == 127
+        case .ipv6(let high, let low):
+            if high == 0, low == 1 { return true }
+            return mappedIPv4?.isLoopback ?? false
+        }
+    }
+
+    public var isPublic: Bool {
+        switch self {
+        case .ipv4(let value):
+            let first = UInt8((value >> 24) & 0xff)
+            let second = UInt8((value >> 16) & 0xff)
+            let third = UInt8((value >> 8) & 0xff)
+
+            if first == 0 || first == 10 || first == 127 || first >= 224 {
+                return false
+            }
+            if first == 100, (64...127).contains(second) { return false }
+            if first == 169, second == 254 { return false }
+            if first == 172, (16...31).contains(second) { return false }
+            if first == 192, second == 168 { return false }
+            if first == 192, second == 0, third == 0 || third == 2 { return false }
+            if first == 198, (18...19).contains(second) { return false }
+            if first == 198, second == 51, third == 100 { return false }
+            if first == 203, second == 0, third == 113 { return false }
+            return true
+
+        case .ipv6(let high, let low):
+            if let mappedIPv4 { return mappedIPv4.isPublic }
+            if high == 0, low == 0 || low == 1 { return false }
+
+            let first = UInt8((high >> 56) & 0xff)
+            let second = UInt8((high >> 48) & 0xff)
+            if first == 0xff || first & 0xfe == 0xfc { return false }
+            if first == 0xfe, second & 0xc0 == 0x80 { return false }
+
+            // Documentation and deprecated site-local space are not routable.
+            if high >> 32 == 0x2001_0db8 { return false }
+            if first == 0xfe, second & 0xc0 == 0xc0 { return false }
+            return true
+        }
+    }
+
+    private var mappedIPv4: WebFetchIPAddress? {
+        guard case .ipv6(let high, let low) = self,
+              high == 0,
+              low >> 32 == 0xffff
+        else {
+            return nil
+        }
+        return .ipv4(UInt32(truncatingIfNeeded: low))
+    }
+}
+
+public protocol WebFetchHostResolving: Sendable {
+    func resolve(host: String, port: UInt16, timeout: TimeInterval) async throws -> [WebFetchIPAddress]
+}
+
+public struct SystemWebFetchHostResolver: WebFetchHostResolving {
+    // getaddrinfo is not cancellable; one worker bounds stranded DNS threads.
+    private static let lookupQueue = DispatchQueue(
+        label: "org.opengrok.web-fetch.dns",
+        qos: .utility
+    )
+
+    public init() {}
+
+    public func resolve(
+        host: String,
+        port: UInt16,
+        timeout: TimeInterval
+    ) async throws -> [WebFetchIPAddress] {
+        try Task.checkCancellation()
+        let deadline = max(0.05, min(timeout, 30))
+        let addresses: [WebFetchIPAddress] = try await withCheckedThrowingContinuation { continuation in
+            let pending = WebFetchDNSContinuation(continuation)
+            Self.lookupQueue.async {
+                pending.finish(Result { try Self.lookup(host: host, port: port) })
+            }
+            // The deadline must not share the queue blocked inside getaddrinfo.
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + deadline) {
+                pending.finish(.failure(WebMediaToolError.blockedURL(
+                    "DNS resolution timed out for \(host)"
+                )))
+            }
+        }
+        try Task.checkCancellation()
+        return addresses
+    }
+
+    private static func lookup(host: String, port: UInt16) throws -> [WebFetchIPAddress] {
+        #if canImport(Darwin) || canImport(Glibc)
+        var hints = addrinfo()
+        hints.ai_family = AF_UNSPEC
+        var results: UnsafeMutablePointer<addrinfo>?
+        let status = getaddrinfo(host, String(port), &hints, &results)
+        guard status == 0, let head = results else {
+            let detail = String(cString: gai_strerror(status))
+            throw WebMediaToolError.blockedURL("DNS resolution failed for \(host): \(detail)")
+        }
+        defer { freeaddrinfo(head) }
+
+        var addresses: [WebFetchIPAddress] = []
+        var cursor: UnsafeMutablePointer<addrinfo>? = head
+        while let info = cursor?.pointee {
+            if let address = info.ai_addr, info.ai_family == AF_INET,
+               info.ai_addrlen >= socklen_t(MemoryLayout<sockaddr_in>.size) {
+                let value = address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                    $0.pointee.sin_addr.s_addr
+                }
+                addresses.append(.ipv4(UInt32(bigEndian: value)))
+            } else if let address = info.ai_addr, info.ai_family == AF_INET6,
+                      info.ai_addrlen >= socklen_t(MemoryLayout<sockaddr_in6>.size) {
+                let value = address.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) {
+                    $0.pointee.sin6_addr
+                }
+                addresses.append(WebFetchIPAddress(ipv6Address: value))
+            }
+            cursor = info.ai_next
+        }
+
+        guard !addresses.isEmpty else {
+            throw WebMediaToolError.blockedURL("DNS resolution returned no addresses for \(host)")
+        }
+        return addresses
+        #else
+        throw WebMediaToolError.blockedURL("DNS resolution is unavailable for \(host)")
+        #endif
+    }
+}
+
+private final class WebFetchDNSContinuation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<[WebFetchIPAddress], any Error>?
+
+    init(_ continuation: CheckedContinuation<[WebFetchIPAddress], any Error>) {
+        self.continuation = continuation
+    }
+
+    func finish(_ result: Result<[WebFetchIPAddress], any Error>) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(with: result)
+    }
+}
+
+final class WebFetchNoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let trustDelegate: HTTPTransportSessionDelegate
+
+    init(configuration: HTTPTransportConfiguration = HTTPTransportConfiguration()) {
+        trustDelegate = HTTPTransportSessionDelegate(
+            validateCertificates: configuration.tls.validateCertificates,
+            extraRootCertificates: configuration.tls.extraRootCertificates
+        )
+        super.init()
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        trustDelegate.urlSession(session, didReceive: challenge, completionHandler: completionHandler)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+}
+
 private actor WebFetchCache {
     struct Entry: Sendable {
         var expiresAt: Date
@@ -189,16 +430,48 @@ public struct WebFetchClient: Sendable {
     public var params: WebFetchParams
     public var transport: any HTTPTransport
     public var artifactDirectory: URL
+    private let resolver: any WebFetchHostResolving
+    private let transportConfigurationError: String?
     private let cache: WebFetchCache
 
     public init(
         params: WebFetchParams = WebFetchParams(),
         transport: any HTTPTransport = URLSessionHTTPTransport(),
         artifactDirectory: URL? = nil,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        resolver: any WebFetchHostResolving = SystemWebFetchHostResolver()
     ) {
         self.params = params
-        self.transport = transport
+        self.resolver = resolver
+
+        let configuredProxy: HTTPProxyConfiguration?
+        let proxyError: String?
+        if let endpoint = params.proxyEndpoint {
+            do {
+                configuredProxy = try Self.proxyConfiguration(for: endpoint)
+                proxyError = nil
+            } catch {
+                configuredProxy = nil
+                proxyError = String(describing: error)
+            }
+        } else {
+            configuredProxy = nil
+            proxyError = nil
+        }
+        self.transportConfigurationError = proxyError
+
+        if let sessionTransport = transport as? URLSessionHTTPTransport {
+            var configuration = sessionTransport.configuration
+            if let configuredProxy { configuration.proxy = configuredProxy }
+            let session = URLSession(
+                configuration: HTTPSessionConfigurationBuilder.makeEphemeral(configuration),
+                delegate: WebFetchNoRedirectDelegate(configuration: configuration),
+                delegateQueue: nil
+            )
+            self.transport = URLSessionHTTPTransport(configuration: configuration, session: session)
+        } else {
+            self.transport = transport
+        }
         self.artifactDirectory = artifactDirectory ?? Self.defaultArtifactDirectory(environment: environment)
         self.cache = WebFetchCache(ttl: params.cacheTTL, capacity: params.cacheEntryLimit)
     }
@@ -218,6 +491,9 @@ public struct WebFetchClient: Sendable {
     }
 
     public func fetch(_ input: WebFetchInput) async throws -> WebFetchOutput {
+        if let transportConfigurationError {
+            throw WebMediaToolError.invalidConfiguration(transportConfigurationError)
+        }
         var currentURL = try validateAndNormalize(input.url)
         let cacheKey = currentURL.absoluteString
         if let cached = await cache.value(for: cacheKey) { return cached }
@@ -225,6 +501,7 @@ public struct WebFetchClient: Sendable {
         var redirects = 0
         while true {
             try Task.checkCancellation()
+            try await validateResolvedHost(currentURL)
             let request = HTTPRequest(
                 method: .get,
                 url: currentURL,
@@ -264,6 +541,17 @@ public struct WebFetchClient: Sendable {
                     detail: String(data: response.body.prefix(512), encoding: .utf8) ?? ""
                 )
             }
+            if let reportedURL = response.metadata.url {
+                let normalizedReportedURL = try validateAndNormalize(reportedURL.absoluteString)
+                guard normalizedReportedURL.host == currentURL.host,
+                      normalizedReportedURL.scheme == currentURL.scheme
+                else {
+                    throw WebMediaToolError.crossHostRedirect(
+                        originalHost: currentURL.host ?? "unknown",
+                        redirectURL: normalizedReportedURL.absoluteString
+                    )
+                }
+            }
             guard response.body.count <= params.contentLimit else {
                 throw WebMediaToolError.responseTooLarge(tool: "web_fetch", limit: params.contentLimit)
             }
@@ -283,6 +571,73 @@ public struct WebFetchClient: Sendable {
 
     public func fetch(url: String) async throws -> WebFetchOutput {
         try await fetch(WebFetchInput(url: url))
+    }
+
+    private static func proxyConfiguration(for endpoint: String) throws -> HTTPProxyConfiguration {
+        guard let components = URLComponents(string: endpoint),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = components.host,
+              !host.isEmpty,
+              components.path.isEmpty || components.path == "/",
+              components.query == nil,
+              components.fragment == nil,
+              components.url != nil
+        else {
+            throw WebMediaToolError.invalidConfiguration(
+                "web_fetch proxy endpoint must be an HTTP or HTTPS origin"
+            )
+        }
+
+        let port = components.port ?? (scheme == "https" ? 443 : 80)
+        guard (1...65_535).contains(port) else {
+            throw WebMediaToolError.invalidConfiguration("web_fetch proxy port is invalid")
+        }
+        return HTTPProxyConfiguration(
+            host: host,
+            port: port,
+            username: components.user,
+            password: components.password
+        )
+    }
+
+    private func validateResolvedHost(_ url: URL) async throws {
+        guard let rawHost = url.host, !rawHost.isEmpty else {
+            throw WebMediaToolError.blockedURL("URL has no hostname")
+        }
+        let host = rawHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        let addresses: [WebFetchIPAddress]
+        if let literal = WebFetchIPAddress(literal: host) {
+            addresses = [literal]
+        } else {
+            guard let port = UInt16(exactly: url.port ?? (url.scheme == "https" ? 443 : 80)) else {
+                throw WebMediaToolError.invalidRequest("URL port is invalid")
+            }
+            do {
+                addresses = try await resolver.resolve(host: host, port: port, timeout: params.timeout)
+            } catch let error as WebMediaToolError {
+                throw error
+            } catch {
+                throw WebMediaToolError.blockedURL(
+                    "DNS resolution failed for \(host): \(String(describing: error))"
+                )
+            }
+        }
+
+        guard !addresses.isEmpty else {
+            throw WebMediaToolError.blockedURL("DNS resolution returned no addresses for \(host)")
+        }
+        for address in addresses where !address.isPublic {
+            // Both gates matter: a public hostname rebinding to 127/8 is never local.
+            let loopbackAllowed = params.localHostsAllowed
+                && isExplicitLocalHost(host)
+                && address.isLoopback
+            guard loopbackAllowed else {
+                throw WebMediaToolError.blockedURL(
+                    "\(host) resolves to non-public address \(address)"
+                )
+            }
+        }
     }
 
     private func send(_ request: HTTPRequest, tool: String) async throws -> HTTPResponse {
@@ -346,8 +701,14 @@ public struct WebFetchClient: Sendable {
             throw WebMediaToolError.invalidRequest("URL is invalid")
         }
         let originalHost = components.host ?? ""
+        guard !hasAmbiguousNumericHost(originalHost) else {
+            throw WebMediaToolError.invalidRequest(
+                "numeric IP addresses must use canonical decimal notation"
+            )
+        }
         if components.scheme?.lowercased() == "http", !isExplicitLocalHost(originalHost) { components.scheme = "https" }
-        guard components.scheme?.lowercased() == "https" else {
+        let scheme = components.scheme?.lowercased()
+        guard scheme == "https" || scheme == "http" && isExplicitLocalHost(originalHost) else {
             throw WebMediaToolError.invalidRequest("web_fetch only supports HTTP and HTTPS URLs")
         }
         guard components.user == nil, components.password == nil else {
@@ -356,14 +717,15 @@ public struct WebFetchClient: Sendable {
         guard let host = components.host, !host.isEmpty else {
             throw WebMediaToolError.invalidRequest("URL has no hostname")
         }
-        if host.split(separator: ".").count < 2 && !isExplicitLocalHost(host) {
+        if WebFetchIPAddress(literal: host) == nil,
+           host.split(separator: ".").count < 2,
+           !isExplicitLocalHost(host) {
             throw WebMediaToolError.invalidRequest("hostname must have at least two dot-separated parts: \(host)")
         }
-        if isPrivateHost(host), !(params.localHostsAllowed && isExplicitLocalHost(host)) {
-            throw WebMediaToolError.blockedURL(host)
+        guard !params.domainAllowlist.isEmpty else {
+            throw WebMediaToolError.blockedURL("the configured domain allowlist is empty")
         }
         guard (params.localHostsAllowed && isExplicitLocalHost(host))
-            || params.domainAllowlist.isEmpty
             || matchesAllowedDomain(host, path: components.path, allowlist: params.domainAllowlist)
         else {
             throw WebMediaToolError.blockedURL("\(host) is not in the configured domain allowlist")
@@ -480,34 +842,45 @@ private func normalizeDomain(_ value: String) -> String {
         .replacingOccurrences(of: "www.", with: "", options: [.anchored])
 }
 
-private func isExplicitLocalHost(_ host: String) -> Bool {
-    let normalized = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-    if normalized == "localhost" || normalized.hasSuffix(".localhost") { return true }
-    let octets = normalized.split(separator: ".").compactMap { Int($0) }
-    return octets.count == 4 && octets[0] == 127
-        || normalized == "::1"
-        || normalized == "0:0:0:0:0:0:0:1"
-        || normalized == "::ffff:127.0.0.1"
+private func hasAmbiguousNumericHost(_ host: String) -> Bool {
+    let normalized = host.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    let components = normalized.split(separator: ".", omittingEmptySubsequences: false)
+    guard !components.isEmpty else { return false }
+
+    let numericOnly = components.allSatisfy { component in
+        guard !component.isEmpty else { return false }
+        if component.count > 2,
+           component.hasPrefix("0x") || component.hasPrefix("0X") {
+            return component.dropFirst(2).utf8.allSatisfy { byte in
+                (byte >= 48 && byte <= 57)
+                    || (byte >= 65 && byte <= 70)
+                    || (byte >= 97 && byte <= 102)
+            }
+        }
+        return component.utf8.allSatisfy { $0 >= 48 && $0 <= 57 }
+    }
+    guard numericOnly else { return false }
+    guard components.count == 4 else { return true }
+
+    return components.contains { component in
+        (component.count > 1 && component.first == "0") || UInt8(component) == nil
+    }
 }
 
-private func isPrivateHost(_ host: String) -> Bool {
-    let normalized = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-    if isExplicitLocalHost(normalized) || normalized.hasSuffix(".local") { return true }
-    if normalized.hasPrefix("fc") || normalized.hasPrefix("fd") || normalized.hasPrefix("fe80:") { return true }
-    let octets = normalized.split(separator: ".").compactMap { Int($0) }
-    guard octets.count == 4 else { return false }
-    if octets[0] == 0 || octets[0] == 10 || octets[0] == 100 && (64...127).contains(octets[1])
-        || octets[0] == 169 && octets[1] == 254
-        || octets[0] == 192 && octets[1] == 168
-        || octets[0] == 192 && octets[1] == 0 && octets[2] == 0
-        || octets[0] == 192 && octets[1] == 0 && octets[2] == 2
-        || octets[0] == 198 && (18...19).contains(octets[1])
-        || octets[0] == 198 && octets[1] == 51 && octets[2] == 100
-        || octets[0] == 203 && octets[1] == 0 && octets[2] == 113
-        || octets[0] >= 240 {
-        return true
+private func isExplicitLocalHost(_ host: String) -> Bool {
+    let normalized = host
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        .lowercased()
+    if normalized == "localhost" { return true }
+    guard let address = WebFetchIPAddress(literal: normalized) else { return false }
+    switch address {
+    case .ipv4:
+        return address.isLoopback
+    case .ipv6(let high, let low):
+        return high == 0 && low == 1
     }
-    return octets[0] == 172 && (16...31).contains(octets[1])
 }
 
 private func htmlToMarkdown(_ raw: String) -> String {

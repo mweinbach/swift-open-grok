@@ -1,9 +1,9 @@
 import Foundation
+import OpenGrokConfig
 import OpenGrokConfigTypes
-import OpenGrokFileUtils
 
 public func chunkHash(_ text: String) -> String {
-    FileChecksum.sha256Hex(text)
+    Blake3.hexDigest(Array(text.utf8))
 }
 
 public func chunkMarkdown(_ content: String, config: MemoryIndexConfig = MemoryIndexConfig()) -> [MemoryChunk] {

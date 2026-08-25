@@ -16,11 +16,12 @@ public enum ShellFileMode: Sendable, Equatable {
 private let shellReaders: Set<String> = [
     "cat", "tac", "nl", "head", "tail", "grep", "egrep", "fgrep", "rg", "sed",
     "awk", "less", "more", "bat", "strings", "xxd", "od", "hexdump", "base64",
-    "cut", "sort", "uniq", "wc", "diff", "jq", "yq", "ag", "ack", "zcat",
+    "cut", "sort", "uniq", "wc", "diff", "comm", "rev", "jq", "yq", "ag", "ack",
+    "zcat", "zgrep", "select-string",
 ]
 
 private let shellWriters: Set<String> = [
-    "tee", "truncate",
+    "tee", "truncate", "set-content", "add-content", "out-file", "tee-object",
 ]
 
 private let pathMovers: Set<String> = [
@@ -28,13 +29,204 @@ private let pathMovers: Set<String> = [
     "chmod", "chown", "chgrp",
 ]
 
+private struct ShellPathOperand {
+    let path: String
+    let mode: ShellFileMode?
+}
+
+private struct PeeledShellInvocation {
+    var words: [String]
+    var ambiguous = false
+    var displayOnly = false
+}
+
+private enum InlineShellScript {
+    case literal(String)
+    case ambiguous
+    case notInline
+}
+
+private func shellScriptHasBalancedQuotes(_ script: String) -> Bool {
+    var singleQuoted = false
+    var doubleQuoted = false
+    var escaped = false
+    for character in script {
+        if escaped {
+            escaped = false
+        } else if character == "\\", !singleQuoted {
+            escaped = true
+        } else if character == "'", !doubleQuoted {
+            singleQuoted.toggle()
+        } else if character == "\"", !singleQuoted {
+            doubleQuoted.toggle()
+        }
+    }
+    return !singleQuoted && !doubleQuoted && !escaped
+}
+
+private func shellOptionContainsCommand(_ word: String) -> Bool {
+    word.hasPrefix("-") && !word.hasPrefix("--") && word.dropFirst().contains("c")
+}
+
+private func literalInlineShellScript(_ words: [String]) -> InlineShellScript {
+    var foundCommandOption = false
+    var index = 1
+    while index < words.count {
+        let word = words[index]
+        if word == "--" || word == "-" {
+            guard foundCommandOption else { return .notInline }
+            let next = index + 1
+            return next < words.count ? .literal(words[next]) : .ambiguous
+        }
+        if !word.hasPrefix("-") && !word.hasPrefix("+") {
+            return foundCommandOption ? .literal(word) : .notInline
+        }
+        if ["-o", "+o", "-O", "+O"].contains(word) {
+            guard index + 1 < words.count else { return .ambiguous }
+            index += 2
+            continue
+        }
+        if shellOptionContainsCommand(word) {
+            foundCommandOption = true
+        }
+        index += 1
+    }
+    return foundCommandOption ? .ambiguous : .notInline
+}
+
+private func unwrapShellFileAccessInvocation(_ words: [String]) -> PeeledShellInvocation {
+    var result = PeeledShellInvocation(words: words)
+    var depth = 0
+    while let head = result.words.first {
+        let program = (head as NSString).lastPathComponent.lowercased()
+        guard ["env", "timeout", "nice", "ionice", "chrt", "stdbuf", "command", "exec", "builtin"].contains(program)
+        else { return result }
+        guard depth < 8 else {
+            result.ambiguous = true
+            result.words.removeAll()
+            return result
+        }
+        depth += 1
+        result.words.removeFirst()
+
+        switch program {
+        case "env":
+            while let argument = result.words.first {
+                if isEnvAssignment(argument) {
+                    result.words.removeFirst()
+                    continue
+                }
+                if argument == "-S" || argument == "--split-string"
+                    || argument.hasPrefix("--split-string=")
+                    || (argument.hasPrefix("-S") && argument.count > 2)
+                {
+                    result.ambiguous = true
+                    result.words.removeAll()
+                    return result
+                }
+                if argument == "--" {
+                    result.words.removeFirst()
+                    break
+                }
+                guard argument.hasPrefix("-") else { break }
+                result.words.removeFirst()
+                if argument == "-u" || argument == "--unset" || argument == "-C" || argument == "--chdir" {
+                    guard !result.words.isEmpty else {
+                        result.ambiguous = true
+                        return result
+                    }
+                    if argument == "-C" || argument == "--chdir" {
+                        result.ambiguous = true
+                    }
+                    result.words.removeFirst()
+                } else if !["-i", "--ignore-environment", "-0", "--null", "-v", "--debug"].contains(argument) {
+                    result.ambiguous = true
+                    result.words.removeAll()
+                    return result
+                }
+            }
+
+        case "timeout":
+            while let argument = result.words.first, argument.hasPrefix("-") {
+                result.words.removeFirst()
+                if argument == "--" { break }
+                if ["-k", "--kill-after", "-s", "--signal"].contains(argument) {
+                    guard !result.words.isEmpty else {
+                        result.ambiguous = true
+                        return result
+                    }
+                    result.words.removeFirst()
+                }
+            }
+            guard !result.words.isEmpty else {
+                result.ambiguous = true
+                return result
+            }
+            result.words.removeFirst()
+
+        case "command":
+            while let argument = result.words.first, argument.hasPrefix("-") {
+                result.words.removeFirst()
+                if argument == "--" { break }
+                if argument == "-v" || argument == "-V" {
+                    result.displayOnly = true
+                    return result
+                }
+                guard argument == "-p" else {
+                    result.ambiguous = true
+                    result.words.removeAll()
+                    return result
+                }
+            }
+
+        case "exec":
+            while let argument = result.words.first, argument.hasPrefix("-") {
+                result.words.removeFirst()
+                if argument == "--" { break }
+                if argument == "-a" {
+                    guard !result.words.isEmpty else {
+                        result.ambiguous = true
+                        return result
+                    }
+                    result.words.removeFirst()
+                } else if argument != "-c" && argument != "-l" {
+                    result.ambiguous = true
+                    result.words.removeAll()
+                    return result
+                }
+            }
+
+        case "builtin":
+            if result.words.first == "--" { result.words.removeFirst() }
+            if result.words.first?.hasPrefix("-") == true {
+                result.ambiguous = true
+                result.words.removeAll()
+                return result
+            }
+
+        default:
+            result.words = unwrapWrappers([head] + result.words)
+        }
+    }
+    return result
+}
+
 extension CompiledPolicy {
     /// Escalation-only shell file-access gate. Returns reject/ask, never allow.
     public func evaluateShellFileAccess(_ cmd: String, cwd: String) -> PermissionDecision? {
         guard hasFileRestrictions else { return nil }
+        return evaluateShellFileAccess(cmd, cwd: cwd, inlineDepth: 0)
+    }
 
-        // Unparseable / high-risk constructs → ask (fail closed).
-        guard let segments = allCommandsFromScript(cmd) else {
+    private func evaluateShellFileAccess(
+        _ cmd: String,
+        cwd: String,
+        inlineDepth: Int
+    ) -> PermissionDecision? {
+        guard inlineDepth <= 8,
+              shellScriptHasBalancedQuotes(cmd),
+              let segments = allCommandsFromScript(cmd)
+        else {
             return .ask
         }
 
@@ -53,11 +245,38 @@ extension CompiledPolicy {
         }
 
         for words in segments {
-            let unwrapped = unwrapWrappers(words)
+            let peeled = unwrapShellFileAccessInvocation(words)
+            forcedAsk = forcedAsk || peeled.ambiguous
+            guard !peeled.displayOnly else { continue }
+            let unwrapped = peeled.words
             guard let first = unwrapped.first else { continue }
             let program = (first as NSString).lastPathComponent.lowercased()
 
-            if program == "cd" || program == "pushd" {
+            if first.contains("$"), unwrapped.dropFirst().contains(where: shellOptionContainsCommand) {
+                forcedAsk = true
+                continue
+            }
+
+            if ["bash", "sh", "dash", "zsh", "ksh"].contains(program) {
+                switch literalInlineShellScript(unwrapped) {
+                case .literal(let script):
+                    if script.contains("$"), !script.contains(" ") {
+                        forcedAsk = true
+                    } else {
+                        decision = combineDecisions(
+                            decision,
+                            evaluateShellFileAccess(script, cwd: cwd, inlineDepth: inlineDepth + 1)
+                        )
+                    }
+                case .ambiguous:
+                    forcedAsk = true
+                case .notInline:
+                    break
+                }
+                continue
+            }
+
+            if program == "cd" || program == "pushd" || program == "popd" {
                 // Relative operands after cd are unpinnable → ask.
                 forcedAsk = true
                 continue
@@ -84,7 +303,10 @@ extension CompiledPolicy {
 
             let modes: [ShellFileMode]
             if shellReaders.contains(program) {
-                if program == "sed", unwrapped.contains(where: { $0 == "-i" || $0.hasPrefix("-i") }) {
+                if program == "sed", unwrapped.contains(where: {
+                    $0 == "--in-place" || $0.hasPrefix("--in-place=")
+                        || ($0.hasPrefix("-") && !$0.hasPrefix("--") && $0.dropFirst().contains("i"))
+                }) {
                     modes = [.read, .write]
                 } else {
                     modes = [.read]
@@ -97,22 +319,25 @@ extension CompiledPolicy {
                 continue
             }
 
-            let operands = pathOperands(unwrapped)
+            let operands = pathOperands(unwrapped, program: program)
             if operands.isEmpty {
                 // Known reader/writer without a clear path operand → ask when restricted.
                 forcedAsk = true
                 continue
             }
-            for op in operands {
-                if op.contains("$") || op.contains("*") {
+            for operand in operands {
+                if operand.path.contains("$") || operand.path.contains("*") || operand.path.contains("?") {
                     forcedAsk = true
                 }
-                for mode in modes {
+                for mode in operand.mode.map({ [$0] }) ?? modes {
                     decision = combineDecisions(
                         decision,
-                        escalateShellPath(op, cwd: cwd, mode: mode)
+                        escalateShellPath(operand.path, cwd: cwd, mode: mode)
                     )
                 }
+            }
+            if readerCanSearchRecursively(program, words: unwrapped, operands: operands, cwd: cwd) {
+                forcedAsk = true
             }
         }
 
@@ -133,32 +358,109 @@ extension CompiledPolicy {
         }
     }
 
-    private func pathOperands(_ words: [String]) -> [String] {
-        var out: [String] = []
+    private func pathOperands(_ words: [String], program: String) -> [ShellPathOperand] {
+        var out: [ShellPathOperand] = []
         var i = 1
+        var needsSearchPattern = ["grep", "egrep", "fgrep", "rg", "ag", "ack", "zgrep", "select-string"].contains(program)
+        var needsExpression = ["sed", "awk", "jq", "yq"].contains(program)
         while i < words.count {
             let w = words[i]
             if w == "--" {
-                out.append(contentsOf: words[(i + 1)...])
+                for operand in words.dropFirst(i + 1) {
+                    if needsSearchPattern || needsExpression {
+                        needsSearchPattern = false
+                        needsExpression = false
+                    } else {
+                        out.append(ShellPathOperand(path: operand, mode: nil))
+                    }
+                }
                 break
             }
             if w.hasPrefix("-") {
-                // Options that take a value: drop next token heuristically.
-                if ["-o", "--output", "-C", "--chdir"].contains(w), i + 1 < words.count {
+                if program == "sort", w == "-o" || w == "--output" {
+                    if i + 1 < words.count {
+                        out.append(ShellPathOperand(path: words[i + 1], mode: .write))
+                    }
+                    i += 2
+                    continue
+                }
+                if program == "sort", w.hasPrefix("--output=") {
+                    out.append(ShellPathOperand(path: String(w.dropFirst("--output=".count)), mode: .write))
+                    i += 1
+                    continue
+                }
+                if program == "sort", w.hasPrefix("-o"), w.count > 2 {
+                    out.append(ShellPathOperand(path: String(w.dropFirst(2)), mode: .write))
+                    i += 1
+                    continue
+                }
+                if w == "-f" || w == "--file" {
+                    if i + 1 < words.count {
+                        out.append(ShellPathOperand(path: words[i + 1], mode: .read))
+                    }
+                    if ["grep", "egrep", "fgrep", "rg", "zgrep"].contains(program) {
+                        needsSearchPattern = false
+                    }
+                    if ["sed", "awk"].contains(program) {
+                        needsExpression = false
+                    }
+                    i += 2
+                    continue
+                }
+                if ["-e", "--regexp", "--expression"].contains(w) {
+                    needsSearchPattern = false
+                    needsExpression = false
+                    i += min(2, words.count - i)
+                    continue
+                }
+                if (["-m", "-A", "-B", "-C", "-g", "-t", "-T", "--glob", "--type", "--type-not", "--max-count", "--context", "--after-context", "--before-context", "--chdir"].contains(w)
+                    || (w == "-n" && ["head", "tail"].contains(program))
+                    || (w == "-s" && program == "truncate")),
+                   i + 1 < words.count,
+                   !words[i + 1].hasPrefix("-")
+                {
                     i += 2
                     continue
                 }
                 i += 1
                 continue
             }
-            if w.contains("="), !w.hasPrefix("/") {
+            if needsSearchPattern || needsExpression {
+                needsSearchPattern = false
+                needsExpression = false
                 i += 1
                 continue
             }
-            out.append(w)
+            out.append(ShellPathOperand(path: w, mode: nil))
             i += 1
         }
         return out
+    }
+
+    private func readerCanSearchRecursively(
+        _ program: String,
+        words: [String],
+        operands: [ShellPathOperand],
+        cwd: String
+    ) -> Bool {
+        let implicitlyRecursive = ["rg", "ag", "ack"].contains(program)
+        let explicitlyRecursive = ["grep", "egrep", "fgrep", "zgrep"].contains(program)
+            && words.contains { $0 == "-r" || $0 == "-R" || $0 == "--recursive" || $0 == "--dereference-recursive" }
+        guard implicitlyRecursive || explicitlyRecursive else { return false }
+        let searchedPaths = operands.filter { $0.mode != .write }
+        guard !searchedPaths.isEmpty else { return true }
+        return searchedPaths.contains { operand in
+            let path = operand.path
+            if path == "." || path == ".." || path.hasSuffix("/") {
+                return true
+            }
+            let absolute = path.hasPrefix("/")
+                ? path
+                : URL(fileURLWithPath: cwd, isDirectory: true).appendingPathComponent(path).path
+            var isDirectory: ObjCBool = false
+            return FileManager.default.fileExists(atPath: absolute, isDirectory: &isDirectory)
+                && isDirectory.boolValue
+        }
     }
 
     private func escalateShellPath(

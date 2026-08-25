@@ -55,11 +55,12 @@ public enum UpdateServiceError: Error, Sendable, Equatable, CustomStringConverti
 // MARK: - Platform gate
 
 extension ReleasePlatform {
-    /// Rust publishes Open Grok updates for exactly two targets
-    /// (`auto_update.rs:794-826`). Anything else has no asset to download, so
+    /// Rust publishes Open Grok updates for exactly three targets
+    /// (`auto_update.rs:918-960`). Anything else has no asset to download, so
     /// fail with the same message rather than 404ing on a synthesized name.
     public var isSupportedForRelease: Bool {
         (operatingSystem == "macos" && architecture == "aarch64")
+            || (operatingSystem == "linux" && architecture == "x86_64")
             || (operatingSystem == "windows" && architecture == "x86_64")
     }
 
@@ -67,9 +68,9 @@ extension ReleasePlatform {
         operatingSystem == "windows" ? ".exe" : ""
     }
 
-    /// `macos-aarch64` / `windows-x86_64` — the infix in the on-disk download
-    /// name, kept separate from ``assetName`` so a downloaded file still parses
-    /// back to its version.
+    /// `macos-aarch64` / `linux-x86_64` / `windows-x86_64` — the infix in the
+    /// on-disk download name, kept separate from ``assetName`` so a downloaded
+    /// file still parses back to its version.
     public var versionedPlatform: String {
         "\(operatingSystem)-\(architecture)"
     }
@@ -77,13 +78,14 @@ extension ReleasePlatform {
     public var displayName: String {
         switch (operatingSystem, architecture) {
         case ("macos", "aarch64"): return "macOS Apple Silicon"
+        case ("linux", "x86_64"): return "Linux x86_64"
         case ("windows", "x86_64"): return "Windows x86_64"
         default: return "\(operatingSystem) \(architecture)"
         }
     }
 
     public static var unsupportedPlatformMessage: String {
-        "Open Grok currently publishes updates only for macOS on Apple Silicon and Windows x86_64"
+        "Open Grok currently publishes updates only for macOS on Apple Silicon, Linux x86_64, and Windows x86_64"
     }
 }
 

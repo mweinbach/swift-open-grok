@@ -92,9 +92,10 @@ public func loginXAIWithSession(
     policy: ForceLoginTeam? = nil
 ) async throws {
     if let policy {
-        let actual = auth.teamID ?? auth.principalID
-            ?? peekAccessTokenPrincipalID(auth.key)
-        try enforceLoginPrincipal(policy: policy, actual: actual)
+        try enforceLoginPrincipal(
+            policy: policy,
+            actual: peekAccessTokenPrincipalID(auth.key)
+        )
     }
     try await manager.loginWithSession(auth)
 }

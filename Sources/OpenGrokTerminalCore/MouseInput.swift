@@ -252,7 +252,12 @@ public enum MouseReportDecoder {
         let buttonByte = fields[0]
         let column = fields[1]
         let row = fields[2]
-        guard buttonByte >= 0, column >= 0, row >= 0 else { return .malformed }
+        // Crossterm stores both coordinates as u16; Swift Int must not widen the wire domain.
+        guard buttonByte >= 0,
+              column >= 0, column <= Int(UInt16.max),
+              row >= 0, row <= Int(UInt16.max) else {
+            return .malformed
+        }
 
         return .event(
             makeEvent(

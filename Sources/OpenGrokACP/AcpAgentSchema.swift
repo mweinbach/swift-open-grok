@@ -44,6 +44,83 @@ public struct Implementation: Hashable, Sendable, Codable {
     }
 }
 
+/// Optional Open Grok-specific facts carried by an initialize response's `_meta`.
+///
+/// Values remain optional because only the live composition knows its working
+/// directory, effective feature switches, and connected provider catalog.
+public struct OpenGrokInitializeMetadata: Hashable, Sendable, Codable {
+    public var currentWorkingDirectory: String?
+    public var defaultAuthMethodId: AuthMethodId?
+    public var modelProviders: [String: JSONValue]?
+    public var availableCommands: [AvailableCommand]?
+    public var sessionRecap: Bool?
+    public var pluginDirectoriesSupported: Bool?
+
+    public init(
+        currentWorkingDirectory: String? = nil,
+        defaultAuthMethodId: AuthMethodId? = nil,
+        modelProviders: [String: JSONValue]? = nil,
+        availableCommands: [AvailableCommand]? = nil,
+        sessionRecap: Bool? = nil,
+        pluginDirectoriesSupported: Bool? = nil
+    ) {
+        self.currentWorkingDirectory = currentWorkingDirectory
+        self.defaultAuthMethodId = defaultAuthMethodId
+        self.modelProviders = modelProviders
+        self.availableCommands = availableCommands
+        self.sessionRecap = sessionRecap
+        self.pluginDirectoriesSupported = pluginDirectoriesSupported
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case currentWorkingDirectory
+        case defaultAuthMethodId
+        case modelProviders
+        case availableCommands
+        case sessionRecap
+        case pluginDirectoriesSupported = "x.ai/pluginDirs"
+    }
+
+    /// Project typed values without re-encoding arbitrary provider JSON.
+    public var wireValues: AcpMeta {
+        var values: AcpMeta = [:]
+        if let currentWorkingDirectory {
+            values["currentWorkingDirectory"] = .string(currentWorkingDirectory)
+        }
+        if let defaultAuthMethodId {
+            values["defaultAuthMethodId"] = .string(defaultAuthMethodId.rawValue)
+        }
+        if let modelProviders {
+            values["modelProviders"] = .object(modelProviders)
+        }
+        if let availableCommands {
+            values["availableCommands"] = .array(availableCommands.map { command in
+                var fields: AcpMeta = [
+                    "name": .string(command.name),
+                    "description": .string(command.description),
+                ]
+                if let input = command.input {
+                    switch input {
+                    case .unstructured(let hint):
+                        fields["input"] = .object(["hint": .string(hint)])
+                    }
+                }
+                if let metadata = command.meta {
+                    fields["_meta"] = .object(metadata)
+                }
+                return .object(fields)
+            })
+        }
+        if let sessionRecap {
+            values["sessionRecap"] = .bool(sessionRecap)
+        }
+        if let pluginDirectoriesSupported {
+            values["x.ai/pluginDirs"] = .bool(pluginDirectoriesSupported)
+        }
+        return values
+    }
+}
+
 // MARK: - Capabilities
 
 /// Prompt capabilities advertised by the agent.

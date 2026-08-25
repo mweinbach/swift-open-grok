@@ -78,13 +78,18 @@ public func isUnsafeTrustRoot(_ path: String, home: String? = nil) -> Bool {
     return false
 }
 
-/// Scan for repo-local code-exec config files under `cwd` / parents (shallow).
-public func repoConfigsPresent(at cwd: URL) -> Bool {
+/// Scan the same Git-bounded directory chain consumed by project configuration.
+public func repoConfigsPresent(
+    at cwd: URL,
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> Bool {
     let names = [
         ".mcp.json",
         ".claude/settings.json",
         ".claude/settings.local.json",
+        ".claude/plugins",
         ".cursor/hooks.json",
+        ".cursor/mcp.json",
         ".opengrok/hooks",
         ".opengrok/hooks.toml",
         ".opengrok/lsp.json",
@@ -105,21 +110,74 @@ public func repoConfigsPresent(at cwd: URL) -> Bool {
         ".envrc",
         "CLAUDE.md",
     ]
-    var dir = cwd.standardizedFileURL.resolvingSymlinksInPath()
-    for _ in 0..<8 {
+    let directory = cwd.standardizedFileURL.resolvingSymlinksInPath()
+    let chain = projectDirChain(cwd: directory, environment: environment)
+    let ownerHome = environment["HOME"].map {
+        URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path
+    }
+    let ownerState = userGrokHome(environment: environment)
+    for dir in chain {
+        if dir.standardizedFileURL.resolvingSymlinksInPath().path == ownerHome {
+            continue
+        }
         for name in names {
             let candidate = dir.appendingPathComponent(name)
+            if name == ".opengrok/config.toml", isUserGrokConfigFile(
+                candidate,
+                userHome: ownerState,
+                environment: environment
+            ) {
+                continue
+            }
             if repositoryTrustMarkerPresentOrUncertain(candidate) {
                 return true
             }
         }
-        if repositoryTrustMarkerPresentOrUncertain(dir.appendingPathComponent(".git")) {
+    }
+
+    // Older callers discover ancestor hooks even without Git metadata. Keep
+    // that narrower compatibility seam, but never let it widen project-config
+    // discovery or cross into the owner's global configuration.
+    return chain.count == 1 && repositoryAncestorHooksPresent(
+        above: directory,
+        environment: environment
+    )
+}
+
+private func repositoryAncestorHooksPresent(
+    above cwd: URL,
+    environment: [String: String]
+) -> Bool {
+    if repositoryTrustMarkerPresentOrUncertain(cwd.appendingPathComponent(".git")) {
+        return false
+    }
+
+    let ownerHome = environment["HOME"].map {
+        URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path
+    }
+    let ownerState = userGrokHome(environment: environment)?
+        .standardizedFileURL.resolvingSymlinksInPath().path
+    var directory = cwd
+
+    for _ in 1..<8 {
+        let parent = directory.deletingLastPathComponent()
+        guard parent.path.count < directory.path.count else { break }
+        let canonicalParent = parent.standardizedFileURL.resolvingSymlinksInPath()
+        if canonicalParent.path == ownerHome || canonicalParent.path == ownerState {
             break
         }
-        let parent = dir.deletingLastPathComponent()
-        if parent.path == dir.path { break }
-        dir = parent
+
+        if repositoryTrustMarkerPresentOrUncertain(
+            canonicalParent.appendingPathComponent(".opengrok/hooks")
+        ) {
+            return true
+        }
+        if repositoryTrustMarkerPresentOrUncertain(canonicalParent.appendingPathComponent(".git")) {
+            break
+        }
+        directory = canonicalParent
     }
+
     return false
 }
 

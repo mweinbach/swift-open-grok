@@ -168,6 +168,8 @@ public struct SamplerConfig: Sendable {
     /// Extra request headers applied verbatim.
     public var extraHeaders: [(name: String, value: String)]
     public var queryParams: [String: String]
+    /// Header names mapped to environment variable names, never secret values.
+    public var envHTTPHeaders: [String: String]
     public var contextWindow: UInt64
     public var forceHTTP1: Bool
     public var maxRetries: UInt32?
@@ -183,6 +185,8 @@ public struct SamplerConfig: Sendable {
     public var userId: String?
     public var clientVersion: String?
     public var supportsBackendSearch: Bool
+    /// Capability of this exact authenticated provider route, not model spelling.
+    public var supportsStandaloneWebSearch: Bool
     public var codexMultiAgentV2: Bool
     /// Applied execution policy. Only the Codex provider may project it.
     public var codexPermissions: CodexPermissions?
@@ -209,6 +213,7 @@ public struct SamplerConfig: Sendable {
         authScheme: AuthScheme = .bearer,
         extraHeaders: [(name: String, value: String)] = [],
         queryParams: [String: String] = [:],
+        envHTTPHeaders: [String: String] = [:],
         contextWindow: UInt64 = 0,
         forceHTTP1: Bool = false,
         maxRetries: UInt32? = nil,
@@ -223,6 +228,7 @@ public struct SamplerConfig: Sendable {
         userId: String? = nil,
         clientVersion: String? = nil,
         supportsBackendSearch: Bool = false,
+        supportsStandaloneWebSearch: Bool = false,
         codexMultiAgentV2: Bool = false,
         codexPermissions: CodexPermissions? = nil,
         compactionsRemaining: CompactionsRemaining? = nil,
@@ -243,6 +249,7 @@ public struct SamplerConfig: Sendable {
         self.authScheme = authScheme
         self.extraHeaders = extraHeaders
         self.queryParams = queryParams
+        self.envHTTPHeaders = envHTTPHeaders
         self.contextWindow = contextWindow
         self.forceHTTP1 = forceHTTP1
         self.maxRetries = maxRetries
@@ -257,6 +264,7 @@ public struct SamplerConfig: Sendable {
         self.userId = userId
         self.clientVersion = clientVersion
         self.supportsBackendSearch = supportsBackendSearch
+        self.supportsStandaloneWebSearch = supportsStandaloneWebSearch
         self.codexMultiAgentV2 = codexMultiAgentV2
         self.codexPermissions = codexPermissions
         self.compactionsRemaining = compactionsRemaining
@@ -283,6 +291,7 @@ extension SamplerConfig: Codable {
         case authScheme = "auth_scheme"
         case extraHeaders = "extra_headers"
         case queryParams = "query_params"
+        case envHTTPHeaders = "env_http_headers"
         case contextWindow = "context_window"
         case forceHTTP1 = "force_http1"
         case maxRetries = "max_retries"
@@ -297,6 +306,7 @@ extension SamplerConfig: Codable {
         case userId = "user_id"
         case clientVersion = "client_version"
         case supportsBackendSearch = "supports_backend_search"
+        case supportsStandaloneWebSearch = "supports_standalone_web_search"
         case codexMultiAgentV2 = "codex_multi_agent_v2"
         case codexPermissions = "codex_permissions"
         case compactionsRemaining = "compactions_remaining"
@@ -318,6 +328,7 @@ extension SamplerConfig: Codable {
             authScheme: try c.decodeIfPresent(AuthScheme.self, forKey: .authScheme) ?? .bearer,
             extraHeaders: Self.decodeHeaders(try c.decodeIfPresent([String: String].self, forKey: .extraHeaders)),
             queryParams: try c.decodeIfPresent([String: String].self, forKey: .queryParams) ?? [:],
+            envHTTPHeaders: try c.decodeIfPresent([String: String].self, forKey: .envHTTPHeaders) ?? [:],
             contextWindow: try c.decodeIfPresent(UInt64.self, forKey: .contextWindow) ?? 0,
             forceHTTP1: try c.decodeIfPresent(Bool.self, forKey: .forceHTTP1) ?? false,
             maxRetries: try c.decodeIfPresent(UInt32.self, forKey: .maxRetries),
@@ -332,6 +343,7 @@ extension SamplerConfig: Codable {
             userId: try c.decodeIfPresent(String.self, forKey: .userId),
             clientVersion: try c.decodeIfPresent(String.self, forKey: .clientVersion),
             supportsBackendSearch: try c.decodeIfPresent(Bool.self, forKey: .supportsBackendSearch) ?? false,
+            supportsStandaloneWebSearch: try c.decodeIfPresent(Bool.self, forKey: .supportsStandaloneWebSearch) ?? false,
             codexMultiAgentV2: try c.decodeIfPresent(Bool.self, forKey: .codexMultiAgentV2) ?? false,
             codexPermissions: try c.decodeIfPresent(CodexPermissions.self, forKey: .codexPermissions),
             compactionsRemaining: try c.decodeIfPresent(CompactionsRemaining.self, forKey: .compactionsRemaining),
@@ -353,6 +365,7 @@ extension SamplerConfig: Codable {
         try c.encode(authScheme, forKey: .authScheme)
         try c.encode(Self.encodeHeaders(extraHeaders), forKey: .extraHeaders)
         try c.encode(queryParams, forKey: .queryParams)
+        try c.encode(envHTTPHeaders, forKey: .envHTTPHeaders)
         try c.encode(contextWindow, forKey: .contextWindow)
         try c.encode(forceHTTP1, forKey: .forceHTTP1)
         try c.encodeIfPresent(maxRetries, forKey: .maxRetries)
@@ -367,6 +380,7 @@ extension SamplerConfig: Codable {
         try c.encodeIfPresent(userId, forKey: .userId)
         try c.encodeIfPresent(clientVersion, forKey: .clientVersion)
         try c.encode(supportsBackendSearch, forKey: .supportsBackendSearch)
+        try c.encode(supportsStandaloneWebSearch, forKey: .supportsStandaloneWebSearch)
         try c.encode(codexMultiAgentV2, forKey: .codexMultiAgentV2)
         try c.encodeIfPresent(codexPermissions, forKey: .codexPermissions)
         try c.encodeIfPresent(compactionsRemaining, forKey: .compactionsRemaining)

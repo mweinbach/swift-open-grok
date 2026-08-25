@@ -344,7 +344,7 @@ public enum GrokToolsV1 {
     }
 
     /// Proto message `FinalizeToolServerConfigRequest`.
-    public struct FinalizeToolServerConfigRequest: ProtobufMessage, Codable, Sendable, Hashable {
+    public struct FinalizeToolServerConfigRequest: ProtobufMessage, Codable, Sendable, Hashable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
         /// Field 1.
         public var tools: [ToolConfigEntry]
         /// Field 2.
@@ -355,18 +355,30 @@ public enum GrokToolsV1 {
         public var initialToolStateJson: String?
         /// Field 5.
         public var behaviorPreset: String?
+        /// Field 6.
+        public var clientCallbackAddr: String?
+        /// Field 7.
+        public var sessionId: String?
+        /// Field 8. Never expose this bearer secret through diagnostic surfaces.
+        public var clientCallbackSecret: String?
         public init(
             tools: [ToolConfigEntry] = [],
             truncation: TruncationConfig? = nil,
             systemRemindersEnabled: Bool = false,
             initialToolStateJson: String? = nil,
-            behaviorPreset: String? = nil
+            behaviorPreset: String? = nil,
+            clientCallbackAddr: String? = nil,
+            sessionId: String? = nil,
+            clientCallbackSecret: String? = nil
         ) {
             self.tools = tools
             self.truncation = truncation
             self.systemRemindersEnabled = systemRemindersEnabled
             self.initialToolStateJson = initialToolStateJson
             self.behaviorPreset = behaviorPreset
+            self.clientCallbackAddr = clientCallbackAddr
+            self.sessionId = sessionId
+            self.clientCallbackSecret = clientCallbackSecret
         }
         public init() {
             self.tools = []
@@ -374,6 +386,26 @@ public enum GrokToolsV1 {
             self.systemRemindersEnabled = false
             self.initialToolStateJson = nil
             self.behaviorPreset = nil
+            self.clientCallbackAddr = nil
+            self.sessionId = nil
+            self.clientCallbackSecret = nil
+        }
+        public var description: String {
+            "FinalizeToolServerConfigRequest(tools: \(tools), truncation: \(String(describing: truncation)), systemRemindersEnabled: \(systemRemindersEnabled), initialToolStateJson: \(String(describing: initialToolStateJson)), behaviorPreset: \(String(describing: behaviorPreset)), clientCallbackAddr: \(String(describing: clientCallbackAddr)), sessionId: \(String(describing: sessionId)), clientCallbackSecret: \(clientCallbackSecret == nil ? "nil" : "[REDACTED]"))"
+        }
+        public var debugDescription: String { description }
+        public var customMirror: Mirror {
+            let children: [Mirror.Child] = [
+                ("tools", tools),
+                ("truncation", truncation as Any),
+                ("systemRemindersEnabled", systemRemindersEnabled),
+                ("initialToolStateJson", initialToolStateJson as Any),
+                ("behaviorPreset", behaviorPreset as Any),
+                ("clientCallbackAddr", clientCallbackAddr as Any),
+                ("sessionId", sessionId as Any),
+                ("clientCallbackSecret", clientCallbackSecret == nil ? "nil" : "[REDACTED]"),
+            ]
+            return Mirror(self, children: children, displayStyle: .struct)
         }
         public func protobufData() -> Data {
             var w = ProtoWriter()
@@ -382,6 +414,9 @@ public enum GrokToolsV1 {
             w.writeBool(3, systemRemindersEnabled)
             if let v = initialToolStateJson { w.writeStringPresence(4, v, has: true) }
             if let v = behaviorPreset { w.writeStringPresence(5, v, has: true) }
+            if let v = clientCallbackAddr { w.writeStringPresence(6, v, has: true) }
+            if let v = sessionId { w.writeStringPresence(7, v, has: true) }
+            if let v = clientCallbackSecret { w.writeStringPresence(8, v, has: true) }
             return w.data
         }
         public mutating func merge(from wire: Data) throws {
@@ -403,6 +438,15 @@ public enum GrokToolsV1 {
                 case 5:
                     guard wireType == 2 else { try r.skip(wireType: wireType); continue }
                     behaviorPreset = try r.readString()
+                case 6:
+                    guard wireType == 2 else { try r.skip(wireType: wireType); continue }
+                    clientCallbackAddr = try r.readString()
+                case 7:
+                    guard wireType == 2 else { try r.skip(wireType: wireType); continue }
+                    sessionId = try r.readString()
+                case 8:
+                    guard wireType == 2 else { try r.skip(wireType: wireType); continue }
+                    clientCallbackSecret = try r.readString()
                 default:
                     try r.skip(wireType: wireType)
                 }
@@ -418,6 +462,19 @@ public enum GrokToolsV1 {
             public static let systemRemindersEnabled: UInt32 = 3
             public static let initialToolStateJson: UInt32 = 4
             public static let behaviorPreset: UInt32 = 5
+            public static let clientCallbackAddr: UInt32 = 6
+            public static let sessionId: UInt32 = 7
+            public static let clientCallbackSecret: UInt32 = 8
+        }
+        private enum CodingKeys: String, CodingKey {
+            case tools
+            case truncation
+            case systemRemindersEnabled = "system_reminders_enabled"
+            case initialToolStateJson = "initial_tool_state_json"
+            case behaviorPreset = "behavior_preset"
+            case clientCallbackAddr = "client_callback_addr"
+            case sessionId = "session_id"
+            case clientCallbackSecret = "client_callback_secret"
         }
     }
 
@@ -744,22 +801,27 @@ public enum GrokToolsV1 {
         public var tools: [ToolInfo]
         /// Field 4.
         public var versionWarnings: [VersionWarning]
+        /// Field 5.
+        public var callbackStatus: CallbackStatus?
         public init(
             success: Bool = false,
             message: String = "",
             tools: [ToolInfo] = [],
-            versionWarnings: [VersionWarning] = []
+            versionWarnings: [VersionWarning] = [],
+            callbackStatus: CallbackStatus? = nil
         ) {
             self.success = success
             self.message = message
             self.tools = tools
             self.versionWarnings = versionWarnings
+            self.callbackStatus = callbackStatus
         }
         public init() {
             self.success = false
             self.message = ""
             self.tools = []
             self.versionWarnings = []
+            self.callbackStatus = nil
         }
         public func protobufData() -> Data {
             var w = ProtoWriter()
@@ -767,6 +829,7 @@ public enum GrokToolsV1 {
             w.writeString(2, message)
             for item in tools { w.writeMessagePresence(3, item.protobufData(), has: true) }
             for item in versionWarnings { w.writeMessagePresence(4, item.protobufData(), has: true) }
+            if let v = callbackStatus { w.writeMessagePresence(5, v.protobufData(), has: true) }
             return w.data
         }
         public mutating func merge(from wire: Data) throws {
@@ -785,6 +848,9 @@ public enum GrokToolsV1 {
                 case 4:
                     guard wireType == 2 else { try r.skip(wireType: wireType); continue }
                     versionWarnings.append(try VersionWarning(protobufBytes: try r.readLengthDelimited()))
+                case 5:
+                    guard wireType == 2 else { try r.skip(wireType: wireType); continue }
+                    callbackStatus = try CallbackStatus(protobufBytes: try r.readLengthDelimited())
                 default:
                     try r.skip(wireType: wireType)
                 }
@@ -799,6 +865,14 @@ public enum GrokToolsV1 {
             public static let message: UInt32 = 2
             public static let tools: UInt32 = 3
             public static let versionWarnings: UInt32 = 4
+            public static let callbackStatus: UInt32 = 5
+        }
+        private enum CodingKeys: String, CodingKey {
+            case success
+            case message
+            case tools
+            case versionWarnings = "version_warnings"
+            case callbackStatus = "callback_status"
         }
     }
 
@@ -3851,6 +3925,7 @@ public enum GrokToolsV1 {
 public typealias AgentCompletionRequirement = GrokToolsV1.AgentCompletionRequirement
 public typealias AgentToolExecConfig = GrokToolsV1.AgentToolExecConfig
 public typealias AgentToolRetryConfig = GrokToolsV1.AgentToolRetryConfig
+public typealias CallbackStatus = GrokToolsV1.CallbackStatus
 public typealias ClearToolOverrideRequest = GrokToolsV1.ClearToolOverrideRequest
 public typealias ClearToolOverrideResponse = GrokToolsV1.ClearToolOverrideResponse
 public typealias DisableToolRequest = GrokToolsV1.DisableToolRequest
@@ -3885,6 +3960,7 @@ public typealias GetTruncationConfigRequest = GrokToolsV1.GetTruncationConfigReq
 public typealias GetTruncationConfigResponse = GrokToolsV1.GetTruncationConfigResponse
 public typealias ListToolsRequest = GrokToolsV1.ListToolsRequest
 public typealias ListToolsResponse = GrokToolsV1.ListToolsResponse
+public typealias NotificationAck = GrokToolsV1.NotificationAck
 public typealias OutputFieldSpec = GrokToolsV1.OutputFieldSpec
 public typealias OutputFormat = GrokToolsV1.OutputFormat
 public typealias OutputFormatSpec = GrokToolsV1.OutputFormatSpec
@@ -3900,19 +3976,25 @@ public typealias SetToolOverrideRequest = GrokToolsV1.SetToolOverrideRequest
 public typealias SetToolOverrideResponse = GrokToolsV1.SetToolOverrideResponse
 public typealias SetTruncationConfigRequest = GrokToolsV1.SetTruncationConfigRequest
 public typealias SetTruncationConfigResponse = GrokToolsV1.SetTruncationConfigResponse
+public typealias SpawnSubagentRequest = GrokToolsV1.SpawnSubagentRequest
 public typealias StreamDataChunk = GrokToolsV1.StreamDataChunk
 public typealias StreamDataKind = GrokToolsV1.StreamDataKind
 public typealias StreamFinalResult = GrokToolsV1.StreamFinalResult
+public typealias SubagentResultMsg = GrokToolsV1.SubagentResultMsg
 public typealias ToolCategory = GrokToolsV1.ToolCategory
 public typealias ToolInfo = GrokToolsV1.ToolInfo
+public typealias ToolNotificationMsg = GrokToolsV1.ToolNotificationMsg
 public typealias ToolSource = GrokToolsV1.ToolSource
 public typealias ToolStreamChunk = GrokToolsV1.ToolStreamChunk
 public typealias ToolSuccess = GrokToolsV1.ToolSuccess
 public typealias TruncationConfig = GrokToolsV1.TruncationConfig
 public typealias VersionWarning = GrokToolsV1.VersionWarning
+public typealias GrokToolsCallbackService = GrokToolsV1.GrokToolsCallbackService
 public typealias GrokToolsService = GrokToolsV1.GrokToolsService
 public typealias ProtobufToolError = GrokToolsV1.ToolError
 public typealias ProtobufToolCapabilities = GrokToolsV1.ToolCapabilities
 public typealias ProtobufToolConfigEntry = GrokToolsV1.ToolConfigEntry
 public let grokToolsServiceRPCNames: [String] = GrokToolsV1.serviceRPCNames
 public let grokToolsServiceStreamingRPCs: Set<String> = GrokToolsV1.streamingRPCNames
+public let grokToolsCallbackServiceRPCNames: [String] = GrokToolsV1.callbackServiceRPCNames
+public let grokToolsCallbackServiceStreamingRPCs: Set<String> = GrokToolsV1.callbackStreamingRPCNames

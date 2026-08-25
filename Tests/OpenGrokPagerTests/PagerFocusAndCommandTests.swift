@@ -275,6 +275,20 @@ struct PagerFocusAndCommandTests {
         #expect(rows?.contains { $0.name == "/gboom" } == false)
     }
 
+    @Test("the command palette includes dynamically registered session commands")
+    func commandPaletteIncludesDynamicCommands() async throws {
+        let harness = try await Harness.run(
+            [.key(KeyEvent(key: .char("p"), modifiers: [.control], character: "p"))],
+            generatedPrompt: "a dynamically registered command"
+        )
+        let rows = await harness.overlayRequests.compactMap { request in
+            if case .commandPalette(let rows) = request { return rows }
+            return nil
+        }.first
+
+        #expect(rows?.contains { $0.name == "/defer" } == true)
+    }
+
     @Test("Ctrl+N needs a second press before it replaces the session")
     func ctrlNConfirms() async throws {
         let single = try await Harness.run([

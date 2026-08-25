@@ -40,6 +40,7 @@ public struct DefaultModelJSON: Sendable, Equatable {
     public var provider: ModelProvider
     public var envKey: EnvKeys?
     public var toolMode: ToolMode?
+    public var subagentContextDefault: ModelSubagentContextMode?
     public var multiAgentVersion: String?
     public var agentType: String
     public var inferenceIdleTimeoutSecs: UInt64?
@@ -49,6 +50,7 @@ public struct DefaultModelJSON: Sendable, Equatable {
     public var reasoningEfforts: [ReasoningEffortOption]
     public var supportedInApi: Bool
     public var supportsBackendSearch: Bool
+    public var supportsStandaloneWebSearch: Bool?
     public var compactionsRemaining: CompactionsRemaining?
     public var compactionAtTokens: CompactionAtTokens?
     public var showModelFingerprint: Bool
@@ -76,6 +78,7 @@ public struct DefaultModelJSON: Sendable, Equatable {
             provider: info.provider,
             envKey: entry.envKey,
             toolMode: info.toolMode,
+            subagentContextDefault: info.subagentContextDefault,
             multiAgentVersion: nil,
             agentType: info.agentType,
             inferenceIdleTimeoutSecs: info.inferenceIdleTimeoutSecs,
@@ -85,6 +88,7 @@ public struct DefaultModelJSON: Sendable, Equatable {
             reasoningEfforts: info.reasoningEfforts,
             supportedInApi: info.supportedInApi,
             supportsBackendSearch: info.supportsBackendSearch,
+            supportsStandaloneWebSearch: info.supportsStandaloneWebSearch,
             compactionsRemaining: info.compactionsRemaining,
             compactionAtTokens: info.compactionAtTokens,
             showModelFingerprint: info.showModelFingerprint,
@@ -222,6 +226,30 @@ private func parseDefaultModelJSON(_ obj: [String: Any]) throws -> DefaultModelJ
     } else {
         toolMode = nil
     }
+    let subagentContextDefault: ModelSubagentContextMode?
+    if let value = obj["subagent_context_default"], !(value is NSNull) {
+        guard let raw = value as? String,
+              let decoded = ModelSubagentContextMode(wireValue: raw)
+        else {
+            throw ModelsError.invalidDefaultModels(
+                "unknown subagent context mode for model '\(model)'"
+            )
+        }
+        subagentContextDefault = decoded
+    } else {
+        subagentContextDefault = nil
+    }
+    let supportsStandaloneWebSearch: Bool?
+    if let value = obj["supports_standalone_web_search"], !(value is NSNull) {
+        guard let decoded = value as? Bool else {
+            throw ModelsError.invalidDefaultModels(
+                "invalid standalone web-search capability for model '\(model)'"
+            )
+        }
+        supportsStandaloneWebSearch = decoded
+    } else {
+        supportsStandaloneWebSearch = nil
+    }
     let envKey: EnvKeys?
     if let s = obj["env_key"] as? String {
         envKey = .one(s)
@@ -338,6 +366,7 @@ private func parseDefaultModelJSON(_ obj: [String: Any]) throws -> DefaultModelJ
         provider: provider,
         envKey: envKey,
         toolMode: toolMode,
+        subagentContextDefault: subagentContextDefault,
         multiAgentVersion: obj["multi_agent_version"] as? String,
         agentType: (obj["agent_type"] as? String) ?? DEFAULT_AGENT_TYPE,
         inferenceIdleTimeoutSecs: idleTimeout,
@@ -347,6 +376,7 @@ private func parseDefaultModelJSON(_ obj: [String: Any]) throws -> DefaultModelJ
         reasoningEfforts: reasoningEfforts,
         supportedInApi: obj["supported_in_api"] as? Bool ?? true,
         supportsBackendSearch: obj["supports_backend_search"] as? Bool ?? false,
+        supportsStandaloneWebSearch: supportsStandaloneWebSearch,
         compactionsRemaining: compactionsRemaining,
         compactionAtTokens: compactionAtTokens,
         showModelFingerprint: obj["show_model_fingerprint"] as? Bool ?? false,
@@ -405,7 +435,7 @@ public func embeddedModels(
 /// (`crates/codegen/xai-grok-shell/src/agent/models/resolution.rs:116-142`):
 /// the globally bundled default wins when it is present in the visible
 /// catalog, otherwise the **first entry in catalog order** does. For a
-/// single-provider catalog the bundled default (`grok-4.5`) is only reachable
+/// single-provider catalog the bundled default (`grok-4.6`) is only reachable
 /// for xAI, so every other provider falls to its first entry.
 ///
 /// Catalog order is therefore load-bearing, and upstream sets it deliberately:
@@ -522,6 +552,7 @@ public func defaultModelConfigs(
             provider: m.provider,
             envKey: m.envKey,
             toolMode: m.toolMode,
+            subagentContextDefault: m.subagentContextDefault,
             multiAgentVersion: m.multiAgentVersion,
             codexMultiAgentV2: m.provider == .codex && m.multiAgentVersion == "v2",
             agentType: m.agentType,
@@ -534,6 +565,7 @@ public func defaultModelConfigs(
             supportsReasoningSummaryParameter: m.provider == .codex,
             defaultReasoningSummary: m.provider == .codex ? .detailed : .none,
             supportsBackendSearch: m.supportsBackendSearch,
+            supportsStandaloneWebSearch: m.supportsStandaloneWebSearch,
             compactionsRemaining: m.compactionsRemaining,
             compactionAtTokens: m.compactionAtTokens,
             showModelFingerprint: m.showModelFingerprint,

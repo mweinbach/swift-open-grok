@@ -171,6 +171,40 @@ public func buildSeatbeltProfile(_ resolved: ResolvedSandboxProfile, workspace: 
         lines.append("(allow file-read* file-write* (subpath \"\(escaped)\"))")
     }
 
+    // Hook configuration is an executable security boundary. Denying only
+    // `file-write-data` leaves rename, unlink, chmod, and replacement open;
+    // denying the home subpath would instead break sessions and receipts.
+    // Apply every write action to the exact source and pin writable ancestor
+    // directory entries without denying unrelated files beneath them.
+    var pinnedAncestors = Set<String>()
+    for source in resolved.writeDeny {
+        for alias in macosDenyAliases(source.path) {
+            let escaped = seatbeltEscape(alias.path)
+            let filter = source.isDirectory
+                ? "(subpath \"\(escaped)\")"
+                : "(literal \"\(escaped)\")"
+            lines.append("(allow file-read* \(filter))")
+            lines.append("(deny file-write* \(filter))")
+            for action in seatbeltWriteDenyActions {
+                lines.append("(deny \(action) \(filter))")
+            }
+        }
+
+        var ancestor = source.path.deletingLastPathComponent()
+        while ancestor.path != "/" {
+            if resolved.readWrite.contains(where: {
+                pathIsUnderRoot(candidate: ancestor.path, root: $0.path)
+            }) {
+                for alias in macosDenyAliases(ancestor)
+                where pinnedAncestors.insert(alias.path).inserted {
+                    let escaped = seatbeltEscape(alias.path)
+                    lines.append("(deny file-write-unlink (literal \"\(escaped)\"))")
+                }
+            }
+            ancestor.deleteLastPathComponent()
+        }
+    }
+
     // Exact deny paths with macOS firmlink alias expansion and write sub-actions
     for path in resolved.deny {
         let aliases = macosDenyAliases(path)
@@ -272,6 +306,7 @@ public struct BwrapDenyPlan: Sendable, Equatable {
     public var readOnly: [String]
     public var readWrite: [String]
     public var defaultRead: Bool
+    public var hookWriteDeny: HookWriteDenyPlan?
 
     public init(
         denyWrite: [String],
@@ -280,7 +315,8 @@ public struct BwrapDenyPlan: Sendable, Equatable {
         restrictNetwork: Bool = false,
         readOnly: [String] = [],
         readWrite: [String] = [],
-        defaultRead: Bool = true
+        defaultRead: Bool = true,
+        hookWriteDeny: HookWriteDenyPlan? = nil
     ) {
         self.denyWrite = denyWrite
         self.denyRead = denyRead
@@ -289,6 +325,7 @@ public struct BwrapDenyPlan: Sendable, Equatable {
         self.readOnly = readOnly
         self.readWrite = readWrite
         self.defaultRead = defaultRead
+        self.hookWriteDeny = hookWriteDeny
     }
 }
 
@@ -554,7 +591,8 @@ public func bwrapReexecCommand(
     receiptToken: String? = nil,
     readOnly: [String] = [],
     readWrite: [String] = [],
-    defaultRead: Bool = true
+    defaultRead: Bool = true,
+    hookWriteDeny: HookWriteDenyPlan? = nil
 ) -> [String]? {
     if isVerifiedInsideBwrap(environment: environment) { return nil }
     _ = restrictNetwork
@@ -598,6 +636,26 @@ public func bwrapReexecCommand(
             argv.append(contentsOf: ["--ro-bind", path, path])
         }
     }
+    if let hookWriteDeny {
+        do {
+            try revalidateHookWriteDenyPlan(hookWriteDeny)
+        } catch {
+            return nil
+        }
+        for ancestor in hookWriteDeny.writableAncestors {
+            guard ancestor.path.path != "/",
+                  readWrite.contains(where: {
+                      pathIsUnderRoot(candidate: ancestor.path.path, root: $0)
+                  })
+            else {
+                return nil
+            }
+            argv.append(contentsOf: ["--bind", ancestor.path.path, ancestor.path.path])
+        }
+        for leaf in hookWriteDeny.leaves {
+            argv.append(contentsOf: ["--ro-bind", leaf.path.path, leaf.path.path])
+        }
+    }
     for path in denyRead {
         let isDir = denyPathIsDir(URL(fileURLWithPath: path))
         if let placeholder = bwrapBlockedPlaceholder(name: isDir ? "sandbox-blocked-dir" : "sandbox-blocked", wantDir: isDir, environment: environment) {
@@ -615,13 +673,15 @@ public func bwrapReexecCommand(
 public func bwrapDenyPlan(
     profile: ProfileName,
     workspace: URL,
-    config: SandboxConfig? = nil
+    config: SandboxConfig? = nil,
+    environment: [String: String] = ProcessInfo.processInfo.environment
 ) -> BwrapDenyPlan? {
-    let cfg = config ?? loadSandboxConfig(workspace: workspace)
+    let cfg = config ?? loadSandboxConfig(workspace: workspace, environment: environment)
     var denyWrite: [String] = []
     var readOnly: [String] = []
     var readWrite: [String] = []
     var defaultRead = true
+    var hookWriteDeny: HookWriteDenyPlan?
     if isDevboxBased(profile: profile, config: cfg) {
         denyWrite.append("/data")
     }
@@ -629,13 +689,28 @@ public func bwrapDenyPlan(
     var hasGlobs = false
     var restrictNet = profile.restrictsNetwork
     if profile != .off {
-        guard let resolved = try? profile.resolve(workspace: workspace, config: cfg) else {
+        guard let resolved = try? profile.resolve(
+            workspace: workspace,
+            config: cfg,
+            environment: environment
+        ) else {
             return nil
         }
         readOnly = resolved.readOnly.map(\.path)
         readWrite = resolved.readWrite.map(\.path)
         defaultRead = resolved.defaultRead
         restrictNet = resolved.restrictNetwork
+        if !resolved.writeDeny.isEmpty {
+            guard let protection = try? buildHookWriteDenyPlan(
+                sources: resolved.writeDeny,
+                writableRoots: resolved.readWrite,
+                readableRoots: resolved.readOnly,
+                defaultRead: resolved.defaultRead
+            ) else {
+                return nil
+            }
+            hookWriteDeny = protection
+        }
         let (exact, globs) = partitionDenyEntries(resolved.denyEntries)
         hasGlobs = !globs.isEmpty
         for entry in exact {
@@ -664,7 +739,8 @@ public func bwrapDenyPlan(
         restrictNetwork: restrictNet,
         readOnly: Array(Set(readOnly)).sorted(),
         readWrite: Array(Set(readWrite)).sorted(),
-        defaultRead: defaultRead
+        defaultRead: defaultRead,
+        hookWriteDeny: hookWriteDeny
     )
 }
 

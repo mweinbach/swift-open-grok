@@ -14,8 +14,9 @@ public struct MCPProtocolVersion: RawRepresentable, Codable, Sendable, Hashable,
         self.init(rawValue: value)
     }
 
-    public static let latest = MCPProtocolVersion("2025-06-18")
-    public static let june2025 = latest
+    public static let november2025 = MCPProtocolVersion("2025-11-25")
+    public static let latest = november2025
+    public static let june2025 = MCPProtocolVersion("2025-06-18")
     public static let march2025 = MCPProtocolVersion("2025-03-26")
     public static let november2024 = MCPProtocolVersion("2024-11-05")
 

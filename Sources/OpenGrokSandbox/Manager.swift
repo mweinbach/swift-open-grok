@@ -163,8 +163,25 @@ public final class SandboxManager: @unchecked Sendable {
             return
         }
 
-        let config = loadSandboxConfig(workspace: workspace)
-        let resolved = try profile.resolve(workspace: workspace, config: config)
+        #if os(Linux)
+        let environment = linuxReexecHooks.environment()
+        #else
+        let environment = ProcessInfo.processInfo.environment
+        #endif
+        let config = loadSandboxConfig(workspace: workspace, environment: environment)
+        let mustProtectHooks = requiresHookWriteDeny(
+            profile: profile,
+            workspace: workspace,
+            config: config
+        )
+        if mustProtectHooks {
+            try ensureGlobalHookSlots(environment: environment)
+        }
+        let resolved = try profile.resolve(
+            workspace: workspace,
+            config: config,
+            environment: environment
+        )
         netRestricted = resolved.restrictNetwork
 
         let support: SandboxSupportInfo
@@ -185,7 +202,8 @@ public final class SandboxManager: @unchecked Sendable {
                 workspace: workspace,
                 error: support.details
             ))
-            if failClosed || requiresReadDeny(profile: profile, workspace: workspace, config: config) {
+            if failClosed || mustProtectHooks
+                || requiresReadDeny(profile: profile, workspace: workspace, config: config) {
                 throw SandboxError.unsupported(support.details)
             }
             applied = false
@@ -198,7 +216,8 @@ public final class SandboxManager: @unchecked Sendable {
                 workspace: workspace,
                 error: support.details
             ))
-            if failClosed || requiresReadDeny(profile: profile, workspace: workspace, config: config) {
+            if failClosed || mustProtectHooks
+                || requiresReadDeny(profile: profile, workspace: workspace, config: config) {
                 throw SandboxError.unsupported(support.details)
             }
             applied = false
@@ -225,7 +244,8 @@ public final class SandboxManager: @unchecked Sendable {
                 workspace: workspace,
                 error: "\(error)"
             ))
-            if failClosed || requiresReadDeny(profile: profile, workspace: workspace, config: config) {
+            if failClosed || mustProtectHooks
+                || requiresReadDeny(profile: profile, workspace: workspace, config: config) {
                 throw error
             }
             applied = false
@@ -285,12 +305,24 @@ enum PlatformEnforcer {
         linuxReexecHooks: LinuxBwrapReexecHooks = .production
     ) throws {
         #if os(macOS)
+        if !resolved.writeDeny.isEmpty {
+            let protection = try buildHookWriteDenyPlan(
+                sources: resolved.writeDeny,
+                writableRoots: resolved.readWrite,
+                readableRoots: resolved.readOnly,
+                defaultRead: resolved.defaultRead
+            )
+            try revalidateHookWriteDenyPlan(protection)
+        }
         let sbpl = buildSeatbeltProfile(resolved, workspace: workspace)
         try applySeatbeltProfile(sbpl)
         #elseif os(Linux)
         let environment = linuxReexecHooks.environment()
         if isVerifiedInsideBwrap(environment: environment) {
             try validateBwrapReceipt(environment: environment)
+            if !resolved.writeDeny.isEmpty {
+                try verifyHookWriteDenyEnforced(resolved.writeDeny)
+            }
             return
         }
         guard let bwrapPath = linuxReexecHooks.discoverBubblewrap(environment) else {
@@ -299,8 +331,15 @@ enum PlatformEnforcer {
         guard linuxReexecHooks.probe(bwrapPath) else {
             throw SandboxError.unsupported("bubblewrap executable failed the runtime capability probe at \(bwrapPath)")
         }
-        guard let plan = bwrapDenyPlan(profile: profile, workspace: workspace) else {
+        guard let plan = bwrapDenyPlan(
+            profile: profile,
+            workspace: workspace,
+            environment: environment
+        ) else {
             throw SandboxError.enforcementFailed("could not resolve a fail-closed bubblewrap deny plan")
+        }
+        if !resolved.writeDeny.isEmpty, plan.hookWriteDeny == nil {
+            throw SandboxError.enforcementFailed("required owner-global hook write-deny plan is absent")
         }
         let receipt = try createBwrapReceipt(environment: environment)
         guard let command = bwrapReexecCommand(
@@ -315,7 +354,8 @@ enum PlatformEnforcer {
             receiptToken: receipt.token,
             readOnly: plan.readOnly,
             readWrite: plan.readWrite,
-            defaultRead: plan.defaultRead
+            defaultRead: plan.defaultRead,
+            hookWriteDeny: plan.hookWriteDeny
         ) else {
             throw SandboxError.enforcementFailed("bubblewrap re-exec command could not be prepared")
         }

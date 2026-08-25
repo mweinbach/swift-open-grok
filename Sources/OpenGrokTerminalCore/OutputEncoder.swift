@@ -25,10 +25,9 @@ public enum ANSIOutput {
 
     /// OSC 8 hyperlink open. Control characters are stripped from `url`.
     public static func osc8Open(url: String, id: UInt32?) -> String {
-        let u = String(url.unicodeScalars.filter { scalar in
-            let v = scalar.value
-            return v >= 0x20 && v != 0x7F
-        }.map { Character($0) })
+        let u = String(url.unicodeScalars.filter {
+            $0.properties.generalCategory != .control
+        })
         if let id {
             return "\u{1B}]8;id=\(id);\(u)\u{07}"
         }

@@ -90,13 +90,73 @@ public protocol MCPAuthorizationProviding: Sendable {
     func handleUnauthorized(staleToken: String?) async -> Bool
 }
 
+private struct MCPIncrementalEventParser: Sendable {
+    private var parser = SSEParser(maxBufferedBytes: 4 * 1024 * 1024)
+    private var pendingCarriageReturn = false
+
+    var lastEventID: String? { parser.lastSeenEventID }
+
+    mutating func push(_ chunk: Data) throws -> [SSEEvent] {
+        guard !chunk.isEmpty else { return [] }
+
+        var bytes = chunk
+        if pendingCarriageReturn {
+            bytes.insert(0x0D, at: bytes.startIndex)
+            pendingCarriageReturn = false
+        }
+
+        // SSEParser normalizes complete CRLF pairs within each push. Holding a
+        // trailing CR prevents a chunk boundary from becoming a false blank line.
+        if bytes.last == 0x0D {
+            bytes.removeLast()
+            pendingCarriageReturn = true
+        }
+
+        if parser.retainedBytes + bytes.count + (pendingCarriageReturn ? 1 : 0)
+            > parser.maxBufferedBytes {
+            throw HTTPError.bufferExceeded(limit: parser.maxBufferedBytes)
+        }
+        guard !bytes.isEmpty else { return [] }
+        return try parser.push(bytes)
+    }
+
+    mutating func finish() throws -> [SSEEvent] {
+        var completed: [SSEEvent] = []
+        if pendingCarriageReturn {
+            pendingCarriageReturn = false
+            completed = try parser.push(Data([0x0D]))
+        }
+        completed.append(contentsOf: parser.finish())
+        return completed
+    }
+}
+
+private struct MCPHTTPPostResult: Sendable {
+    let metadata: HTTPResponseMetadata
+    let message: MCPWireMessage?
+}
+
+private enum MCPHTTPEventStreamResult: Sendable {
+    case ended
+    case unauthorized
+    case unsupported
+}
+
 public actor MCPHTTPTransport: MCPTransport, MCPProgressObservingTransport {
+    private static let maximumResponseBytes = 4 * 1024 * 1024
+
     private let httpTransport: any HTTPTransport
     private let configuration: MCPHTTPTransportConfiguration
     private let authorization: (any MCPAuthorizationProviding)?
     private let eventEmitter = MCPTransportEventEmitter()
     private var sessionID: String?
     private var isClosed = false
+    private var isInitialized = false
+    private var hasEventSink = false
+    private var eventStreamTask: Task<Void, Never>?
+    private var eventStreamGeneration: UInt64 = 0
+    private var lastEventID: String?
+    private var activeRequests: [UUID: Task<MCPHTTPPostResult, Error>] = [:]
 
     public init(
         httpTransport: any HTTPTransport,
@@ -116,6 +176,14 @@ public actor MCPHTTPTransport: MCPTransport, MCPProgressObservingTransport {
         clientID: UInt64 = 0
     ) {
         eventEmitter.configure(events, serverName: serverName, clientID: clientID)
+        hasEventSink = events != nil
+        if hasEventSink {
+            startEventStreamIfNeeded()
+        } else {
+            eventStreamTask?.cancel()
+            eventStreamTask = nil
+            eventStreamGeneration &+= 1
+        }
     }
 
     func observeProgress(
@@ -145,6 +213,10 @@ public actor MCPHTTPTransport: MCPTransport, MCPProgressObservingTransport {
             let response = try await sendMessage(message)
             if isInitialize, case .response(let payload)? = response {
                 eventEmitter.initialized(payload)
+                if payload.error == nil {
+                    isInitialized = true
+                    startEventStreamIfNeeded()
+                }
             } else if isInitialize, response == nil {
                 eventEmitter.handshakeFailed(MCPError.transport("MCP initialize returned no response"))
             }
@@ -163,7 +235,11 @@ public actor MCPHTTPTransport: MCPTransport, MCPProgressObservingTransport {
 
         do {
             var attachedToken: String?
-            var response = try await sendOnce(body: body, attachedToken: &attachedToken)
+            var response = try await sendOnce(
+                message: message,
+                body: body,
+                attachedToken: &attachedToken
+            )
             // 401 with an auth seam: try disk-fresh/refresh recovery once,
             // then replay. Upstream recovers the same failure via
             // `force_reauth(false)` + one retry at the tool-call layer
@@ -172,26 +248,16 @@ public actor MCPHTTPTransport: MCPTransport, MCPProgressObservingTransport {
             if response.metadata.statusCode == 401,
                let authorization,
                await authorization.handleUnauthorized(staleToken: attachedToken) {
-                response = try await sendOnce(body: body, attachedToken: &attachedToken)
+                response = try await sendOnce(
+                    message: message,
+                    body: body,
+                    attachedToken: &attachedToken
+                )
             }
             guard (200..<300).contains(response.metadata.statusCode) else {
                 throw MCPError.transport("MCP HTTP status \(response.metadata.statusCode)")
             }
-            if let value = headerValue("mcp-session-id", in: response.metadata.headers) {
-                sessionID = value
-            }
-            guard !response.body.isEmpty else { return nil }
-            let requestID: JsonRpcId?
-            if case .request(let request) = message {
-                requestID = request.id
-            } else {
-                requestID = nil
-            }
-            return try decodeHTTPBody(
-                response.body,
-                contentType: response.metadata.contentType,
-                matching: requestID
-            )
+            return response.message
         } catch let error as MCPError {
             throw error
         } catch {
@@ -199,12 +265,58 @@ public actor MCPHTTPTransport: MCPTransport, MCPProgressObservingTransport {
         }
     }
 
-    private func sendOnce(body: Data, attachedToken: inout String?) async throws -> HTTPResponse {
+    private func sendOnce(
+        message: MCPWireMessage,
+        body: Data,
+        attachedToken: inout String?
+    ) async throws -> MCPHTTPPostResult {
+        let request = try await makeRequest(
+            method: .post,
+            body: body,
+            sessionID: sessionID,
+            attachedToken: &attachedToken
+        )
+        let requestID: JsonRpcId?
+        if case .request(let payload) = message {
+            requestID = payload.id
+        } else {
+            requestID = nil
+        }
+
+        let identifier = UUID()
+        let operation = Task { [weak self] () throws -> MCPHTTPPostResult in
+            guard let self else { throw MCPError.transportClosed }
+            return try await self.readPOST(request, matching: requestID)
+        }
+        activeRequests[identifier] = operation
+        defer { activeRequests.removeValue(forKey: identifier) }
+
+        return try await withTaskCancellationHandler {
+            try await operation.value
+        } onCancel: {
+            operation.cancel()
+        }
+    }
+
+    private func makeRequest(
+        method: HTTPMethod,
+        body: Data? = nil,
+        sessionID: String?,
+        lastEventID: String? = nil,
+        attachedToken: inout String?
+    ) async throws -> HTTPRequest {
+        attachedToken = nil
         var headers = configuration.headers
-        headers["Content-Type"] = headers["Content-Type"] ?? "application/json"
-        headers["Accept"] = headers["Accept"] ?? "application/json, text/event-stream"
+        if method == .post {
+            headers["Content-Type"] = headers["Content-Type"] ?? "application/json"
+        }
+        headers["Accept"] = headers["Accept"]
+            ?? (method == .get ? "text/event-stream" : "application/json, text/event-stream")
         if let sessionID {
             headers["Mcp-Session-Id"] = sessionID
+        }
+        if let lastEventID {
+            headers["Last-Event-ID"] = lastEventID
         }
         // A statically configured Authorization header wins; upstream never
         // builds the auth client when config carries one (servers.rs:4294-4304).
@@ -222,78 +334,357 @@ public actor MCPHTTPTransport: MCPTransport, MCPProgressObservingTransport {
             headers["Authorization"] = "Bearer \(token)"
         }
 
-        let request = HTTPRequest(
-            method: .post,
+        return HTTPRequest(
+            method: method,
             url: configuration.endpoint,
             headers: headers,
             body: body,
             timeout: configuration.timeout,
-            idempotency: .nonIdempotent
+            idempotency: method == .post ? .nonIdempotent : .idempotent
         )
-        return try await httpTransport.send(request)
     }
 
-    public func close() {
-        isClosed = true
-        eventEmitter.transportClosed()
-    }
-
-    private func decodeHTTPBody(
-        _ data: Data,
-        contentType: String?,
+    private func readPOST(
+        _ request: HTTPRequest,
         matching requestID: JsonRpcId?
-    ) throws -> MCPWireMessage {
-        guard contentType?.lowercased().contains("text/event-stream") == true else {
-            return try MCPWireCodec.decode(data)
-        }
-
-        let text = String(decoding: data, as: UTF8.self)
-        var eventData: [String] = []
+    ) async throws -> MCPHTTPPostResult {
+        var metadata: HTTPResponseMetadata?
+        var responseBody = Data()
+        var parser = MCPIncrementalEventParser()
         var sawDataEvent = false
 
-        func matchingMessage() throws -> MCPWireMessage? {
-            guard !eventData.isEmpty else { return nil }
-            sawDataEvent = true
-            defer { eventData.removeAll(keepingCapacity: true) }
-
-            let message = try MCPWireCodec.decodeString(eventData.joined(separator: "\n"))
-            if case .notification(let notification) = message {
-                eventEmitter.notification(notification)
-                if requestID != nil { return nil }
-            }
-            guard let requestID else { return message }
-            guard case .response(let response) = message, response.id == requestID else {
-                return nil
-            }
-            return message
-        }
-
-        var matchedMessage: MCPWireMessage?
-
-        // CRLF is one Swift Character, so checking against "\r" and "\n"
-        // separately misses the most common HTTP event-stream delimiter.
-        for line in text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
-            if line.isEmpty {
-                if let message = try matchingMessage(), matchedMessage == nil {
-                    matchedMessage = message
+        for try await event in httpTransport.stream(request) {
+            try Task.checkCancellation()
+            switch event {
+            case .metadata(let value):
+                guard metadata == nil else {
+                    throw MCPError.parse("MCP HTTP stream repeated response metadata")
                 }
-                continue
+                metadata = value
+                guard (200..<300).contains(value.statusCode) else {
+                    return MCPHTTPPostResult(metadata: value, message: nil)
+                }
+                if let nextSessionID = headerValue("mcp-session-id", in: value.headers) {
+                    updateSessionID(nextSessionID)
+                }
+
+            case .body(let chunk):
+                guard let metadata else {
+                    throw MCPError.parse("MCP HTTP stream sent body before response metadata")
+                }
+                if metadata.isEventStream {
+                    let events = try parser.push(chunk)
+                    if let message = try matchingMessage(
+                        in: events,
+                        requestID: requestID,
+                        sawDataEvent: &sawDataEvent
+                    ) {
+                        return MCPHTTPPostResult(metadata: metadata, message: message)
+                    }
+                } else {
+                    guard responseBody.count <= Self.maximumResponseBytes - chunk.count else {
+                        throw HTTPError.bufferExceeded(limit: Self.maximumResponseBytes)
+                    }
+                    responseBody.append(chunk)
+                }
+
+            case .end:
+                return try finishPOST(
+                    metadata: metadata,
+                    body: responseBody,
+                    parser: &parser,
+                    requestID: requestID,
+                    sawDataEvent: &sawDataEvent
+                )
             }
-
-            guard line.hasPrefix("data:") else { continue }
-            var value = line.dropFirst(5)
-            if value.first == " " { value = value.dropFirst() }
-            eventData.append(String(value))
         }
 
-        if let message = try matchingMessage(), matchedMessage == nil {
-            matchedMessage = message
+        try Task.checkCancellation()
+        return try finishPOST(
+            metadata: metadata,
+            body: responseBody,
+            parser: &parser,
+            requestID: requestID,
+            sawDataEvent: &sawDataEvent
+        )
+    }
+
+    private func finishPOST(
+        metadata: HTTPResponseMetadata?,
+        body: Data,
+        parser: inout MCPIncrementalEventParser,
+        requestID: JsonRpcId?,
+        sawDataEvent: inout Bool
+    ) throws -> MCPHTTPPostResult {
+        guard let metadata else {
+            throw MCPError.transport("MCP HTTP stream ended without response metadata")
         }
-        if let matchedMessage { return matchedMessage }
+        guard metadata.isEventStream else {
+            return MCPHTTPPostResult(
+                metadata: metadata,
+                message: body.isEmpty ? nil : try MCPWireCodec.decode(body)
+            )
+        }
+
+        if let message = try matchingMessage(
+            in: parser.finish(),
+            requestID: requestID,
+            sawDataEvent: &sawDataEvent
+        ) {
+            return MCPHTTPPostResult(metadata: metadata, message: message)
+        }
         guard sawDataEvent else {
             throw MCPError.parse("MCP event stream contained no data event")
         }
         throw MCPError.parse("MCP event stream contained no response matching the request id")
+    }
+
+    private func matchingMessage(
+        in events: [SSEEvent],
+        requestID: JsonRpcId?,
+        sawDataEvent: inout Bool
+    ) throws -> MCPWireMessage? {
+        var matchedMessage: MCPWireMessage?
+        for event in events {
+            guard !event.data.isEmpty else { continue }
+            sawDataEvent = true
+            let message = try MCPWireCodec.decodeString(event.data)
+            if case .notification(let notification) = message {
+                eventEmitter.notification(notification)
+                if requestID == nil, matchedMessage == nil {
+                    matchedMessage = message
+                }
+                continue
+            }
+            guard matchedMessage == nil else { continue }
+            if let requestID {
+                guard case .response(let response) = message, response.id == requestID else {
+                    continue
+                }
+            }
+            matchedMessage = message
+        }
+        return matchedMessage
+    }
+
+    private func updateSessionID(_ value: String) {
+        guard sessionID != value else { return }
+        sessionID = value
+        lastEventID = nil
+        eventStreamTask?.cancel()
+        eventStreamTask = nil
+        eventStreamGeneration &+= 1
+        startEventStreamIfNeeded()
+    }
+
+    private func startEventStreamIfNeeded() {
+        guard !isClosed,
+              isInitialized,
+              hasEventSink,
+              let sessionID,
+              eventStreamTask == nil
+        else { return }
+
+        eventStreamGeneration &+= 1
+        let generation = eventStreamGeneration
+        eventStreamTask = Task { [weak self] in
+            await self?.runEventStream(sessionID: sessionID, generation: generation)
+        }
+    }
+
+    private func runEventStream(sessionID: String, generation: UInt64) async {
+        var consecutiveFailures = 0
+        var recoveredUnauthorized = false
+
+        while isCurrentEventStream(sessionID: sessionID, generation: generation) {
+            var attachedToken: String?
+            let openedAt = ProcessInfo.processInfo.systemUptime
+
+            do {
+                let request = try await makeRequest(
+                    method: .get,
+                    sessionID: sessionID,
+                    lastEventID: lastEventID,
+                    attachedToken: &attachedToken
+                )
+                guard isCurrentEventStream(sessionID: sessionID, generation: generation) else {
+                    return
+                }
+
+                let outcome = try await readEventStream(
+                    request,
+                    sessionID: sessionID,
+                    generation: generation
+                )
+                switch outcome {
+                case .unsupported:
+                    return
+                case .unauthorized:
+                    guard !recoveredUnauthorized,
+                          let authorization,
+                          await authorization.handleUnauthorized(staleToken: attachedToken)
+                    else { return }
+                    recoveredUnauthorized = true
+                    continue
+                case .ended:
+                    recoveredUnauthorized = false
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard isCurrentEventStream(sessionID: sessionID, generation: generation) else {
+                    return
+                }
+            }
+
+            guard isCurrentEventStream(sessionID: sessionID, generation: generation) else {
+                return
+            }
+            if ProcessInfo.processInfo.systemUptime - openedAt >= 2 {
+                consecutiveFailures = 0
+            } else {
+                consecutiveFailures += 1
+            }
+
+            if consecutiveFailures > 1 {
+                let exponent = min(consecutiveFailures - 2, 6)
+                let milliseconds = min(500 * (1 << exponent), 30_000)
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000)
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    private func readEventStream(
+        _ request: HTTPRequest,
+        sessionID: String,
+        generation: UInt64
+    ) async throws -> MCPHTTPEventStreamResult {
+        var metadata: HTTPResponseMetadata?
+        var parser = MCPIncrementalEventParser()
+
+        for try await event in httpTransport.stream(request) {
+            try Task.checkCancellation()
+            guard isCurrentEventStream(sessionID: sessionID, generation: generation) else {
+                return .unsupported
+            }
+
+            switch event {
+            case .metadata(let value):
+                guard metadata == nil else {
+                    throw MCPError.parse("MCP event stream repeated response metadata")
+                }
+                metadata = value
+                if value.statusCode == 401 { return .unauthorized }
+                guard (200..<300).contains(value.statusCode), value.isEventStream else {
+                    return .unsupported
+                }
+                if let responseSessionID = headerValue("mcp-session-id", in: value.headers),
+                   responseSessionID != sessionID {
+                    return .unsupported
+                }
+
+            case .body(let chunk):
+                guard metadata != nil else {
+                    throw MCPError.parse("MCP event stream sent body before response metadata")
+                }
+                let events = try parser.push(chunk)
+                if let latestID = parser.lastEventID {
+                    lastEventID = latestID
+                }
+                try publishServerNotifications(
+                    events,
+                    sessionID: sessionID,
+                    generation: generation
+                )
+
+            case .end:
+                let events = try parser.finish()
+                if let latestID = parser.lastEventID {
+                    lastEventID = latestID
+                }
+                try publishServerNotifications(
+                    events,
+                    sessionID: sessionID,
+                    generation: generation
+                )
+                return .ended
+            }
+        }
+
+        let events = try parser.finish()
+        if let latestID = parser.lastEventID {
+            lastEventID = latestID
+        }
+        try publishServerNotifications(events, sessionID: sessionID, generation: generation)
+        return metadata == nil ? .unsupported : .ended
+    }
+
+    private func publishServerNotifications(
+        _ events: [SSEEvent],
+        sessionID: String,
+        generation: UInt64
+    ) throws {
+        for event in events {
+            guard isCurrentEventStream(sessionID: sessionID, generation: generation) else {
+                return
+            }
+            guard !event.data.isEmpty else { continue }
+            let message = try MCPWireCodec.decodeString(event.data)
+            if case .notification(let notification) = message {
+                eventEmitter.notification(notification)
+            }
+        }
+    }
+
+    private func isCurrentEventStream(sessionID: String, generation: UInt64) -> Bool {
+        !isClosed
+            && !Task.isCancelled
+            && self.sessionID == sessionID
+            && eventStreamGeneration == generation
+    }
+
+    public func close() async {
+        guard !isClosed else { return }
+        isClosed = true
+        eventStreamGeneration &+= 1
+        eventStreamTask?.cancel()
+        eventStreamTask = nil
+        for operation in activeRequests.values {
+            operation.cancel()
+        }
+        activeRequests.removeAll()
+        eventEmitter.transportClosed()
+
+        guard let sessionID else { return }
+        do {
+            var attachedToken: String?
+            var request = try await makeRequest(
+                method: .delete,
+                sessionID: sessionID,
+                attachedToken: &attachedToken
+            )
+            var response = try await httpTransport.send(request)
+            if response.metadata.statusCode == 401,
+               let authorization,
+               await authorization.handleUnauthorized(staleToken: attachedToken) {
+                request = try await makeRequest(
+                    method: .delete,
+                    sessionID: sessionID,
+                    attachedToken: &attachedToken
+                )
+                response = try await httpTransport.send(request)
+            }
+            guard (200..<300).contains(response.metadata.statusCode)
+                    || response.metadata.statusCode == 404
+                    || response.metadata.statusCode == 405
+            else { return }
+        } catch {
+            // Session teardown is best effort; local shutdown must stay final.
+        }
     }
 
     private func headerValue(_ name: String, in headers: [String: String]) -> String? {

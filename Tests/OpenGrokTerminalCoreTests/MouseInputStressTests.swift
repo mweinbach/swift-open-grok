@@ -118,11 +118,16 @@ struct MouseInputStressTests {
             #expect(e.x == 3839 && e.y == 2159)
         } else { Issue.record("4K coordinate failed") }
 
-        if case .event(let e) = MouseReportDecoder.decodeSGR(sgrBytes(0, 9_999_999, 9_999_999, press: true)) {
-            #expect(e.x == 9_999_998 && e.y == 9_999_998)
+        if case .event(let e) = MouseReportDecoder.decodeSGR(
+            sgrBytes(0, Int(UInt16.max), Int(UInt16.max), press: true)
+        ) {
+            #expect(e.x == Int(UInt16.max) - 1 && e.y == Int(UInt16.max) - 1)
         } else { Issue.record("Max supported coordinate failed") }
 
-        // Overflow attempt (9 digits >= 100_000_000) must return .malformed
+        #expect(MouseReportDecoder.decodeSGR(sgrBytes(0, 65_536, 5, press: true)) == .malformed)
+        #expect(MouseReportDecoder.decodeSGR(sgrBytes(0, 5, 65_536, press: true)) == .malformed)
+        #expect(MouseReportDecoder.decodeSGR(sgrBytes(0, 1_000_000, 5, press: true)) == .malformed)
+        #expect(MouseReportDecoder.decodeSGR(sgrBytes(0, 5, 1_000_000, press: true)) == .malformed)
         #expect(MouseReportDecoder.decodeSGR(sgrBytes(0, 100_000_000, 5, press: true)) == .malformed)
         #expect(MouseReportDecoder.decodeSGR(bytes("\u{1B}[<0;999999999999;5M")) == .malformed)
 

@@ -35,7 +35,69 @@ public enum HostOs: String, Sendable, Equatable, Hashable {
 }
 
 public func detectTerminalBrandFromEnv(_ env: [String: String]) -> TerminalName {
-    MouseScrollTerminalBrand.from(termProgram: env["TERM_PROGRAM"])
+    func value(_ key: String) -> String? {
+        guard let value = env[key], !value.isEmpty else { return nil }
+        return value
+    }
+
+    if value("CURSOR_TRACE_ID") != nil {
+        return .cursor
+    }
+    if let askpass = value("VSCODE_GIT_ASKPASS_MAIN") {
+        let normalized = askpass.lowercased()
+        if normalized.contains("cursor") { return .cursor }
+        if normalized.contains("windsurf") { return .windsurf }
+        return .vsCode
+    }
+
+    if let program = value("TERM_PROGRAM") {
+        let normalized = program.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .filter { $0 != " " && $0 != "-" && $0 != "_" && $0 != "." }
+        switch normalized {
+        case "appleterminal": return .appleTerminal
+        case "ghostty": return .ghostty
+        case "iterm", "iterm2", "itermapp": return .iterm2
+        case "warp", "warpterminal": return .warpTerminal
+        case "vscode": return .vsCode
+        case "wezterm": return .wezTerm
+        case "kitty": return .kitty
+        case "alacritty": return .alacritty
+        case "rio": return .rio
+        case "terminator": return .terminator
+        case "zed": return .zed
+        case "grokdesktop": return .grokDesktop
+        case "windowsterminal": return .windowsTerminal
+        case "otty": return .otty
+        default: break
+        }
+    }
+
+    if let emulator = value("TERMINAL_EMULATOR")?.lowercased(),
+       emulator.contains("jetbrains") || emulator.contains("jediterm") {
+        return .jetBrains
+    }
+    if value("WEZTERM_VERSION") != nil { return .wezTerm }
+    if value("ITERM_SESSION_ID") != nil
+        || value("ITERM_PROFILE") != nil
+        || value("LC_TERMINAL")?.lowercased() == "iterm2" {
+        return .iterm2
+    }
+    if value("TERM_SESSION_ID") != nil { return .appleTerminal }
+    if value("KITTY_WINDOW_ID") != nil || value("TERM")?.contains("kitty") == true {
+        return .kitty
+    }
+    if value("ALACRITTY_SOCKET") != nil || value("TERM") == "alacritty" {
+        return .alacritty
+    }
+    if value("TERM") == "rio" { return .rio }
+    if let term = value("TERM"), ["foot", "foot-extra", "foot-direct"].contains(term) {
+        return .foot
+    }
+    if value("TERMINATOR_UUID") != nil { return .terminator }
+    if value("VTE_VERSION") != nil { return .vte }
+    if value("WT_SESSION") != nil { return .windowsTerminal }
+    return .unknown
 }
 
 // MARK: - Select All Capability
@@ -91,6 +153,18 @@ public func detectGraphicsProtocol(
 ) -> GraphicsProtocol {
     if let override = testGraphicsProtocolOverride {
         return override
+    }
+    if environment["TERM"]?.lowercased() == "dumb" {
+        return .none
+    }
+    if let backend = environment["BYOBU_BACKEND"], !backend.isEmpty {
+        if backend.lowercased() == "tmux" { return .none }
+        if backend.lowercased() != "screen",
+           let tmux = environment["TMUX"], !tmux.isEmpty {
+            return .none
+        }
+    } else if let tmux = environment["TMUX"], !tmux.isEmpty {
+        return .none
     }
     let brand = detectTerminalBrandFromEnv(environment)
     let isWindows = host == .windows || environment["OS"] == "Windows_NT"
@@ -261,4 +335,3 @@ extension KittyImageFormat {
         }
     }
 }
-

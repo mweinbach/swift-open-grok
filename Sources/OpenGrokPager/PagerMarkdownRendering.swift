@@ -91,7 +91,7 @@ public struct PagerMarkdownRenderer: Sendable {
                         selectionText: $0
                     )
                 })
-                result.append(mermaidAffordanceLine(width: width))
+                result.append(mermaidAffordanceLine())
                 lineIndex = max(lineIndex + 1, span.outputLineRange.upperBound)
                 continue
             }
@@ -189,19 +189,11 @@ public struct PagerMarkdownRenderer: Sendable {
             .trimmingCharacters(in: .newlines)
     }
 
-    private static func mermaidAffordanceLine(width: Int) -> PagerStyledLine {
-        let labels = ["[Open Image]", "[Copy Image Path]", "[Copy Source]"]
-        var spans = [PagerStyledSpan(text: "◇ mermaid", foreground: .brightBlack, style: [.dim])]
-        var used = UnicodeDisplayWidth.width(of: "◇ mermaid")
-        for label in labels {
-            let gap = "   "
-            let needed = UnicodeDisplayWidth.width(of: gap + label)
-            guard used + needed <= max(1, width) else { break }
-            spans.append(PagerStyledSpan(text: gap, foreground: .brightBlack))
-            spans.append(PagerStyledSpan(text: label, foreground: .brightBlue, style: [.bold]))
-            used += needed
-        }
-        return PagerStyledLine(spans: spans, selectionText: "")
+    private static func mermaidAffordanceLine() -> PagerStyledLine {
+        PagerStyledLine(
+            spans: [PagerStyledSpan(text: "◇ mermaid", foreground: .brightBlack, style: [.dim])],
+            selectionText: ""
+        )
     }
 
     /// Paint attributes for one markdown inline style.
@@ -253,8 +245,9 @@ public struct PagerMarkdownRenderer: Sendable {
     /// Split one rendered markdown line into styled spans, further splitting at
     /// hyperlink boundaries so each link becomes its own addressable span.
     ///
-    /// Hyperlink column ranges are Character offsets into the line's text, so
-    /// the walk here counts Characters rather than display columns.
+    /// Hyperlink ranges use terminal display columns, not Character offsets:
+    /// one CJK or emoji grapheme can occupy two cells, while a combining mark
+    /// can occupy none. Never split a grapheme when a clipped range meets it.
     private static func spans(
         for line: MarkdownRenderLine,
         hyperlinks: [MarkdownHyperlink]
@@ -263,32 +256,44 @@ public struct PagerMarkdownRenderer: Sendable {
         var column = 0
         for segment in line.segments {
             let (foreground, style) = attributes(for: segment.style)
-            let characters = Array(segment.text)
-            var offset = 0
-            while offset < characters.count {
-                let absolute = column + offset
-                let link = hyperlinks.first { $0.columnRange.contains(absolute) }
-                let boundary: Int
-                if let link {
-                    boundary = min(characters.count, link.columnRange.upperBound - column)
-                } else {
-                    boundary = hyperlinks
-                        .map(\.columnRange.lowerBound)
-                        .filter { $0 > absolute }
-                        .min()
-                        .map { min(characters.count, $0 - column) }
-                        ?? characters.count
+            var pendingText = ""
+            var pendingURL: String?
+
+            for character in segment.text {
+                let grapheme = String(character)
+                let graphemeWidth = UnicodeDisplayWidth.width(ofGrapheme: grapheme)
+                let graphemeColumns = column..<(column + graphemeWidth)
+                let link = hyperlinks.first { hyperlink in
+                    if graphemeWidth == 0 {
+                        return hyperlink.columnRange.contains(column)
+                            || (hyperlink.columnRange.upperBound == column && hyperlink.url == pendingURL)
+                    }
+                    return hyperlink.columnRange.overlaps(graphemeColumns)
                 }
-                let end = max(offset + 1, boundary)
+
+                if !pendingText.isEmpty, pendingURL != link?.url {
+                    spans.append(PagerStyledSpan(
+                        text: pendingText,
+                        foreground: foreground,
+                        style: style,
+                        url: pendingURL
+                    ))
+                    pendingText.removeAll(keepingCapacity: true)
+                }
+
+                pendingText.append(character)
+                pendingURL = link?.url
+                column += graphemeWidth
+            }
+
+            if !pendingText.isEmpty {
                 spans.append(PagerStyledSpan(
-                    text: String(characters[offset..<min(end, characters.count)]),
+                    text: pendingText,
                     foreground: foreground,
                     style: style,
-                    url: link?.url
+                    url: pendingURL
                 ))
-                offset = end
             }
-            column += characters.count
         }
         return spans
     }

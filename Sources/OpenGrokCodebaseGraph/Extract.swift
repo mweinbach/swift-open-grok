@@ -174,7 +174,7 @@ func tokenize(_ source: String, language: SourceLanguage) -> [Tok] {
     func advance() -> Character {
         let c = chars[i]
         i += 1
-        if c == "\n" {
+        if c.isNewline {
             line += 1
             col = 1
         } else {
@@ -189,13 +189,13 @@ func tokenize(_ source: String, language: SourceLanguage) -> [Tok] {
         let c = peek()!
 
         // Newline
-        if c == "\n" {
+        if c.isNewline {
             _ = advance()
             tokens.append(Tok(kind: .newline, text: "\n", line: startLine, column: startCol))
             continue
         }
         // Whitespace
-        if c == " " || c == "\t" || c == "\r" {
+        if c == " " || c == "\t" {
             _ = advance()
             continue
         }
@@ -203,7 +203,7 @@ func tokenize(_ source: String, language: SourceLanguage) -> [Tok] {
         // Comments
         if language == .python && c == "#" {
             var text = ""
-            while let p = peek(), p != "\n" {
+            while let p = peek(), !p.isNewline {
                 text.append(advance())
             }
             tokens.append(Tok(kind: .comment, text: text, line: startLine, column: startCol))
@@ -211,7 +211,7 @@ func tokenize(_ source: String, language: SourceLanguage) -> [Tok] {
         }
         if c == "/" && peek(1) == "/" && language != .python {
             var text = ""
-            while let p = peek(), p != "\n" {
+            while let p = peek(), !p.isNewline {
                 text.append(advance())
             }
             tokens.append(Tok(kind: .comment, text: text, line: startLine, column: startCol))
@@ -265,7 +265,7 @@ func tokenize(_ source: String, language: SourceLanguage) -> [Tok] {
                     continue
                 }
                 if ch == quote { break }
-                if ch == "\n" && quote != "`" && language != .python { break }
+                if ch.isNewline && quote != "`" && language != .python { break }
             }
             tokens.append(Tok(kind: .string, text: text, line: startLine, column: startCol))
             continue

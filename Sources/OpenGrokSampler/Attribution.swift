@@ -13,16 +13,20 @@ public enum SamplingConsumer: String, Sendable, Equatable, Hashable {
     case responses = "responses"
     case messagesStream = "messages_stream"
     case messages = "messages"
+    case standaloneWebSearch = "standalone_web_search"
 
     /// Stable string identifier for this emit site.
     public var asEndpoint: String { rawValue }
 }
 
-/// Maximum prefix length the sampler shares with attribution callbacks.
+/// Maximum trailing bearer fragment shared with attribution callbacks.
 ///
-/// Bearers leaving the sampler are 12-character prefixes only — the full
-/// credential never crosses this boundary.
-public let SENT_BEARER_PREFIX_LEN = 12
+/// JWT headers and provider-key prefixes are shared across credentials; only
+/// their distinguishing Unicode-safe tail may cross the attribution boundary.
+public let BEARER_SUFFIX_LEN = 12
+
+/// Compatibility spelling for callers compiled against the original port.
+public let SENT_BEARER_PREFIX_LEN = BEARER_SUFFIX_LEN
 
 /// Hook invoked by ``SamplingClient`` at every 401 response site.
 ///
@@ -33,15 +37,17 @@ public protocol Auth401AttributionCallback: Sendable {
     ///
     /// - Parameters:
     ///   - consumer: which endpoint emitted the 401
-    ///   - sentBearerPrefix: first ``SENT_BEARER_PREFIX_LEN`` characters of the
+    ///   - sentBearerPrefix: last ``BEARER_SUFFIX_LEN`` characters of the
     ///     bearer actually sent, or `nil` when no auth header was present
     func record401(consumer: SamplingConsumer, sentBearerPrefix: String?)
 }
 
-/// Truncate a bearer/token to the scrubbed prefix shared across the boundary.
+/// Last 12 extended grapheme clusters, preserving short and non-ASCII tokens.
+public func scrubbedBearerSuffix(_ bearer: String) -> String {
+    String(bearer.suffix(BEARER_SUFFIX_LEN))
+}
+
+/// Compatibility spelling; the returned fragment is always the bearer tail.
 public func scrubbedBearerPrefix(_ bearer: String) -> String {
-    if bearer.count <= SENT_BEARER_PREFIX_LEN {
-        return bearer
-    }
-    return String(bearer.prefix(SENT_BEARER_PREFIX_LEN))
+    scrubbedBearerSuffix(bearer)
 }

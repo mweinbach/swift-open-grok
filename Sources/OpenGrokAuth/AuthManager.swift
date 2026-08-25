@@ -17,6 +17,8 @@ public enum AuthUnauthorizedRecoveryResult: Sendable, Equatable {
 /// Single source of truth for xAI credentials.
 public actor AuthManager {
     private var cached: GrokAuth?
+    private var rejectedPolicyError: AuthError?
+    private var refreshPersistenceError: AuthError?
     private let path: URL
     public let scope: String
     public let grokComConfig: GrokComConfig
@@ -51,8 +53,18 @@ public actor AuthManager {
         if let inline = environment["OPENGROK_AUTH"],
            let data = inline.data(using: .utf8),
            let auth = try? AuthJSON.decoder.decode(GrokAuth.self, from: data) {
-            self.cached = auth
-            snapshotBox.write(credentialSnapshot(from: auth))
+            if let error = Self.cachedTokenPolicyError(
+                auth,
+                config: config,
+                environment: environment
+            ) {
+                self.cached = nil
+                self.rejectedPolicyError = error
+                snapshotBox.write(CredentialSnapshot())
+            } else {
+                self.cached = auth
+                snapshotBox.write(credentialSnapshot(from: auth))
+            }
             return
         }
 
@@ -62,8 +74,24 @@ public actor AuthManager {
             config: config,
             environment: environment
         )
-        self.cached = initial
-        snapshotBox.write(credentialSnapshot(from: initial))
+        if let initial,
+           let error = Self.cachedTokenPolicyError(
+               initial,
+               config: config,
+               environment: environment
+           ) {
+            self.cached = nil
+            self.rejectedPolicyError = error
+            Self.removePersistedCredentialIfUnchanged(
+                at: path,
+                scope: scope,
+                rejected: initial
+            )
+            snapshotBox.write(CredentialSnapshot())
+        } else {
+            self.cached = initial
+            snapshotBox.write(credentialSnapshot(from: initial))
+        }
     }
 
     private static func loadInitial(
@@ -103,27 +131,33 @@ public actor AuthManager {
     }
 
     private func publishSnapshot() {
-        snapshotBox.write(credentialSnapshot(from: cached))
+        let vetted = cached.flatMap { auth in
+            cachedTokenPolicyError(auth) == nil ? auth : nil
+        }
+        snapshotBox.write(credentialSnapshot(from: vetted))
     }
 
     // MARK: - Reads
 
     public func current() -> GrokAuth? {
-        guard let auth = cached else { return nil }
+        guard let auth = cached, cachedTokenPolicyError(auth) == nil else { return nil }
         if isExpired(auth, environment: environment) { return nil }
         return auth
     }
 
     public func currentOrExpired() -> GrokAuth? {
-        cached
+        guard let cached, cachedTokenPolicyError(cached) == nil else { return nil }
+        return cached
     }
 
     public func tokenType() -> TokenType {
-        TokenType.from(auth: cached)
+        TokenType.from(auth: currentOrExpired())
     }
 
     public func isLoggedIn() -> Bool {
-        currentOrExpired() != nil || hasXAIAPIKeyEnv(environment)
+        currentOrExpired() != nil
+            || (!grokComConfig.apiKeyAuthDisabled(environment: environment)
+                && hasXAIAPIKeyEnv(environment))
     }
 
     public var authFilePath: URL { path }
@@ -132,22 +166,45 @@ public actor AuthManager {
 
     /// Hot-swap in-memory credential without disk write.
     public func hotSwap(_ auth: GrokAuth) {
+        if let error = cachedTokenPolicyError(auth) {
+            rejectCachedCredential(auth, error: error, clearMatchingDisk: false)
+            return
+        }
         cached = auth
         permanentFailure = nil
+        rejectedPolicyError = nil
+        refreshPersistenceError = nil
         publishSnapshot()
     }
 
     /// Persist + swap. Cancellation before write leaves prior credentials intact.
     public func update(_ auth: GrokAuth) throws {
         try Task.checkCancellation()
+        if let error = cachedTokenPolicyError(auth) {
+            throw error
+        }
         let lock = try tryLockAuthFile(at: path)
         defer { lock.release() }
-        try Task.checkCancellation()
+        try updateUnderHeldLock(auth, checkCancellation: true)
+    }
+
+    private func updateUnderHeldLock(
+        _ auth: GrokAuth,
+        checkCancellation: Bool
+    ) throws {
+        if checkCancellation {
+            try Task.checkCancellation()
+        }
+        if let error = cachedTokenPolicyError(auth) {
+            throw error
+        }
         var store = try readAuthJSONOrEmptyRecoveringCorrupt(at: path)
         store[scope] = auth
         try writeAuthJSON(at: path, store: store)
         cached = auth
         permanentFailure = nil
+        rejectedPolicyError = nil
+        refreshPersistenceError = nil
         publishSnapshot()
     }
 
@@ -165,6 +222,8 @@ public actor AuthManager {
         let auth = GrokAuth(key: trimmed, authMode: .apiKey)
         cached = auth
         permanentFailure = nil
+        rejectedPolicyError = nil
+        refreshPersistenceError = nil
         publishSnapshot()
     }
 
@@ -195,6 +254,8 @@ public actor AuthManager {
         }
         cached = nil
         permanentFailure = nil
+        rejectedPolicyError = nil
+        refreshPersistenceError = nil
         publishSnapshot()
         return LogoutResult(
             wasLoggedIn: wasLoggedIn,
@@ -216,6 +277,8 @@ public actor AuthManager {
         if scopeName == scope {
             cached = nil
             permanentFailure = nil
+            rejectedPolicyError = nil
+            refreshPersistenceError = nil
             publishSnapshot()
         }
     }
@@ -228,8 +291,11 @@ public actor AuthManager {
 
     public func auth() async throws -> GrokAuth {
         try Task.checkCancellation()
+        if let rejectedPolicyError {
+            throw rejectedPolicyError
+        }
         if let cached, let policyError = cachedTokenPolicyError(cached) {
-            _ = try? clear()
+            rejectCachedCredential(cached, error: policyError, clearMatchingDisk: true)
             throw policyError
         }
         if let auth = cached, !isExpired(auth, environment: environment) {
@@ -252,6 +318,8 @@ public actor AuthManager {
                !grokComConfig.apiKeyAuthDisabled(environment: environment) {
                 let auth = GrokAuth(key: envKey, authMode: .apiKey)
                 cached = auth
+                rejectedPolicyError = nil
+                refreshPersistenceError = nil
                 publishSnapshot()
                 return auth
             }
@@ -277,6 +345,13 @@ public actor AuthManager {
     /// reached a terminal refresh-token failure so relay callers can choose
     /// between immediate reconnect, backoff, and cancellation.
     public func recoverUnauthorized() async -> AuthUnauthorizedRecoveryResult {
+        if rejectedPolicyError != nil {
+            return .retryableFailure
+        }
+        if let cached, let error = cachedTokenPolicyError(cached) {
+            rejectCachedCredential(cached, error: error, clearMatchingDisk: true)
+            return .retryableFailure
+        }
         let before = cached?.key
         let type = TokenType.from(auth: cached)
         guard type.isRefreshable else { return .retryableFailure }
@@ -309,6 +384,12 @@ public actor AuthManager {
             await self.performRefresh(reason: reason)
         }
         try Task.checkCancellation()
+        if let rejectedPolicyError {
+            throw rejectedPolicyError
+        }
+        if let refreshPersistenceError {
+            throw refreshPersistenceError
+        }
         if ok, let auth = cached {
             if reason == .serverRejected || !isExpired(auth, environment: environment) {
                 return auth
@@ -325,10 +406,16 @@ public actor AuthManager {
 
     private func performRefresh(reason: RefreshReason) async -> Bool {
         guard !Task.isCancelled else { return false }
+        refreshPersistenceError = nil
         let diskAuth: GrokAuth? = {
             guard let store = try? readAuthJSON(at: path) else { return nil }
             return lookupAuth(store, scope: scope)
         }()
+
+        if let diskAuth, let error = cachedTokenPolicyError(diskAuth) {
+            rejectCachedCredential(diskAuth, error: error, clearMatchingDisk: true)
+            return false
+        }
 
         // Sibling adoption: disk has different valid token.
         if let diskAuth,
@@ -336,12 +423,51 @@ public actor AuthManager {
            diskAuth.key != cached?.key {
             cached = diskAuth
             permanentFailure = nil
+            rejectedPolicyError = nil
+            publishSnapshot()
+            return true
+        }
+
+        guard let refresher else { return false }
+
+        let fileLock: AdvisoryLock
+        do {
+            fileLock = try tryLockAuthFile(at: path)
+        } catch {
+            if let adopted = tryAdoptDisk(requiringDifferentKey: true) {
+                return cached?.key == adopted.key
+            }
+            return false
+        }
+        defer { fileLock.release() }
+
+        let lockedDiskAuth: GrokAuth? = {
+            guard let store = try? readAuthJSON(at: path) else { return nil }
+            return lookupAuth(store, scope: scope)
+        }()
+
+        if let lockedDiskAuth, let error = cachedTokenPolicyError(lockedDiskAuth) {
+            rejectCachedCredential(
+                lockedDiskAuth,
+                error: error,
+                clearMatchingDisk: true,
+                existingLock: fileLock
+            )
+            return false
+        }
+
+        if let lockedDiskAuth,
+           !isExpired(lockedDiskAuth, environment: environment),
+           lockedDiskAuth.key != cached?.key {
+            cached = lockedDiskAuth
+            permanentFailure = nil
+            rejectedPolicyError = nil
             publishSnapshot()
             return true
         }
 
         let credential = resolveRefreshCredential(
-            disk: diskAuth,
+            disk: lockedDiskAuth,
             expired: cached,
             current: {
                 guard let c = cached, !isExpired(c, environment: environment) else { return nil }
@@ -350,26 +476,39 @@ public actor AuthManager {
             reason: reason
         )
 
-        guard let refresher else { return false }
-
-        let outcome = await refresher.refresh(reason: reason, current: credential)
-        do {
-            try Task.checkCancellation()
-        } catch {
+        if let credential, let error = cachedTokenPolicyError(credential) {
+            rejectCachedCredential(
+                credential,
+                error: error,
+                clearMatchingDisk: true,
+                existingLock: fileLock
+            )
             return false
         }
+        guard !Task.isCancelled else { return false }
+
+        let outcome = await refresher.refresh(reason: reason, current: credential)
         switch outcome {
         case .success(let auth):
             do {
-                try update(auth)
+                // Once the refresh token was spent, cancellation must not discard its
+                // rotated successor: persist it before the waiting caller is cancelled.
+                try updateUnderHeldLock(auth, checkCancellation: false)
                 return true
-            } catch is CancellationError {
+            } catch let error as AuthError {
+                if case .pinnedTeamMismatch = error {
+                    rejectCachedCredential(auth, error: error, clearMatchingDisk: false)
+                } else if case .apiKeyAuthDisabled = error {
+                    rejectCachedCredential(auth, error: error, clearMatchingDisk: false)
+                } else {
+                    refreshPersistenceError = error
+                }
                 return false
             } catch {
-                cached = auth
-                permanentFailure = nil
-                publishSnapshot()
-                return true
+                refreshPersistenceError = .storage(
+                    "could not durably persist refreshed authentication credentials"
+                )
+                return false
             }
         case .permanentFailure(let failReason, let triedKey):
             permanentFailure = (
@@ -383,13 +522,22 @@ public actor AuthManager {
         }
     }
 
-    private func tryAdoptDisk() -> GrokAuth? {
+    private func tryAdoptDisk(requiringDifferentKey: Bool = false) -> GrokAuth? {
         guard let store = try? readAuthJSON(at: path),
               let auth = lookupAuth(store, scope: scope),
               !isExpired(auth, environment: environment)
         else { return nil }
+        if let error = cachedTokenPolicyError(auth) {
+            rejectCachedCredential(auth, error: error, clearMatchingDisk: true)
+            return nil
+        }
+        if requiringDifferentKey, auth.key == cached?.key {
+            return nil
+        }
         cached = auth
         permanentFailure = nil
+        rejectedPolicyError = nil
+        refreshPersistenceError = nil
         publishSnapshot()
         return auth
     }
@@ -415,20 +563,93 @@ public actor AuthManager {
     }
 
     private func cachedTokenPolicyError(_ auth: GrokAuth) -> AuthError? {
-        if auth.authMode == .apiKey && grokComConfig.apiKeyAuthDisabled(environment: environment) {
-            return .apiKeyAuthDisabled
+        Self.cachedTokenPolicyError(auth, config: grokComConfig, environment: environment)
+    }
+
+    private static func cachedTokenPolicyError(
+        _ auth: GrokAuth,
+        config: GrokComConfig,
+        environment: [String: String]
+    ) -> AuthError? {
+        if auth.authMode == .apiKey {
+            return config.apiKeyAuthDisabled(environment: environment)
+                ? .apiKeyAuthDisabled
+                : nil
         }
-        if let policy = grokComConfig.forceLoginTeamUUID {
-            let actual = auth.teamID ?? auth.principalID
-            do {
-                try enforceLoginPrincipal(policy: policy, actual: actual)
-            } catch let err as AuthError {
-                return err
-            } catch {
-                return nil
+        guard let policy = config.forceLoginTeamUUID else { return nil }
+        do {
+            try enforceLoginPrincipal(
+                policy: policy,
+                actual: peekAccessTokenPrincipalID(auth.key)
+            )
+            return nil
+        } catch let error as AuthError {
+            return error
+        } catch {
+            return .pinnedTeamMismatch(
+                message: "The access-token principal could not be verified against administrator policy."
+            )
+        }
+    }
+
+    private func rejectCachedCredential(
+        _ rejected: GrokAuth,
+        error: AuthError,
+        clearMatchingDisk: Bool,
+        existingLock: AdvisoryLock? = nil
+    ) {
+        if clearMatchingDisk {
+            Self.removePersistedCredentialIfUnchanged(
+                at: path,
+                scope: scope,
+                rejected: rejected,
+                existingLock: existingLock
+            )
+        }
+        cached = nil
+        permanentFailure = nil
+        rejectedPolicyError = error
+        refreshPersistenceError = nil
+        snapshotBox.write(CredentialSnapshot())
+    }
+
+    private static func removePersistedCredentialIfUnchanged(
+        at path: URL,
+        scope: String,
+        rejected: GrokAuth,
+        existingLock: AdvisoryLock? = nil
+    ) {
+        let lock: AdvisoryLock
+        if let existingLock {
+            lock = existingLock
+        } else {
+            guard let acquired = try? tryLockAuthFile(at: path) else { return }
+            lock = acquired
+        }
+        defer {
+            if existingLock == nil {
+                lock.release()
             }
         }
-        return nil
+
+        guard var store = try? readAuthJSON(at: path) else { return }
+        let ownedScope: String
+        if store[scope] == rejected {
+            ownedScope = scope
+        } else if scope != legacyAuthScope,
+                  store[scope] == nil,
+                  store[legacyAuthScope] == rejected {
+            ownedScope = legacyAuthScope
+        } else {
+            return
+        }
+
+        store.removeValue(forKey: ownedScope)
+        if store.isEmpty {
+            try? FileManager.default.removeItem(at: path)
+        } else {
+            try? writeAuthJSON(at: path, store: store)
+        }
     }
 }
 

@@ -448,9 +448,22 @@ public struct OpenGrokShellToolCall: Sendable, Equatable {
     }
 }
 
+public struct OpenGrokShellToolImage: Sendable, Equatable {
+    public let mimeType: String
+    public let base64Data: String
+    public let path: String?
+
+    public init(mimeType: String, base64Data: String, path: String? = nil) {
+        self.mimeType = mimeType
+        self.base64Data = base64Data
+        self.path = path
+    }
+}
+
 public struct OpenGrokShellToolCallResult: Sendable, Equatable {
     public let value: JSONValue
     public let promptText: String
+    public let images: [OpenGrokShellToolImage]
     /// Pager/card terminal state. Distinct from `Result.failure` so a nonzero
     /// bash exit keeps real `promptText` (combined output + exit detail) while
     /// the live update still paints a failed accent. Default `.succeeded`.
@@ -459,11 +472,13 @@ public struct OpenGrokShellToolCallResult: Sendable, Equatable {
     public init(
         value: JSONValue,
         promptText: String,
-        displayState: OpenGrokShellToolState = .succeeded
+        displayState: OpenGrokShellToolState = .succeeded,
+        images: [OpenGrokShellToolImage] = []
     ) {
         self.value = value
         self.promptText = promptText
         self.displayState = displayState
+        self.images = images
     }
 }
 

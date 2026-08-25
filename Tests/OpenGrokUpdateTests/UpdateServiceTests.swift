@@ -8,17 +8,21 @@ import Testing
 
 @Suite("release platform gate")
 struct ReleasePlatformTests {
-    @Test("only the two published targets are installable")
+    @Test("only the three published updater targets are installable")
     func supportedTargets() {
         #expect(ReleasePlatform(operatingSystem: "macos", architecture: "aarch64")
+            .isSupportedForRelease)
+        #expect(ReleasePlatform(operatingSystem: "linux", architecture: "x86_64")
             .isSupportedForRelease)
         #expect(ReleasePlatform(operatingSystem: "windows", architecture: "x86_64")
             .isSupportedForRelease)
         // Anything else has no asset published, so it must fail with a clear
         // message rather than 404 on a synthesized name.
-        #expect(ReleasePlatform(operatingSystem: "linux", architecture: "x86_64")
+        #expect(ReleasePlatform(operatingSystem: "linux", architecture: "aarch64")
             .isSupportedForRelease == false)
         #expect(ReleasePlatform(operatingSystem: "macos", architecture: "x86_64")
+            .isSupportedForRelease == false)
+        #expect(ReleasePlatform(operatingSystem: "windows", architecture: "aarch64")
             .isSupportedForRelease == false)
     }
 
@@ -26,6 +30,8 @@ struct ReleasePlatformTests {
     func assetNames() {
         #expect(ReleasePlatform(operatingSystem: "macos", architecture: "aarch64").assetName
             == "open-grok-macos-aarch64")
+        #expect(ReleasePlatform(operatingSystem: "linux", architecture: "x86_64").assetName
+            == "open-grok-linux-x86_64")
         #expect(ReleasePlatform(operatingSystem: "windows", architecture: "x86_64").assetName
             == "open-grok-windows-x86_64.exe")
     }
@@ -35,6 +41,18 @@ struct ReleasePlatformTests {
         let platform = ReleasePlatform(operatingSystem: "macos", architecture: "aarch64")
         #expect(platform.versionedPlatform == "macos-aarch64")
         #expect(platform.binaryExtension == "")
+
+        let linuxPlatform = ReleasePlatform(operatingSystem: "linux", architecture: "x86_64")
+        #expect(linuxPlatform.versionedPlatform == "linux-x86_64")
+        #expect(linuxPlatform.binaryExtension == "")
+    }
+
+    @Test("Linux platform and unsupported-platform text match the pinned updater")
+    func platformDisplayText() {
+        let linuxPlatform = ReleasePlatform(operatingSystem: "linux", architecture: "x86_64")
+        #expect(linuxPlatform.displayName == "Linux x86_64")
+        #expect(ReleasePlatform.unsupportedPlatformMessage
+            == "Open Grok currently publishes updates only for macOS on Apple Silicon, Linux x86_64, and Windows x86_64")
     }
 }
 
@@ -49,6 +67,16 @@ struct UpdatePathsTests {
         )
         #expect(url.lastPathComponent == "open-grok-0.1.220-macos-aarch64")
         #expect(url.deletingLastPathComponent().lastPathComponent == "downloads")
+    }
+
+    @Test("Linux downloads use the pinned updater's versioned platform")
+    func linuxDownloadPath() {
+        let paths = UpdatePaths(environment: ["OPENGROK_HOME": "/tmp/og-home"])
+        let url = paths.downloadURL(
+            version: "0.1.220",
+            platform: ReleasePlatform(operatingSystem: "linux", architecture: "x86_64")
+        )
+        #expect(url.lastPathComponent == "open-grok-0.1.220-linux-x86_64")
     }
 }
 

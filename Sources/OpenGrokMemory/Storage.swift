@@ -1,6 +1,13 @@
 import Foundation
+import OpenGrokConfig
 import OpenGrokFileUtils
 import OpenGrokPaths
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 public struct MemoryStorage: Equatable, Sendable {
     public let globalDir: URL
@@ -11,27 +18,38 @@ public struct MemoryStorage: Equatable, Sendable {
     public init(
         cwd: URL,
         rootOverride: URL? = nil,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        workspaceIdentity: String? = nil
     ) {
         self.init(
             cwd: cwd,
             globalDir: rootOverride ?? OpenGrokStatePaths.stateDirectory(environment: environment)
                 .appendingPathComponent("memory", isDirectory: true),
-            useWorkspaceHash: true
+            useWorkspaceHash: true,
+            workspaceIdentity: workspaceIdentity ?? Self.discoverWorkspaceIdentity(cwd: cwd)
         )
     }
 
     public static func newFlat(cwd: URL, root: URL) -> MemoryStorage {
-        MemoryStorage(cwd: cwd, globalDir: root.standardizedFileURL, useWorkspaceHash: false)
+        MemoryStorage(
+            cwd: cwd,
+            globalDir: root.standardizedFileURL,
+            useWorkspaceHash: false,
+            workspaceIdentity: nil
+        )
     }
 
-    private init(cwd: URL, globalDir: URL, useWorkspaceHash: Bool) {
+    private init(cwd: URL, globalDir: URL, useWorkspaceHash: Bool, workspaceIdentity: String?) {
         let normalizedCWD = cwd.standardizedFileURL
         let workspaceDir: URL
         if useWorkspaceHash {
-            let name = slugify(normalizedCWD.lastPathComponent, maxLength: 40)
+            let canonicalCWD = normalizedCWD.resolvingSymlinksInPath().standardizedFileURL
+            let identity = workspaceIdentity.flatMap(Self.validatedWorkspaceIdentity)
+            let slugSource = identity?.split(separator: "/").last.map(String.init)
+                ?? canonicalCWD.lastPathComponent
+            let name = slugify(slugSource, maxLength: 40)
             let slug = name.isEmpty ? "workspace" : name
-            let hash = String(FileChecksum.sha256Hex(normalizedCWD.path).prefix(8))
+            let hash = Blake3.hexPrefix(identity ?? canonicalCWD.path, length: 8)
             workspaceDir = globalDir.appendingPathComponent("\(slug)-\(hash)", isDirectory: true)
         } else {
             workspaceDir = globalDir
@@ -82,16 +100,19 @@ public struct MemoryStorage: Equatable, Sendable {
             return path
         }
 
-        try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+        try Self.ensureSecureDirectory(globalDir)
+        try Self.ensureSecureDirectory(workspaceDir)
+        try Self.ensureSecureDirectory(sessionsDir)
         if append, FileManager.default.fileExists(atPath: path.path) {
+            try SecureFile.ensureOwnerOnlyPermissions(at: path)
             let old = try String(contentsOf: path, encoding: .utf8)
             let timestamp = Self.utcTimestamp()
-            try writeAtomically(
-                path,
+            try SecureFile.write(
+                at: path,
                 contents: "\(old)\n\n---\n\n<!-- flush \(timestamp) -->\n\n\(content)"
             )
         } else {
-            try writeAtomically(path, contents: content)
+            try SecureFile.write(at: path, contents: content)
         }
         return path
     }
@@ -101,15 +122,16 @@ public struct MemoryStorage: Equatable, Sendable {
         switch scope {
         case .global:
             path = globalMemoryFile
-            try FileManager.default.createDirectory(at: globalDir, withIntermediateDirectories: true)
+            try Self.ensureSecureDirectory(globalDir)
         case .workspace:
             if isEphemeral { return }
             path = workspaceMemoryFile
-            try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+            try Self.ensureSecureDirectory(globalDir)
+            try Self.ensureSecureDirectory(workspaceDir)
         case .session:
             throw MemoryError.unsupportedScope(scope)
         }
-        try writeAtomically(path, contents: content)
+        try SecureFile.write(at: path, contents: content)
     }
 
     public func appendToMemory(scope: MemoryScope, content: String) throws {
@@ -121,19 +143,24 @@ public struct MemoryStorage: Equatable, Sendable {
         switch scope {
         case .global:
             path = globalMemoryFile
-            try FileManager.default.createDirectory(at: globalDir, withIntermediateDirectories: true)
+            try Self.ensureSecureDirectory(globalDir)
         case .workspace:
             path = workspaceMemoryFile
-            try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+            try Self.ensureSecureDirectory(globalDir)
+            try Self.ensureSecureDirectory(workspaceDir)
         case .session:
             throw MemoryError.unsupportedScope(scope)
         }
 
-        let existing = FileManager.default.fileExists(atPath: path.path)
-            ? try String(contentsOf: path, encoding: .utf8)
-            : ""
+        let existing: String
+        if FileManager.default.fileExists(atPath: path.path) {
+            try SecureFile.ensureOwnerOnlyPermissions(at: path)
+            existing = try String(contentsOf: path, encoding: .utf8)
+        } else {
+            existing = ""
+        }
         let output = existing.isEmpty ? normalized : "\(existing)\n\n\(normalized)"
-        try writeAtomically(path, contents: output)
+        try SecureFile.write(at: path, contents: output)
     }
 
     public func readFile(path: URL, from: Int = 0, lines: Int? = nil) throws -> String {
@@ -142,6 +169,9 @@ public struct MemoryStorage: Equatable, Sendable {
             throw MemoryError.memoryDirectoryMissing(canonicalRoot.path)
         }
 
+        if try path.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink == true {
+            throw MemoryError.unsafePath(path.path)
+        }
         let canonicalPath = path.resolvingSymlinksInPath().standardizedFileURL
         guard isWithin(canonicalPath, root: canonicalRoot) else {
             throw MemoryError.pathOutsideMemory(path: path.path, root: canonicalRoot.path)
@@ -159,39 +189,49 @@ public struct MemoryStorage: Equatable, Sendable {
 
     public func listMemoryFiles() throws -> [URL] {
         var files: [URL] = []
-        if FileManager.default.fileExists(atPath: globalMemoryFile.path) {
+        if try Self.isSafeRegularFile(globalMemoryFile) {
             files.append(globalMemoryFile)
         }
-        if FileManager.default.fileExists(atPath: workspaceMemoryFile.path) {
+        if try Self.isSafeRegularFile(workspaceMemoryFile) {
             files.append(workspaceMemoryFile)
         }
         if FileManager.default.fileExists(atPath: sessionsDir.path) {
+            try Self.ensureSecureDirectory(sessionsDir)
             let sessionFiles = try FileManager.default.contentsOfDirectory(
                 at: sessionsDir,
-                includingPropertiesForKeys: [.isRegularFileKey],
+                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
                 options: [.skipsHiddenFiles]
             )
-            files.append(contentsOf: sessionFiles.filter { $0.pathExtension == "md" }.sorted { $0.path < $1.path })
+            for file in sessionFiles where file.pathExtension == "md" {
+                if try Self.isSafeRegularFile(file) {
+                    files.append(file)
+                }
+            }
+            files.sort { $0.path < $1.path }
         }
         return files
     }
 
     public func ensureInitialized() throws {
-        try FileManager.default.createDirectory(at: globalDir, withIntermediateDirectories: true)
+        try Self.ensureSecureDirectory(globalDir)
         if !FileManager.default.fileExists(atPath: globalMemoryFile.path) {
-            try writeAtomically(
-                globalMemoryFile,
+            try SecureFile.write(
+                at: globalMemoryFile,
                 contents: "# Global Memory\n\n> This file is automatically managed by Grok's memory system.\n> You can also edit it manually — changes will be indexed on next session.\n\n## Preferences\n\n<!-- Add any cross-project preferences here -->\n"
             )
+        } else {
+            try SecureFile.ensureOwnerOnlyPermissions(at: globalMemoryFile)
         }
         if isEphemeral { return }
 
-        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        try Self.ensureSecureDirectory(workspaceDir)
         if !FileManager.default.fileExists(atPath: workspaceMemoryFile.path) {
-            try writeAtomically(
-                workspaceMemoryFile,
+            try SecureFile.write(
+                at: workspaceMemoryFile,
                 contents: "# Project Memory — \(workspacePath.path)\n\n> Auto-populated by dream consolidation. Edit freely.\n"
             )
+        } else {
+            try SecureFile.ensureOwnerOnlyPermissions(at: workspaceMemoryFile)
         }
     }
 
@@ -207,6 +247,153 @@ public struct MemoryStorage: Equatable, Sendable {
         guard FileManager.default.fileExists(atPath: globalMemoryFile.path) else { return false }
         try FileManager.default.removeItem(at: globalMemoryFile)
         return true
+    }
+
+    public static func normalizeRemoteURL(_ remote: String) -> String? {
+        let value = remote.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty,
+              !value.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+              let colon = value.firstIndex(of: ":")
+        else { return nil }
+
+        let prefix = value[..<colon]
+        let rawPath: Substring
+        if prefix.contains("@"), !prefix.contains("/") {
+            rawPath = value[value.index(after: colon)...]
+        } else {
+            guard let scheme = value.range(of: "//"),
+                  let firstSlash = value[scheme.upperBound...].firstIndex(of: "/")
+            else { return nil }
+            rawPath = value[value.index(after: firstSlash)...]
+        }
+
+        var cleaned = String(rawPath)
+        if cleaned.hasSuffix(".git") {
+            cleaned.removeLast(4)
+        }
+        cleaned = cleaned.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return validatedWorkspaceIdentity(cleaned)
+    }
+
+    /// Read repository-local configuration without running a shell. The live
+    /// composition can inject Git's authoritative answer when includes apply.
+    public static func discoverWorkspaceIdentity(cwd: URL) -> String? {
+        var current = cwd.resolvingSymlinksInPath().standardizedFileURL
+        while true {
+            let marker = current.appendingPathComponent(".git")
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: marker.path, isDirectory: &isDirectory) {
+                let gitDirectory: URL
+                if isDirectory.boolValue {
+                    gitDirectory = marker
+                } else {
+                    guard let pointer = try? String(contentsOf: marker, encoding: .utf8),
+                          pointer.hasPrefix("gitdir:")
+                    else { return nil }
+                    let rawPath = String(pointer.dropFirst("gitdir:".count))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !rawPath.isEmpty else { return nil }
+                    gitDirectory = URL(fileURLWithPath: rawPath, relativeTo: current)
+                        .standardizedFileURL
+                }
+
+                let commonMarker = gitDirectory.appendingPathComponent("commondir")
+                let commonDirectory: URL
+                if let relative = try? String(contentsOf: commonMarker, encoding: .utf8) {
+                    commonDirectory = URL(
+                        fileURLWithPath: relative.trimmingCharacters(in: .whitespacesAndNewlines),
+                        relativeTo: gitDirectory
+                    ).standardizedFileURL
+                } else {
+                    commonDirectory = gitDirectory
+                }
+                return originIdentity(in: commonDirectory.appendingPathComponent("config"))
+                    ?? originIdentity(in: gitDirectory.appendingPathComponent("config"))
+            }
+
+            let parent = current.deletingLastPathComponent().standardizedFileURL
+            guard parent.path.count < current.path.count else { return nil }
+            current = parent
+        }
+    }
+
+    static func ensureSecureDirectory(_ directory: URL) throws {
+        try PathSecurity.rejectHostileLexical(directory.path)
+        if FileManager.default.fileExists(atPath: directory.path) {
+            try validateSecureDirectory(directory, enforcePermissions: false)
+        }
+        try createDirAllOwnerOnly(directory)
+        try validateSecureDirectory(directory)
+    }
+
+    private static func validateSecureDirectory(
+        _ directory: URL,
+        enforcePermissions: Bool = true
+    ) throws {
+        let values = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true, values.isSymbolicLink != true else {
+            throw MemoryError.unsafePath(directory.path)
+        }
+        #if !os(Windows)
+        let attributes = try FileManager.default.attributesOfItem(atPath: directory.path)
+        guard (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == getuid() else {
+            throw MemoryError.unsafePath(directory.path)
+        }
+        if enforcePermissions {
+            guard (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o700 else {
+                throw MemoryError.unsafePath(directory.path)
+            }
+        }
+        #endif
+    }
+
+    private static func isSafeRegularFile(_ path: URL) throws -> Bool {
+        guard FileManager.default.fileExists(atPath: path.path) else { return false }
+        let values = try path.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true else {
+            throw MemoryError.unsafePath(path.path)
+        }
+        try SecureFile.ensureOwnerOnlyPermissions(at: path)
+        guard try SecureFile.isOwnerOnly(at: path) else {
+            throw MemoryError.unsafePath(path.path)
+        }
+        return true
+    }
+
+    private static func validatedWorkspaceIdentity(_ identity: String) -> String? {
+        guard identity.contains("/"), !identity.contains("\\"),
+              !identity.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
+        else { return nil }
+        let components = identity.split(separator: "/", omittingEmptySubsequences: false)
+        guard components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            return nil
+        }
+        return identity
+    }
+
+    private static func originIdentity(in configuration: URL) -> String? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: configuration.path),
+              let size = attributes[.size] as? NSNumber,
+              size.intValue <= 1_048_576,
+              let contents = try? String(contentsOf: configuration, encoding: .utf8)
+        else { return nil }
+
+        var inOrigin = false
+        for line in contents.split(whereSeparator: \.isNewline) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("[") {
+                inOrigin = trimmed.lowercased() == "[remote \"origin\"]"
+                continue
+            }
+            guard inOrigin, let separator = trimmed.firstIndex(of: "=") else { continue }
+            let key = trimmed[..<separator].trimmingCharacters(in: .whitespaces).lowercased()
+            guard key == "url" else { continue }
+            let value = trimmed[trimmed.index(after: separator)...]
+                .trimmingCharacters(in: .whitespaces)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            return normalizeRemoteURL(value)
+        }
+        return nil
     }
 }
 

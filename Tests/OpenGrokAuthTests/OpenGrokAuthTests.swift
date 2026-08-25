@@ -518,11 +518,16 @@ struct AuthManagerTests {
         var cfg = makeConfig()
         cfg.forceLoginTeamUUID = .single("required-team")
         let manager = AuthManager(grokHome: home, config: cfg, environment: [:])
-        var auth = GrokAuth.testDefault(key: "k", userID: "u", authMode: .oidc)
+        var auth = GrokAuth.testDefault(
+            key: buildTestJWT(payload: ["principal_id": "other-team"]),
+            userID: "u",
+            authMode: .oidc
+        )
         auth.teamID = "other-team"
         auth.expiresAt = Date().addingTimeInterval(3600)
-        // hotSwap bypasses policy; auth() enforces.
         await manager.hotSwap(auth)
+        #expect(await manager.currentOrExpired() == nil)
+        #expect(manager.snapshotBox.read().token == nil)
         do {
             _ = try await manager.auth()
             Issue.record("expected pinned team mismatch")

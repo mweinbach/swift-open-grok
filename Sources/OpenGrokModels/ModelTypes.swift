@@ -21,6 +21,40 @@ public let DEFAULT_CONTEXT_WINDOW: UInt64 = 256_000
 /// Fallback context window for a brand-new config-only model (200k).
 public let NEW_MODEL_DEFAULT_CONTEXT_WINDOW: UInt64 = 200_000
 
+/// Initial conversation context selected for subagents spawned on a model.
+///
+/// Catalogs accept the same legacy aliases as Rust's `SubagentContextMode`,
+/// while persisted values always use its canonical `fresh` / `fork` spelling.
+public enum ModelSubagentContextMode: String, Sendable, Equatable, Hashable, Codable {
+    case fresh
+    case fork
+
+    public init?(wireValue: String) {
+        switch wireValue {
+        case "fresh", "Fresh", "new", "clean": self = .fresh
+        case "fork", "Fork", "forked", "Forked": self = .fork
+        default: return nil
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let value = try container.decode(String.self)
+        guard let decoded = Self(wireValue: value) else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "unknown subagent context mode: \(value)"
+            )
+        }
+        self = decoded
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+}
+
 // MARK: - ModelInfo
 
 /// Shared model metadata — the common fields across all model sources.
@@ -39,6 +73,7 @@ public struct ModelInfo: Sendable, Equatable, Codable {
     public var apiBackend: ApiBackend
     public var provider: ModelProvider
     public var toolMode: ToolMode?
+    public var subagentContextDefault: ModelSubagentContextMode?
     public var codexMultiAgentV2: Bool
     public var authScheme: AuthScheme
     /// Insertion-ordered extra headers.
@@ -65,6 +100,7 @@ public struct ModelInfo: Sendable, Equatable, Codable {
     public var supportsReasoningSummaryParameter: Bool
     public var defaultReasoningSummary: ReasoningSummary
     public var supportsBackendSearch: Bool
+    public var supportsStandaloneWebSearch: Bool?
     public var compactionsRemaining: CompactionsRemaining?
     public var compactionAtTokens: CompactionAtTokens?
     public var showModelFingerprint: Bool
@@ -83,6 +119,7 @@ public struct ModelInfo: Sendable, Equatable, Codable {
         apiBackend: ApiBackend = .defaultValue,
         provider: ModelProvider = .defaultValue,
         toolMode: ToolMode? = nil,
+        subagentContextDefault: ModelSubagentContextMode? = nil,
         codexMultiAgentV2: Bool = false,
         authScheme: AuthScheme = .defaultValue,
         extraHeaders: [(String, String)] = [],
@@ -103,6 +140,7 @@ public struct ModelInfo: Sendable, Equatable, Codable {
         supportsReasoningSummaryParameter: Bool = true,
         defaultReasoningSummary: ReasoningSummary = .none,
         supportsBackendSearch: Bool = false,
+        supportsStandaloneWebSearch: Bool? = nil,
         compactionsRemaining: CompactionsRemaining? = nil,
         compactionAtTokens: CompactionAtTokens? = nil,
         showModelFingerprint: Bool = false,
@@ -120,6 +158,7 @@ public struct ModelInfo: Sendable, Equatable, Codable {
         self.apiBackend = apiBackend
         self.provider = provider
         self.toolMode = toolMode
+        self.subagentContextDefault = subagentContextDefault
         self.codexMultiAgentV2 = codexMultiAgentV2
         self.authScheme = authScheme
         self.extraHeaders = extraHeaders
@@ -140,6 +179,7 @@ public struct ModelInfo: Sendable, Equatable, Codable {
         self.supportsReasoningSummaryParameter = supportsReasoningSummaryParameter
         self.defaultReasoningSummary = defaultReasoningSummary
         self.supportsBackendSearch = supportsBackendSearch
+        self.supportsStandaloneWebSearch = supportsStandaloneWebSearch
         self.compactionsRemaining = compactionsRemaining
         self.compactionAtTokens = compactionAtTokens
         self.showModelFingerprint = showModelFingerprint
@@ -207,6 +247,7 @@ public struct ModelInfo: Sendable, Equatable, Codable {
         case topP = "top_p"
         case apiBackend = "api_backend"
         case toolMode = "tool_mode"
+        case subagentContextDefault = "subagent_context_default"
         case codexMultiAgentV2 = "codex_multi_agent_v2"
         case authScheme = "auth_scheme"
         case extraHeaders = "extra_headers"
@@ -225,6 +266,7 @@ public struct ModelInfo: Sendable, Equatable, Codable {
         case supportsReasoningSummaryParameter = "supports_reasoning_summary_parameter"
         case defaultReasoningSummary = "default_reasoning_summary"
         case supportsBackendSearch = "supports_backend_search"
+        case supportsStandaloneWebSearch = "supports_standalone_web_search"
         case compactionsRemaining = "compactions_remaining"
         case compactionAtTokens = "compaction_at_tokens"
         case showModelFingerprint = "show_model_fingerprint"
@@ -268,6 +310,8 @@ public struct ModelInfo: Sendable, Equatable, Codable {
         } else {
             toolMode = nil
         }
+        subagentContextDefault =
+            try c.decodeIfPresent(ModelSubagentContextMode.self, forKey: .subagentContextDefault)
         codexMultiAgentV2 = try c.decodeIfPresent(Bool.self, forKey: .codexMultiAgentV2) ?? false
         if let raw = try c.decodeIfPresent(String.self, forKey: .authScheme) {
             guard let decoded = WireCodec.authScheme(raw) else {
@@ -320,6 +364,8 @@ public struct ModelInfo: Sendable, Equatable, Codable {
             defaultReasoningSummary = .none
         }
         supportsBackendSearch = try c.decodeIfPresent(Bool.self, forKey: .supportsBackendSearch) ?? false
+        supportsStandaloneWebSearch =
+            try c.decodeIfPresent(Bool.self, forKey: .supportsStandaloneWebSearch)
         compactionsRemaining = try c.decodeIfPresent(CompactionsRemaining.self, forKey: .compactionsRemaining)
         compactionAtTokens = try c.decodeIfPresent(CompactionAtTokens.self, forKey: .compactionAtTokens)
         showModelFingerprint = try c.decodeIfPresent(Bool.self, forKey: .showModelFingerprint) ?? false
@@ -344,6 +390,7 @@ public struct ModelInfo: Sendable, Equatable, Codable {
         if let toolMode {
             try c.encode(WireCodec.toolModeWire(toolMode), forKey: .toolMode)
         }
+        try c.encodeIfPresent(subagentContextDefault, forKey: .subagentContextDefault)
         if codexMultiAgentV2 { try c.encode(true, forKey: .codexMultiAgentV2) }
         try c.encode(authScheme, forKey: .authScheme)
         if !extraHeaders.isEmpty {
@@ -371,6 +418,7 @@ public struct ModelInfo: Sendable, Equatable, Codable {
         try c.encode(supportsReasoningSummaryParameter, forKey: .supportsReasoningSummaryParameter)
         try c.encode(defaultReasoningSummary.rawValue, forKey: .defaultReasoningSummary)
         try c.encode(supportsBackendSearch, forKey: .supportsBackendSearch)
+        try c.encodeIfPresent(supportsStandaloneWebSearch, forKey: .supportsStandaloneWebSearch)
         try c.encodeIfPresent(compactionsRemaining, forKey: .compactionsRemaining)
         try c.encodeIfPresent(compactionAtTokens, forKey: .compactionAtTokens)
         if showModelFingerprint { try c.encode(true, forKey: .showModelFingerprint) }
@@ -390,6 +438,7 @@ public struct ModelInfo: Sendable, Equatable, Codable {
             && lhs.apiBackend == rhs.apiBackend
             && lhs.provider == rhs.provider
             && lhs.toolMode == rhs.toolMode
+            && lhs.subagentContextDefault == rhs.subagentContextDefault
             && lhs.codexMultiAgentV2 == rhs.codexMultiAgentV2
             && lhs.authScheme == rhs.authScheme
             && lhs.extraHeaders.map(\.0) == rhs.extraHeaders.map(\.0)
@@ -411,6 +460,7 @@ public struct ModelInfo: Sendable, Equatable, Codable {
             && lhs.supportsReasoningSummaryParameter == rhs.supportsReasoningSummaryParameter
             && lhs.defaultReasoningSummary == rhs.defaultReasoningSummary
             && lhs.supportsBackendSearch == rhs.supportsBackendSearch
+            && lhs.supportsStandaloneWebSearch == rhs.supportsStandaloneWebSearch
             && lhs.compactionsRemaining == rhs.compactionsRemaining
             && lhs.compactionAtTokens == rhs.compactionAtTokens
             && lhs.showModelFingerprint == rhs.showModelFingerprint
@@ -530,6 +580,7 @@ public struct ModelEntryConfig: Sendable, Equatable {
     public var envKey: EnvKeys?
     public var apiKey: String?
     public var toolMode: ToolMode?
+    public var subagentContextDefault: ModelSubagentContextMode?
     public var multiAgentVersion: String?
     public var codexMultiAgentV2: Bool
     public var authScheme: AuthScheme?
@@ -544,6 +595,7 @@ public struct ModelEntryConfig: Sendable, Equatable {
     public var supportsReasoningSummaryParameter: Bool
     public var defaultReasoningSummary: ReasoningSummary
     public var supportsBackendSearch: Bool
+    public var supportsStandaloneWebSearch: Bool?
     public var compactionsRemaining: CompactionsRemaining?
     public var compactionAtTokens: CompactionAtTokens?
     public var showModelFingerprint: Bool
@@ -570,6 +622,7 @@ public struct ModelEntryConfig: Sendable, Equatable {
         envKey: EnvKeys? = nil,
         apiKey: String? = nil,
         toolMode: ToolMode? = nil,
+        subagentContextDefault: ModelSubagentContextMode? = nil,
         multiAgentVersion: String? = nil,
         codexMultiAgentV2: Bool = false,
         authScheme: AuthScheme? = nil,
@@ -584,6 +637,7 @@ public struct ModelEntryConfig: Sendable, Equatable {
         supportsReasoningSummaryParameter: Bool = true,
         defaultReasoningSummary: ReasoningSummary = .none,
         supportsBackendSearch: Bool = false,
+        supportsStandaloneWebSearch: Bool? = nil,
         compactionsRemaining: CompactionsRemaining? = nil,
         compactionAtTokens: CompactionAtTokens? = nil,
         showModelFingerprint: Bool = false,
@@ -609,6 +663,7 @@ public struct ModelEntryConfig: Sendable, Equatable {
         self.envKey = envKey
         self.apiKey = apiKey
         self.toolMode = toolMode
+        self.subagentContextDefault = subagentContextDefault
         self.multiAgentVersion = multiAgentVersion
         self.codexMultiAgentV2 = codexMultiAgentV2
         self.authScheme = authScheme
@@ -623,6 +678,7 @@ public struct ModelEntryConfig: Sendable, Equatable {
         self.supportsReasoningSummaryParameter = supportsReasoningSummaryParameter
         self.defaultReasoningSummary = defaultReasoningSummary
         self.supportsBackendSearch = supportsBackendSearch
+        self.supportsStandaloneWebSearch = supportsStandaloneWebSearch
         self.compactionsRemaining = compactionsRemaining
         self.compactionAtTokens = compactionAtTokens
         self.showModelFingerprint = showModelFingerprint
@@ -649,6 +705,7 @@ extension ModelInfo {
             apiBackend: entry.apiBackend,
             provider: entry.provider,
             toolMode: entry.toolMode,
+            subagentContextDefault: entry.subagentContextDefault,
             codexMultiAgentV2: entry.codexMultiAgentV2,
             authScheme: entry.authScheme ?? .defaultValue,
             extraHeaders: entry.extraHeaders,
@@ -668,6 +725,7 @@ extension ModelInfo {
             supportsReasoningSummaryParameter: entry.supportsReasoningSummaryParameter,
             defaultReasoningSummary: entry.defaultReasoningSummary,
             supportsBackendSearch: entry.supportsBackendSearch,
+            supportsStandaloneWebSearch: entry.supportsStandaloneWebSearch,
             compactionsRemaining: entry.compactionsRemaining,
             compactionAtTokens: entry.compactionAtTokens,
             showModelFingerprint: entry.showModelFingerprint,
@@ -699,6 +757,7 @@ public struct ConfigModelOverride: Sendable, Equatable {
     public var provider: ModelProvider?
     public var authScheme: AuthScheme?
     public var toolMode: ToolMode?
+    public var subagentContextDefault: ModelSubagentContextMode?
     public var extraHeaders: [(String, String)]
     public var contextWindow: UInt64?
     public var autoCompactThresholdPercent: UInt8?
@@ -715,6 +774,7 @@ public struct ConfigModelOverride: Sendable, Equatable {
     public var supportsReasoningSummaryParameter: Bool?
     public var defaultReasoningSummary: ReasoningSummary?
     public var supportsBackendSearch: Bool?
+    public var supportsStandaloneWebSearch: Bool?
     public var compactionsRemaining: CompactionsRemaining?
     public var compactionAtTokens: CompactionAtTokens?
     public var showModelFingerprint: Bool?
@@ -739,6 +799,7 @@ public struct ConfigModelOverride: Sendable, Equatable {
         provider: ModelProvider? = nil,
         authScheme: AuthScheme? = nil,
         toolMode: ToolMode? = nil,
+        subagentContextDefault: ModelSubagentContextMode? = nil,
         extraHeaders: [(String, String)] = [],
         contextWindow: UInt64? = nil,
         autoCompactThresholdPercent: UInt8? = nil,
@@ -755,6 +816,7 @@ public struct ConfigModelOverride: Sendable, Equatable {
         supportsReasoningSummaryParameter: Bool? = nil,
         defaultReasoningSummary: ReasoningSummary? = nil,
         supportsBackendSearch: Bool? = nil,
+        supportsStandaloneWebSearch: Bool? = nil,
         compactionsRemaining: CompactionsRemaining? = nil,
         compactionAtTokens: CompactionAtTokens? = nil,
         showModelFingerprint: Bool? = nil,
@@ -778,6 +840,7 @@ public struct ConfigModelOverride: Sendable, Equatable {
         self.provider = provider
         self.authScheme = authScheme
         self.toolMode = toolMode
+        self.subagentContextDefault = subagentContextDefault
         self.extraHeaders = extraHeaders
         self.contextWindow = contextWindow
         self.autoCompactThresholdPercent = autoCompactThresholdPercent
@@ -794,6 +857,7 @@ public struct ConfigModelOverride: Sendable, Equatable {
         self.supportsReasoningSummaryParameter = supportsReasoningSummaryParameter
         self.defaultReasoningSummary = defaultReasoningSummary
         self.supportsBackendSearch = supportsBackendSearch
+        self.supportsStandaloneWebSearch = supportsStandaloneWebSearch
         self.compactionsRemaining = compactionsRemaining
         self.compactionAtTokens = compactionAtTokens
         self.showModelFingerprint = showModelFingerprint
@@ -835,11 +899,13 @@ public struct ConfigModelOverride: Sendable, Equatable {
             }
             if baseURL == nil { entry.info.baseURL = "" }
             entry.info.toolMode = nil
+            entry.info.subagentContextDefault = nil
             entry.info.codexMultiAgentV2 = false
             entry.info.authScheme = .defaultValue
             entry.info.extraHeaders = []
             entry.info.agentType = entry.info.provider == .codex ? "codex" : DEFAULT_AGENT_TYPE
             entry.info.supportsBackendSearch = false
+            entry.info.supportsStandaloneWebSearch = nil
             entry.info.reasoningEffort = nil
             entry.info.supportsReasoningEffort = false
             entry.info.reasoningEfforts = []
@@ -866,6 +932,7 @@ public struct ConfigModelOverride: Sendable, Equatable {
         }
 
         if let v = toolMode { entry.info.toolMode = v }
+        if let v = subagentContextDefault { entry.info.subagentContextDefault = v }
         if !extraHeaders.isEmpty { entry.info.extraHeaders = extraHeaders }
         if let cw = contextWindow, cw > 0 { entry.info.contextWindow = cw }
         if let v = useConcise { entry.info.useConcise = v }
@@ -901,6 +968,7 @@ public struct ConfigModelOverride: Sendable, Equatable {
             entry.info.defaultReasoningSummary = v
         }
         if let v = supportsBackendSearch { entry.info.supportsBackendSearch = v }
+        if let v = supportsStandaloneWebSearch { entry.info.supportsStandaloneWebSearch = v }
         if compactionsRemaining != nil {
             entry.info.compactionsRemaining = compactionsRemaining
         }
@@ -915,7 +983,7 @@ public struct ConfigModelOverride: Sendable, Equatable {
         if authProvider != nil { entry.authProvider = authProvider }
         if !queryParams.isEmpty { entry.queryParams = Dictionary(uniqueKeysWithValues: queryParams) }
         if !envHTTPHeaders.isEmpty { entry.envHTTPHeaders = Dictionary(uniqueKeysWithValues: envHTTPHeaders) }
-        if supportedInApi == nil, apiKey != nil || envKey != nil {
+        if supportedInApi == nil, apiKey != nil || envKey != nil || authProvider != nil {
             entry.info.supportedInApi = true
         }
         return entry
@@ -937,6 +1005,7 @@ extension ModelEntryConfig {
         lhs.maxCompletionTokens == rhs.maxCompletionTokens && lhs.apiBackend == rhs.apiBackend &&
         lhs.provider == rhs.provider && lhs.envKey == rhs.envKey && lhs.apiKey == rhs.apiKey &&
         lhs.toolMode == rhs.toolMode && lhs.multiAgentVersion == rhs.multiAgentVersion &&
+        lhs.subagentContextDefault == rhs.subagentContextDefault &&
         lhs.codexMultiAgentV2 == rhs.codexMultiAgentV2 && lhs.authScheme == rhs.authScheme &&
         lhs.agentType == rhs.agentType && lhs.inferenceIdleTimeoutSecs == rhs.inferenceIdleTimeoutSecs &&
         lhs.maxRetries == rhs.maxRetries && lhs.hidden == rhs.hidden &&
@@ -946,6 +1015,7 @@ extension ModelEntryConfig {
         lhs.supportsReasoningSummaryParameter == rhs.supportsReasoningSummaryParameter &&
         lhs.defaultReasoningSummary == rhs.defaultReasoningSummary &&
         lhs.supportsBackendSearch == rhs.supportsBackendSearch &&
+        lhs.supportsStandaloneWebSearch == rhs.supportsStandaloneWebSearch &&
         lhs.compactionsRemaining == rhs.compactionsRemaining &&
         lhs.compactionAtTokens == rhs.compactionAtTokens &&
         lhs.showModelFingerprint == rhs.showModelFingerprint &&
@@ -967,6 +1037,7 @@ extension ConfigModelOverride {
         equalStringPairs(lhs.envHTTPHeaders, rhs.envHTTPHeaders) &&
         lhs.temperature == rhs.temperature && lhs.topP == rhs.topP && lhs.apiBackend == rhs.apiBackend &&
         lhs.provider == rhs.provider && lhs.authScheme == rhs.authScheme && lhs.toolMode == rhs.toolMode &&
+        lhs.subagentContextDefault == rhs.subagentContextDefault &&
         equalStringPairs(lhs.extraHeaders, rhs.extraHeaders) && lhs.contextWindow == rhs.contextWindow &&
         lhs.autoCompactThresholdPercent == rhs.autoCompactThresholdPercent &&
         lhs.systemPromptLabel == rhs.systemPromptLabel && lhs.useConcise == rhs.useConcise &&
@@ -978,6 +1049,7 @@ extension ConfigModelOverride {
         lhs.supportsReasoningSummaryParameter == rhs.supportsReasoningSummaryParameter &&
         lhs.defaultReasoningSummary == rhs.defaultReasoningSummary &&
         lhs.supportsBackendSearch == rhs.supportsBackendSearch &&
+        lhs.supportsStandaloneWebSearch == rhs.supportsStandaloneWebSearch &&
         lhs.compactionsRemaining == rhs.compactionsRemaining &&
         lhs.compactionAtTokens == rhs.compactionAtTokens &&
         lhs.showModelFingerprint == rhs.showModelFingerprint &&
@@ -1028,6 +1100,7 @@ extension ModelInfo {
         let slug = model.lowercased()
         return slug.contains("vision") || slug.contains("omni") || slug.contains("vl")
             || slug.contains("grok-vision") || slug.contains("4o") || slug.contains("4.5")
+            || slug.contains("4.6")
             || slug.contains("claude-3-7") || slug.contains("claude-3-5")
     }
 

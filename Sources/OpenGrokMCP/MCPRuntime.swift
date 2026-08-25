@@ -18,7 +18,7 @@ public struct MCPServerConfiguration: Sendable, Hashable, Equatable {
     public init(
         serverInfo: MCPImplementation = MCPImplementation(name: OpenGrokMCP.productName, version: "0.0.0"),
         capabilities: MCPCapabilities = MCPCapabilities(),
-        supportedProtocolVersions: [MCPProtocolVersion] = [.latest, .march2025, .november2024],
+        supportedProtocolVersions: [MCPProtocolVersion] = [.latest, .june2025, .march2025, .november2024],
         instructions: String? = nil
     ) {
         self.serverInfo = serverInfo
@@ -312,7 +312,7 @@ public struct MCPClientConfiguration: Sendable, Hashable, Equatable {
     public init(
         clientInfo: MCPImplementation = MCPImplementation(name: OpenGrokMCP.productName, version: "0.0.0"),
         protocolVersion: MCPProtocolVersion = .latest,
-        supportedProtocolVersions: [MCPProtocolVersion] = [.latest, .march2025, .november2024],
+        supportedProtocolVersions: [MCPProtocolVersion] = [.latest, .june2025, .march2025, .november2024],
         capabilities: MCPCapabilities = MCPCapabilities()
     ) {
         self.clientInfo = clientInfo

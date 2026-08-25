@@ -24,10 +24,15 @@ public struct MermaidDiagram: Equatable, Sendable {
     public enum Kind: Equatable, Sendable {
         case flowchart
         case stateDiagram
+        case classDiagram
+        case entityRelationshipDiagram
+        case sequenceDiagram
     }
 
     public var kind: Kind
     public var graph: FlowchartGraph
+    /// Family-specific structure that cannot be represented by graph edges alone.
+    public var details: MermaidDiagramDetails?
     /// Settings read from the source's frontmatter.
     public var config: RenderConfig
     /// Title read from the source's frontmatter, if any.
@@ -47,13 +52,31 @@ public enum MermaidRenderer {
 
         let kind: MermaidDiagram.Kind
         let graph: FlowchartGraph
+        let details: MermaidDiagramDetails?
         switch token {
         case "stateDiagram", "stateDiagram-v2":
             kind = .stateDiagram
             graph = try parseStateDiagram(body)
+            details = nil
         case "graph", "flowchart":
             kind = .flowchart
             graph = try parseFlowchart(body)
+            details = nil
+        case "classDiagram", "classDiagram-v2":
+            kind = .classDiagram
+            let diagram = try parseClassDiagram(body)
+            graph = diagram.flowchartGraph
+            details = .classDiagram(diagram)
+        case "erDiagram":
+            kind = .entityRelationshipDiagram
+            let diagram = try parseEntityRelationshipDiagram(body)
+            graph = diagram.flowchartGraph
+            details = .entityRelationshipDiagram(diagram)
+        case "sequenceDiagram":
+            kind = .sequenceDiagram
+            let diagram = try parseSequenceDiagram(body)
+            graph = diagram.flowchartGraph
+            details = .sequenceDiagram(diagram)
         case let other?:
             throw MermaidError.unsupportedDiagramType(other)
         case nil:
@@ -63,6 +86,7 @@ public enum MermaidRenderer {
         return MermaidDiagram(
             kind: kind,
             graph: graph,
+            details: details,
             config: parsed.config,
             title: parsed.frontmatter?.title
         )
@@ -70,9 +94,10 @@ public enum MermaidRenderer {
 
     /// Places every node, cluster, and edge.
     public static func layout(_ diagram: MermaidDiagram) -> MermaidLayoutResult {
-        // State diagrams reuse the flowchart layout; only their metrics differ,
-        // and those are selected from the node shapes.
-        computeFlowchartLayout(diagram.graph, config: diagram.config)
+        if case let .sequenceDiagram(sequence)? = diagram.details {
+            return computeSequenceDiagramLayout(sequence, config: diagram.config)
+        }
+        return computeFlowchartLayout(diagram.graph, config: diagram.config)
     }
 
     /// Draws a laid-out diagram as a self-contained SVG document.

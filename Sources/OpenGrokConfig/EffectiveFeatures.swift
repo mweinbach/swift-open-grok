@@ -180,25 +180,29 @@ extension EffectiveFeatures {
                 defaultValue: true,
                 inputs: inputs
             ),
-            webFetch: resolveFlag(
+            webFetch: resolveProtectedMediaFlag(
                 key: "web_fetch",
                 envVar: "GROK_WEB_FETCH",
-                remoteValue: nil,
+                remoteValue: inputs.remote.webFetchEnabled,
                 defaultValue: true,
+                remotelyDenied: inputs.remote.webFetchEnabled == false,
                 inputs: inputs
             ),
-            imageGen: resolveFlag(
+            imageGen: resolveProtectedMediaFlag(
                 key: "image_gen",
                 envVar: "GROK_IMAGE_GEN",
-                remoteValue: nil,
+                remoteValue: inputs.remote.imageGenEnabled,
                 defaultValue: true,
+                remotelyDenied: inputs.remote.imageGenEnabled == false
+                    || inputs.remote.imagineToolDisabled("image_gen"),
                 inputs: inputs
             ),
-            imageEdit: resolveFlag(
+            imageEdit: resolveProtectedMediaFlag(
                 key: "image_edit",
                 envVar: "GROK_IMAGE_EDIT",
                 remoteValue: nil,
                 defaultValue: true,
+                remotelyDenied: inputs.remote.imagineToolDisabled("image_edit"),
                 inputs: inputs
             ),
             feedback: resolveFlag(
@@ -300,6 +304,29 @@ extension EffectiveFeatures {
                 defaultValue: "verbose",
                 inputs: inputs
             )
+        )
+    }
+
+    private static func resolveProtectedMediaFlag(
+        key: String,
+        envVar: String,
+        remoteValue: Bool?,
+        defaultValue: Bool,
+        remotelyDenied: Bool,
+        inputs: FeatureResolutionInputs
+    ) -> Resolved<Bool> {
+        if let requirement = inputs.requirements[key] {
+            return Resolved(value: requirement, source: .requirement)
+        }
+        if remotelyDenied {
+            return Resolved(value: false, source: .remote)
+        }
+        return resolveFlag(
+            key: key,
+            envVar: envVar,
+            remoteValue: remoteValue,
+            defaultValue: defaultValue,
+            inputs: inputs
         )
     }
 

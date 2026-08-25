@@ -161,6 +161,14 @@ public func worktreeRemove(source: URL, dest: URL, force: Bool = true) throws ->
         recoveredPartial = true
     }
 
+    if !force {
+        return try validatedNonForcedWorktreeRemoval(
+            source: source,
+            dest: dest,
+            recoveredPartial: recoveredPartial
+        )
+    }
+
     // Read registration BEFORE deleting the tree.
     let registrationDir = readWorktreeGitdir(worktreePath: dest)
 
@@ -220,6 +228,98 @@ public func worktreeRemove(source: URL, dest: URL, force: Bool = true) throws ->
         issues: issues,
         recoveredPartialMarker: recoveredPartial
     )
+}
+
+private func validatedNonForcedWorktreeRemoval(
+    source: URL,
+    dest: URL,
+    recoveredPartial: Bool
+) throws -> RemoveReport {
+    let attributes: [FileAttributeKey: Any]
+    do {
+        attributes = try FileManager.default.attributesOfItem(atPath: dest.path)
+    } catch {
+        throw FastWorktreeError.gitFailed(
+            "refusing non-forced removal because the destination cannot be inspected: \(error)"
+        )
+    }
+    guard (attributes[.type] as? FileAttributeType) == .typeDirectory else {
+        throw FastWorktreeError.gitFailed(
+            "refusing non-forced removal of a symlink or non-directory: \(dest.path)"
+        )
+    }
+
+    let sourceIdentity = try discoverGitRepo(at: source)
+    let destinationIdentity = try discoverGitRepo(at: dest)
+    let destinationRoot = dest.standardizedFileURL.resolvingSymlinksInPath()
+    guard let destinationTopLevel = destinationIdentity.toplevel,
+          pathsEqual(destinationTopLevel.resolvingSymlinksInPath(), destinationRoot),
+          pathsEqual(
+              sourceIdentity.commonDir.resolvingSymlinksInPath(),
+              destinationIdentity.commonDir.resolvingSymlinksInPath()
+          )
+    else {
+        throw FastWorktreeError.gitFailed(
+            "refusing non-forced removal of an unknown or unrelated worktree: \(dest.path)"
+        )
+    }
+    if let primary = sourceIdentity.toplevel,
+       pathsEqual(primary.resolvingSymlinksInPath(), destinationRoot)
+    {
+        throw FastWorktreeError.primaryCheckoutProtected(dest.path)
+    }
+
+    let linked = try listLinkedWorktrees(source: sourceIdentity.operationRoot)
+        .filter { pathsEqual($0.path.resolvingSymlinksInPath(), destinationRoot) }
+    guard linked.count == 1, linked[0].bare == false else {
+        throw FastWorktreeError.gitFailed(
+            "refusing non-forced removal of an unregistered worktree: \(dest.path)"
+        )
+    }
+
+    let dirty = try getModifiedFiles(repoPath: dest)
+    guard dirty.allDirtyPaths.isEmpty else {
+        throw FastWorktreeError.gitFailed(
+            "refusing non-forced removal of a dirty worktree: \(dest.path)"
+        )
+    }
+
+    let submodules = try runGit(
+        ["submodule", "status", "--recursive"],
+        cwd: dest,
+        timeout: 15
+    )
+    guard submodules.exitCode == 0 else {
+        let message = submodules.stderr.isEmpty ? submodules.stdout : submodules.stderr
+        throw FastWorktreeError.gitFailed(
+            "refusing non-forced removal because recursive submodule state is unknown: \(message)"
+        )
+    }
+    for line in submodules.stdout.split(whereSeparator: \.isNewline) {
+        guard line.first == " " else {
+            throw FastWorktreeError.gitFailed(
+                "refusing non-forced removal of a dirty or uninitialized submodule: \(line)"
+            )
+        }
+    }
+
+    let result = try runGit(
+        ["worktree", "remove", dest.path],
+        cwd: sourceIdentity.operationRoot
+    )
+    guard result.exitCode == 0 else {
+        let message = result.stderr.isEmpty ? result.stdout : result.stderr
+        throw FastWorktreeError.gitFailed(
+            "non-forced Git worktree removal refused: \(message)"
+        )
+    }
+    guard !FileManager.default.fileExists(atPath: dest.path) else {
+        throw FastWorktreeError.gitFailed(
+            "Git reported removal but the worktree still exists: \(dest.path)"
+        )
+    }
+
+    return RemoveReport(path: dest, removed: true, recoveredPartialMarker: recoveredPartial)
 }
 
 /// Read the `gitdir:` pointer from a linked worktree's `.git` file.
@@ -309,8 +409,15 @@ func parseWorktreePorcelain(_ text: String) -> [LinkedWorktreeInfo] {
 /// Scan dirty files via `git status --porcelain=v1 -z` for clean-mode skips.
 public func getModifiedFiles(repoPath: URL) throws -> DirtyFilesReport {
     let result = try runGit(
-        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-        cwd: repoPath
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+        cwd: repoPath,
+        timeout: 15
     )
     guard result.exitCode == 0 else {
         throw FastWorktreeError.gitFailed(result.stderr)
@@ -386,7 +493,7 @@ public struct GitCommandResult: Sendable {
     public var stderr: String
 }
 
-private final class GitPipeReader: @unchecked Sendable {
+final class GitPipeReader: @unchecked Sendable {
     private let handle: FileHandle
     private let finished = DispatchSemaphore(value: 0)
     private let lock = NSLock()
@@ -408,6 +515,15 @@ private final class GitPipeReader: @unchecked Sendable {
 
     func result() -> Data {
         finished.wait()
+        return capturedOutput()
+    }
+
+    func result(until deadline: DispatchTime) -> Data? {
+        guard finished.wait(timeout: deadline) == .success else { return nil }
+        return capturedOutput()
+    }
+
+    private func capturedOutput() -> Data {
         lock.lock()
         defer { lock.unlock() }
         return output
@@ -415,6 +531,22 @@ private final class GitPipeReader: @unchecked Sendable {
 }
 
 public func runGit(_ args: [String], cwd: URL) throws -> GitCommandResult {
+    try executeGit(args, cwd: cwd, timeout: nil)
+}
+
+private func runGit(
+    _ args: [String],
+    cwd: URL,
+    timeout: TimeInterval
+) throws -> GitCommandResult {
+    try executeGit(args, cwd: cwd, timeout: timeout)
+}
+
+private func executeGit(
+    _ args: [String],
+    cwd: URL,
+    timeout: TimeInterval?
+) throws -> GitCommandResult {
     // Reject smuggled options in path-like args that are destinations.
     for arg in args {
         if arg.contains("\0") {
@@ -460,9 +592,36 @@ public func runGit(_ args: [String], cwd: URL) throws -> GitCommandResult {
     let stderrReader = GitPipeReader(err.fileHandleForReading)
     stdoutReader.start()
     stderrReader.start()
-    finished.wait()
-    let stdout = String(data: stdoutReader.result(), encoding: .utf8) ?? ""
-    let stderr = String(data: stderrReader.result(), encoding: .utf8) ?? ""
+
+    let stdoutData: Data
+    let stderrData: Data
+    if let timeout {
+        let deadline = DispatchTime.now() + timeout
+        guard finished.wait(timeout: deadline) == .success else {
+            if process.isRunning {
+                process.terminate()
+            }
+            throw FastWorktreeError.gitFailed(
+                "git command timed out after \(timeout) seconds: \(args.joined(separator: " "))"
+            )
+        }
+        guard let boundedStdout = stdoutReader.result(until: deadline),
+              let boundedStderr = stderrReader.result(until: deadline)
+        else {
+            throw FastWorktreeError.gitFailed(
+                "git command output timed out after \(timeout) seconds: \(args.joined(separator: " "))"
+            )
+        }
+        stdoutData = boundedStdout
+        stderrData = boundedStderr
+    } else {
+        finished.wait()
+        stdoutData = stdoutReader.result()
+        stderrData = stderrReader.result()
+    }
+
+    let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
+    let stderr = String(data: stderrData, encoding: .utf8) ?? ""
     return GitCommandResult(exitCode: process.terminationStatus, stdout: stdout, stderr: stderr)
 }
 

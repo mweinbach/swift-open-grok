@@ -31,8 +31,8 @@ private actor LateReturningTokenRefresher: TokenRefresher {
 
 @Suite("authentication refresh cancellation and shared-flight ownership")
 struct AuthRefreshCancellationParityTests {
-    @Test("a cancelled late OAuth refresh cannot update disk, actor credentials, or snapshots")
-    func cancelledRefreshCannotAdoptOrPersistLateOAuthCredentials() async throws {
+    @Test("a cancelled late OAuth refresh still durably preserves rotated credentials")
+    func cancelledRefreshDurablyPreservesRotatedOAuthCredentials() async throws {
         let home = FileManager.default.temporaryDirectory
             .appendingPathComponent("open-grok-auth-refresh-cancellation-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
@@ -43,12 +43,11 @@ struct AuthRefreshCancellationParityTests {
         expired.expiresAt = Date().addingTimeInterval(-600)
         try await manager.update(expired)
         let authPath = home.appendingPathComponent("auth.json")
-        let originalCredentials = try Data(contentsOf: authPath)
         let refresher = LateReturningTokenRefresher()
         await manager.configureRefresher(refresher)
         var refreshed = expired
-        refreshed.key = "must-not-persist-cancelled-bearer"
-        refreshed.refreshToken = "must-not-persist-cancelled-refresh"
+        refreshed.key = "durably-rotated-bearer"
+        refreshed.refreshToken = "durably-rotated-refresh"
         refreshed.expiresAt = Date().addingTimeInterval(3_600)
         let task = Task {
             try await manager.auth()
@@ -62,17 +61,17 @@ struct AuthRefreshCancellationParityTests {
             let credential = try await task.value
             Issue.record("cancelled refresh unexpectedly returned \(credential.key)")
         } catch is CancellationError {
-            // The shared task is cancelled before it can adopt or commit.
+            // Cancellation ends this waiter, not the already completed token rotation.
         } catch {
             Issue.record("cancelled refresh returned an unexpected error: \(error)")
         }
 
-        let currentCredentials = try Data(contentsOf: authPath)
         let current = await manager.currentOrExpired()
-        #expect(currentCredentials == originalCredentials)
-        #expect(current?.key == "previous-team-bearer")
-        #expect(current?.refreshToken == "previous-team-refresh-token")
-        #expect(manager.snapshotBox.read().token == "previous-team-bearer")
+        let persisted = try readAuthJSON(at: authPath)
+        #expect(persisted.values.contains { $0.key == "durably-rotated-bearer" })
+        #expect(current?.key == "durably-rotated-bearer")
+        #expect(current?.refreshToken == "durably-rotated-refresh")
+        #expect(manager.snapshotBox.read().token == "durably-rotated-bearer")
     }
 
     @Test("cancelling one waiter never cancels an OAuth refresh another caller still needs")

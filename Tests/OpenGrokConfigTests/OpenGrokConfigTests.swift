@@ -49,6 +49,19 @@ struct Blake3Tests {
 
 @Suite("TOML")
 struct TOMLTests {
+    @Test("empty quoted values are not mistaken for multiline delimiters")
+    func emptyQuotedStrings() throws {
+        let document = try parseTOML("basic = \"\"\nliteral = ''\n")
+        #expect(document["basic"]?.stringValue == "")
+        #expect(document["literal"]?.stringValue == "")
+
+        let multiline = try parseTOML(
+            "basic = \"\"\"configured\"\"\"\nliteral = '''configured'''\n"
+        )
+        #expect(multiline["basic"]?.stringValue == "configured")
+        #expect(multiline["literal"]?.stringValue == "configured")
+    }
+
     @Test("hexadecimal integers")
     func hex() throws {
         let v = try parseTOML("a = 0xDEAD_BEEF\nb = 0x10\nc = -0xFF")

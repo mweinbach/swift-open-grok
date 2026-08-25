@@ -91,10 +91,10 @@ struct ServiceTierCatalogTests {
         #expect(!parsed[0].entry.info.supportsFastServiceTier)
         #expect(parsed[0].entry.info.fastServiceTierID == nil)
 
-        // The embedded xAI default has no tiers either — `/fast` on grok-4.5
+        // The embedded xAI default has no tiers either — `/fast` on grok-4.6
         // must refuse, not silently send a tier.
         let catalog = resolveModelCatalog(input: .default)
-        let grok = try #require(catalog["grok-4.5"])
+        let grok = try #require(catalog["grok-4.6"])
         #expect(!grok.info.supportsFastServiceTier)
     }
 

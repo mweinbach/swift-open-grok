@@ -1,74 +1,18 @@
 import Foundation
 
-#if os(Linux)
-import Glibc
-#endif
-
 public enum FoundationTrustStoreBridge {
-    private final class State: @unchecked Sendable {
-        let lock = NSLock()
-        var systemBundle: Data?
-        var extraRoots: Set<Data> = []
-        var generatedBundlePath: String?
-    }
-
-    private static let state = State()
-
     public static var supportsAdditionalTrustRoots: Bool {
-        #if os(Linux)
-        return systemBundleURL(environment: ProcessInfo.processInfo.environment) != nil
-        #else
-        return false
-        #endif
+        false
     }
 
     @discardableResult
     public static func prepare(extraRootCertificates: [Data]) -> Bool {
         guard !extraRootCertificates.isEmpty else { return true }
-        #if os(Linux)
-        state.lock.lock()
-        defer { state.lock.unlock() }
 
-        if state.systemBundle == nil {
-            guard let source = systemBundleURL(environment: ProcessInfo.processInfo.environment),
-                  let data = try? Data(contentsOf: source),
-                  !data.isEmpty
-            else { return false }
-            state.systemBundle = data
-        }
-
-        state.extraRoots.formUnion(extraRootCertificates)
-        guard let systemBundle = state.systemBundle else { return false }
-        let bundle = combinedPEMBundle(
-            systemPEM: systemBundle,
-            extraRootCertificates: Array(state.extraRoots)
-        )
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("open-grok", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(
-                at: directory,
-                withIntermediateDirectories: true
-            )
-            let url = directory.appendingPathComponent(
-                "foundation-ca-\(ProcessInfo.processInfo.processIdentifier).pem"
-            )
-            try bundle.write(to: url, options: .atomic)
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: url.path
-            )
-            guard setenv("CURL_CA_BUNDLE", url.path, 1) == 0,
-                  setenv("SSL_CERT_FILE", url.path, 1) == 0
-            else { return false }
-            state.generatedBundlePath = url.path
-            return true
-        } catch {
-            return false
-        }
-        #else
+        // Linux FoundationNetworking cannot install session-local trust anchors.
+        // Environment-backed bundles would also trust these roots in unrelated
+        // clients and inherited subprocesses, so preserve strict system trust.
         return false
-        #endif
     }
 
     public static func combinedPEMBundle(

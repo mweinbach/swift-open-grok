@@ -74,6 +74,7 @@ public enum SearchReplaceTool {
             }
             let absolute = SessionFS.resolve(cwd: resources.cwd, path: input.filePath)
             try SessionFS.enforceRoots(absolute, roots: resources.allowedRoots)
+            try GitIgnoreAccessPolicy.enforce(path: absolute, resources: resources, operation: "edited")
             if SessionFS.isDirectory(absolute) {
                 throw SessionFSError.isDirectory(absolute)
             }

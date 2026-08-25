@@ -550,10 +550,7 @@ private struct InlineParser {
                 break
             }
             if characters[index] == "\n" {
-                let previousIsSpace = !result.isEmpty && textValue(result.last).last == " "
-                if previousIsSpace {
-                    result.append(.softBreak)
-                } else if index >= 2 && characters[index - 1] == " " && characters[index - 2] == " " {
+                if index >= 2 && characters[index - 1] == " " && characters[index - 2] == " " {
                     removeTrailingSpaces(&result)
                     result.append(.hardBreak)
                 } else {
@@ -593,9 +590,15 @@ private struct InlineParser {
                 result.append(link)
                 continue
             }
-            if characters[index] == "<", let link = consumeAutolink() {
-                result.append(link)
-                continue
+            if characters[index] == "<" {
+                if consumeHTMLLineBreak() {
+                    result.append(.hardBreak)
+                    continue
+                }
+                if let link = consumeAutolink() {
+                    result.append(link)
+                    continue
+                }
             }
             if consumeDelimited("**", into: &result, kind: .strong) ||
                 consumeDelimited("__", into: &result, kind: .strong) ||
@@ -695,6 +698,28 @@ private struct InlineParser {
         return .link(text: [.text(value)], destination: value.contains("@") && !value.contains("://") ? "mailto:\(value)" : value, title: nil)
     }
 
+    private mutating func consumeHTMLLineBreak() -> Bool {
+        guard index + 2 < characters.count,
+              characters[index] == "<",
+              characters[index + 1] == "b" || characters[index + 1] == "B",
+              characters[index + 2] == "r" || characters[index + 2] == "R" else {
+            return false
+        }
+
+        var cursor = index + 3
+        while cursor < characters.count && characters[cursor] != ">" {
+            guard characters[cursor] != "\n" else { return false }
+            cursor += 1
+        }
+        guard cursor < characters.count else { return false }
+
+        let suffix = String(characters[(index + 3)..<cursor]).trimmingCharacters(in: .whitespaces)
+        guard suffix.isEmpty || suffix == "/" else { return false }
+
+        index = cursor + 1
+        return true
+    }
+
     private mutating func consumeMath() -> MarkdownInline? {
         guard let match = InlineMathParser.parse(characters, at: index) else { return nil }
         index = match.endIndex
@@ -753,14 +778,12 @@ private struct InlineParser {
 
     private func removeTrailingSpaces(_ result: inout [MarkdownInline]) {
         guard case let .text(value)? = result.last else { return }
-        let trimmed = String(value.drop(while: { $0 == " " }).reversed().drop(while: { $0 == " " }).reversed())
-        result[result.count - 1] = .text(trimmed)
-    }
-
-    private func textValue(_ inline: MarkdownInline?) -> String {
-        guard let inline else { return "" }
-        if case let .text(value) = inline { return value }
-        return ""
+        let trimmed = String(value.reversed().drop(while: { $0 == " " }).reversed())
+        if trimmed.isEmpty {
+            result.removeLast()
+        } else {
+            result[result.count - 1] = .text(trimmed)
+        }
     }
 
     private enum DelimitedKind {
@@ -808,13 +831,17 @@ private func decodeEntity(_ value: String) -> String? {
     if let replacement = named[value] { return replacement }
     if value.hasPrefix("&#x") || value.hasPrefix("&#X"), value.hasSuffix(";") {
         let digits = String(value.dropFirst(3).dropLast())
-        if let scalar = UInt32(digits, radix: 16), let unicode = UnicodeScalar(scalar) {
+        if let scalar = UInt32(digits, radix: 16),
+           let unicode = UnicodeScalar(scalar),
+           unicode.properties.generalCategory != .control {
             return String(unicode)
         }
     }
     if value.hasPrefix("&#"), value.hasSuffix(";") {
         let digits = String(value.dropFirst(2).dropLast())
-        if let scalar = UInt32(digits), let unicode = UnicodeScalar(scalar) {
+        if let scalar = UInt32(digits),
+           let unicode = UnicodeScalar(scalar),
+           unicode.properties.generalCategory != .control {
             return String(unicode)
         }
     }
@@ -909,7 +936,8 @@ private func listMarker(_ line: String) -> ListMarker? {
     guard !value.isEmpty else { return nil }
     if let first = value.first, first == "-" || first == "+" || first == "*" {
         guard value.dropFirst().first?.isWhitespace == true else { return nil }
-        return ListMarker(indentation: indentation, ordered: false, start: 1, markerWidth: 2, content: String(value.dropFirst(1)).trimmingCharacters(in: .whitespaces))
+        let content = String(value.dropFirst().drop(while: { $0.isWhitespace }))
+        return ListMarker(indentation: indentation, ordered: false, start: 1, markerWidth: 2, content: content)
     }
     var digits = ""
     for character in value {
@@ -923,7 +951,7 @@ private func listMarker(_ line: String) -> ListMarker? {
         ordered: true,
         start: Int(digits) ?? 1,
         markerWidth: digits.count + 2,
-        content: String(remainder).trimmingCharacters(in: .whitespaces)
+        content: String(remainder.drop(while: { $0.isWhitespace }))
     )
 }
 

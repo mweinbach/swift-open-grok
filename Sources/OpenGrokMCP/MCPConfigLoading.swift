@@ -57,16 +57,31 @@ public struct MCPConfigProblem: Sendable, Equatable {
 
 public struct MCPConfigLoadResult: Sendable, Equatable {
     public var servers: [MCPServerDeclaration]
+    /// Original setup-bearing declarations, including unresolved or invalid
+    /// schemas. Keeping these separate prevents a placeholder transport from
+    /// being dialed while leaving its schema reachable to the ACP setup flow.
+    public var setupServers: [MCPServerDeclaration]
     public var problems: [MCPConfigProblem]
 
-    public init(servers: [MCPServerDeclaration] = [], problems: [MCPConfigProblem] = []) {
+    public init(
+        servers: [MCPServerDeclaration] = [],
+        setupServers: [MCPServerDeclaration] = [],
+        problems: [MCPConfigProblem] = []
+    ) {
         self.servers = servers
+        self.setupServers = setupServers
         self.problems = problems
     }
 
     /// Declarations that should actually be dialed.
     public var enabledServers: [MCPServerDeclaration] {
         servers.filter(\.isEnabled)
+    }
+
+    /// Setup rows absent from the resolved transport catalog.
+    public var setupRequiredServers: [MCPServerDeclaration] {
+        let resolvedNames = Set(servers.map(\.name))
+        return setupServers.filter { !resolvedNames.contains($0.name) }
     }
 }
 
@@ -80,7 +95,11 @@ public enum MCPConfigLoader {
     ///
     /// Servers are returned in declaration order. A server whose table fails to
     /// decode is reported in `problems` and skipped; the rest still load.
-    public static func load(from document: TOMLValue, scope: String? = nil) -> MCPConfigLoadResult {
+    public static func load(
+        from document: TOMLValue,
+        scope: String? = nil,
+        preferences: McpPreferencesFile? = nil
+    ) -> MCPConfigLoadResult {
         guard let root = document.table else { return MCPConfigLoadResult() }
         var table: TOMLTable?
         for name in rootTableNames {
@@ -92,6 +111,7 @@ public enum MCPConfigLoader {
         guard let table else { return MCPConfigLoadResult() }
 
         var servers: [MCPServerDeclaration] = []
+        var setupServers: [MCPServerDeclaration] = []
         var problems: [MCPConfigProblem] = []
 
         for (name, value) in table.pairs {
@@ -104,29 +124,53 @@ public enum MCPConfigLoader {
             }
             do {
                 let config = try decodeServer(value)
-                if let blank = blankTransportField(config) {
-                    problems.append(MCPConfigProblem(
-                        server: name,
-                        message: "missing or empty '\(blank)'"
-                    ))
-                    continue
-                }
-                servers.append(MCPServerDeclaration(name: name, config: config, scope: scope))
+                appendDeclaration(
+                    named: name,
+                    config: config,
+                    scope: scope,
+                    preferences: preferences,
+                    servers: &servers,
+                    setupServers: &setupServers,
+                    problems: &problems
+                )
             } catch {
                 problems.append(MCPConfigProblem(server: name, message: describe(error)))
             }
         }
-        return MCPConfigLoadResult(servers: servers, problems: problems)
+        return MCPConfigLoadResult(
+            servers: servers,
+            setupServers: setupServers,
+            problems: problems
+        )
     }
 
     /// Decode a `.mcp.json`-style document (`{"mcpServers": {...}}`).
-    public static func load(jsonData: Data, scope: String? = nil) -> MCPConfigLoadResult {
+    public static func load(
+        jsonData: Data,
+        scope: String? = nil,
+        preferences: McpPreferencesFile? = nil
+    ) -> MCPConfigLoadResult {
         do {
             let decoded = try JSONDecoder().decode(McpConfig.self, from: jsonData)
-            let servers = decoded.mcpServers.pairs.map {
-                MCPServerDeclaration(name: $0.0, config: $0.1, scope: scope)
+            var servers: [MCPServerDeclaration] = []
+            var setupServers: [MCPServerDeclaration] = []
+            var problems: [MCPConfigProblem] = []
+            for (name, config) in decoded.mcpServers.pairs {
+                appendDeclaration(
+                    named: name,
+                    config: config,
+                    scope: scope,
+                    preferences: preferences,
+                    servers: &servers,
+                    setupServers: &setupServers,
+                    problems: &problems
+                )
             }
-            return MCPConfigLoadResult(servers: servers)
+            return MCPConfigLoadResult(
+                servers: servers,
+                setupServers: setupServers,
+                problems: problems
+            )
         } catch {
             return MCPConfigLoadResult(problems: [
                 MCPConfigProblem(server: "(document)", message: describe(error))
@@ -144,6 +188,42 @@ public enum MCPConfigLoader {
         case .streamableHttp(let url, _, _, _, _, _, _):
             return url.trimmingCharacters(in: .whitespaces).isEmpty ? "url" : nil
         }
+    }
+
+    private static func appendDeclaration(
+        named name: String,
+        config: McpServerConfig,
+        scope: String?,
+        preferences: McpPreferencesFile?,
+        servers: inout [MCPServerDeclaration],
+        setupServers: inout [MCPServerDeclaration],
+        problems: inout [MCPConfigProblem]
+    ) {
+        let raw = MCPServerDeclaration(name: name, config: config, scope: scope)
+        let resolved: McpServerConfig
+        if config.setup != nil {
+            setupServers.append(raw)
+            switch config.resolveSetup(preferences: preferences?.servers[name]) {
+            case .resolved(let configuration):
+                resolved = configuration
+            case .required:
+                return
+            case .invalid(let reason):
+                problems.append(MCPConfigProblem(server: name, message: reason))
+                return
+            }
+        } else {
+            resolved = config
+        }
+
+        if let blank = blankTransportField(resolved) {
+            problems.append(MCPConfigProblem(
+                server: name,
+                message: "missing or empty '\(blank)'"
+            ))
+            return
+        }
+        servers.append(MCPServerDeclaration(name: name, config: resolved, scope: scope))
     }
 
     private static func decodeServer(_ value: TOMLValue) throws -> McpServerConfig {
@@ -240,6 +320,7 @@ public extension MCPServerDeclaration {
         authorization: (any MCPAuthorizationProviding)? = nil
     ) throws -> any MCPTransport {
         guard config.enabled else { throw MCPConnectError.disabled(name) }
+        guard config.setup == nil else { throw MCPConnectError.setupRequired(name) }
 
         switch config.transport {
         case .stdio(let command, let args, let env, let cwd):

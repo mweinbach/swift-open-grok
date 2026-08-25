@@ -239,14 +239,18 @@ struct MemoryConfigTests {
 
 @Suite("MCP config types")
 struct McpConfigTypesTests {
-    @Test("McpServerPreferences snake_case and round-trip")
+    @Test("McpServerPreferences accepts legacy snake_case and emits upstream camelCase")
     func mcpPreferences() throws {
         let json = #"{"values":{"site":"us5"},"source":{"kind":"user"},"updated_at":"2026-01-01T00:00:00Z"}"#
         let prefs = try JSONDecoder().decode(McpServerPreferences.self, from: Data(json.utf8))
         #expect(prefs.values["site"] == "us5")
         #expect(prefs.source?.kind == "user")
         #expect(prefs.updatedAt == "2026-01-01T00:00:00Z")
-        let again = try JSONDecoder().decode(McpServerPreferences.self, from: try JSONEncoder().encode(prefs))
+        let encoded = try JSONEncoder().encode(prefs)
+        let object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        #expect(object["updatedAt"] as? String == "2026-01-01T00:00:00Z")
+        #expect(object["updated_at"] == nil)
+        let again = try JSONDecoder().decode(McpServerPreferences.self, from: encoded)
         #expect(again == prefs)
     }
 

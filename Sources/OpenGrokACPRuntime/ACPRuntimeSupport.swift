@@ -1,6 +1,7 @@
 import Foundation
 import OpenGrokACP
 import OpenGrokShared
+import OpenGrokVersion
 import OpenGrokWorkspace
 
 public enum ACPConnectionState: String, Hashable, Sendable, Codable {
@@ -157,10 +158,20 @@ public struct ACPAgentConfiguration: Sendable {
     public var modes: SessionModeState?
     public var models: SessionModelState?
 
-    public init(
-        protocolVersion: ProtocolVersion = .v1,
-        agentCapabilities: AgentCapabilities = AgentCapabilities(
+    public static func defaultAgentCapabilities(
+        supportsEmbeddedContext: Bool = false,
+        supportsHTTPMCP: Bool = true,
+        supportsSSEMCP: Bool = true
+    ) -> AgentCapabilities {
+        AgentCapabilities(
             loadSession: true,
+            promptCapabilities: PromptCapabilities(
+                embeddedContext: supportsEmbeddedContext
+            ),
+            mcpCapabilities: McpCapabilities(
+                http: supportsHTTPMCP,
+                sse: supportsSSEMCP
+            ),
             sessionCapabilities: SessionCapabilities(
                 list: EmptyCapability(),
                 fork: EmptyCapability(),
@@ -168,10 +179,19 @@ public struct ACPAgentConfiguration: Sendable {
                 close: EmptyCapability()
             ),
             auth: AgentAuthCapabilities(logout: EmptyCapability())
-        ),
+        )
+    }
+
+    public init(
+        protocolVersion: ProtocolVersion = .v1,
+        agentCapabilities: AgentCapabilities = ACPAgentConfiguration.defaultAgentCapabilities(),
         authMethods: [AuthMethod] = [],
-        agentInfo: Implementation = Implementation(name: "open-grok", version: "0.0.0"),
+        agentInfo: Implementation = Implementation(
+            name: OpenGrokACPExtension.executable,
+            version: OpenGrokVersion.compiledVersion
+        ),
         meta: AcpMeta? = OpenGrokACPExtension.wireDictionary.mapValues { .string($0) },
+        initializationMetadata: OpenGrokInitializeMetadata? = nil,
         requireAuthentication: Bool = false,
         modes: SessionModeState? = nil,
         models: SessionModelState? = nil
@@ -180,7 +200,15 @@ public struct ACPAgentConfiguration: Sendable {
         self.agentCapabilities = agentCapabilities
         self.authMethods = authMethods
         self.agentInfo = agentInfo
-        self.meta = meta
+        var resolvedMetadata = meta ?? [:]
+        resolvedMetadata["grokShell"] = .bool(true)
+        resolvedMetadata["agentVersion"] = .string(agentInfo.version)
+        if let initializationMetadata {
+            resolvedMetadata.merge(initializationMetadata.wireValues) { _, configured in
+                configured
+            }
+        }
+        self.meta = resolvedMetadata
         self.requireAuthentication = requireAuthentication
         self.modes = modes
         self.models = models

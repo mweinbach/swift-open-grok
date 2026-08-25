@@ -482,21 +482,26 @@ private func inheritDonorMetadata(into entry: inout ModelEntry, from donor: Mode
     if entry.info.toolMode == nil {
         entry.info.toolMode = donor.info.toolMode
     }
+    if entry.info.subagentContextDefault == nil {
+        entry.info.subagentContextDefault = donor.info.subagentContextDefault
+    }
 }
 
 private func inheritSiblingMetadata(_ resolved: inout OrderedModelMap) {
-    typealias DonorMeta = (UInt64, ApiBackend, ToolMode?)
+    typealias DonorMeta = (UInt64, ApiBackend, ToolMode?, ModelSubagentContextMode?)
     var donors: [ModelProvider: [String: DonorMeta]] = [:]
     for entry in resolved.values() where entry.info.contextWindow != DEFAULT_CONTEXT_WINDOW {
         donors[entry.info.provider, default: [:]][entry.info.model] = (
             entry.info.contextWindow,
             entry.info.apiBackend,
-            entry.info.toolMode
+            entry.info.toolMode,
+            entry.info.subagentContextDefault
         )
     }
     for (key, var entry) in resolved.pairs() {
         guard let providerDonors = donors[entry.info.provider],
-              let (donorCW, donorBackend, donorToolMode) = providerDonors[entry.info.model] else {
+              let (donorCW, donorBackend, donorToolMode, donorSubagentContext) =
+                providerDonors[entry.info.model] else {
             continue
         }
         if entry.info.contextWindow == DEFAULT_CONTEXT_WINDOW {
@@ -507,6 +512,9 @@ private func inheritSiblingMetadata(_ resolved: inout OrderedModelMap) {
         }
         if entry.info.toolMode == nil {
             entry.info.toolMode = donorToolMode
+        }
+        if entry.info.subagentContextDefault == nil {
+            entry.info.subagentContextDefault = donorSubagentContext
         }
         resolved[key] = entry
     }

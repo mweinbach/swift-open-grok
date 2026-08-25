@@ -25,6 +25,7 @@
 
 import Foundation
 import OpenGrokFileUtils
+import OpenGrokShared
 
 // MARK: - Trust policy
 
@@ -340,7 +341,60 @@ public struct PluginInstallLocation: Sendable {
     }
 }
 
-/// One installed plugin repository.
+/// Per-plugin metadata retained in Rust's `InstalledRepo.plugins` map.
+public struct PluginRepositoryPlugin: Hashable, Sendable, Codable {
+    public var subdirectory: String?
+    public var version: String?
+    public var additionalFields: [String: JSONValue]
+
+    public init(
+        subdirectory: String? = nil,
+        version: String? = nil,
+        additionalFields: [String: JSONValue] = [:]
+    ) {
+        self.subdirectory = subdirectory
+        self.version = version
+        self.additionalFields = additionalFields
+    }
+
+    public init(from decoder: Decoder) throws {
+        let value = try JSONValue(from: decoder)
+        guard var object = value.objectValue else {
+            throw PluginRegistryError.malformed("plugin metadata must be a JSON object")
+        }
+        subdirectory = try PluginInstallRegistry.optionalString(
+            object.removeValue(forKey: "subdir"), field: "plugins.*.subdir"
+        )
+        version = try PluginInstallRegistry.optionalString(
+            object.removeValue(forKey: "version"), field: "plugins.*.version"
+        )
+        additionalFields = object
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var object = additionalFields
+        if let subdirectory { object["subdir"] = .string(subdirectory) }
+        if let version { object["version"] = .string(version) }
+        try JSONValue.object(object).encode(to: encoder)
+    }
+}
+
+public enum PluginRegistryError: Error, Sendable, Equatable, CustomStringConvertible {
+    case malformed(String)
+    case unsupportedVersion(Int)
+    case injectedSaveFailure
+
+    public var description: String {
+        switch self {
+        case .malformed(let reason): return "invalid plugin install registry: \(reason)"
+        case .unsupportedVersion(let version):
+            return "unsupported plugin install registry version \(version)"
+        case .injectedSaveFailure: return "test-injected registry save failure"
+        }
+    }
+}
+
+/// One installed plugin repository, preserving Rust's complete registry shape.
 public struct PluginInstallRecord: Hashable, Sendable, Codable {
     public var repoKey: String
     public var sourceIdentifier: String
@@ -350,6 +404,16 @@ public struct PluginInstallRecord: Hashable, Sendable, Codable {
     public var sha: String?
     public var pluginNames: [String]
     public var enabled: Bool
+    public var installedPath: String?
+    public var installedAt: String
+    public var updatedAt: String
+    public var commit: String?
+    public var subdirectory: String?
+    public var pluginDetails: [String: PluginRepositoryPlugin]
+    public var marketplace: MarketplaceProvenance?
+    public var additionalFields: [String: JSONValue]
+    public var additionalKindFields: [String: JSONValue]
+    public var additionalMarketplaceFields: [String: JSONValue]
 
     public init(
         repoKey: String,
@@ -359,8 +423,19 @@ public struct PluginInstallRecord: Hashable, Sendable, Codable {
         ref: String? = nil,
         sha: String? = nil,
         pluginNames: [String] = [],
-        enabled: Bool = true
+        enabled: Bool = true,
+        installedPath: String? = nil,
+        installedAt: String? = nil,
+        updatedAt: String? = nil,
+        commit: String? = nil,
+        subdirectory: String? = nil,
+        pluginDetails: [String: PluginRepositoryPlugin] = [:],
+        marketplace: MarketplaceProvenance? = nil,
+        additionalFields: [String: JSONValue] = [:],
+        additionalKindFields: [String: JSONValue] = [:],
+        additionalMarketplaceFields: [String: JSONValue] = [:]
     ) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
         self.repoKey = repoKey
         self.sourceIdentifier = sourceIdentifier
         self.url = url
@@ -369,41 +444,394 @@ public struct PluginInstallRecord: Hashable, Sendable, Codable {
         self.sha = sha
         self.pluginNames = pluginNames
         self.enabled = enabled
+        self.installedPath = installedPath
+        self.installedAt = installedAt ?? timestamp
+        self.updatedAt = updatedAt ?? self.installedAt
+        self.commit = commit
+        self.subdirectory = subdirectory
+        var details = pluginDetails
+        for name in pluginNames where details[name] == nil {
+            details[name] = PluginRepositoryPlugin()
+        }
+        self.pluginDetails = details
+        self.marketplace = marketplace
+        self.additionalFields = additionalFields
+        self.additionalKindFields = additionalKindFields
+        self.additionalMarketplaceFields = additionalMarketplaceFields
+    }
+
+    public init(from decoder: Decoder) throws {
+        let value = try JSONValue(from: decoder)
+        guard let object = value.objectValue else {
+            throw PluginRegistryError.malformed("repository record must be a JSON object")
+        }
+        if object["kind"] != nil {
+            guard let key = object["repo_key"]?.stringValue else {
+                throw PluginRegistryError.malformed("standalone repository is missing repo_key")
+            }
+            self = try Self.canonical(key: key, object: object)
+        } else {
+            self = try Self.legacy(object: object)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        try JSONValue.object(canonicalObject()).encode(to: encoder)
+    }
+
+    static func canonical(key: String, object original: [String: JSONValue]) throws -> Self {
+        var object = original
+        guard let kindValue = object.removeValue(forKey: "kind"),
+              var kind = kindValue.objectValue,
+              let type = kind.removeValue(forKey: "type")?.stringValue else {
+            throw PluginRegistryError.malformed("repo '\(key)' has no valid installation kind")
+        }
+        guard let installedPath = object.removeValue(forKey: "path")?.stringValue else {
+            throw PluginRegistryError.malformed("repo '\(key)' is missing its installed path")
+        }
+        guard let installedAt = object.removeValue(forKey: "installed_at")?.stringValue,
+              let updatedAt = object.removeValue(forKey: "updated_at")?.stringValue else {
+            throw PluginRegistryError.malformed("repo '\(key)' is missing install timestamps")
+        }
+        guard let pluginObject = object.removeValue(forKey: "plugins")?.objectValue else {
+            throw PluginRegistryError.malformed("repo '\(key)' has no plugin map")
+        }
+
+        let subdirectory = try PluginInstallRegistry.optionalString(
+            kind.removeValue(forKey: "subdir"), field: "repos.\(key).kind.subdir"
+        )
+        let sourceIdentifier: String
+        let url: String?
+        let path: String?
+        let ref: String?
+        let commit: String?
+        switch type {
+        case "Git":
+            guard let gitURL = kind.removeValue(forKey: "url")?.stringValue,
+                  let gitCommit = kind.removeValue(forKey: "commit")?.stringValue else {
+                throw PluginRegistryError.malformed("Git repo '\(key)' requires url and commit")
+            }
+            url = gitURL
+            path = nil
+            ref = try PluginInstallRegistry.optionalString(
+                kind.removeValue(forKey: "git_ref"), field: "repos.\(key).kind.git_ref"
+            )
+            commit = gitCommit
+            sourceIdentifier = subdirectory.map { "\(gitURL)#\($0)" } ?? gitURL
+        case "Local":
+            guard let sourcePath = kind.removeValue(forKey: "source_path")?.stringValue else {
+                throw PluginRegistryError.malformed("Local repo '\(key)' requires source_path")
+            }
+            url = nil
+            path = sourcePath
+            ref = nil
+            commit = nil
+            sourceIdentifier = subdirectory.map { "\(sourcePath)#\($0)" } ?? sourcePath
+        default:
+            throw PluginRegistryError.malformed("repo '\(key)' uses unsupported kind '\(type)'")
+        }
+
+        var details: [String: PluginRepositoryPlugin] = [:]
+        for (name, plugin) in pluginObject {
+            let data = try JSONEncoder().encode(plugin)
+            details[name] = try JSONDecoder().decode(PluginRepositoryPlugin.self, from: data)
+        }
+        let marketplace: MarketplaceProvenance?
+        let marketplaceAdditionalFields: [String: JSONValue]
+        if let value = object.removeValue(forKey: "marketplace") {
+            guard var marketplaceObject = value.objectValue else {
+                throw PluginRegistryError.malformed("repo '\(key)' marketplace must be an object")
+            }
+            marketplace = try JSONDecoder().decode(
+                MarketplaceProvenance.self,
+                from: JSONEncoder().encode(value)
+            )
+            marketplaceObject.removeValue(forKey: "source_url_or_path")
+            marketplaceObject.removeValue(forKey: "source_display_name")
+            marketplaceObject.removeValue(forKey: "plugin_subdir")
+            marketplaceAdditionalFields = marketplaceObject
+        } else {
+            marketplace = nil
+            marketplaceAdditionalFields = [:]
+        }
+        let enabledValue = object.removeValue(forKey: "enabled")
+        if let enabledValue, enabledValue.boolValue == nil {
+            throw PluginRegistryError.malformed("repo '\(key)' enabled must be a boolean")
+        }
+        let enabled = enabledValue?.boolValue ?? true
+
+        return self.init(
+            repoKey: key,
+            sourceIdentifier: sourceIdentifier,
+            url: url,
+            path: path,
+            ref: ref,
+            sha: ref.flatMap { PluginPin.isFullCommitSHA($0) ? $0 : nil },
+            pluginNames: details.keys.sorted(),
+            enabled: enabled,
+            installedPath: installedPath,
+            installedAt: installedAt,
+            updatedAt: updatedAt,
+            commit: commit,
+            subdirectory: subdirectory,
+            pluginDetails: details,
+            marketplace: marketplace,
+            additionalFields: object,
+            additionalKindFields: kind,
+            additionalMarketplaceFields: marketplaceAdditionalFields
+        )
+    }
+
+    static func legacy(object: [String: JSONValue]) throws -> Self {
+        guard let key = object["repoKey"]?.stringValue,
+              let identifier = object["sourceIdentifier"]?.stringValue else {
+            throw PluginRegistryError.malformed("legacy repository requires repoKey and sourceIdentifier")
+        }
+        guard let namesValue = object["pluginNames"]?.arrayValue else {
+            throw PluginRegistryError.malformed("legacy repo '\(key)' requires pluginNames")
+        }
+        let names = try namesValue.map { value -> String in
+            guard let name = value.stringValue else {
+                throw PluginRegistryError.malformed("legacy repo '\(key)' has a non-string plugin name")
+            }
+            return name
+        }
+        let enabledValue = object["enabled"]
+        if let enabledValue, enabledValue.boolValue == nil {
+            throw PluginRegistryError.malformed("legacy repo '\(key)' enabled must be a boolean")
+        }
+        return self.init(
+            repoKey: key,
+            sourceIdentifier: identifier,
+            url: try PluginInstallRegistry.optionalString(object["url"], field: "url"),
+            path: try PluginInstallRegistry.optionalString(object["path"], field: "path"),
+            ref: try PluginInstallRegistry.optionalString(object["ref"], field: "ref"),
+            sha: try PluginInstallRegistry.optionalString(object["sha"], field: "sha"),
+            pluginNames: names,
+            enabled: enabledValue?.boolValue ?? true
+        )
+    }
+
+    func canonicalObject() -> [String: JSONValue] {
+        var kind = additionalKindFields
+        if let url {
+            kind["type"] = .string("Git")
+            kind["url"] = .string(url)
+            kind["commit"] = .string(commit ?? sha ?? "")
+            if let ref = ref ?? sha { kind["git_ref"] = .string(ref) }
+        } else {
+            kind["type"] = .string("Local")
+            kind["source_path"] = .string(path ?? sourceIdentifier)
+        }
+        if let subdirectory { kind["subdir"] = .string(subdirectory) }
+
+        var plugins: [String: JSONValue] = [:]
+        for name in Set(pluginNames).union(pluginDetails.keys) {
+            let detail = pluginDetails[name] ?? PluginRepositoryPlugin()
+            var entry = detail.additionalFields
+            if let subdirectory = detail.subdirectory { entry["subdir"] = .string(subdirectory) }
+            if let version = detail.version { entry["version"] = .string(version) }
+            plugins[name] = .object(entry)
+        }
+
+        var object = additionalFields
+        object["kind"] = .object(kind)
+        object["installed_at"] = .string(installedAt)
+        object["updated_at"] = .string(updatedAt)
+        object["path"] = .string(installedPath ?? path ?? sourceIdentifier)
+        object["plugins"] = .object(plugins)
+        if let marketplace {
+            var provenance = additionalMarketplaceFields
+            provenance["source_url_or_path"] = .string(marketplace.sourceURLOrPath)
+            provenance["source_display_name"] = .string(marketplace.sourceDisplayName)
+            provenance["plugin_subdir"] = .string(marketplace.pluginSubdirectory)
+            object["marketplace"] = .object(provenance)
+        }
+        if !enabled { object["enabled"] = .bool(false) }
+        return object
     }
 }
 
-/// The on-disk `registry.json`.
+/// Rust-compatible `{ "version": 1, "repos": { ... } }` install registry.
 public struct PluginInstallRegistry: Hashable, Sendable, Codable {
-    public var repositories: [PluginInstallRecord]
+    public static let testFailRegistrySaveEnvironmentKey =
+        "XAI_GROK_TEST_FAIL_REGISTRY_SAVE_AFTER_SERIALIZE"
 
-    public init(repositories: [PluginInstallRecord] = []) {
+    public var repositories: [PluginInstallRecord]
+    public var additionalFields: [String: JSONValue]
+
+    public init(
+        repositories: [PluginInstallRecord] = [],
+        additionalFields: [String: JSONValue] = [:]
+    ) {
         self.repositories = repositories
+        self.additionalFields = additionalFields
     }
 
     public static func load(from url: URL) -> PluginInstallRegistry {
-        guard let data = try? Data(contentsOf: url),
-              let registry = try? JSONDecoder().decode(PluginInstallRegistry.self, from: data)
-        else { return PluginInstallRegistry() }
-        return registry
+        (try? loadOrThrow(from: url)) ?? PluginInstallRegistry()
     }
 
-    public func save(to url: URL) throws {
+    /// Missing files are empty; unreadable, malformed, or unknown schemas fail closed.
+    public static func loadOrThrow(from url: URL) throws -> PluginInstallRegistry {
+        if let values = try? url.resourceValues(forKeys: [.isSymbolicLinkKey]),
+           values.isSymbolicLink == true {
+            throw PluginRegistryError.malformed("registry.json must not be a symbolic link")
+        }
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch let error as NSError {
+            if error.domain == NSCocoaErrorDomain,
+               error.code == NSFileReadNoSuchFileError {
+                return PluginInstallRegistry()
+            }
+            throw error
+        }
+        do {
+            return try JSONDecoder().decode(PluginInstallRegistry.self, from: data)
+        } catch let error as PluginRegistryError {
+            throw error
+        } catch {
+            throw PluginRegistryError.malformed(error.localizedDescription)
+        }
+    }
+
+    public func save(
+        to url: URL,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
+        var normalized = self
+        for index in normalized.repositories.indices
+        where normalized.repositories[index].installedPath == nil {
+            normalized.repositories[index].installedPath = url
+                .deletingLastPathComponent()
+                .appendingPathComponent(normalized.repositories[index].repoKey)
+                .path
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        // Write-then-rename so a crash mid-save cannot leave a truncated
-        // registry that would orphan every installed plugin.
-        let temporary = url.appendingPathExtension("tmp")
-        try encoder.encode(self).write(to: temporary, options: .atomic)
-        _ = try? FileManager.default.removeItem(at: url)
-        try FileManager.default.moveItem(at: temporary, to: url)
+        let data = try encoder.encode(normalized)
+        if environment[Self.testFailRegistrySaveEnvironmentKey] != nil {
+            throw PluginRegistryError.injectedSaveFailure
+        }
+        // Foundation's `.atomic` writes a sibling then renames over the old
+        // file; removing the old registry first creates a crash-visible hole.
+        try data.write(to: url, options: .atomic)
     }
 
     public func record(named name: String) -> PluginInstallRecord? {
         repositories.first { $0.repoKey == name || $0.pluginNames.contains(name) }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let value = try JSONValue(from: decoder)
+        guard var object = value.objectValue else {
+            throw PluginRegistryError.malformed("registry root must be a JSON object")
+        }
+        let declaredVersion = object.removeValue(forKey: "version")
+        if let version = declaredVersion {
+            guard let number = version.int64Value else {
+                throw PluginRegistryError.malformed("registry version must be an integer")
+            }
+            guard number == 1 else {
+                throw PluginRegistryError.unsupportedVersion(Int(number))
+            }
+        }
+
+        if let repos = object.removeValue(forKey: "repos") {
+            guard declaredVersion != nil else {
+                throw PluginRegistryError.malformed("canonical registry is missing its version")
+            }
+            guard let map = repos.objectValue else {
+                throw PluginRegistryError.malformed("repos must be an object keyed by repository")
+            }
+            repositories = try map.keys.sorted().map { key in
+                guard let record = map[key]?.objectValue else {
+                    throw PluginRegistryError.malformed("repo '\(key)' must be a JSON object")
+                }
+                return try PluginInstallRecord.canonical(key: key, object: record)
+            }
+            additionalFields = object
+            return
+        }
+
+        if let legacy = object.removeValue(forKey: "repositories") {
+            guard let entries = legacy.arrayValue else {
+                throw PluginRegistryError.malformed("legacy repositories must be an array")
+            }
+            repositories = try entries.map { entry in
+                guard let record = entry.objectValue else {
+                    throw PluginRegistryError.malformed("legacy repository must be a JSON object")
+                }
+                return try PluginInstallRecord.legacy(object: record)
+            }
+            additionalFields = object
+            return
+        }
+
+        if let marketplace = object.removeValue(forKey: "plugins") {
+            guard declaredVersion != nil else {
+                throw PluginRegistryError.malformed("legacy marketplace registry is missing its version")
+            }
+            guard let entries = marketplace.arrayValue else {
+                throw PluginRegistryError.malformed("legacy marketplace plugins must be an array")
+            }
+            repositories = try entries.map { value in
+                let plugin = try JSONDecoder().decode(
+                    InstalledMarketplacePlugin.self,
+                    from: JSONEncoder().encode(value)
+                )
+                let source = plugin.provenance.sourceURLOrPath
+                let remote = source.contains("://") || source.hasPrefix("git@")
+                return PluginInstallRecord(
+                    repoKey: plugin.key,
+                    sourceIdentifier: "\(source)#\(plugin.provenance.pluginSubdirectory)",
+                    url: remote ? source : nil,
+                    path: remote ? nil : source,
+                    pluginNames: [plugin.name],
+                    installedPath: plugin.path,
+                    installedAt: plugin.installedAt,
+                    updatedAt: plugin.updatedAt,
+                    commit: remote ? "" : nil,
+                    subdirectory: plugin.provenance.pluginSubdirectory,
+                    pluginDetails: [
+                        plugin.name: PluginRepositoryPlugin(version: plugin.version)
+                    ],
+                    marketplace: plugin.provenance
+                )
+            }
+            additionalFields = object
+            return
+        }
+
+        throw PluginRegistryError.malformed("expected canonical repos or a supported legacy registry")
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var root = additionalFields
+        var repos: [String: JSONValue] = [:]
+        for record in repositories {
+            guard repos[record.repoKey] == nil else {
+                throw PluginRegistryError.malformed("duplicate repository key '\(record.repoKey)'")
+            }
+            repos[record.repoKey] = .object(record.canonicalObject())
+        }
+        root["version"] = .number(.int64(1))
+        root["repos"] = .object(repos)
+        try JSONValue.object(root).encode(to: encoder)
+    }
+
+    static func optionalString(_ value: JSONValue?, field: String) throws -> String? {
+        guard let value, !value.isNull else { return nil }
+        guard let string = value.stringValue else {
+            throw PluginRegistryError.malformed("\(field) must be a string")
+        }
+        return string
     }
 }
 
@@ -441,6 +869,7 @@ public enum PluginInstallSource: Sendable, Equatable {
 
         let looksRemote = text.hasPrefix("http://")
             || text.hasPrefix("https://")
+            || text.hasPrefix("file://")
             || text.hasPrefix("git@")
             || text.hasPrefix("ssh://")
 

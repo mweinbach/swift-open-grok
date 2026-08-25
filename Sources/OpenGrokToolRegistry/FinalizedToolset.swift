@@ -400,7 +400,10 @@ private func accessKind(for tool: FinalizedTool, args: JSONValue) -> AccessKind 
     case .webFetch:
         return .webFetch(stringArg(args, keys: ["url"]) ?? "")
     case .webSearch:
-        return .webSearch(stringArg(args, keys: ["query"]) ?? "")
+        if tool.id == "web__run" {
+            return .read(nil)
+        }
+        return .webSearch(webSearchAccessSubject(args))
     case .imageGen, .videoGen, .imageToVideo, .referenceToVideo:
         // Media generation is deliberately *not* an edit or a web category.
         // `From<&ToolInput> for AccessKind`
@@ -424,6 +427,29 @@ private func stringArg(_ args: JSONValue, keys: [String]) -> String? {
         if case .string(let s) = obj[k] { return s }
     }
     return nil
+}
+
+private func webSearchAccessSubject(_ args: JSONValue) -> String {
+    if let query = stringArg(args, keys: ["query"]) {
+        return query
+    }
+    guard case .object(let object) = args else { return "" }
+    let commandFields: [(name: String, field: String, prefix: String)] = [
+        ("search_query", "q", ""),
+        ("image_query", "q", ""),
+        ("open", "ref_id", "open "),
+        ("finance", "ticker", "finance "),
+        ("weather", "location", "weather "),
+    ]
+    for command in commandFields {
+        guard case .array(let entries) = object[command.name],
+              let first = entries.first,
+              case .object(let fields) = first,
+              case .string(let value) = fields[command.field]
+        else { continue }
+        return command.prefix + value
+    }
+    return ""
 }
 
 private func applyOutputCap(_ typed: TypedToolOutput, toolId: String) -> TypedToolOutput {

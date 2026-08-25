@@ -685,10 +685,12 @@ public struct DefaultOpenGrokShellACPRuntimeFactory: OpenGrokShellACPRuntimeFact
         extensionHandler: (any ACPAgentExtensionHandler)?,
         extensionNotifications: ACPExtensionNotificationRouter?,
         onSessionOpened: (@Sendable (AcpSessionId, AcpMeta?) async throws -> Void)? = nil,
-        onSessionClosed: (@Sendable (AcpSessionId) async -> Void)? = nil
+        onSessionClosed: (@Sendable (AcpSessionId) async -> Void)? = nil,
+        configuration: ACPAgentConfiguration = ACPAgentConfiguration()
     ) -> OpenGrokShellACPComponents {
         let store = InMemoryACPSessionStore()
         let runtime = ACPAgentRuntime(
+            configuration: configuration,
             store: store,
             promptDriver: promptDriver,
             workspaceBoundary: workspace.acpBoundary,
@@ -718,10 +720,7 @@ public actor ProviderBackedACPPromptDriver: ACPPromptDriver {
         context: ACPPromptContext,
         emit: @escaping @Sendable (SessionNotification, ACPNotificationDisposition) async -> Void
     ) async throws -> PromptResponse {
-        let text = context.request.prompt.compactMap { block -> String? in
-            if case let .text(value) = block { return value.text }
-            return nil
-        }.joined()
+        let text = try Self.promptText(for: context.request.prompt)
         let turnID = context.request.messageId ?? UUID().uuidString
         activeTurnID = turnID
         defer { activeTurnID = nil }
@@ -755,6 +754,34 @@ public actor ProviderBackedACPPromptDriver: ACPPromptDriver {
             userMessageId: context.request.messageId ?? turnID,
             meta: meta
         )
+    }
+
+    static func promptText(for blocks: [ContentBlock]) throws -> String {
+        try blocks.map { block in
+            switch block {
+            case .text(let value):
+                return value.text
+            case .resource(let resource):
+                switch resource.resource {
+                case .text(let contents):
+                    return contents.text
+                case .blob:
+                    throw OpenGrokShellError.invalidTurnRequest(
+                        "embedded binary resources are not supported"
+                    )
+                }
+            case .resourceLink(let link):
+                return link.uri
+            case .image:
+                throw OpenGrokShellError.invalidTurnRequest(
+                    "ACP prompt images are not supported"
+                )
+            case .audio:
+                throw OpenGrokShellError.invalidTurnRequest(
+                    "ACP prompt audio is not supported"
+                )
+            }
+        }.joined()
     }
 
     static func stopReason(for result: OpenGrokShellTurnResult) -> OpenGrokACP.StopReason {
@@ -929,12 +956,13 @@ public actor OpenGrokShell: OpenGrokShellFacade {
         let workspace: any OpenGrokShellWorkspace
         let providerSession: any OpenGrokShellProviderSession
         let acp: OpenGrokShellACPComponents
-        let mailbox: SessionCommandMailbox
+        var mailbox: SessionCommandMailbox
         var summary: SessionSummary
         var phase: SessionLifecyclePhase
         var chatHistory: [JSONValue]
         var persistedState: PersistedSessionState
         var activeTurnID: String?
+        var suppressPersistenceUntilNextTurn: Bool
     }
 
     private let configuration: OpenGrokShellConfiguration
@@ -1069,7 +1097,8 @@ public actor OpenGrokShell: OpenGrokShellFacade {
             phase: .idle,
             chatHistory: persistedState.chatHistory,
             persistedState: persistedState,
-            activeTurnID: nil
+            activeTurnID: nil,
+            suppressPersistenceUntilNextTurn: false
         )
         let acpSnapshot = ACPSessionSnapshot(
             sessionId: AcpSessionId(request.sessionID.rawValue),
@@ -1103,6 +1132,58 @@ public actor OpenGrokShell: OpenGrokShellFacade {
     public func lookupSession(_ sessionID: SessionID) async -> OpenGrokShellSessionDescriptor? {
         guard let session = sessions[sessionID] else { return nil }
         return await descriptor(for: session)
+    }
+
+    /// Forget every durable conversation surface before its files are removed.
+    /// Shutdown must not recreate the deleted auxiliary state; only an accepted
+    /// new turn may reopen persistence for this retained session identity.
+    public func clearSessionHistoryForDeletion(_ sessionID: SessionID) async throws {
+        try requireRunning()
+        guard let existing = sessions[sessionID] else {
+            throw OpenGrokShellError.sessionNotFound(sessionID.rawValue)
+        }
+        guard existing.activeTurnID == nil, existing.phase == .idle else {
+            throw OpenGrokShellError.turnAlreadyActive(
+                existing.activeTurnID ?? sessionID.rawValue
+            )
+        }
+
+        let mailbox = await existing.mailbox.snapshot()
+        guard mailbox.queued.isEmpty, mailbox.inFlight == nil else {
+            throw OpenGrokShellError.turnAlreadyActive(
+                mailbox.inFlight?.commandID ?? sessionID.rawValue
+            )
+        }
+
+        // The mailbox snapshot crosses actor isolation; a turn may have been
+        // accepted during that hop, so recheck the live session before wiping.
+        guard var session = sessions[sessionID] else {
+            throw OpenGrokShellError.sessionNotFound(sessionID.rawValue)
+        }
+        guard session.activeTurnID == nil, session.phase == .idle else {
+            throw OpenGrokShellError.turnAlreadyActive(
+                session.activeTurnID ?? sessionID.rawValue
+            )
+        }
+
+        session.mailbox = try SessionCommandMailbox(sessionID: sessionID, ownerID: "shell")
+        session.summary.sessionSummary = ""
+        session.summary.messageCount = 0
+        session.summary.chatMessageCount = 0
+        session.summary.nextTraceTurn = 0
+        session.summary.updatedAt = configuration.now()
+        session.summary.extra.removeAll()
+        session.chatHistory.removeAll(keepingCapacity: false)
+        session.persistedState = PersistedSessionState(summary: session.summary)
+        session.suppressPersistenceUntilNextTurn = true
+        sessions[sessionID] = session
+
+        turnOutcomes = turnOutcomes.filter { $0.key.sessionID != sessionID }
+        turnCommands = turnCommands.filter { $0.key.sessionID != sessionID }
+        turnPromptIDs = turnPromptIDs.filter { $0.key.sessionID != sessionID }
+        turnUpdateSequences = turnUpdateSequences.filter { $0.key.sessionID != sessionID }
+        requestedCancellations = requestedCancellations.filter { $0.sessionID != sessionID }
+        cancellableTurns = cancellableTurns.filter { $0.sessionID != sessionID }
     }
 
     public func synchronizeProviderBoundary(
@@ -1146,6 +1227,7 @@ public actor OpenGrokShell: OpenGrokShellFacade {
         guard try await session.mailbox.claimNext(by: "shell")?.commandID == command.commandID else {
             throw OpenGrokShellError.turnAlreadyActive(request.turnID)
         }
+        session.suppressPersistenceUntilNextTurn = false
         session.activeTurnID = request.turnID
         session.phase = .sampling
         session.summary.chatMessageCount &+= 1
@@ -1569,7 +1651,8 @@ public actor OpenGrokShell: OpenGrokShellFacade {
     }
 
     private func persistSession(_ sessionID: SessionID) async throws {
-        guard let session = sessions[sessionID] else { return }
+        guard let session = sessions[sessionID],
+              !session.suppressPersistenceUntilNextTurn else { return }
         let mailbox = await session.mailbox.snapshot()
         var state = session.persistedState
         state.summary = session.summary

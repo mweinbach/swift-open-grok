@@ -21,6 +21,7 @@ public enum ViewImageTool {
             guard let path else { throw SessionFSError.invalidInput("missing path") }
             let absolute = SessionFS.resolve(cwd: resources.cwd, path: path)
             try SessionFS.enforceRoots(absolute, roots: resources.allowedRoots)
+            try GitIgnoreAccessPolicy.enforce(path: absolute, resources: resources, operation: "read")
             guard SessionFS.fileExists(absolute) else {
                 throw SessionFSError.notFound(absolute)
             }

@@ -997,17 +997,36 @@ public final class URLSessionHTTPTransport: NSObject, HTTPTransport, @unchecked 
                         TransportFailure(kind: .permanent, detail: "non-HTTP response")
                     )
                 }
-                try mailbox.push(.metadata(Self.metadata(from: http)))
+                let metadata = Self.metadata(from: http)
+                try mailbox.push(.metadata(metadata))
 
+                let flushEventBoundaries = metadata.isEventStream
+                let chunkLimit = flushEventBoundaries
+                    ? min(16 * 1024, mailbox.maxPendingBytes)
+                    : 16 * 1024
                 var chunk = Data()
-                chunk.reserveCapacity(16 * 1024)
+                chunk.reserveCapacity(chunkLimit)
+                var previousByte: UInt8?
+                var byteBeforePrevious: UInt8?
                 for try await byte in bytes {
                     try Task.checkCancellation()
                     chunk.append(byte)
-                    if chunk.count >= 16 * 1024 {
+
+                    // An SSE response can remain open indefinitely, so its
+                    // complete LF or CRLF frames cannot wait for a full chunk.
+                    // Keep delimiter state outside `chunk` because its bounded
+                    // partial flush can split a CRLF sequence.
+                    let completesEvent = flushEventBoundaries && byte == 0x0A && (
+                        previousByte == 0x0A
+                            || (previousByte == 0x0D && byteBeforePrevious == 0x0A)
+                    )
+                    byteBeforePrevious = previousByte
+                    previousByte = byte
+
+                    if completesEvent || chunk.count >= chunkLimit {
                         try mailbox.push(.body(chunk))
                         chunk = Data()
-                        chunk.reserveCapacity(16 * 1024)
+                        chunk.reserveCapacity(chunkLimit)
                     }
                 }
                 if !chunk.isEmpty {

@@ -108,6 +108,10 @@ public enum BuiltinToolCatalog {
             "path": stringProp("File or directory to search."),
             "glob": stringProp("Glob filter."),
             "-i": boolProp("Case insensitive."),
+            "-A": intProp("Number of context lines after each match."),
+            "-B": intProp("Number of context lines before each match."),
+            "-C": intProp("Number of context lines before and after each match."),
+            "type": stringProp("File type to search."),
             "head_limit": intProp("Limit match lines."),
             "multiline": boolProp("Multiline mode."),
             "output_mode": stringProp("Output mode: content, files_with_matches, or count."),
@@ -843,7 +847,7 @@ public enum BuiltinToolCatalog {
     /// strip MCP access (`builder.rs:2243-2261`).
     public static var builtinTools: [RegisteredToolSpec] {
         fileTools + mediaTools + videoTools + webTools + sessionStateTools + planModeTools
-            + askUserQuestionTools + mcpMetaTools
+            + webRunTools + askUserQuestionTools + mcpMetaTools
     }
 
     public static var allQualifiedIds: Set<String> {

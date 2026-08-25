@@ -179,6 +179,7 @@ struct ToolInputSchemaValidator: Sendable {
             // Optional Rust fields accept explicit null even when a hand-built
             // Swift catalog omitted JSON Schema's nullable type union.
             if acceptsFirstPartyCoercions,
+               toolID != "web__run",
                candidate.isNull,
                !required.contains(key),
                !declaresBoolean(property)

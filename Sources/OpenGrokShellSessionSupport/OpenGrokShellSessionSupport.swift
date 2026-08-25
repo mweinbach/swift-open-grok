@@ -1,8 +1,16 @@
 import Foundation
+import OpenGrokFileUtils
 import OpenGrokShared
 import OpenGrokVersion
 #if canImport(FoundationNetworking)
 import FoundationNetworking
+#endif
+#if os(Windows)
+import OpenGrokConfig
+#elseif canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
 #endif
 
 public enum ShellSessionSupportError: Error, Sendable, Equatable {
@@ -1662,43 +1670,606 @@ public actor SessionStateStore {
     private let root: URL
 
     public init(root: URL) {
-        self.root = root
+        self.root = root.standardizedFileURL
     }
 
     public func save(_ state: PersistedSessionState) throws {
         try validateSessionPathComponent(state.summary.sessionID.rawValue)
-        let sessionRoot = root.appendingPathComponent("sessions", isDirectory: true).appendingPathComponent(state.summary.sessionID.rawValue, isDirectory: true)
         do {
-            try FileManager.default.createDirectory(at: sessionRoot, withIntermediateDirectories: true)
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
             let data = try encoder.encode(state)
-            let temporary = sessionRoot.appendingPathComponent("\(Self.fileName).tmp")
-            try data.write(to: temporary, options: .atomic)
-            let destination = sessionRoot.appendingPathComponent(Self.fileName)
-            try atomicallyReplaceItem(at: destination, with: temporary)
+            try SessionStateSecureStorage(root: root).save(
+                data,
+                sessionID: state.summary.sessionID.rawValue
+            )
         } catch {
-            throw ShellSessionSupportError.persistence(error.localizedDescription)
+            throw persistenceFailure(error)
         }
     }
 
     public func load(sessionID: SessionID) throws -> PersistedSessionState? {
         try validateSessionPathComponent(sessionID.rawValue)
-        let file = root.appendingPathComponent("sessions", isDirectory: true).appendingPathComponent(sessionID.rawValue, isDirectory: true).appendingPathComponent(Self.fileName)
-        guard FileManager.default.fileExists(atPath: file.path) else { return nil }
         do {
-            return try JSONDecoder().decode(PersistedSessionState.self, from: Data(contentsOf: file))
+            guard let data = try SessionStateSecureStorage(root: root).load(
+                sessionID: sessionID.rawValue
+            ) else {
+                return nil
+            }
+            return try JSONDecoder().decode(PersistedSessionState.self, from: data)
         } catch {
-            throw ShellSessionSupportError.persistence("invalid session state: \(error.localizedDescription)")
+            throw ShellSessionSupportError.persistence("invalid session state: \(describePersistenceError(error))")
         }
     }
 
     public func delete(sessionID: SessionID) throws {
         try validateSessionPathComponent(sessionID.rawValue)
-        let directory = root.appendingPathComponent("sessions", isDirectory: true).appendingPathComponent(sessionID.rawValue, isDirectory: true)
-        guard FileManager.default.fileExists(atPath: directory.path) else { return }
-        do { try FileManager.default.removeItem(at: directory) }
-        catch { throw ShellSessionSupportError.persistence(error.localizedDescription) }
+        do {
+            try SessionStateSecureStorage(root: root).delete(sessionID: sessionID.rawValue)
+        } catch {
+            throw persistenceFailure(error)
+        }
+    }
+
+    private func persistenceFailure(_ error: Error) -> ShellSessionSupportError {
+        if let failure = error as? ShellSessionSupportError {
+            return failure
+        }
+        return .persistence(error.localizedDescription)
+    }
+
+    private func describePersistenceError(_ error: Error) -> String {
+        if case let ShellSessionSupportError.persistence(message) = error {
+            return message
+        }
+        return error.localizedDescription
+    }
+}
+
+private struct SessionStateSecureStorage {
+    let root: URL
+
+    #if os(Windows)
+    func save(_ data: Data, sessionID: String) throws {
+        guard let directory = try sessionDirectory(sessionID: sessionID, create: true) else {
+            throw failure("session directory could not be created")
+        }
+        let destination = directory.appendingPathComponent(SessionStateStore.fileName)
+        try secureExistingFile(destination)
+        try AtomicFile.write(destination, data: data, options: .ownerOnly)
+        try SecureFile.ensureOwnerOnlyPermissions(at: destination)
+        guard try SecureFile.isOwnerOnly(at: destination) else {
+            throw failure("session state is not private to the current user")
+        }
+    }
+
+    func load(sessionID: String) throws -> Data? {
+        guard let directory = try sessionDirectory(sessionID: sessionID, create: false) else {
+            return nil
+        }
+        let destination = directory.appendingPathComponent(SessionStateStore.fileName)
+        guard try secureExistingFile(destination) else { return nil }
+        return try PathSecurity.readNoFollow(destination, maximumBytes: nil, requireOwnerOnly: true)
+    }
+
+    func delete(sessionID: String) throws {
+        guard let directory = try sessionDirectory(sessionID: sessionID, create: false) else {
+            return
+        }
+        let destination = directory.appendingPathComponent(SessionStateStore.fileName)
+        if try secureExistingFile(destination) {
+            try FileManager.default.removeItem(at: destination)
+        }
+        try FileManager.default.removeItem(at: directory)
+    }
+
+    private func sessionDirectory(sessionID: String, create: Bool) throws -> URL? {
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        let directory = sessions.appendingPathComponent(sessionID, isDirectory: true)
+
+        for path in [root, sessions, directory] {
+            if let metadata = try WindowsSecurePath.metadata(at: path) {
+                guard metadata.isDirectory, !metadata.isReparsePoint else {
+                    throw failure("session directory must be a real, non-symlink directory: \(path.path)")
+                }
+            } else if !create {
+                return nil
+            }
+        }
+
+        try OpenGrokConfig.createDirAllOwnerOnly(directory, stateRoot: root)
+        return directory
+    }
+
+    @discardableResult
+    private func secureExistingFile(_ path: URL) throws -> Bool {
+        guard let metadata = try WindowsSecurePath.metadata(at: path) else { return false }
+        guard !metadata.isDirectory, !metadata.isReparsePoint else {
+            throw failure("session state must be a regular, non-symlink file: \(path.path)")
+        }
+        try SecureFile.ensureOwnerOnlyPermissions(at: path)
+        guard try SecureFile.isOwnerOnly(at: path) else {
+            throw failure("session state is not private to the current user")
+        }
+        return true
+    }
+    #elseif canImport(Darwin) || canImport(Glibc)
+    private static var directoryFlags: Int32 {
+        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+    }
+
+    private final class SessionDirectory {
+        let rootDescriptor: Int32
+        let sessionsDescriptor: Int32
+        let descriptor: Int32
+        let root: URL
+        let sessionID: String
+
+        init(rootDescriptor: Int32, sessionsDescriptor: Int32, descriptor: Int32, root: URL, sessionID: String) {
+            self.rootDescriptor = rootDescriptor
+            self.sessionsDescriptor = sessionsDescriptor
+            self.descriptor = descriptor
+            self.root = root
+            self.sessionID = sessionID
+        }
+
+        deinit {
+            close(descriptor)
+            close(sessionsDescriptor)
+            close(rootDescriptor)
+        }
+    }
+
+    func save(_ data: Data, sessionID: String) throws {
+        guard let directory = try sessionDirectory(sessionID: sessionID, create: true) else {
+            throw failure("session directory could not be created")
+        }
+        try verify(directory)
+        if let existing = try openFile(in: directory, allowMissing: true) {
+            close(existing)
+        }
+
+        let temporary = ".state-\(UUID().uuidString).tmp"
+        let descriptor = temporary.withCString {
+            openat(
+                directory.descriptor,
+                $0,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                mode_t(0o600)
+            )
+        }
+        guard descriptor >= 0 else {
+            throw failure("create private session-state file: \(posixDescription())")
+        }
+
+        var descriptorOpen = true
+        var temporaryExists = true
+        defer {
+            if descriptorOpen { close(descriptor) }
+            if temporaryExists {
+                _ = temporary.withCString { unlinkat(directory.descriptor, $0, 0) }
+            }
+        }
+
+        try data.withUnsafeBytes { buffer in
+            guard let base = buffer.baseAddress else { return }
+            var offset = 0
+            while offset < buffer.count {
+                #if canImport(Darwin)
+                let written = Darwin.write(descriptor, base.advanced(by: offset), buffer.count - offset)
+                #else
+                let written = Glibc.write(descriptor, base.advanced(by: offset), buffer.count - offset)
+                #endif
+                if written < 0 {
+                    if errno == EINTR { continue }
+                    throw failure("write private session-state file: \(posixDescription())")
+                }
+                guard written > 0 else {
+                    throw failure("write private session-state file: zero-byte write")
+                }
+                offset += written
+            }
+        }
+
+        guard fchmod(descriptor, mode_t(0o600)) == 0, fsync(descriptor) == 0 else {
+            throw failure("secure private session-state file: \(posixDescription())")
+        }
+        close(descriptor)
+        descriptorOpen = false
+
+        try verify(directory)
+        if let existing = try openFile(in: directory, allowMissing: true) {
+            close(existing)
+        }
+        let renamed = temporary.withCString { source in
+            SessionStateStore.fileName.withCString { destination in
+                renameat(directory.descriptor, source, directory.descriptor, destination)
+            }
+        }
+        guard renamed == 0 else {
+            throw failure("atomically persist private session state: \(posixDescription())")
+        }
+        temporaryExists = false
+        guard fsync(directory.descriptor) == 0 else {
+            throw failure("synchronize private session directory: \(posixDescription())")
+        }
+        try verify(directory)
+    }
+
+    func load(sessionID: String) throws -> Data? {
+        guard let directory = try sessionDirectory(sessionID: sessionID, create: false) else {
+            return nil
+        }
+        try verify(directory)
+        guard let descriptor = try openFile(in: directory, allowMissing: true) else {
+            return nil
+        }
+        defer { close(descriptor) }
+
+        var result = Data()
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                #if canImport(Darwin)
+                Darwin.read(descriptor, bytes.baseAddress, bytes.count)
+                #else
+                Glibc.read(descriptor, bytes.baseAddress, bytes.count)
+                #endif
+            }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw failure("read private session state: \(posixDescription())")
+            }
+            guard count > 0 else { break }
+            result.append(contentsOf: buffer.prefix(count))
+        }
+        try verify(directory)
+        return result
+    }
+
+    func delete(sessionID: String) throws {
+        guard let directory = try sessionDirectory(sessionID: sessionID, create: false) else {
+            return
+        }
+        try verify(directory)
+        try removeEntries(descriptor: directory.descriptor)
+        try verify(directory)
+        let removed = sessionID.withCString {
+            unlinkat(directory.sessionsDescriptor, $0, AT_REMOVEDIR)
+        }
+        guard removed == 0 else {
+            throw failure("remove private session directory: \(posixDescription())")
+        }
+        try verify(directory, requireSession: false)
+    }
+
+    private func sessionDirectory(sessionID: String, create: Bool) throws -> SessionDirectory? {
+        guard root.isFileURL else {
+            throw failure("session-state root must be a local file URL")
+        }
+        guard let rootDescriptor = try openRoot(create: create) else { return nil }
+        var ownsRoot = true
+        defer { if ownsRoot { close(rootDescriptor) } }
+
+        guard let sessionsDescriptor = try openDirectory(
+            named: "sessions",
+            under: rootDescriptor,
+            create: create
+        ) else { return nil }
+        var ownsSessions = true
+        defer { if ownsSessions { close(sessionsDescriptor) } }
+
+        guard let descriptor = try openDirectory(
+            named: sessionID,
+            under: sessionsDescriptor,
+            create: create
+        ) else { return nil }
+        ownsRoot = false
+        ownsSessions = false
+        return SessionDirectory(
+            rootDescriptor: rootDescriptor,
+            sessionsDescriptor: sessionsDescriptor,
+            descriptor: descriptor,
+            root: root,
+            sessionID: sessionID
+        )
+    }
+
+    private func openRoot(create: Bool) throws -> Int32? {
+        let anchor = "/".withCString { open($0, Self.directoryFlags) }
+        guard anchor >= 0 else {
+            throw failure("open filesystem root for session state: \(posixDescription())")
+        }
+
+        let components = root.path.split(separator: "/").map(String.init)
+        var current = anchor
+        var createdAncestor = false
+
+        do {
+            for (index, component) in components.enumerated() {
+                let isApplicationRoot = index == components.count - 1
+                var next = component.withCString { openat(current, $0, Self.directoryFlags) }
+
+                if next < 0, errno == ENOENT {
+                    guard create else {
+                        close(current)
+                        return nil
+                    }
+                    guard let created = try openDirectory(named: component, under: current, create: true) else {
+                        throw failure("session-state root disappeared during creation")
+                    }
+                    next = created
+                    createdAncestor = true
+                } else if next < 0 {
+                    var information = stat()
+                    let inspected = component.withCString {
+                        fstatat(current, $0, &information, AT_SYMLINK_NOFOLLOW)
+                    }
+
+                    // macOS exposes its temporary state root through trusted,
+                    // root-owned /var and /tmp aliases. User-owned aliases can
+                    // redirect application state and must never be followed.
+                    guard inspected == 0,
+                          information.st_mode & mode_t(S_IFMT) == mode_t(S_IFLNK),
+                          information.st_uid == 0,
+                          !isApplicationRoot,
+                          !createdAncestor
+                    else {
+                        throw failure("session-state root contains an unsafe symlink or directory: \(component)")
+                    }
+                    next = component.withCString {
+                        openat(current, $0, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                    }
+                    guard next >= 0 else {
+                        throw failure("open trusted system directory alias: \(posixDescription())")
+                    }
+                }
+
+                if isApplicationRoot || createdAncestor {
+                    do {
+                        try secureDirectory(next, description: isApplicationRoot ? root.path : component)
+                    } catch {
+                        close(next)
+                        throw error
+                    }
+                }
+                close(current)
+                current = next
+            }
+
+            if components.isEmpty {
+                try secureDirectory(current, description: root.path)
+            }
+            return current
+        } catch {
+            close(current)
+            throw error
+        }
+    }
+
+    private func openDirectory(named component: String, under parent: Int32, create: Bool) throws -> Int32? {
+        if create {
+            let created = component.withCString { mkdirat(parent, $0, mode_t(0o700)) }
+            if created != 0, errno != EEXIST {
+                throw failure("create private session directory: \(posixDescription())")
+            }
+        }
+
+        let descriptor = component.withCString { openat(parent, $0, Self.directoryFlags) }
+        guard descriptor >= 0 else {
+            if !create, errno == ENOENT { return nil }
+            throw failure("session directory must be a real, non-symlink directory: \(posixDescription())")
+        }
+        do {
+            try secureDirectory(descriptor, description: component)
+            return descriptor
+        } catch {
+            close(descriptor)
+            throw error
+        }
+    }
+
+    private func secureDirectory(_ descriptor: Int32, description: String) throws {
+        var information = stat()
+        guard fstat(descriptor, &information) == 0 else {
+            throw failure("inspect session directory: \(posixDescription())")
+        }
+        guard information.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+              information.st_uid == geteuid()
+        else {
+            throw failure("session directory is not owned by the current user: \(description)")
+        }
+
+        let permissions = information.st_mode & mode_t(0o777)
+        guard permissions & mode_t(0o022) == 0 else {
+            throw failure("session directory is writable by another user: \(description)")
+        }
+        if permissions != mode_t(0o700), fchmod(descriptor, mode_t(0o700)) != 0 {
+            throw failure("restrict session directory to its owner: \(posixDescription())")
+        }
+    }
+
+    private func openFile(in directory: SessionDirectory, allowMissing: Bool) throws -> Int32? {
+        let descriptor = SessionStateStore.fileName.withCString {
+            openat(directory.descriptor, $0, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        }
+        guard descriptor >= 0 else {
+            if allowMissing, errno == ENOENT { return nil }
+            throw failure("session state must be a real, non-symlink file: \(posixDescription())")
+        }
+
+        do {
+            var information = stat()
+            guard fstat(descriptor, &information) == 0 else {
+                throw failure("inspect session state: \(posixDescription())")
+            }
+            guard information.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+                  information.st_uid == geteuid(),
+                  information.st_nlink == 1
+            else {
+                throw failure("session state must be an owned regular file without hard links")
+            }
+
+            let permissions = information.st_mode & mode_t(0o777)
+            guard permissions & mode_t(0o022) == 0 else {
+                throw failure("session state is writable by another user")
+            }
+            if permissions != mode_t(0o600), fchmod(descriptor, mode_t(0o600)) != 0 {
+                throw failure("restrict session state to its owner: \(posixDescription())")
+            }
+            return descriptor
+        } catch {
+            close(descriptor)
+            throw error
+        }
+    }
+
+    private func verify(_ directory: SessionDirectory, requireSession: Bool = true) throws {
+        let observedRoot = directory.root.path.withCString { open($0, Self.directoryFlags) }
+        guard observedRoot >= 0 else {
+            throw failure("session-state root changed during its operation")
+        }
+        defer { close(observedRoot) }
+        guard sameFile(directory.rootDescriptor, observedRoot) else {
+            throw failure("session-state root changed during its operation")
+        }
+
+        let observedSessions = "sessions".withCString {
+            openat(observedRoot, $0, Self.directoryFlags)
+        }
+        guard observedSessions >= 0 else {
+            throw failure("session parent directory changed during its operation")
+        }
+        defer { close(observedSessions) }
+        guard sameFile(directory.sessionsDescriptor, observedSessions) else {
+            throw failure("session parent directory changed during its operation")
+        }
+        guard requireSession else { return }
+
+        let observed = directory.sessionID.withCString {
+            openat(observedSessions, $0, Self.directoryFlags)
+        }
+        guard observed >= 0 else {
+            throw failure("session directory changed during its operation")
+        }
+        defer { close(observed) }
+        guard sameFile(directory.descriptor, observed) else {
+            throw failure("session directory changed during its operation")
+        }
+    }
+
+    private func sameFile(_ first: Int32, _ second: Int32) -> Bool {
+        var firstInformation = stat()
+        var secondInformation = stat()
+        return fstat(first, &firstInformation) == 0
+            && fstat(second, &secondInformation) == 0
+            && firstInformation.st_dev == secondInformation.st_dev
+            && firstInformation.st_ino == secondInformation.st_ino
+    }
+
+    private func removeEntries(descriptor: Int32) throws {
+        let duplicate = dup(descriptor)
+        guard duplicate >= 0 else {
+            throw failure("inspect private session directory: \(posixDescription())")
+        }
+        guard let stream = fdopendir(duplicate) else {
+            close(duplicate)
+            throw failure("inspect private session directory: \(posixDescription())")
+        }
+        defer { closedir(stream) }
+
+        var entries: [String] = []
+        while true {
+            errno = 0
+            guard let entry = readdir(stream) else {
+                if errno != 0 {
+                    throw failure("inspect private session directory: \(posixDescription())")
+                }
+                break
+            }
+            var storage = entry.pointee.d_name
+            let capacity = MemoryLayout.size(ofValue: storage)
+            let name = withUnsafePointer(to: &storage) { pointer in
+                pointer.withMemoryRebound(
+                    to: CChar.self,
+                    capacity: capacity
+                ) { String(validatingCString: $0) }
+            }
+            guard let name else {
+                throw failure("private session directory contains an invalid file name")
+            }
+            if name != ".", name != ".." {
+                entries.append(name)
+            }
+        }
+
+        for entry in entries {
+            var information = stat()
+            let inspected = entry.withCString {
+                fstatat(descriptor, $0, &information, AT_SYMLINK_NOFOLLOW)
+            }
+            guard inspected == 0 else {
+                throw failure("inspect private session entry: \(posixDescription())")
+            }
+            let kind = information.st_mode & mode_t(S_IFMT)
+            if kind == mode_t(S_IFDIR) {
+                guard let child = try openDirectory(named: entry, under: descriptor, create: false) else {
+                    throw failure("private session entry disappeared")
+                }
+                defer { close(child) }
+                try removeEntries(descriptor: child)
+            } else {
+                guard kind == mode_t(S_IFREG),
+                      information.st_uid == geteuid(),
+                      information.st_nlink == 1,
+                      information.st_mode & mode_t(0o022) == 0
+                else {
+                    throw failure("session directory contains a symlink, hard link, or unsafe entry")
+                }
+                if entry == SessionStateStore.fileName,
+                   let opened = try openFileDescriptor(named: entry, under: descriptor) {
+                    close(opened)
+                }
+            }
+
+            let flags: Int32 = kind == mode_t(S_IFDIR) ? AT_REMOVEDIR : 0
+            let removed = entry.withCString { unlinkat(descriptor, $0, flags) }
+            guard removed == 0 else {
+                throw failure("remove private session entry: \(posixDescription())")
+            }
+        }
+    }
+
+    private func openFileDescriptor(named name: String, under parent: Int32) throws -> Int32? {
+        let descriptor = name.withCString {
+            openat(parent, $0, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        }
+        guard descriptor >= 0 else {
+            if errno == ENOENT { return nil }
+            throw failure("session state must be a real, non-symlink file: \(posixDescription())")
+        }
+        return descriptor
+    }
+
+    private func posixDescription() -> String {
+        String(cString: strerror(errno))
+    }
+    #else
+    func save(_ data: Data, sessionID: String) throws {
+        throw failure("owner-private session-state persistence is unavailable on this platform")
+    }
+
+    func load(sessionID: String) throws -> Data? {
+        throw failure("owner-private session-state persistence is unavailable on this platform")
+    }
+
+    func delete(sessionID: String) throws {
+        throw failure("owner-private session-state persistence is unavailable on this platform")
+    }
+    #endif
+
+    private func failure(_ detail: String) -> ShellSessionSupportError {
+        .persistence(detail)
     }
 }
 

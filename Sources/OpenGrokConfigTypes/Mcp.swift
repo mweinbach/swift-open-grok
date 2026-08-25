@@ -317,7 +317,8 @@ public struct McpServerPreferences: Hashable, Sendable, Codable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case values
         case source
-        case updatedAt = "updated_at"
+        case updatedAt
+        case legacyUpdatedAt = "updated_at"
     }
 
     public init(from decoder: Decoder) throws {
@@ -325,6 +326,7 @@ public struct McpServerPreferences: Hashable, Sendable, Codable, Equatable {
         values = try c.decodeIfPresent([String: String].self, forKey: .values) ?? [:]
         source = try c.decodeIfPresent(McpPreferenceSource.self, forKey: .source)
         updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt)
+            ?? c.decodeIfPresent(String.self, forKey: .legacyUpdatedAt)
     }
 
     public func encode(to encoder: Encoder) throws {

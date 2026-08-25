@@ -247,6 +247,13 @@ private func parseCodexWireModel(_ obj: [String: Any], baseURL: String) -> Codex
         toolMode = nil
     }
 
+    let subagentContextDefault = (
+        obj["subagent_context_default"] as? String
+            ?? obj["subagentContextDefault"] as? String
+    ).flatMap(ModelSubagentContextMode.init(wireValue:))
+    let supportsStandaloneWebSearch = obj["supports_standalone_web_search"] as? Bool
+        ?? obj["supportsStandaloneWebSearch"] as? Bool
+
     let multiAgent = obj["multi_agent_version"] as? String
     let supportsSummary = obj["supports_reasoning_summary_parameter"] as? Bool ?? true
     let defaultSummary = WireCodec.reasoningSummary(obj["default_reasoning_summary"] as? String)
@@ -298,6 +305,7 @@ private func parseCodexWireModel(_ obj: [String: Any], baseURL: String) -> Codex
     info.apiBackend = .responses
     info.provider = .codex
     info.toolMode = toolMode
+    info.subagentContextDefault = subagentContextDefault
     info.codexMultiAgentV2 = multiAgent == "v2"
     info.agentType = "codex"
     info.contextWindow = effectiveContext
@@ -314,6 +322,7 @@ private func parseCodexWireModel(_ obj: [String: Any], baseURL: String) -> Codex
     info.supportsReasoningSummaryParameter = supportsSummary
     info.defaultReasoningSummary = supportsSummary ? defaultSummary : .none
     info.supportsBackendSearch = supportsSearch
+    info.supportsStandaloneWebSearch = supportsStandaloneWebSearch
 
     let entry = ModelEntry(info: info)
     return CodexCatalogModel(

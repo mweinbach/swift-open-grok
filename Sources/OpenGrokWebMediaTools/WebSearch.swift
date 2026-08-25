@@ -139,10 +139,12 @@ public struct WebSearchResult: Sendable, Equatable, Hashable, Codable {
 public struct WebSearchClient: Sendable {
     public var configuration: WebSearchConfig
     public var transport: any HTTPTransport
+    public var filter: WebSearchFilter
 
     public init(
         configuration: WebSearchConfig,
-        transport: any HTTPTransport = URLSessionHTTPTransport()
+        transport: any HTTPTransport = URLSessionHTTPTransport(),
+        filter: WebSearchFilter = WebSearchFilter()
     ) throws {
         switch configuration {
         case .disabled:
@@ -162,11 +164,20 @@ public struct WebSearchClient: Sendable {
         }
         self.configuration = configuration
         self.transport = transport
+        self.filter = filter
     }
 
     public func search(_ request: WebSearchRequest) async throws -> WebSearchResult {
+        let effective = filter.resolveFilters(modelAllowed: request.allowedDomains)
         switch configuration {
         case .enabled(let apiKey, let baseURL, let model, let extraHeaders, _):
+            var filters: [String: Any] = [:]
+            if let allowed = effective.allowedDomains {
+                filters["allowed_domains"] = allowed
+            }
+            if let excluded = effective.excludedDomains {
+                filters["excluded_domains"] = excluded
+            }
             let body: [String: Any] = [
                 "model": model,
                 "input": request.query,
@@ -175,8 +186,8 @@ public struct WebSearchClient: Sendable {
                 "top_p": 0.95,
                 "max_output_tokens": 8_192,
                 "tools": [[
-                    "type": "web_search_preview",
-                    "filters": request.allowedDomains.map { ["allowed_domains": $0] } ?? [:]
+                    "type": "web_search",
+                    "filters": filters
                 ]]
             ]
             let response = try await send(
@@ -194,7 +205,9 @@ public struct WebSearchClient: Sendable {
                 "max_tokens_per_page": 1_024
             ]
             var requestBody = body
-            if let domains = request.allowedDomains { requestBody["search_domain_filter"] = domains }
+            if let domains = effective.allowedDomains {
+                requestBody["search_domain_filter"] = domains
+            }
             let response = try await send(
                 tool: "web_search",
                 url: endpoint(baseURL, path: "search"),

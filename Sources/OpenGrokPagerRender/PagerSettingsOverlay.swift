@@ -469,7 +469,7 @@ extension PagerSettingsOverlay {
             clampSelection()
             return .redraw
         case .char(let character) where event.modifiers.subtracting(.shift).isEmpty:
-            guard !character.isNewline, character.unicodeScalars.allSatisfy({ !$0.properties.isDefaultIgnorableCodePoint }) else {
+            guard isSafeSettingsCharacter(character) else {
                 return .consumed
             }
             filterQuery.append(character)
@@ -735,7 +735,7 @@ extension PagerSettingsOverlay {
     func validateSecret(_ text: String) -> String? {
         if text.utf8.count > Self.maximumSecretBytes { return "Key is too long" }
         if text.contains(where: \.isWhitespace) { return "Key cannot contain whitespace" }
-        if text.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F }) {
+        if text.unicodeScalars.contains(where: pagerIsUnsafeDisplayScalar) {
             return "Key contains control characters"
         }
         return nil
@@ -804,5 +804,5 @@ extension PagerSettingsOverlay {
 /// `safe_settings_char` — printable, non-control, and not a line break.
 func isSafeSettingsCharacter(_ character: Character) -> Bool {
     guard !character.isNewline else { return false }
-    return character.unicodeScalars.allSatisfy { $0.value >= 0x20 && $0.value != 0x7F }
+    return character.unicodeScalars.allSatisfy { !pagerIsUnsafeDisplayScalar($0) }
 }

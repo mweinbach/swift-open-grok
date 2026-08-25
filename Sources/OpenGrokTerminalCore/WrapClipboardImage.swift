@@ -37,40 +37,50 @@ public enum WrapImagePaste: Sendable, Equatable {
 /// Returns `nil` if the payload does not start with wrap magic (caller treats as normal text).
 /// Malformed wrap frames yield `.noImage` so they never land as text.
 public func decodeWrapImagePaste(payload: String) -> WrapImagePaste? {
-    let trimmed = payload.trimmingCharacters(in: .whitespacesAndNewlines)
-    if trimmed == MAGIC_NONE {
+    if payload == MAGIC_NONE {
         return .noImage
     }
     guard payload.hasPrefix(MAGIC_IMG) else {
         return nil
     }
 
-    // Split into lines preserving base64 body
-    let lines = payload.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-    guard lines.count >= 3, lines[0] == MAGIC_IMG else {
+    let frame = payload.dropFirst(MAGIC_IMG.count)
+    guard frame.first == "\n" else {
         return .noImage
     }
 
-    let mime = lines[1]
-    let b64 = lines[2...].joined()
-
-    if mime.isEmpty || b64.isEmpty || b64.hasPrefix("=") {
+    let imageFields = frame.dropFirst()
+    guard let mimeSeparator = imageFields.utf8.firstIndex(of: 0x0A) else {
         return .noImage
     }
 
-    // Quick size-check before allocating decoded buffer: 4 base64 chars produce ~3 bytes.
-    let approxDecoded = (b64.count * 3) / 4
-    if approxDecoded > MAX_WRAP_IMAGE_BYTES {
+    let mimeBytes = imageFields.utf8[..<mimeSeparator]
+    let base64Start = imageFields.utf8.index(after: mimeSeparator)
+    var base64 = imageFields[base64Start...]
+    while let last = base64.last, last.isWhitespace {
+        base64 = base64.dropLast()
+    }
+
+    guard !mimeBytes.isEmpty,
+          !base64.isEmpty,
+          !base64.utf8.contains(where: { $0 == 0x0A || $0 == 0x0D }) else {
         return .noImage
     }
 
-    guard let data = Data(base64Encoded: b64),
+    // Bound the encoded length before multiplication or decoded-buffer allocation.
+    let encodedByteCount = base64.utf8.count
+    guard encodedByteCount <= (MAX_WRAP_IMAGE_BYTES / 3 + 1) * 4,
+          (encodedByteCount * 3) / 4 <= MAX_WRAP_IMAGE_BYTES else {
+        return .noImage
+    }
+
+    guard let data = Data(base64Encoded: String(base64)),
           !data.isEmpty,
           data.count <= MAX_WRAP_IMAGE_BYTES else {
         return .noImage
     }
 
-    return .image(data: data, mimeType: mime)
+    return .image(data: data, mimeType: String(decoding: mimeBytes, as: UTF8.self))
 }
 
 /// Encode image data and MIME type into wrap image payload framing.

@@ -111,5 +111,23 @@ public enum GrokToolsServiceDescriptor: Sendable {
     public static let methodFinalizeAgent = methodPath("FinalizeAgent")
 }
 
+/// Fully-qualified unary RPC paths for the client-hosted callback contract.
+public enum GrokToolsCallbackServiceDescriptor: Sendable {
+    public static let packageName = GrokToolsServiceDescriptor.packageName
+    public static let serviceName = "xai.grok.tools.v1.GrokToolsCallbackService"
+
+    public static func methodPath(_ rpc: String) -> String {
+        "/\(serviceName)/\(rpc)"
+    }
+
+    /// Callback RPC paths in their exact proto declaration order.
+    public static var allMethodPaths: [String] {
+        grokToolsCallbackServiceRPCNames.map(methodPath)
+    }
+
+    public static let methodSendNotification = methodPath("SendNotification")
+    public static let methodSpawnSubagent = methodPath("SpawnSubagent")
+}
+
 /// Protobuf package name for the Grok tools service contract.
 public let grokToolsProtoPackage = GrokToolsServiceDescriptor.packageName

@@ -540,22 +540,14 @@ struct TOMLParser {
         switch c {
         case "\"":
             // Multi-line basic ("""...""") or basic ("...").
-            if next == "\"" {
-                let i = src.index(after: pos)
-                if i < src.endIndex && src[i] == "\"" {
-                    return .string(try parseMultilineBasicString())
-                }
-                return .string(try parseBasicString())
+            if src[pos...].hasPrefix("\"\"\"") {
+                return .string(try parseMultilineBasicString())
             }
             return .string(try parseBasicString())
         case "'":
             // Multi-line literal ('''...''') or literal ('...').
-            if next == "'" {
-                let i = src.index(after: pos)
-                if i < src.endIndex && src[i] == "'" {
-                    return .string(try parseMultilineLiteralString())
-                }
-                return .string(try parseLiteralString())
+            if src[pos...].hasPrefix("'''") {
+                return .string(try parseMultilineLiteralString())
             }
             return .string(try parseLiteralString())
         case "[":

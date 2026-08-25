@@ -57,6 +57,35 @@ enum MermaidSamples {
           style A fill:#f9f,stroke:#333
         """
 
+    static let classDiagram = """
+        classDiagram
+          class Animal {
+            +int age
+            +isMammal() bool
+          }
+          Animal <|-- Duck
+          Duck ..> Pond : swims in
+        """
+
+    static let entityRelationshipDiagram = """
+        erDiagram
+          CUSTOMER ||--o{ ORDER : places
+          CUSTOMER {
+            string name PK
+            int custNumber
+          }
+          ORDER ||--|{ LINE_ITEM : contains
+        """
+
+    static let sequenceDiagram = """
+        sequenceDiagram
+          participant C as Client
+          participant S as Server
+          C->>S: GET /items
+          S-->>C: 200 OK
+          Note over C,S: happy path
+        """
+
     static let all: [(name: String, source: String)] = [
         ("minimalFlowchart", minimalFlowchart),
         ("branchingFlowchart", branchingFlowchart),
@@ -434,6 +463,12 @@ struct MermaidRendererAPITests {
         #expect(try MermaidRenderer.parse(MermaidSamples.minimalFlowchart).kind == .flowchart)
         #expect(try MermaidRenderer.parse(MermaidSamples.minimalStateDiagram).kind == .stateDiagram)
         #expect(try MermaidRenderer.parse("flowchart LR\n  A --> B").kind == .flowchart)
+        #expect(try MermaidRenderer.parse(MermaidSamples.classDiagram).kind == .classDiagram)
+        #expect(
+            try MermaidRenderer.parse(MermaidSamples.entityRelationshipDiagram).kind
+                == .entityRelationshipDiagram
+        )
+        #expect(try MermaidRenderer.parse(MermaidSamples.sequenceDiagram).kind == .sequenceDiagram)
     }
 
     @Test("frontmatter title is carried on the diagram")
@@ -452,7 +487,7 @@ struct MermaidRendererAPITests {
 
     @Test("unsupported families are reported by name")
     func unsupportedFamilies() {
-        for family in ["sequenceDiagram", "classDiagram", "erDiagram", "pie", "gantt", "mindmap"] {
+        for family in ["pie", "gantt", "mindmap", "timeline", "quadrantChart"] {
             #expect(throws: MermaidError.unsupportedDiagramType(family)) {
                 try MermaidRenderer.parse("\(family)\n  something")
             }

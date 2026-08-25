@@ -118,12 +118,15 @@ public enum HookDiscovery {
         projectTrusted: Bool = false
     ) -> HookLoadResult {
         let directories = defaultDirectories(workspaceRoot: workspaceRoot, environment: environment)
-        return load(
-            globalDirectory: directories.global,
-            projectDirectory: projectTrusted ? directories.project : nil,
+        let globalSources = GlobalHookSourceDiscovery.resolve(environment: environment)
+        var result = load(
+            globalSources: globalSources.discoverySources,
+            projectSources: projectTrusted ? [.directory(directories.project)] : [],
             environment: environment,
             projectTrusted: projectTrusted
         )
+        result.errors.insert(contentsOf: globalSources.errors, at: 0)
+        return result
     }
 
     public static func registryFromSpecsDeduped(_ specs: [HookSpec]) -> HookRegistry {
@@ -131,37 +134,15 @@ public enum HookDiscovery {
     }
 
     private static func load(source: HookSource, environment: [String: String]) -> HookParseResult {
-        switch source {
-        case .settingsFile(let path):
-            guard FileManager.default.fileExists(atPath: path.path) else { return HookParseResult() }
-            do {
-                return parseHookFile(try String(contentsOf: path, encoding: .utf8), path: path, environment: environment)
-            } catch {
-                return HookParseResult(errors: [.readFile(path: path, detail: String(describing: error))])
-            }
-        case .directory(let directory):
-            guard FileManager.default.fileExists(atPath: directory.path) else { return HookParseResult() }
-            do {
-                let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])
-                    .filter { isDirectHookJSONName($0.lastPathComponent) }
-                    .filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true }
-                    .sorted { $0.path < $1.path }
-                var result = HookParseResult()
-                for file in files {
-                    do {
-                        let parsed = parseHookFile(try String(contentsOf: file, encoding: .utf8), path: file, environment: environment)
-                        result.specs.append(contentsOf: parsed.specs)
-                        result.errors.append(contentsOf: parsed.errors)
-                        result.skippedEvents.append(contentsOf: parsed.skippedEvents)
-                    } catch {
-                        result.errors.append(.readFile(path: file, detail: String(describing: error)))
-                    }
-                }
-                return result
-            } catch {
-                return HookParseResult(errors: [.readFile(path: directory, detail: String(describing: error))])
-            }
+        let loaded = GlobalHookSourceSecurity.documents(from: source)
+        var result = HookParseResult(errors: loaded.errors)
+        for document in loaded.documents {
+            let parsed = parseHookFile(document.contents, path: document.path, environment: environment)
+            result.specs.append(contentsOf: parsed.specs)
+            result.errors.append(contentsOf: parsed.errors)
+            result.skippedEvents.append(contentsOf: parsed.skippedEvents)
         }
+        return result
     }
 }
 

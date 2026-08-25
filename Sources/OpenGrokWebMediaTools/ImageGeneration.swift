@@ -58,6 +58,7 @@ public let XAI_IMAGINE_EDIT_MODEL = "grok-imagine-image-edit"
 /// Codex's image-generation extension model at the pinned upstream contract.
 public let OPENAI_IMAGE_MODEL = "gpt-image-2"
 public let CODEX_IMAGE_TURN_ID_HEADER = "x-codex-image-turn-id"
+public let IMAGE_GENERATION_SESSION_ID_HEADER = "x-grok-session-id"
 /// Some Imagine models expand the prompt then generate, and the proxy buffers
 /// the whole image before sending any bytes, so the client may receive nothing
 /// for well over a minute. Keep these generous.
@@ -259,7 +260,8 @@ public struct ImageGenClient: Sendable {
     public func generate(
         prompt: String,
         aspectRatio: String,
-        turnID: String
+        turnID: String,
+        sessionID: String? = nil
     ) async throws -> Data {
         let payload: [String: JSONValue]
         switch provider {
@@ -285,7 +287,8 @@ public struct ImageGenClient: Sendable {
             endpoint: "generations",
             operation: "generation",
             payload: payload,
-            turnID: turnID
+            turnID: turnID,
+            sessionID: sessionID
         )
     }
 
@@ -293,8 +296,14 @@ public struct ImageGenClient: Sendable {
         prompt: String,
         dataURLs: [String],
         aspectRatio: String,
-        turnID: String
+        turnID: String,
+        sessionID: String? = nil
     ) async throws -> Data {
+        guard dataURLs.allSatisfy(Self.isImageDataURL) else {
+            throw ImageGenError.invalidArguments(
+                "image edit references must be resolved to base64 image data URLs before sending"
+            )
+        }
         if provider == .openAI, dataURLs.count > OPENAI_IMAGE_EDIT_MAX_REFERENCES {
             throw ImageGenError.invalidArguments(
                 "OpenAI image editing accepts at most \(OPENAI_IMAGE_EDIT_MAX_REFERENCES) reference images."
@@ -331,7 +340,8 @@ public struct ImageGenClient: Sendable {
             endpoint: "edits",
             operation: "edit",
             payload: payload,
-            turnID: turnID
+            turnID: turnID,
+            sessionID: sessionID
         )
     }
 
@@ -341,7 +351,8 @@ public struct ImageGenClient: Sendable {
         endpoint: String,
         payload: [String: JSONValue],
         turnID: String,
-        bearer: String?
+        bearer: String?,
+        sessionID: String? = nil
     ) throws -> HTTPRequest {
         let trimmed = trimTrailingSlash(baseURL)
         guard let url = URL(string: "\(trimmed)/images/\(endpoint)") else {
@@ -354,7 +365,12 @@ public struct ImageGenClient: Sendable {
         if provider == .openAI {
             headers[CODEX_IMAGE_TURN_ID_HEADER] = turnID
         }
-        let body = try JSONEncoder().encode(JSONValue.object(payload))
+        if let sessionID, !sessionID.isEmpty {
+            headers[IMAGE_GENERATION_SESSION_ID_HEADER] = sessionID
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .withoutEscapingSlashes
+        let body = try encoder.encode(JSONValue.object(payload))
         return HTTPRequest(
             method: .post,
             url: url,
@@ -369,7 +385,8 @@ public struct ImageGenClient: Sendable {
         endpoint: String,
         operation: String,
         payload: [String: JSONValue],
-        turnID: String
+        turnID: String,
+        sessionID: String?
     ) async throws -> Data {
         // Capture the bearer once so the request and any 401 attribution see
         // the same value even if the provider rotates mid-flight.
@@ -382,7 +399,8 @@ public struct ImageGenClient: Sendable {
             endpoint: endpoint,
             payload: payload,
             turnID: turnID,
-            bearer: sentBearer
+            bearer: sentBearer,
+            sessionID: sessionID
         )
         let response = try await transport.send(request)
         let status = response.metadata.statusCode
@@ -408,6 +426,21 @@ public struct ImageGenClient: Sendable {
             throw ImageGenError.invalidArguments("Failed to decode base64 image data")
         }
         return decoded
+    }
+
+    private static func isImageDataURL(_ value: String) -> Bool {
+        guard value.hasPrefix("data:image/"),
+              let separator = value.range(of: ";base64,"),
+              separator.upperBound < value.endIndex
+        else { return false }
+        return value[separator.upperBound...].unicodeScalars.allSatisfy { scalar in
+            (65...90).contains(scalar.value)
+                || (97...122).contains(scalar.value)
+                || (48...57).contains(scalar.value)
+                || scalar.value == 43
+                || scalar.value == 47
+                || scalar.value == 61
+        }
     }
 
     /// Extract the first `data[].b64_json` from an image response body.

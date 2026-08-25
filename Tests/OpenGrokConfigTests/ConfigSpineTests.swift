@@ -148,6 +148,8 @@ struct RemoteSettingsAllowlistTests {
             "session_recap", "session_search", "doom_loop_recovery", "trace_upload_enabled", "two_pass_compaction_enabled",
             "ask_user_question_enabled", "write_file_enabled", "cancel_rewind_enabled",
             "compaction_mode", "compaction_detail",
+            "web_fetch_enabled", "web_fetch_proxy", "web_fetch_allowed_domains",
+            "image_gen_enabled", "video_gen_enabled", "imagine_tools_disabled",
         ]
         #expect(remoteSettingsAllowlistedWireNames == expected)
     }
@@ -158,7 +160,6 @@ struct RemoteSettingsAllowlistTests {
             "leader_mode", "max_upload_file_bytes",
             "memory_enabled", "lsp_tools_enabled", "folder_trust_enabled",
             "file_toolset",
-            "web_fetch_enabled", "image_gen_enabled", "video_gen_enabled",
             "feedback_enabled",
             "default_model", "subscription_tier", "permission_mode",
             "auto_mode", "suggestions_enabled", "auto_compact_threshold_percent",
@@ -483,8 +484,8 @@ struct RemoteFieldsInertnessTests {
         #expect(projected.sessionRecap == false)
     }
 
-    @Test("non-allowlisted remote webFetchEnabled cannot override EffectiveFeatures")
-    func webFetchInert() {
+    @Test("reviewed remote webFetchEnabled closes EffectiveFeatures")
+    func webFetchRemoteForceOff() {
         var rs = RemoteSettings()
         rs.webFetchEnabled = false
         let projected = AllowlistedRemoteSettings(projecting: rs)
@@ -492,12 +493,12 @@ struct RemoteFieldsInertnessTests {
         let inputs = FeatureResolutionInputs(remote: projected)
         let features = EffectiveFeatures.resolve(inputs)
 
-        #expect(features.webFetch.value == true)
-        #expect(features.webFetch.source == .default)
+        #expect(features.webFetch.value == false)
+        #expect(features.webFetch.source == .remote)
     }
 
-    @Test("non-allowlisted remote imageGenEnabled cannot override EffectiveFeatures")
-    func imageGenInert() {
+    @Test("reviewed remote imageGenEnabled closes EffectiveFeatures")
+    func imageGenRemoteForceOff() {
         var rs = RemoteSettings()
         rs.imageGenEnabled = false
         let projected = AllowlistedRemoteSettings(projecting: rs)
@@ -505,8 +506,8 @@ struct RemoteFieldsInertnessTests {
         let inputs = FeatureResolutionInputs(remote: projected)
         let features = EffectiveFeatures.resolve(inputs)
 
-        #expect(features.imageGen.value == true)
-        #expect(features.imageGen.source == .default)
+        #expect(features.imageGen.value == false)
+        #expect(features.imageGen.source == .remote)
     }
 
     @Test("non-allowlisted remote feedbackEnabled cannot override EffectiveFeatures")

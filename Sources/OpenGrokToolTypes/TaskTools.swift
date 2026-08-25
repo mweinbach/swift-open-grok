@@ -56,6 +56,38 @@ public enum SubagentCapabilityMode: String, Codable, Sendable, Hashable {
     public var wireString: String { rawValue }
 }
 
+/// Whether a spawned child inherits its parent's conversation.
+///
+/// Rust accepts these exact aliases on both the task input and model catalog;
+/// encoding always uses the canonical model-facing spelling.
+public enum SubagentContextMode: String, Codable, Sendable, Hashable {
+    case fresh
+    case fork
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let value = try container.decode(String.self)
+        switch value {
+        case "fresh", "Fresh", "new", "clean":
+            self = .fresh
+        case "fork", "Fork", "forked", "Forked":
+            self = .fork
+        default:
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "unknown SubagentContextMode: \(value)"
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public var wireString: String { rawValue }
+}
+
 /// Isolation mode for subagent execution.
 ///
 /// Mirrors Rust `SubagentIsolationMode`. Wire form is kebab-case
@@ -135,6 +167,9 @@ public struct TaskToolInput: Codable, Sendable, Hashable {
     /// Optional model slug for this subagent.
     public var model: String?
 
+    /// Explicit initial conversation mode. Omission defers to the child model.
+    public var context: SubagentContextMode?
+
     /// Optional reasoning effort override for this subagent.
     public var reasoningEffort: String?
 
@@ -151,6 +186,7 @@ public struct TaskToolInput: Codable, Sendable, Hashable {
         case resumeFrom = "resume_from"
         case cwd
         case model
+        case context
         case reasoningEffort = "reasoning_effort"
         case taskId = "task_id"
     }
@@ -165,6 +201,7 @@ public struct TaskToolInput: Codable, Sendable, Hashable {
         resumeFrom: String? = nil,
         cwd: String? = nil,
         model: String? = nil,
+        context: SubagentContextMode? = nil,
         reasoningEffort: String? = nil,
         taskId: String? = nil
     ) {
@@ -177,6 +214,7 @@ public struct TaskToolInput: Codable, Sendable, Hashable {
         self.resumeFrom = resumeFrom
         self.cwd = cwd
         self.model = model
+        self.context = context
         self.reasoningEffort = reasoningEffort
         self.taskId = taskId
     }
@@ -198,6 +236,7 @@ public struct TaskToolInput: Codable, Sendable, Hashable {
         self.resumeFrom = try c.decodeIfPresent(String.self, forKey: .resumeFrom)
         self.cwd = try c.decodeIfPresent(String.self, forKey: .cwd)
         self.model = try c.decodeIfPresent(String.self, forKey: .model)
+        self.context = try c.decodeIfPresent(SubagentContextMode.self, forKey: .context)
         self.reasoningEffort = try c.decodeIfPresent(String.self, forKey: .reasoningEffort)
         self.taskId = try c.decodeIfPresent(String.self, forKey: .taskId)
     }
