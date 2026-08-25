@@ -244,6 +244,8 @@ public actor ACPLeaderIPCHost {
 
     private var nextClientID: UInt64 = 1
     private var clients: [UInt64: ClientHandle] = [:]
+    private var initializedResponse: JSONValue?
+    private var initializedClientIDs: Set<UInt64> = []
     private var ready = true
     private var stopped = false
     private var activated = false
@@ -382,6 +384,7 @@ public actor ACPLeaderIPCHost {
         await readLoop(clientID: clientID, reader: reader, writer: writer)
 
         clients.removeValue(forKey: clientID)
+        initializedClientIDs.remove(clientID)
         await router.unregister(clientID: String(clientID))
         await channel.close()
         log("leader: client \(clientID) disconnected")
@@ -528,6 +531,41 @@ public actor ACPLeaderIPCHost {
             capabilities: handle.capabilities
         )
 
+        if case .request(let requestID, let method, let params) = injected,
+           ACPMethodRoute.normalize(method: method, params: params).method
+            == AgentMethodNames.initialize,
+           let initializedResponse,
+           !initializedClientIDs.contains(clientID)
+        {
+            guard let request = try? params.decode(InitializeRequest.self),
+                  let response = try? initializedResponse.decode(InitializeResponse.self)
+            else {
+                await deliver(
+                    .response(
+                        id: requestID,
+                        result: nil,
+                        error: ACPRuntimeError.invalidParams("invalid initialize request").acpError
+                    ),
+                    to: clientID
+                )
+                return
+            }
+            guard request.protocolVersion == response.protocolVersion else {
+                await deliver(
+                    .response(
+                        id: requestID,
+                        result: nil,
+                        error: ACPRuntimeError.protocolVersionUnsupported(request.protocolVersion).acpError
+                    ),
+                    to: clientID
+                )
+                return
+            }
+            initializedClientIDs.insert(clientID)
+            await deliver(.response(id: requestID, result: initializedResponse, error: nil), to: clientID)
+            return
+        }
+
         if case .response(let requestID, _, _) = injected,
            await !router.acceptsReverseResponse(requestID, from: String(clientID))
         {
@@ -576,6 +614,18 @@ public actor ACPLeaderIPCHost {
 
         let replies = await ACPLeaderRequestAuthority.$clientID.withValue(String(clientID)) {
             await runtime.handle(outbound)
+        }
+        if case .request(_, let method, let params) = injected,
+           ACPMethodRoute.normalize(method: method, params: params).method
+            == AgentMethodNames.initialize,
+           let request = try? params.decode(InitializeRequest.self),
+           case .response(_, let result?, nil)? = replies.last,
+           let response = try? result.decode(InitializeResponse.self),
+           response.protocolVersion == request.protocolVersion,
+           clients[clientID] != nil
+        {
+            initializedResponse = result
+            initializedClientIDs.insert(clientID)
         }
         if let provisionalClaim,
            replies.contains(where: { message in

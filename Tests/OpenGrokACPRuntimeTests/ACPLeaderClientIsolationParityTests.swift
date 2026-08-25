@@ -246,6 +246,32 @@ struct ACPLeaderAuthorityBoundaryTests {
         #expect(await counter.notifications == 0)
     }
 
+    @Test("a direct ACP runtime still rejects a second initialization")
+    func directRuntimeInitializationIsNotReusable() async throws {
+        let runtime = ACPAgentRuntime()
+        let params = try JSONValue.encode(InitializeRequest(protocolVersion: .v1))
+        let initialized = await runtime.handle(.request(
+            id: .number(1),
+            method: AgentMethodNames.initialize,
+            params: params
+        ))
+        guard case .response(_, _?, nil)? = initialized.last else {
+            Issue.record("the first direct initialization failed")
+            return
+        }
+
+        let repeated = await runtime.handle(.request(
+            id: .number(2),
+            method: AgentMethodNames.initialize,
+            params: params
+        ))
+        guard case .response(_, nil, _?)? = repeated.last else {
+            Issue.record("a direct runtime unexpectedly accepted reinitialization")
+            return
+        }
+        #expect(await runtime.connectionState() == .initialized)
+    }
+
     @Test("claiming an existing session never replaces its first connected driver")
     func repeatedDriverClaimsRemainObservers() async throws {
         let router = ACPLeaderRouter()
@@ -423,11 +449,35 @@ struct ACPLeaderClientIsolationParityTests {
     func failedRequestsDoNotPreclaimFutureSession() async throws {
         try await withLeaderIsolationFixture { fixture in
             let future = AcpSessionId("leader-isolated-root")
+            _ = try await fixture.owner.request(
+                id: 97,
+                method: AgentMethodNames.authenticate,
+                params: .object(["methodId": .string("owner-auth")])
+            )
+            #expect(await fixture.runtime.connectionState() == .authenticated)
+
+            try await fixture.observer.send(.request(
+                id: .number(98),
+                method: AgentMethodNames.initialize,
+                params: try JSONValue.encode(InitializeRequest(protocolVersion: ProtocolVersion(2)))
+            ))
+            let unsupportedInitialization = try await fixture.observer.next {
+                if case .response(.number(98), nil, _?) = $0 { return true }
+                return false
+            }
+            guard case .response(_, nil, let unsupportedError?) = unsupportedInitialization else {
+                Issue.record("an incompatible observer unexpectedly initialized")
+                return
+            }
+            #expect(unsupportedError.code == .invalidRequest)
+            #expect(await fixture.runtime.connectionState() == .authenticated)
+
             _ = try await fixture.observer.request(
                 id: 99,
                 method: AgentMethodNames.initialize,
                 params: try JSONValue.encode(InitializeRequest(protocolVersion: .v1))
             )
+            #expect(await fixture.runtime.connectionState() == .authenticated)
             try await fixture.observer.send(.request(
                 id: .number(100),
                 method: AgentMethodNames.sessionPrompt,
@@ -511,7 +561,10 @@ struct ACPLeaderClientIsolationParityTests {
             let privateReplays = observerNotifications.compactMap(leaderIsolationReplayMetadata)
             #expect(!privateReplays.isEmpty)
             #expect(privateReplays.allSatisfy {
-                $0[ACPLeaderCapabilityInjection.clientIDKey] == .number(.uint64(fixture.observerID))
+                $0[ACPLeaderCapabilityInjection.clientIDKey]?.uint64Value == fixture.observerID
+            })
+            #expect(privateReplays.allSatisfy {
+                $0[ACPLeaderCapabilityInjection.clientIDKey]?.uint64Value != fixture.ownerID
             })
             #expect(await fixture.owner.messages().compactMap(leaderIsolationReplayMetadata).isEmpty)
 
