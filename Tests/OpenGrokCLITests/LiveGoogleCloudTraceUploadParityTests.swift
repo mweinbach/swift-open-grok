@@ -304,11 +304,17 @@ struct LiveGoogleCloudTraceUploadParityTests {
         )
         let segments = assertion.split(separator: ".")
         try #require(segments.count == 3)
+        let headerData = try #require(
+            GoogleCloudTraceUploadFixture.decodeBase64URL(segments[0])
+        )
+        let claimsData = try #require(
+            GoogleCloudTraceUploadFixture.decodeBase64URL(segments[1])
+        )
         let header = try #require(JSONSerialization.jsonObject(
-            with: #require(GoogleCloudTraceUploadFixture.decodeBase64URL(segments[0]))
+            with: headerData
         ) as? [String: Any])
         let claims = try #require(JSONSerialization.jsonObject(
-            with: #require(GoogleCloudTraceUploadFixture.decodeBase64URL(segments[1]))
+            with: claimsData
         ) as? [String: Any])
         let signature = try #require(GoogleCloudTraceUploadFixture.decodeBase64URL(segments[2]))
         #expect(header["alg"] as? String == "RS256")
