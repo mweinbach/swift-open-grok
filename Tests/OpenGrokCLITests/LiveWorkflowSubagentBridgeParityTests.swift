@@ -305,6 +305,54 @@ struct LiveWorkflowSubagentBridgeParityTests {
         #expect(record?.parentSessionID == fixture.parentSessionID)
     }
 
+    @Test("a workflow output-token ceiling reaches the actual child request and disables post-output replay")
+    func workflowOutputTokenBudgetReachesProviderRequest() async throws {
+        let fixture = try WorkflowBridgeFixture()
+        defer { Task { await fixture.dispose() } }
+
+        let result = try await fixture.workflowHost().spawnAgent(RhaiAgentOptions(
+            prompt: "respect the workflow-owned output budget",
+            maxOutputTokens: 384
+        ))
+
+        #expect(result.success)
+        let request = try #require((await fixture.observer.snapshot()).first?.request)
+        #expect(request.maxOutputTokens == 384)
+        #expect(request.retryOnlyBeforeOutput)
+    }
+
+    @Test("unbudgeted workflow children keep the ordinary provider retry behavior")
+    func workflowWithoutOutputBudgetDoesNotChangeRetryPolicy() async throws {
+        let fixture = try WorkflowBridgeFixture()
+        defer { Task { await fixture.dispose() } }
+
+        let result = try await fixture.workflowHost().spawnAgent(RhaiAgentOptions(
+            prompt: "use the ordinary model output ceiling"
+        ))
+
+        #expect(result.success)
+        let request = try #require((await fixture.observer.snapshot()).first?.request)
+        #expect(request.maxOutputTokens == nil)
+        #expect(!request.retryOnlyBeforeOutput)
+    }
+
+    @Test("invalid workflow output budgets fail before child admission or provider sampling")
+    func invalidOutputBudgetFailsBeforeChildAdmission() async throws {
+        for value in [UInt64(0), UInt64(UInt32.max) + 1] {
+            let fixture = try WorkflowBridgeFixture()
+            defer { Task { await fixture.dispose() } }
+
+            await #expect(throws: RhaiHostError.self) {
+                try await fixture.workflowHost().spawnAgent(RhaiAgentOptions(
+                    prompt: "reject the invalid budget",
+                    maxOutputTokens: value
+                ))
+            }
+            #expect(await fixture.observer.snapshot().isEmpty)
+            #expect(await fixture.rootHost.coordinator.listCompleted().isEmpty)
+        }
+    }
+
     @Test("foreign model uses its own provider sampler without invoking the parent's transport")
     func crossProviderModelUsesIsolatedRoute() async throws {
         let fixture = try WorkflowBridgeFixture()

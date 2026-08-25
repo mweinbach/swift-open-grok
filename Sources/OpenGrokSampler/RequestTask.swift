@@ -59,6 +59,7 @@ func runRequestTask(
     let doomPolicy = config.doomLoopRecovery
     let doomMaxRetries = doomPolicy?.maxRetries ?? 0
     var doomRetryCount: UInt32 = 0
+    let outputObservation = SamplingOutputObservation()
 
     while true {
         if cancelToken.isCancelled || Task.isCancelled {
@@ -76,8 +77,12 @@ func runRequestTask(
             idleTimeout: idleTimeout,
             eventContinuation: eventContinuation,
             cancelToken: cancelToken,
-            doomCheck: doomCheck
+            doomCheck: doomCheck,
+            outputObservation: outputObservation
         )
+        let effectiveMaxRetries = retryPolicy.retryOnlyBeforeOutput && outputObservation.hasOutput
+            ? 0
+            : maxRetries
 
         switch outcome {
         case .completed(let response, var metrics):
@@ -95,7 +100,7 @@ func runRequestTask(
             if !(await applyRetryDecision(
                 err,
                 retryCount: &retryCount,
-                maxRetries: maxRetries,
+                maxRetries: effectiveMaxRetries,
                 retryPolicy: retryPolicy,
                 eventContinuation: eventContinuation,
                 requestId: requestId,
@@ -111,6 +116,11 @@ func runRequestTask(
 
         case .failed(let error):
             if case .doomLoopDetected = error {
+                if retryPolicy.retryOnlyBeforeOutput && outputObservation.hasOutput {
+                    emitFailed(eventContinuation, requestId: requestId, error: error)
+                    sendCompletion(completion, .failure(error))
+                    return
+                }
                 let backoff = doomLoopBackoff(retryCount: doomRetryCount + 1)
                 doomRetryCount += 1
                 emitRetrying(
@@ -126,7 +136,7 @@ func runRequestTask(
             if !(await applyRetryDecision(
                 error,
                 retryCount: &retryCount,
-                maxRetries: maxRetries,
+                maxRetries: effectiveMaxRetries,
                 retryPolicy: retryPolicy,
                 eventContinuation: eventContinuation,
                 requestId: requestId,
@@ -148,7 +158,7 @@ func runRequestTask(
             if !(await applyRetryDecision(
                 error,
                 retryCount: &retryCount,
-                maxRetries: maxRetries,
+                maxRetries: effectiveMaxRetries,
                 retryPolicy: retryPolicy,
                 eventContinuation: eventContinuation,
                 requestId: requestId,
@@ -251,7 +261,8 @@ private func runOneAttempt(
     idleTimeout: MonotonicDuration,
     eventContinuation: AsyncStream<SamplingEvent>.Continuation,
     cancelToken: CancellationToken,
-    doomCheck: DoomLoopRecoveryPolicy?
+    doomCheck: DoomLoopRecoveryPolicy?,
+    outputObservation: SamplingOutputObservation
 ) async -> AttemptOutcome {
     switch client.apiBackend {
     case .chatCompletions:
@@ -276,7 +287,8 @@ private func runOneAttempt(
             eventContinuation: eventContinuation,
             cancelToken: cancelToken,
             captured: captured,
-            doomCheck: nil
+            doomCheck: nil,
+            outputObservation: outputObservation
         )
 
     case .responses:
@@ -303,7 +315,8 @@ private func runOneAttempt(
             requestId: requestId,
             idleTimeout: idleTimeout,
             doomLoop: parts.2,
-            clientCustomToolNames: parts.3
+            clientCustomToolNames: parts.3,
+            outputObservation: outputObservation
         )
         return await driveL2(
             l2,
@@ -311,7 +324,8 @@ private func runOneAttempt(
             eventContinuation: eventContinuation,
             cancelToken: cancelToken,
             captured: captured,
-            doomCheck: doomCheck
+            doomCheck: doomCheck,
+            outputObservation: outputObservation
         )
 
     case .messages:
@@ -336,7 +350,8 @@ private func runOneAttempt(
             eventContinuation: eventContinuation,
             cancelToken: cancelToken,
             captured: captured,
-            doomCheck: nil
+            doomCheck: nil,
+            outputObservation: outputObservation
         )
     }
 }
@@ -387,13 +402,15 @@ private func driveL2(
     eventContinuation: AsyncStream<SamplingEvent>.Continuation,
     cancelToken: CancellationToken,
     captured: ErrorCell,
-    doomCheck: DoomLoopRecoveryPolicy?
+    doomCheck: DoomLoopRecoveryPolicy?,
+    outputObservation: SamplingOutputObservation
 ) async -> AttemptOutcome {
     for await event in l2 {
         if cancelToken.isCancelled || Task.isCancelled {
             return .cancelled
         }
 
+        outputObservation.observe(event)
         switch event {
         case .completed(_, let response, let metrics):
             if let policy = doomCheck {

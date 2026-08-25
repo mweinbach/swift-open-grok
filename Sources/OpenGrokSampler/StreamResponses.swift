@@ -150,11 +150,66 @@ public func responsesEventHasMeaningfulContent(_ event: ResponsesStreamEvent) ->
     case .functionCallArgumentsDone(let a, _, _): return !a.isEmpty
     case .customToolCallInputDelta(let d, _, _): return !d.isEmpty
     case .customToolCallInputDone(let input, _, _): return !input.isEmpty
-    case .outputItemAdded, .outputItemDone, .completed, .failed, .incomplete, .error:
+    case .outputItemAdded, .outputItemDone, .completed, .incomplete, .error:
         return true
-    case .other:
+    case .failed(let response):
+        return !(response["output"]?.arrayValue ?? []).isEmpty
+            || (response["usage"]?["output_tokens"]?.intValue ?? 0) > 0
+    case .other(let type, let raw):
+        switch type {
+        case "response.refusal.delta",
+             "response.mcp_call_arguments.delta",
+             "response.code_interpreter_call_code.delta":
+            return !(raw["delta"]?.stringValue ?? "").isEmpty
+        case "response.refusal.done":
+            return !(raw["refusal"]?.stringValue ?? "").isEmpty
+        case "response.reasoning_text.done":
+            return !(raw["text"]?.stringValue ?? "").isEmpty
+        case "response.mcp_call_arguments.done":
+            return !(raw["arguments"]?.stringValue ?? "").isEmpty
+        case "response.code_interpreter_call_code.done":
+            return !(raw["code"]?.stringValue ?? "").isEmpty
+        case "response.content_part.added",
+             "response.content_part.done",
+             "response.file_search_call.in_progress",
+             "response.file_search_call.searching",
+             "response.file_search_call.completed",
+             "response.web_search_call.in_progress",
+             "response.web_search_call.searching",
+             "response.web_search_call.completed",
+             "response.x_search_call.in_progress",
+             "response.x_search_call.searching",
+             "response.x_search_call.completed",
+             "response.reasoning_summary_part.added",
+             "response.reasoning_summary_part.done",
+             "response.image_generation_call.completed",
+             "response.image_generation_call.generating",
+             "response.image_generation_call.in_progress",
+             "response.image_generation_call.partial_image",
+             "response.mcp_call.completed",
+             "response.mcp_call.failed",
+             "response.mcp_call.in_progress",
+             "response.mcp_list_tools.completed",
+             "response.mcp_list_tools.failed",
+             "response.mcp_list_tools.in_progress",
+             "response.code_interpreter_call.in_progress",
+             "response.code_interpreter_call.interpreting",
+             "response.code_interpreter_call.completed",
+             "response.output_text.annotation.added":
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+/// A provider error by itself is not proof that generation or a hosted tool
+/// began. Refusals and backend progress are, even when no display event exists.
+public func responsesEventMayHaveOutput(_ event: ResponsesStreamEvent) -> Bool {
+    if case .error = event {
         return false
     }
+    return responsesEventHasMeaningfulContent(event)
 }
 
 private enum ReasoningUnitKey: Hashable {
@@ -195,7 +250,8 @@ public func streamResponsesWithClientCustomTools(
     requestId: RequestId,
     idleTimeout: MonotonicDuration,
     doomLoop: DoomLoopSignalCollector?,
-    clientCustomToolNames: [String]
+    clientCustomToolNames: [String],
+    outputObservation: SamplingOutputObservation? = nil
 ) -> AsyncStream<SamplingEvent> {
     let customNameSet = Set(clientCustomToolNames)
     return AsyncStream { continuation in
@@ -279,6 +335,7 @@ public func streamResponsesWithClientCustomTools(
                     return
                 }
 
+                outputObservation?.observeResponsesEvent(event)
                 let hasContent = responsesEventHasMeaningfulContent(event)
                 var shouldBreak = false
 

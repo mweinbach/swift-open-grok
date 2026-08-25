@@ -19,6 +19,7 @@ struct LiveWorkflowSubagentInvocation: Sendable {
     let parentSessionID: String
     let sourceProvenance: LiveWorkflowSourceProvenance
     let forkContext: Bool
+    let maxOutputTokens: UInt32?
 }
 
 /// Workflow children must be genuine root-session subagents: only that host
@@ -33,6 +34,7 @@ struct LiveWorkflowSubagentBridge: Sendable {
         let capability: ToolCapabilityMode
         let reasoningEffort: ReasoningEffort?
         let schema: LiveWorkflowSchemaContract?
+        let maxOutputTokens: UInt32?
     }
 
     func run(
@@ -187,11 +189,23 @@ struct LiveWorkflowSubagentBridge: Sendable {
                 )
             }
         }
+        let maxOutputTokens: UInt32?
+        if let requested = options.maxOutputTokens {
+            guard requested > 0, let representable = UInt32(exactly: requested) else {
+                throw RhaiHostError.failed(
+                    "max_output_tokens must be between 1 and \(UInt32.max)"
+                )
+            }
+            maxOutputTokens = representable
+        } else {
+            maxOutputTokens = nil
+        }
         let contract = try options.outputSchema.map(LiveWorkflowSchemaContract.init)
         return ValidatedOptions(
             capability: capability,
             reasoningEffort: reasoningEffort,
-            schema: contract
+            schema: contract,
+            maxOutputTokens: maxOutputTokens
         )
     }
 
@@ -228,7 +242,8 @@ struct LiveWorkflowSubagentBridge: Sendable {
                 runID: runID,
                 parentSessionID: parentSessionID,
                 sourceProvenance: sourceProvenance,
-                forkContext: forkContext
+                forkContext: forkContext,
+                maxOutputTokens: validated.maxOutputTokens
             )
         )
         let completed = await host.coordinator.listCompleted()

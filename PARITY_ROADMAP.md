@@ -1,11 +1,56 @@
 # Parity Roadmap — remaining feature gap to full Rust parity
 
-**Current reference:** `538a16dfb6b5989d835bc1503b600b4d2be9aad6`
-(`1.0.0-open-grok.81`), reaudited 2026-08-22. The historical roadmap below
+**Current reference:** `00e176c8fb4035701c24199bf9225973c1b13c20`
+(`1.0.0-open-grok.82`), reaudited 2026-08-24. The historical roadmap below
 preserves its original audit context; `PORT_STATUS.md` is authoritative for
 the current live classifications, verification evidence, intentional security
 divergences, and still-unverified platforms. `CRATE_MAP.md` now enumerates all
 93 root workspace members plus the separately rooted Markdown fuzz crate.
+
+**Current upstream `.82` live-seam closure (2026-08-24):**
+
+- **LIVE — local session trace export.** The executable now reaches
+  `open-grok trace <SESSION_ID> [--local] [-o PATH] [--json]`, recursively
+  archives canonical owner-private durable session documents, adds the
+  upstream-redacted configuration snapshot and export metadata, and collects
+  bounded, process-ordered memory traces. The portable real GNU-tar/gzip
+  writer supports long Unicode paths and multi-block streams; unsafe source
+  files, symbolic-link destinations, traversal, and oversized archives fail
+  closed. Disabled uploads fall back to local export. **Remote trace upload
+  remains ABSENT:** when upload is enabled, the command refuses to send private
+  data and requires explicit `--local` (`xai-grok-pager/src/trace_cmd.rs:35-73,
+  80-153,351-420`; `memory_trace.rs:573-659`).
+- **LIVE — complete cancellation and lifecycle hook matching.** Canonical and
+  alias registrations are all retained; subagent-stop hooks match the actual
+  agent type; each lifecycle event matches only its authentic payload field;
+  real user interrupts and maximum-turn exits emit distinct `StopCancelled`
+  observe hooks (`xai-grok-hooks/src/event.rs:149-180,584-608`;
+  `config.rs:26-44,829-865`).
+- **LIVE — budget-safe provider retries and workflow output limits.** Workflow
+  `max_output_tokens` is validated before child admission and reaches the
+  provider wire request. Budgeted children never replay a request after visible
+  output, a refusal, or a hosted-tool side effect; ordinary requests retain
+  their existing retry behavior (`xai-grok-sampler/src/config.rs:290-308`;
+  `actor/request_task.rs:138-165,244-250`; `xai-grok-shell/src/session/
+  acp_session_impl/spawn.rs:1399-1411`).
+- **LIVE — atomic prompt file completion and browser-style replacement.**
+  Existing file, image, and paste chips survive Unicode `@file` completion with
+  correct byte ranges, line-viewer behavior, and grouped undo/redo. Selection
+  deletion explicitly restores the normalized caret position, preserving
+  clipboard replacement and complete grapheme-cluster boundaries
+  (`xai-grok-pager/src/views/prompt_widget/mod.rs:2084-2101`;
+  `xai-ratatui-textarea/src/textarea.rs:997-1005,2278-2300,2660-2703`).
+- **LIVE — connection-bound ACP task authority.** Task-control requests must
+  retain their original connected carrier; foreign child inspection and
+  cancellation produce inert upstream-shaped hidden results without executing
+  the handler, and disconnected carriers cannot mutate durable tasks
+  (`xai-grok-shell/src/extensions/task.rs:431-474`;
+  `agent/mvp_agent/acp_agent.rs:3343-3353`).
+
+The focused serialized verification matrix passed **226 tests in 24 suites
+across 8 nonempty test-product summaries**, exit 0. The complete package gate,
+cross-platform execution, remote CI, and release certification are separate
+evidence; this focused result does not claim them.
 
 **Produced:** 2026-08-06, from a seven-domain read-only audit swarm against reference pin
 `70002584da34e4c37ea14a3bce35341b7d04f9a7` (v0.1.220-open-grok.57), on the tree at the
@@ -17,7 +62,7 @@ DIVERGED, judged at the live seam (`Sources/OpenGrokCLI`), never at the library.
 
 **Historical upstream drift note:** the original audit observed the `.58`
 micro-delta after its `.57` pin. Both historical snapshots have since been
-superseded by the current `.81` reference recorded above.
+superseded by the current `.82` reference recorded above.
 
 **Wave 14 corrections (2026-08-07):** B3's "shared by in-pager `/login` … screen-mode
 relaunch" was wrong: upstream `/login` never suspends (in-TUI OAuth/device code) and

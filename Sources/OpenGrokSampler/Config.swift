@@ -84,13 +84,65 @@ public protocol HeaderInjector: Sendable {
 public struct RetryPolicy: Codable, Sendable, Equatable {
     public var maxRetries: UInt32
     public var rateLimitRetryThreshold: UInt32
+    /// Once any model or hosted-tool output has been observed, fail instead
+    /// of replaying a request whose partial effects cannot be taken back.
+    public var retryOnlyBeforeOutput: Bool
 
     public init(
         maxRetries: UInt32 = DEFAULT_MAX_RETRIES,
-        rateLimitRetryThreshold: UInt32 = RATE_LIMIT_RETRY_THRESHOLD
+        rateLimitRetryThreshold: UInt32 = RATE_LIMIT_RETRY_THRESHOLD,
+        retryOnlyBeforeOutput: Bool = false
     ) {
         self.maxRetries = maxRetries
         self.rateLimitRetryThreshold = rateLimitRetryThreshold
+        self.retryOnlyBeforeOutput = retryOnlyBeforeOutput
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case maxRetries = "max_retries"
+        case rateLimitRetryThreshold = "rate_limit_retry_threshold"
+        case retryOnlyBeforeOutput = "retry_only_before_output"
+        case legacyMaxRetries = "maxRetries"
+        case legacyRateLimitRetryThreshold = "rateLimitRetryThreshold"
+        case legacyRetryOnlyBeforeOutput = "retryOnlyBeforeOutput"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let maxRetries = try container.decodeIfPresent(UInt32.self, forKey: .maxRetries) {
+            self.maxRetries = maxRetries
+        } else {
+            self.maxRetries = try container.decode(UInt32.self, forKey: .legacyMaxRetries)
+        }
+        if let threshold = try container.decodeIfPresent(
+            UInt32.self,
+            forKey: .rateLimitRetryThreshold
+        ) {
+            self.rateLimitRetryThreshold = threshold
+        } else {
+            self.rateLimitRetryThreshold = try container.decode(
+                UInt32.self,
+                forKey: .legacyRateLimitRetryThreshold
+            )
+        }
+        if let retryOnlyBeforeOutput = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .retryOnlyBeforeOutput
+        ) {
+            self.retryOnlyBeforeOutput = retryOnlyBeforeOutput
+        } else {
+            self.retryOnlyBeforeOutput = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .legacyRetryOnlyBeforeOutput
+            ) ?? false
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(maxRetries, forKey: .maxRetries)
+        try container.encode(rateLimitRetryThreshold, forKey: .rateLimitRetryThreshold)
+        try container.encode(retryOnlyBeforeOutput, forKey: .retryOnlyBeforeOutput)
     }
 
     public static let `default` = RetryPolicy()

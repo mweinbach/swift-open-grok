@@ -1087,6 +1087,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         let inheritedForkItems = forkItems
         let childAntigravityRoster = antigravityRoster
         let inheritedAntigravityConversationID = resumeSource?.antigravityConversationID
+        let childOutputTokenBudget = workflow?.maxOutputTokens
 
         bookkeeping[childID] = Bookkeeping(
             startedAt: Date(),
@@ -1165,7 +1166,8 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                             model: childModel,
                             cwd: childCWD,
                             resumeItems: inheritedItems,
-                            forkItems: inheritedForkItems
+                            forkItems: inheritedForkItems,
+                            maxOutputTokens: childOutputTokenBudget
                         )
                     }
                     do {
@@ -1447,7 +1449,8 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         model: String,
         cwd: URL,
         resumeItems: [ConversationItem]?,
-        forkItems: [ConversationItem]? = nil
+        forkItems: [ConversationItem]? = nil,
+        maxOutputTokens: UInt32? = nil
     ) async -> OpenGrokChildResult {
         let startedAt = Date()
         if shellChildProviderBindings[childID] == nil {
@@ -1651,7 +1654,9 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                     tools: executor.tools,
                     hostedTools: hostedTools,
                     reasoningEffort: childEffort,
-                    codexPermissions: childCodexPermissions
+                    codexPermissions: childCodexPermissions,
+                    maxOutputTokens: maxOutputTokens,
+                    retryOnlyBeforeOutput: maxOutputTokens != nil
                 )) { _ in
                     // A child's tokens stream to no pane; the parent reads the
                     // finished result, same as a workflow child.

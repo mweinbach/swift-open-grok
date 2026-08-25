@@ -434,7 +434,7 @@ public enum CLIRunner {
                 return "Transcript export is not implemented; "
                     + "'open-grok sessions show <ID>' prints the transcript."
             case "trace":
-                return "Trace export and upload are not implemented."
+                return "Trace export requires the asynchronous live application composition."
             case "setup":
                 return "Managed configuration fetch requires the asynchronous live application composition."
             case "share":

@@ -294,6 +294,10 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
     /// Session policy for this turn. Child requests can override the parent's
     /// snapshot without exposing Codex metadata to a non-Codex provider.
     public let codexPermissions: CodexPermissions?
+    /// A task-owned output ceiling, distinct from the model's default limit.
+    public let maxOutputTokens: UInt32?
+    /// Budgeted children must never replay a provider request after output.
+    public let retryOnlyBeforeOutput: Bool
 
     public init(
         sessionID: String,
@@ -307,7 +311,9 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
         hostedTools: [HostedTool] = [],
         jsonSchema: JSONValue? = nil,
         reasoningEffort: ReasoningEffort? = nil,
-        codexPermissions: CodexPermissions? = nil
+        codexPermissions: CodexPermissions? = nil,
+        maxOutputTokens: UInt32? = nil,
+        retryOnlyBeforeOutput: Bool = false
     ) {
         self.sessionID = sessionID
         self.cacheAffinityID = cacheAffinityID
@@ -321,6 +327,8 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
         self.jsonSchema = jsonSchema
         self.reasoningEffort = reasoningEffort
         self.codexPermissions = codexPermissions
+        self.maxOutputTokens = maxOutputTokens
+        self.retryOnlyBeforeOutput = retryOnlyBeforeOutput
     }
 }
 
@@ -643,6 +651,7 @@ public struct OpenGrokLiveSampler: Sendable {
                 hostedTools: request.hostedTools,
                 toolChoice: request.tools.isEmpty && request.hostedTools.isEmpty ? nil : .auto,
                 model: request.model,
+                maxOutputTokens: request.maxOutputTokens,
                 xGrokReqId: request.turnID,
                 xGrokSessionId: request.sessionID,
                 xGrokCacheAffinityId: request.cacheAffinityID,
@@ -651,7 +660,8 @@ public struct OpenGrokLiveSampler: Sendable {
                 jsonSchema: request.jsonSchema
             ),
                 codexPermissions: request.codexPermissions ?? configuration.codexPermissions,
-                doomLoopRecovery: configuration.doomLoopRecovery
+                doomLoopRecovery: configuration.doomLoopRecovery,
+                retryOnlyBeforeOutput: request.retryOnlyBeforeOutput
             ) { event in
                 await emit(event)
             }
@@ -690,9 +700,11 @@ extension SamplingClient {
         idleTimeout: MonotonicDuration = .seconds(300),
         codexPermissions: CodexPermissions? = nil,
         doomLoopRecovery: DoomLoopRecoveryPolicy? = nil,
+        retryOnlyBeforeOutput: Bool = false,
         onEvent: @escaping @Sendable (OpenGrokLiveSamplingEvent) async -> Void
     ) async throws -> ConversationResponse {
         var recoveryAttempts: UInt32 = 0
+        let outputObservation = SamplingOutputObservation()
         while true {
             try Task.checkCancellation()
             let activePolicy = doomLoopRecovery.flatMap { policy in
@@ -705,12 +717,15 @@ extension SamplingClient {
                     idleTimeout: idleTimeout,
                     codexPermissions: codexPermissions,
                     doomLoopRecovery: activePolicy,
+                    outputObservation: outputObservation,
                     onEvent: onEvent
                 )
             } catch let error as SamplingErrorInfo {
                 guard error.kind == .doomLoopDetected,
                       let policy = doomLoopRecovery,
-                      recoveryAttempts < policy.maxRetries else {
+                      recoveryAttempts < policy.maxRetries,
+                      !(retryOnlyBeforeOutput && outputObservation.hasOutput)
+                else {
                     await onEvent(.failed(error))
                     throw CLIApplicationError.failed(error.message)
                 }
@@ -732,6 +747,7 @@ extension SamplingClient {
         idleTimeout: MonotonicDuration,
         codexPermissions: CodexPermissions?,
         doomLoopRecovery: DoomLoopRecoveryPolicy?,
+        outputObservation: SamplingOutputObservation,
         onEvent: @escaping @Sendable (OpenGrokLiveSamplingEvent) async -> Void
     ) async throws -> ConversationResponse {
         let events: AsyncStream<SamplingEvent>
@@ -756,7 +772,8 @@ extension SamplingClient {
                 requestId: requestId,
                 idleTimeout: idleTimeout,
                 doomLoop: doomLoop,
-                clientCustomToolNames: customToolNames
+                clientCustomToolNames: customToolNames,
+                outputObservation: outputObservation
             )
         case .messages:
             let (raw, metadata) = try await conversationStreamMessages(request)
@@ -782,6 +799,7 @@ extension SamplingClient {
 
         for await event in events {
             try Task.checkCancellation()
+            outputObservation.observe(event)
             switch LiveSamplingStreamMapper.map(event) {
             case .emit(.output(let text)):
                 if var buffer = pendingToolDelta {
@@ -1514,6 +1532,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             }
             if LiveExportComposition.handles(command) {
                 return try await LiveExportComposition.session(for: command, context: context)
+            }
+            if LiveTraceComposition.handles(command) {
+                return try LiveTraceComposition.session(for: command, context: context)
             }
             if LiveShareComposition.handles(command) {
                 return try await LiveShareComposition.session(
