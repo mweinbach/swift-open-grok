@@ -40,6 +40,15 @@ final class CodexApprovedRoot {
     deinit {
         close(descriptor)
     }
+    #elseif os(Windows)
+    private let windowsRoot: ForeignSessionApprovedRoot
+
+    init?(_ path: URL) {
+        guard let approved = ForeignSessionApprovedRoot(path) else { return nil }
+        url = approved.url
+        originalPath = path.standardizedFileURL.path
+        windowsRoot = approved
+    }
     #else
     init?(_ path: URL) {
         _ = path
@@ -54,17 +63,33 @@ final class CodexApprovedRoot {
         else { return false }
         close(opened)
         return true
+        #elseif os(Windows)
+        return windowsRoot.subroot(path) != nil
         #else
         return false
         #endif
     }
 
     func relativeComponents(for path: URL) -> [String]? {
+        #if os(Windows)
+        guard (try? PathSecurity.rejectHostileLexical(path.path)) != nil else { return nil }
+        let candidate = path.standardizedFileURL.path.replacingOccurrences(of: "\\", with: "/")
+        #else
         let candidate = path.standardizedFileURL.path
+        #endif
         for root in [url.path, originalPath] {
-            if candidate == root { return [] }
-            guard candidate.hasPrefix(root + "/") else { continue }
-            let suffix = candidate.dropFirst(root.count + 1)
+            #if os(Windows)
+            let normalized = root.replacingOccurrences(of: "\\", with: "/")
+            if candidate.caseInsensitiveCompare(normalized) == .orderedSame { return [] }
+            guard candidate.lowercased().hasPrefix(normalized.lowercased() + "/") else {
+                continue
+            }
+            #else
+            let normalized = root
+            if candidate == normalized { return [] }
+            guard candidate.hasPrefix(normalized + "/") else { continue }
+            #endif
+            let suffix = candidate.dropFirst(normalized.count + 1)
             let components = suffix.split(separator: "/", omittingEmptySubsequences: true)
                 .map(String.init)
             guard components.allSatisfy({
@@ -118,6 +143,9 @@ final class CodexApprovedRoot {
             device: UInt64(information.st_dev),
             inode: UInt64(information.st_ino)
         )
+        #elseif os(Windows)
+        guard let opened = windowsRoot.openRegularFile(path) else { return nil }
+        return CodexApprovedFile(windowsFile: opened)
         #else
         return nil
         #endif
@@ -160,6 +188,11 @@ final class CodexApprovedFile {
     let device: UInt64
     let inode: UInt64
 
+    #if os(Windows)
+    private let windowsFile: ForeignSessionApprovedFile
+    #endif
+
+    #if !os(Windows)
     init(
         descriptor: Int32,
         path: URL,
@@ -175,6 +208,21 @@ final class CodexApprovedFile {
         self.device = device
         self.inode = inode
     }
+    #else
+    init(windowsFile: ForeignSessionApprovedFile) {
+        self.descriptor = -1
+        self.path = windowsFile.path
+        self.modified = windowsFile.modified
+        self.size = windowsFile.size
+        self.device = windowsFile.windowsVolume
+        self.inode = windowsFile.windowsIndex
+        self.windowsFile = windowsFile
+    }
+
+    func read(maximum: Int) -> Data? {
+        windowsFile.read(maximum: maximum)
+    }
+    #endif
 
     deinit {
         #if canImport(Darwin) || canImport(Glibc)
@@ -425,10 +473,24 @@ enum CodexSessionDatabaseScanner {
         else { return nil }
 
         let path: URL
-        if value.hasPrefix("/") {
+        #if os(Windows)
+        let bytes = Array(value.utf8)
+        let driveAbsolute = bytes.count >= 3
+            && ((65...90).contains(bytes[0]) || (97...122).contains(bytes[0]))
+            && bytes[1] == 58 && (bytes[2] == 47 || bytes[2] == 92)
+        let absolute = value.hasPrefix("/") || value.hasPrefix("\\\\") || driveAbsolute
+        #else
+        let absolute = value.hasPrefix("/")
+        #endif
+        if absolute {
             path = URL(fileURLWithPath: value)
         } else {
-            path = value.split(separator: "/").reduce(root.url) { partial, component in
+            #if os(Windows)
+            let components = value.split(whereSeparator: { $0 == "/" || $0 == "\\" })
+            #else
+            let components = value.split(separator: "/")
+            #endif
+            path = components.reduce(root.url) { partial, component in
                 partial.appendingPathComponent(String(component))
             }
         }

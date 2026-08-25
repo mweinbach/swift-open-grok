@@ -254,8 +254,12 @@ public enum CodexSessionScanner {
         let compressed = candidate.path.lastPathComponent.hasSuffix(".jsonl.zst")
         let ceiling = compressed ? CodexZstdSessionReader.maxCompressedBytes : maxHeadBytes
         let limit = Int(min(opened.size, UInt64(ceiling)))
+        #if os(Windows)
+        guard let input = opened.read(maximum: limit) else { return "" }
+        #else
         let handle = FileHandle(fileDescriptor: opened.descriptor, closeOnDealloc: false)
         let input = handle.readData(ofLength: limit)
+        #endif
         let data: Data
         if compressed {
             do {

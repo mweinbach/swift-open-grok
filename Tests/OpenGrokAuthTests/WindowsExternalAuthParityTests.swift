@@ -116,8 +116,11 @@ struct WindowsExternalAuthParityTests {
         )
 
         #expect(execution.exitCode == 0)
-        #expect(execution.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-            .caseInsensitiveCompare(directory.path) == .orderedSame)
+        let reportedPath = execution.stdout
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\\", with: "/")
+        let expectedPath = directory.path.replacingOccurrences(of: "\\", with: "/")
+        #expect(reportedPath.caseInsensitiveCompare(expectedPath) == .orderedSame)
     }
 
     @Test("timed-out direct Windows helpers are terminated within their bounded budget")

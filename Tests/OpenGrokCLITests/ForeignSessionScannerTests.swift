@@ -13,13 +13,39 @@ import Testing
 @testable import OpenGrokCLI
 import OpenGrokSamplingTypes
 
+#if os(Windows)
+import OpenGrokConfig
+#endif
+
 // MARK: - Shared helpers
 
 private func makeTempDir(_ label: String) throws -> URL {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("opengrok-foreign-\(label)-\(UUID().uuidString)", isDirectory: true)
+    #if os(Windows)
+    try OpenGrokConfig.createDirAllOwnerOnly(root, stateRoot: root)
+    #else
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    #endif
     return root
+}
+
+private func createForeignFixtureDirectory(_ directory: URL, under root: URL) throws {
+    #if os(Windows)
+    try OpenGrokConfig.createDirAllOwnerOnly(directory, stateRoot: root)
+    #else
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    #endif
+}
+
+private func makeClaudeProjectDirectory(configDir: URL, cwd: String) throws -> URL {
+    let nativePath = URL(fileURLWithPath: cwd, isDirectory: true).standardizedFileURL.path
+    let sanitized = try #require(ClaudeSessionScanner.sanitizedProjectPath(nativePath))
+    let projectDir = configDir
+        .appendingPathComponent("projects", isDirectory: true)
+        .appendingPathComponent(sanitized, isDirectory: true)
+    try createForeignFixtureDirectory(projectDir, under: configDir)
+    return projectDir
 }
 
 private func dispose(_ url: URL) {
@@ -63,7 +89,7 @@ struct ForeignSessionTypeTests {
         ))
         finishForeignToolScan(&sessions)
         #expect(sessions.count == ForeignSessionLimits.maxSessionsPerTool)
-        #expect(sessions[0].nativeID == "54")
+        #expect(sessions.first?.nativeID == "54")
         for i in 0..<(sessions.count - 1) {
             #expect(sessions[i].updatedAt >= sessions[i + 1].updatedAt)
         }
@@ -108,10 +134,7 @@ struct ClaudeSessionScannerTests {
     func scanFindsMatchingSession() throws {
         let configDir = try makeTempDir("claude-scan")
         defer { dispose(configDir) }
-        let projectDir = configDir
-            .appendingPathComponent("projects", isDirectory: true)
-            .appendingPathComponent("-work-repo", isDirectory: true)
-        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        let projectDir = try makeClaudeProjectDirectory(configDir: configDir, cwd: "/work/repo")
         let sessionID = UUID().uuidString
         let sessionFile = projectDir.appendingPathComponent("\(sessionID).jsonl")
         let jsonl = """
@@ -126,21 +149,19 @@ struct ClaudeSessionScannerTests {
             configDir: configDir
         )
         #expect(sessions.count == 1)
-        #expect(sessions[0].nativeID == sessionID)
-        #expect(sessions[0].tool == .claude)
-        #expect(sessions[0].source == .claudeCode)
-        #expect(sessions[0].title == "Fix the parser bug")
-        #expect(sessions[0].cwd == "/work/repo")
+        let session = try #require(sessions.first)
+        #expect(session.nativeID == sessionID)
+        #expect(session.tool == .claude)
+        #expect(session.source == .claudeCode)
+        #expect(session.title == "Fix the parser bug")
+        #expect(session.cwd == "/work/repo")
     }
 
     @Test("scan skips sessions with wrong cwd")
     func scanSkipsMismatchedCwd() throws {
         let configDir = try makeTempDir("claude-cwd")
         defer { dispose(configDir) }
-        let projectDir = configDir
-            .appendingPathComponent("projects", isDirectory: true)
-            .appendingPathComponent("-work-repo", isDirectory: true)
-        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        let projectDir = try makeClaudeProjectDirectory(configDir: configDir, cwd: "/work/repo")
         let sessionID = UUID().uuidString
         let sessionFile = projectDir.appendingPathComponent("\(sessionID).jsonl")
         try "{\"cwd\":\"/other/path\"}\n".write(to: sessionFile, atomically: true, encoding: .utf8)
@@ -156,10 +177,7 @@ struct ClaudeSessionScannerTests {
     func scanSkipsSidechain() throws {
         let configDir = try makeTempDir("claude-sidechain")
         defer { dispose(configDir) }
-        let projectDir = configDir
-            .appendingPathComponent("projects", isDirectory: true)
-            .appendingPathComponent("-work-repo", isDirectory: true)
-        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        let projectDir = try makeClaudeProjectDirectory(configDir: configDir, cwd: "/work/repo")
         let sessionID = UUID().uuidString
         let sessionFile = projectDir.appendingPathComponent("\(sessionID).jsonl")
         let jsonl = """
@@ -179,10 +197,7 @@ struct ClaudeSessionScannerTests {
     func scanSkipsNonUUID() throws {
         let configDir = try makeTempDir("claude-nonuuid")
         defer { dispose(configDir) }
-        let projectDir = configDir
-            .appendingPathComponent("projects", isDirectory: true)
-            .appendingPathComponent("-work-repo", isDirectory: true)
-        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        let projectDir = try makeClaudeProjectDirectory(configDir: configDir, cwd: "/work/repo")
         let sessionFile = projectDir.appendingPathComponent("not-a-uuid.jsonl")
         try "{\"cwd\":\"/work/repo\"}\n".write(to: sessionFile, atomically: true, encoding: .utf8)
 
@@ -197,10 +212,7 @@ struct ClaudeSessionScannerTests {
     func titlePrecedence() throws {
         let configDir = try makeTempDir("claude-title")
         defer { dispose(configDir) }
-        let projectDir = configDir
-            .appendingPathComponent("projects", isDirectory: true)
-            .appendingPathComponent("-work-repo", isDirectory: true)
-        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        let projectDir = try makeClaudeProjectDirectory(configDir: configDir, cwd: "/work/repo")
         let sessionID = UUID().uuidString
         let sessionFile = projectDir.appendingPathComponent("\(sessionID).jsonl")
         let jsonl = """
@@ -214,7 +226,7 @@ struct ClaudeSessionScannerTests {
             configDir: configDir
         )
         #expect(sessions.count == 1)
-        #expect(sessions[0].title == "My Custom Title")
+        #expect(try #require(sessions.first).title == "My Custom Title")
     }
 
     @Test("first prompt extraction handles bash-input tags")
@@ -248,10 +260,7 @@ struct ClaudeSessionScannerTests {
     func scanExtractsBranch() throws {
         let configDir = try makeTempDir("claude-branch")
         defer { dispose(configDir) }
-        let projectDir = configDir
-            .appendingPathComponent("projects", isDirectory: true)
-            .appendingPathComponent("-work-repo", isDirectory: true)
-        try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
+        let projectDir = try makeClaudeProjectDirectory(configDir: configDir, cwd: "/work/repo")
         let sessionID = UUID().uuidString
         let sessionFile = projectDir.appendingPathComponent("\(sessionID).jsonl")
         let jsonl = """
@@ -265,7 +274,7 @@ struct ClaudeSessionScannerTests {
             configDir: configDir
         )
         #expect(sessions.count == 1)
-        #expect(sessions[0].branch == "feature/add-auth")
+        #expect(try #require(sessions.first).branch == "feature/add-auth")
     }
 
     @Test("config dir resolves from CLAUDE_CONFIG_DIR env")
@@ -273,7 +282,7 @@ struct ClaudeSessionScannerTests {
         let resolved = ClaudeSessionScanner.resolveConfigDir(nil, environment: [
             "CLAUDE_CONFIG_DIR": "/custom/claude"
         ])
-        #expect(resolved?.path == "/custom/claude")
+        #expect(resolved?.path == URL(fileURLWithPath: "/custom/claude", isDirectory: true).path)
     }
 
     @Test("config dir falls back to HOME/.claude")
@@ -309,6 +318,32 @@ struct ClaudeSessionScannerTests {
         )
         #expect(resolved?.standardizedFileURL == expected.standardizedFileURL)
     }
+
+    @Test("scan discovers sessions for the current platform's native workspace path")
+    func scanFindsNativeWorkspacePath() throws {
+        let configDir = try makeTempDir("claude-native-workspace")
+        defer { dispose(configDir) }
+        let workspace = configDir.appendingPathComponent("checkout", isDirectory: true)
+        try createForeignFixtureDirectory(workspace, under: configDir)
+        let projectDir = try makeClaudeProjectDirectory(configDir: configDir, cwd: workspace.path)
+        let sessionID = UUID().uuidString
+        let metadata = try JSONSerialization.data(withJSONObject: ["cwd": workspace.path])
+        let prompt = try JSONSerialization.data(withJSONObject: [
+            "type": "user",
+            "message": ["content": "Read this platform-native workspace"],
+        ] as [String: Any])
+        var contents = metadata
+        contents.append(0x0A)
+        contents.append(prompt)
+        try contents.write(to: projectDir.appendingPathComponent("\(sessionID).jsonl"))
+
+        let sessions = ClaudeSessionScanner.scan(requestedCwd: workspace.path, configDir: configDir)
+        #expect(sessions.count == 1)
+        let session = try #require(sessions.first)
+        #expect(session.nativeID == sessionID)
+        #expect(session.cwd == workspace.path)
+        #expect(session.title == "Read this platform-native workspace")
+    }
 }
 
 // MARK: - Codex scanner
@@ -336,7 +371,7 @@ struct CodexSessionScannerTests {
             .appendingPathComponent(String(components.year!), isDirectory: true)
             .appendingPathComponent(String(format: "%02d", components.month!), isDirectory: true)
             .appendingPathComponent(String(format: "%02d", components.day!), isDirectory: true)
-        try FileManager.default.createDirectory(at: dateDir, withIntermediateDirectories: true)
+        try createForeignFixtureDirectory(dateDir, under: codexHome)
         let sessionID = UUID().uuidString
         let rolloutFile = dateDir
             .appendingPathComponent("rollout-2027-01-15T12-00-00-\(sessionID).jsonl")
@@ -352,11 +387,12 @@ struct CodexSessionScannerTests {
             codexHome: codexHome
         )
         #expect(sessions.count == 1)
-        #expect(sessions[0].nativeID == sessionID)
-        #expect(sessions[0].tool == .codex)
-        #expect(sessions[0].source == .codexCli)
-        #expect(sessions[0].title == "Refactor the database layer")
-        #expect(sessions[0].cwd == "/work/repo")
+        let session = try #require(sessions.first)
+        #expect(session.nativeID == sessionID)
+        #expect(session.tool == .codex)
+        #expect(session.source == .codexCli)
+        #expect(session.title == "Refactor the database layer")
+        #expect(session.cwd == "/work/repo")
     }
 
     @Test("scan skips rollouts with wrong cwd")
@@ -370,7 +406,7 @@ struct CodexSessionScannerTests {
             .appendingPathComponent(String(components.year!), isDirectory: true)
             .appendingPathComponent(String(format: "%02d", components.month!), isDirectory: true)
             .appendingPathComponent(String(format: "%02d", components.day!), isDirectory: true)
-        try FileManager.default.createDirectory(at: dateDir, withIntermediateDirectories: true)
+        try createForeignFixtureDirectory(dateDir, under: codexHome)
         let sessionID = UUID().uuidString
         let rolloutFile = dateDir
             .appendingPathComponent("rollout-2027-01-15T12-00-00-\(sessionID).jsonl")
@@ -413,7 +449,7 @@ struct CodexSessionScannerTests {
         let resolved = CodexSessionScanner.resolveCodexHome(nil, environment: [
             "CODEX_HOME": "/custom/codex"
         ])
-        #expect(resolved?.path == "/custom/codex")
+        #expect(resolved?.path == URL(fileURLWithPath: "/custom/codex", isDirectory: true).path)
     }
 
     @Test("codex home falls back to HOME/.codex")
@@ -461,7 +497,7 @@ struct CodexSessionScannerTests {
             .appendingPathComponent(String(components.year!), isDirectory: true)
             .appendingPathComponent(String(format: "%02d", components.month!), isDirectory: true)
             .appendingPathComponent(String(format: "%02d", components.day!), isDirectory: true)
-        try FileManager.default.createDirectory(at: dateDir, withIntermediateDirectories: true)
+        try createForeignFixtureDirectory(dateDir, under: codexHome)
         let sessionID = UUID().uuidString
         let rolloutFile = dateDir
             .appendingPathComponent("rollout-2027-01-15T12-00-00-\(sessionID).jsonl")
@@ -476,7 +512,7 @@ struct CodexSessionScannerTests {
             codexHome: codexHome
         )
         #expect(sessions.count == 1)
-        #expect(sessions[0].source == .codexVsCode)
+        #expect(try #require(sessions.first).source == .codexVsCode)
     }
 
     @Test("scan extracts atlas source from rollout object")
@@ -490,7 +526,7 @@ struct CodexSessionScannerTests {
             .appendingPathComponent(String(components.year!), isDirectory: true)
             .appendingPathComponent(String(format: "%02d", components.month!), isDirectory: true)
             .appendingPathComponent(String(format: "%02d", components.day!), isDirectory: true)
-        try FileManager.default.createDirectory(at: dateDir, withIntermediateDirectories: true)
+        try createForeignFixtureDirectory(dateDir, under: codexHome)
         let sessionID = UUID().uuidString
         let rolloutFile = dateDir
             .appendingPathComponent("rollout-2027-01-15T12-00-00-\(sessionID).jsonl")
@@ -505,8 +541,69 @@ struct CodexSessionScannerTests {
             codexHome: codexHome
         )
         #expect(sessions.count == 1)
-        #expect(sessions[0].source == .codexAtlas)
+        #expect(try #require(sessions.first).source == .codexAtlas)
     }
+
+    @Test("scan discovers Codex rollouts for the current platform's native workspace path")
+    func scanFindsNativeWorkspacePath() throws {
+        let codexHome = try makeTempDir("codex-native-workspace")
+        defer { dispose(codexHome) }
+        let workspace = codexHome.appendingPathComponent("checkout", isDirectory: true)
+        try createForeignFixtureDirectory(workspace, under: codexHome)
+
+        let components = Calendar(identifier: .gregorian)
+            .dateComponents([.year, .month, .day], from: Date())
+        let dateDir = codexHome
+            .appendingPathComponent("sessions", isDirectory: true)
+            .appendingPathComponent(String(try #require(components.year)), isDirectory: true)
+            .appendingPathComponent(
+                String(format: "%02d", try #require(components.month)),
+                isDirectory: true
+            )
+            .appendingPathComponent(
+                String(format: "%02d", try #require(components.day)),
+                isDirectory: true
+            )
+        try createForeignFixtureDirectory(dateDir, under: codexHome)
+        let sessionID = UUID().uuidString
+        let metadata = try JSONSerialization.data(withJSONObject: [
+            "cwd": workspace.path,
+            "session_id": sessionID,
+            "source": "cli",
+        ])
+        let prompt = try JSONSerialization.data(withJSONObject: [
+            "role": "user",
+            "content": "Read this platform-native Codex workspace",
+        ])
+        var contents = metadata
+        contents.append(0x0A)
+        contents.append(prompt)
+        try contents.write(to: dateDir.appendingPathComponent(
+            "rollout-2027-01-15T12-00-00-\(sessionID).jsonl"
+        ))
+
+        let sessions = CodexSessionScanner.scan(requestedCwd: workspace.path, codexHome: codexHome)
+        #expect(sessions.count == 1)
+        let session = try #require(sessions.first)
+        #expect(session.nativeID == sessionID)
+        #expect(session.cwd == workspace.path)
+        #expect(session.title == "Read this platform-native Codex workspace")
+    }
+
+    #if os(Windows)
+    @Test("Windows discovery rejects inherited and externally writable store authority")
+    func windowsRejectsInheritedStoreAuthority() throws {
+        let parent = try makeTempDir("foreign-inherited-authority")
+        defer { dispose(parent) }
+        let inherited = parent.appendingPathComponent("inherited", isDirectory: true)
+        try FileManager.default.createDirectory(at: inherited, withIntermediateDirectories: false)
+
+        #expect(ForeignSessionApprovedRoot(inherited) == nil)
+        #expect(CodexApprovedRoot(inherited) == nil)
+        #expect(ClaudeSessionScanner.scan(requestedCwd: parent.path, configDir: inherited).isEmpty)
+        #expect(CodexSessionScanner.scan(requestedCwd: parent.path, codexHome: inherited).isEmpty)
+    }
+    #endif
 }
 
 // MARK: - Composition integration
