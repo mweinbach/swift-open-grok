@@ -46,14 +46,19 @@ public struct MCPIcon: Codable, Sendable, Hashable {
             self.mimeType = nil
         }
 
-        let normalizedSizes = sizes?.lazy.compactMap { token -> String? in
-            let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty,
-                  trimmed.utf8.count <= MCPIconLimits.maximumSizeTokenBytes
-            else { return nil }
-            return trimmed
-        }.prefix(MCPIconLimits.maximumSizes).map { $0 }
-        self.sizes = normalizedSizes?.isEmpty == false ? normalizedSizes : nil
+        var normalizedSizes: [String] = []
+        if let sizes {
+            normalizedSizes.reserveCapacity(min(sizes.count, MCPIconLimits.maximumSizes))
+            for token in sizes {
+                let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty,
+                      trimmed.utf8.count <= MCPIconLimits.maximumSizeTokenBytes
+                else { continue }
+                normalizedSizes.append(trimmed)
+                if normalizedSizes.count == MCPIconLimits.maximumSizes { break }
+            }
+        }
+        self.sizes = normalizedSizes.isEmpty ? nil : normalizedSizes
         self.theme = theme
     }
 
