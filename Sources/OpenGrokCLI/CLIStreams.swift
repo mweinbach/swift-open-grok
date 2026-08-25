@@ -10,15 +10,19 @@ import Foundation
 public struct CLIStreams: Sendable {
     public var out: @Sendable (String) -> Void
     public var err: @Sendable (String) -> Void
+    var rawOutput: (@Sendable (Data) -> Void)?
+    var rawError: (@Sendable (Data) -> Void)?
 
     public init(out: @escaping @Sendable (String) -> Void, err: @escaping @Sendable (String) -> Void) {
         self.out = out
         self.err = err
+        self.rawOutput = nil
+        self.rawError = nil
     }
 
     /// Streams bound to the real process stdout/stderr.
     public static var standard: CLIStreams {
-        CLIStreams(
+        var streams = CLIStreams(
             out: { string in
                 FileHandle.standardOutput.write(Data(string.utf8))
             },
@@ -26,6 +30,9 @@ public struct CLIStreams: Sendable {
                 FileHandle.standardError.write(Data(string.utf8))
             }
         )
+        streams.rawOutput = { FileHandle.standardOutput.write($0) }
+        streams.rawError = { FileHandle.standardError.write($0) }
+        return streams
     }
 }
 

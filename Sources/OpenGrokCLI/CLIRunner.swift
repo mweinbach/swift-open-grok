@@ -175,6 +175,12 @@ public enum CLIRunner {
             )
         case .utility(let options) where options.name == "memory":
             return runMemoryClear(options: options, environment: environment, streams: streams)
+        case .utility(let options) where options.name == "wrap":
+            return await LiveWrapComposition.run(
+                options: options,
+                environment: environment,
+                streams: streams
+            )
         case .invalid(let error):
             writeUsageError(error, streams: streams)
             return ExitCode.usage.rawValue
@@ -428,8 +434,8 @@ public enum CLIRunner {
         case .utility(let options):
             switch options.name {
             case "wrap":
-                return "PTY wrapping with OSC 52 clipboard forwarding is not "
-                    + "implemented; run the command directly instead."
+                return "PTY wrapping with OSC 52 clipboard forwarding requires "
+                    + "the asynchronous live application composition."
             case "export":
                 return "Transcript export is not implemented; "
                     + "'open-grok sessions show <ID>' prints the transcript."
