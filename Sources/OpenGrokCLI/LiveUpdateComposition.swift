@@ -439,15 +439,24 @@ public enum LiveUpdateComposition {
             throw CLIApplicationError.failed(describe(error))
         }
 
+        let result: ReleaseInstallService.InstallResult
         do {
-            let result = try await services.install(target, asset, environment, streams.out)
-            streams.out("  ✓ Open Grok v\(result.version) installed successfully!\n")
-            streams.out("  Please restart Open Grok.\n")
+            result = try await services.install(target, asset, environment, streams.out)
         } catch {
             throw CLIApplicationError.failed(
                 "Auto-update failed: \(describe(error))\n\n"
                     + "Please reinstall Open Grok via:\n  \(manualInstallCommand())"
             )
+        }
+        streams.out("  ✓ Open Grok v\(result.version) installed successfully!\n")
+        streams.out("  Please restart Open Grok.\n")
+
+        // The binary is already installed. Discovery or an exiting leader must
+        // never turn that committed update into an apparent installation failure.
+        do {
+            try await services.notifyInstalledLeaders(result.version, environment, streams)
+        } catch {
+            // Leader relaunch is explicitly best-effort (`pager-bin/main.rs:2347-2393`).
         }
     }
 
@@ -475,15 +484,29 @@ public struct LiveUpdateServices: Sendable {
     public let install: @Sendable (
         String, ReleaseAsset, [String: String], @Sendable (String) -> Void
     ) async throws -> ReleaseInstallService.InstallResult
+    public let notifyInstalledLeaders: @Sendable (
+        String, [String: String], CLIStreams
+    ) async throws -> Void
 
     public init(
         fetchLatestRelease: @escaping @Sendable ([String: String]) async throws -> ReleaseCandidate,
         install: @escaping @Sendable (
             String, ReleaseAsset, [String: String], @Sendable (String) -> Void
-        ) async throws -> ReleaseInstallService.InstallResult
+        ) async throws -> ReleaseInstallService.InstallResult,
+        notifyInstalledLeaders: (@Sendable (
+            String, [String: String], CLIStreams
+        ) async throws -> Void)? = nil
     ) {
         self.fetchLatestRelease = fetchLatestRelease
         self.install = install
+        self.notifyInstalledLeaders = notifyInstalledLeaders ?? {
+            installedVersion, environment, streams in
+            await LiveUpdateLeaderRelaunch.notify(
+                installedVersion: installedVersion,
+                environment: environment,
+                streams: streams
+            )
+        }
     }
 
     public static let production = LiveUpdateServices(
