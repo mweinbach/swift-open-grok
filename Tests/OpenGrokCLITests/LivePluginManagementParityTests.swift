@@ -104,8 +104,10 @@ struct LivePluginManagementParityTests {
         let before = try Data(contentsOf: fixture.registry)
         try FileManager.default.removeItem(at: source)
 
+        let started = Date()
         let failed = await fixture.run(["plugin", "update", "git-failure"])
         #expect(failed.status == CLIRunner.ExitCode.failure.rawValue)
+        #expect(Date().timeIntervalSince(started) < 10)
         #expect(FileManager.default.fileExists(atPath: root.path))
         #expect(try Data(contentsOf: fixture.registry) == before)
     }

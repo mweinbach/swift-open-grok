@@ -187,4 +187,32 @@ struct PluginGitOperandTests {
         try PluginGitClient.validateOperand("https://github.com/owner/repo.git")
         try PluginGitClient.validateOperand(String(repeating: "a", count: 40))
     }
+
+    @Test("a failed git child returns immediately without stale process-state polling")
+    func failedGitChildDoesNotWaitForTimeout() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("plugin-fast-failure-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let started = Date()
+        do {
+            try PluginGitClient(gitPath: "/usr/bin/false").clone(
+                url: "file:///missing-plugin-repository",
+                destination: root.appendingPathComponent("checkout", isDirectory: true),
+                ref: nil,
+                sha: nil
+            )
+            Issue.record("a failing git child unexpectedly completed")
+        } catch let error as PluginInstallError {
+            guard case .gitFailed(_, let status, let output) = error else {
+                Issue.record("unexpected plugin failure: \(error)")
+                return
+            }
+            #expect(status != -1)
+            #expect(!output.contains("timed out"))
+        }
+
+        #expect(Date().timeIntervalSince(started) < 5)
+    }
 }

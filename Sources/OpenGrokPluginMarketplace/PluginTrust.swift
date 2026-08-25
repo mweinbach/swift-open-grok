@@ -235,12 +235,20 @@ public struct PluginGitClient: Sendable {
         process.executableURL = URL(fileURLWithPath: gitPath)
         process.arguments = arguments
         process.currentDirectoryURL = directory
+        process.standardInput = FileHandle.nullDevice
+        var environment = ProcessInfo.processInfo.environment
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        environment["GIT_LFS_SKIP_SMUDGE"] = "1"
+        process.environment = environment
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
+        let completion = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in completion.signal() }
 
         do {
             try process.run()
+            try? pipe.fileHandleForWriting.close()
         } catch {
             throw PluginInstallError.gitFailed(
                 command: arguments.first ?? "?",
@@ -249,21 +257,17 @@ public struct PluginGitClient: Sendable {
             )
         }
 
-        // Bounded wait so a git process prompting for credentials on a
-        // non-interactive terminal cannot hang the CLI forever.
-        let deadline = Date().addingTimeInterval(120)
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.02)
-        }
-        if process.isRunning {
+        // Install the handler before launch: Process.isRunning can stay stale
+        // after a fast failed child exits, making polling consume the full cap.
+        if completion.wait(timeout: .now() + 120) == .timedOut {
             process.terminate()
-            Thread.sleep(forTimeInterval: 0.2)
-            if process.isRunning {
+            if completion.wait(timeout: .now() + .milliseconds(200)) == .timedOut {
                 #if os(Windows)
                 process.terminate()
                 #else
                 kill(process.processIdentifier, SIGKILL)
                 #endif
+                _ = completion.wait(timeout: .now() + 1)
             }
             throw PluginInstallError.gitFailed(
                 command: arguments.first ?? "?",
