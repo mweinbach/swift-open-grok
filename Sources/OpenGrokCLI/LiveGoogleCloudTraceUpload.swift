@@ -34,7 +34,7 @@ enum LiveGoogleCloudTraceUpload {
         var message: String {
             switch self {
             case .unsupportedCredentialSource:
-                return "Direct Google Cloud trace upload only supports private service-account or authorized-user credentials."
+                return "Direct Google Cloud trace upload only supports private service-account, authorized-user, or file-backed workload-identity credentials."
             case .missingCredentials:
                 return "Direct Google Cloud trace upload requires scoped private Google Application Default Credentials."
             case .invalidCredentials:
@@ -68,6 +68,35 @@ enum LiveGoogleCloudTraceUpload {
     fileprivate enum Credentials: Sendable, Equatable {
         case serviceAccount(email: String, keyID: String?, privateKey: String)
         case authorizedUser(clientID: String, clientSecret: String, refreshToken: String)
+        case externalAccount(audience: String, subjectToken: String, sourcePath: String)
+    }
+
+    private struct CredentialSourceFormat: Decodable {
+        let type: String
+        let subject_token_field_name: String?
+    }
+
+    private struct CredentialSourceExecutable: Decodable {
+        let command: String?
+        let output_file: String?
+        let timeout_millis: Int?
+    }
+
+    private struct ExternalCredentialSource: Decodable {
+        let file: String?
+        let url: String?
+        let headers: [String: String]?
+        let executable: CredentialSourceExecutable?
+        let environment_id: String?
+        let region_url: String?
+        let regional_cred_verification_url: String?
+        let cred_verification_url: String?
+        let imdsv2_session_token_url: String?
+        let format: CredentialSourceFormat?
+    }
+
+    private struct CredentialImpersonation: Decodable {
+        let token_lifetime_seconds: Int?
     }
 
     private struct CredentialDocument: Decodable {
@@ -79,6 +108,17 @@ enum LiveGoogleCloudTraceUpload {
         let client_secret: String?
         let refresh_token: String?
         let token_uri: String?
+        let audience: String?
+        let subject_token_type: String?
+        let token_url: String?
+        let token_info_url: String?
+        let service_account_impersonation_url: String?
+        let service_account_impersonation: CredentialImpersonation?
+        let delegates: [String]?
+        let credential_source: ExternalCredentialSource?
+        let quota_project_id: String?
+        let workforce_pool_user_project: String?
+        let universe_domain: String?
     }
 
     private struct TokenResponse: Decodable {
@@ -117,6 +157,8 @@ enum LiveGoogleCloudTraceUpload {
         + "https://www.googleapis.com/auth/devstorage.full_control"
 
     private static let googleTokenURL = "https://oauth2.googleapis.com/token"
+    private static let googleSecurityTokenURL = "https://sts.googleapis.com/v1/token"
+    private static let jwtSubjectTokenType = "urn:ietf:params:oauth:token-type:jwt"
     private static let googleStorageHost = "storage.googleapis.com"
     private static let maximumCredentialBytes = 64 * 1024
     private static let maximumArchiveBytes = 64 * 1024 * 1024
@@ -142,9 +184,15 @@ enum LiveGoogleCloudTraceUpload {
             throw Failure.invalidCredentials
         }
 
-        let credentials = try validatedCredentials(credential)
+        let credentials = try validatedCredentials(credential, environment: environment)
         let testOrigin = try loopbackOrigin(document: document, environment: environment)
-        let tokenEndpoint = try tokenEndpoint(for: credential.token_uri, testOrigin: testOrigin)
+        let tokenEndpoint: URL
+        switch credentials {
+        case .externalAccount:
+            tokenEndpoint = try securityTokenEndpoint(for: credential.token_url, testOrigin: testOrigin)
+        case .serviceAccount, .authorizedUser:
+            tokenEndpoint = try Self.tokenEndpoint(for: credential.token_uri, testOrigin: testOrigin)
+        }
         let objectPath = "\(sessionID)/trace_export.tar.gz"
         let endpoint = try storageEndpoint(
             bucket: bucket,
@@ -301,6 +349,16 @@ enum LiveGoogleCloudTraceUpload {
                 )
             )
             contentType = "application/json"
+        case .externalAccount(let audience, let subjectToken, _):
+            requestBody = FormURLEncoding.encodeData([
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "audience": audience,
+                "scope": storageScopes,
+                "subject_token_type": jwtSubjectTokenType,
+                "subject_token": subjectToken,
+                "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            ])
+            contentType = "application/x-www-form-urlencoded"
         }
 
         let request = HTTPRequest(
@@ -457,7 +515,10 @@ enum LiveGoogleCloudTraceUpload {
         }
     }
 
-    private static func validatedCredentials(_ document: CredentialDocument) throws -> Credentials {
+    private static func validatedCredentials(
+        _ document: CredentialDocument,
+        environment: [String: String]
+    ) throws -> Credentials {
         switch document.type {
         case "service_account":
             guard let email = configured(document.client_email),
@@ -493,9 +554,83 @@ enum LiveGoogleCloudTraceUpload {
                 clientSecret: clientSecret,
                 refreshToken: refreshToken
             )
+        case "external_account":
+            return try validatedExternalCredentials(document, environment: environment)
         default:
             throw Failure.unsupportedCredentialSource
         }
+    }
+
+    private static func validatedExternalCredentials(
+        _ document: CredentialDocument,
+        environment: [String: String]
+    ) throws -> Credentials {
+        // Upstream also supports URL/AWS subject sources and impersonation, but
+        // those require distinct network authorities; accepting them here would
+        // turn credential documents into SSRF or cross-account delegation.
+        guard document.client_email == nil,
+              document.private_key_id == nil,
+              document.private_key == nil,
+              document.client_id == nil,
+              document.client_secret == nil,
+              document.refresh_token == nil,
+              document.token_uri == nil,
+              document.token_info_url == nil,
+              document.service_account_impersonation_url == nil,
+              document.service_account_impersonation == nil,
+              document.delegates == nil,
+              document.quota_project_id == nil,
+              document.workforce_pool_user_project == nil,
+              document.universe_domain == nil || document.universe_domain == "googleapis.com",
+              document.subject_token_type == jwtSubjectTokenType,
+              let audience = document.audience,
+              validWorkloadIdentityAudience(audience),
+              let source = document.credential_source,
+              source.url == nil,
+              source.headers == nil,
+              source.executable == nil,
+              source.environment_id == nil,
+              source.region_url == nil,
+              source.regional_cred_verification_url == nil,
+              source.cred_verification_url == nil,
+              source.imdsv2_session_token_url == nil,
+              let path = source.file,
+              !path.isEmpty,
+              path == path.trimmingCharacters(in: .whitespacesAndNewlines)
+        else {
+            throw Failure.unsupportedCredentialSource
+        }
+
+        let data = try privateCredentialData(at: path, environment: environment)
+        guard let contents = String(data: data, encoding: .utf8) else {
+            throw Failure.invalidCredentials
+        }
+
+        let subjectToken: String
+        switch source.format?.type {
+        case nil, "text":
+            guard source.format?.subject_token_field_name == nil else {
+                throw Failure.invalidCredentials
+            }
+            subjectToken = contents
+        case "json":
+            guard let field = source.format?.subject_token_field_name,
+                  validSubjectTokenField(field),
+                  let object = try? JSONSerialization.jsonObject(with: data),
+                  let values = object as? [String: Any],
+                  let value = values[field] as? String
+            else {
+                throw Failure.invalidCredentials
+            }
+            subjectToken = value
+        default:
+            throw Failure.unsupportedCredentialSource
+        }
+
+        guard validSubjectToken(subjectToken) else {
+            throw Failure.invalidCredentials
+        }
+        return .externalAccount(audience: audience, subjectToken: subjectToken, sourcePath: path)
     }
 
     private static func tokenEndpoint(for configuredURL: String?, testOrigin: URL?) throws -> URL {
@@ -514,6 +649,31 @@ enum LiveGoogleCloudTraceUpload {
         }
 
         if let value = configured(configuredURL), value != googleTokenURL {
+            throw Failure.invalidEndpoint
+        }
+        return production
+    }
+
+    private static func securityTokenEndpoint(for configuredURL: String?, testOrigin: URL?) throws -> URL {
+        guard let production = URL(string: googleSecurityTokenURL),
+              let configuredURL
+        else {
+            throw Failure.invalidEndpoint
+        }
+
+        if let testOrigin {
+            let local = testOrigin
+                .appendingPathComponent("v1", isDirectory: true)
+                .appendingPathComponent("token", isDirectory: false)
+            guard configuredURL == googleSecurityTokenURL
+                || configuredURL == local.absoluteString
+            else {
+                throw Failure.invalidEndpoint
+            }
+            return local
+        }
+
+        guard configuredURL == googleSecurityTokenURL else {
             throw Failure.invalidEndpoint
         }
         return production
@@ -604,6 +764,69 @@ enum LiveGoogleCloudTraceUpload {
         !value.isEmpty
             && value.utf8.count <= maximumCredentialBytes
             && value.utf8.allSatisfy { (0x21...0x7E).contains($0) }
+    }
+
+    private static func validWorkloadIdentityAudience(_ value: String) -> Bool {
+        guard value.utf8.count <= 512 else { return false }
+        let segments = value.split(separator: "/", omittingEmptySubsequences: false)
+        guard segments.count == 11,
+              segments[0].isEmpty,
+              segments[1].isEmpty,
+              segments[2] == "iam.googleapis.com",
+              segments[3] == "projects",
+              (1...20).contains(segments[4].utf8.count),
+              segments[4].utf8.allSatisfy({ (0x30...0x39).contains($0) }),
+              segments[5] == "locations",
+              segments[6] == "global",
+              segments[7] == "workloadIdentityPools",
+              validWorkloadIdentitySegment(segments[8]),
+              segments[9] == "providers",
+              validWorkloadIdentitySegment(segments[10])
+        else {
+            return false
+        }
+        return true
+    }
+
+    private static func validWorkloadIdentitySegment(_ value: Substring) -> Bool {
+        let bytes = Array(value.utf8)
+        guard (1...63).contains(bytes.count),
+              let first = bytes.first,
+              let last = bytes.last,
+              lowercaseOrDigit(first),
+              lowercaseOrDigit(last)
+        else {
+            return false
+        }
+        return bytes.allSatisfy { lowercaseOrDigit($0) || $0 == 0x2D }
+    }
+
+    private static func validSubjectTokenField(_ value: String) -> Bool {
+        guard (1...128).contains(value.utf8.count) else { return false }
+        return value.utf8.allSatisfy {
+            ($0 >= 0x41 && $0 <= 0x5A)
+                || lowercaseOrDigit($0)
+                || $0 == 0x2D
+                || $0 == 0x5F
+        }
+    }
+
+    private static func validSubjectToken(_ value: String) -> Bool {
+        let segments = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard value.utf8.count <= maximumTokenBytes,
+              segments.count == 3,
+              segments.allSatisfy({ !$0.isEmpty })
+        else {
+            return false
+        }
+        return segments.allSatisfy { segment in
+            segment.utf8.allSatisfy {
+                ($0 >= 0x41 && $0 <= 0x5A)
+                    || lowercaseOrDigit($0)
+                    || $0 == 0x2D
+                    || $0 == 0x5F
+            }
+        }
     }
 
     private static func validAccessToken(_ value: String) -> Bool {
