@@ -184,6 +184,46 @@ private final class CloudTraceRequestHandler: HttpRequestHandler, @unchecked Sen
     }
 }
 
+private enum S3MultipartTraceFixture {
+    static let bucket = "trace-private-bucket"
+
+    static func initiation(sessionID: String, uploadID: String = "multipart+token/=") -> Data {
+        Data(("<InitiateMultipartUploadResult><Bucket>\(bucket)</Bucket>"
+            + "<Key>\(sessionID)/trace_export.tar.gz</Key>"
+            + "<UploadId>\(uploadID)</UploadId></InitiateMultipartUploadResult>").utf8)
+    }
+
+    static func completion(sessionID: String) -> Data {
+        Data(("<CompleteMultipartUploadResult><Bucket>\(bucket)</Bucket>"
+            + "<Key>\(sessionID)/trace_export.tar.gz</Key>"
+            + "<ETag>completed</ETag></CompleteMultipartUploadResult>").utf8)
+    }
+}
+
+private actor MultipartBoundaryRevokingTransport: HTTPTransport {
+    private let wrapped: MockHTTPTransport
+    private let revoke: @Sendable () async throws -> Void
+    private var requests = 0
+
+    init(wrapped: MockHTTPTransport, revoke: @escaping @Sendable () async throws -> Void) {
+        self.wrapped = wrapped
+        self.revoke = revoke
+    }
+
+    func send(_ request: HTTPRequest) async throws -> HTTPResponse {
+        requests += 1
+        let response = try await wrapped.send(request)
+        if requests == 1 {
+            try await revoke()
+        }
+        return response
+    }
+
+    nonisolated func stream(_ request: HTTPRequest) -> AsyncThrowingStream<HTTPStreamEvent, Error> {
+        wrapped.stream(request)
+    }
+}
+
 @Suite("live direct S3 trace upload security and parity", .serialized)
 struct LiveCloudTraceUploadParityTests {
     @Test("HMAC-SHA256 matches RFC 4231 test case one")
@@ -969,36 +1009,353 @@ struct LiveCloudTraceUploadParityTests {
         #expect(!FileManager.default.fileExists(atPath: fixture.archiveDirectory.path))
     }
 
-    @Test("the upstream 8 MiB multipart threshold refuses before a single PUT")
-    func unsupportedMultipartSizeNeverReachesTransport() async throws {
+    @Test("multipart SigV4 canonical queries are sorted, escaped and independently signed")
+    func multipartCanonicalQueryMatchesIndependentSignature() throws {
+        let authorization = LiveCloudTraceUpload.Authorization(
+            endpoint: try #require(URL(string:
+                "https://trace-bucket.s3.us-west-2.amazonaws.com/canonical-session/trace_export.tar.gz"
+            )),
+            bucket: "trace-bucket",
+            region: "us-west-2",
+            accessKeyID: "AKIDEXAMPLE",
+            secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            sessionToken: nil
+        )
+        let request = try LiveCloudTraceUpload.signedRequest(
+            authorization: authorization,
+            method: .put,
+            query: [("uploadId", "token+part/="), ("partNumber", "2")],
+            body: Data("multipart bytes".utf8),
+            contentType: "application/gzip",
+            now: Date(timeIntervalSince1970: 1_440_938_160)
+        )
+
+        #expect(request.url.absoluteString
+            == authorization.endpoint.absoluteString + "?partNumber=2&uploadId=token%2Bpart%2F%3D")
+        #expect(request.headers["X-Amz-Content-Sha256"]
+            == "478a20786fcad12b4f40a8c0a5e1d3df1de2c616c0de2ed033197103ef28c560")
+        #expect(request.headers["Authorization"]
+            == "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-west-2/s3/aws4_request, "
+                + "SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, "
+                + "Signature=0c62dc3df14046ee5d35962dbd29ca33de16f003c1849ceda309543f25ab5f5a")
+    }
+
+    @Test("the upstream 8 MiB threshold creates, uploads and completes a signed S3 part")
+    func upstreamMultipartThresholdUsesTheProductionUploadPath() async throws {
         let fixture = try CloudTraceUploadFixture()
         defer { fixture.clean() }
-        try await fixture.seed("oversized-cloud")
+        try await fixture.seed("threshold-cloud")
         let environment = try fixture.environment()
         let document = LiveManagedSetupComposition.trustedConfigDocument(environment: environment)
         let authorization = try await LiveTraceUpload.authorize(
-            sessionID: "oversized-cloud",
+            sessionID: "threshold-cloud",
             home: fixture.home,
             document: document,
             environment: environment,
             uploadEnabled: true
         )
-        let transport = MockHTTPTransport()
+        let transport = MockHTTPTransport(responses: [
+            .init(
+                metadata: HTTPResponseMetadata(statusCode: 200),
+                body: S3MultipartTraceFixture.initiation(sessionID: "threshold-cloud")
+            ),
+            .init(metadata: HTTPResponseMetadata(statusCode: 200, headers: ["ETag": "\"part-one\""])),
+            .init(
+                metadata: HTTPResponseMetadata(statusCode: 200),
+                body: S3MultipartTraceFixture.completion(sessionID: "threshold-cloud")
+            ),
+        ])
+
+        let result = try await LiveTraceUpload.upload(
+            sessionID: "threshold-cloud",
+            archive: Data(count: LiveCloudTraceUpload.maximumArchiveBytes),
+            initialAuthorization: authorization,
+            home: fixture.home,
+            document: document,
+            environment: environment,
+            uploadEnabled: true,
+            services: fixture.services(transport),
+            retryNotice: nil
+        )
+
+        #expect(result == "s3://trace-private-bucket/threshold-cloud/trace_export.tar.gz")
+        let requests = transport.recordedRequests
+        #expect(requests.map(\.method) == [.post, .put, .post])
+        #expect(requests[0].url.query == "uploads=")
+        #expect(requests[1].url.absoluteString.contains(
+            "?partNumber=1&uploadId=multipart%2Btoken%2F%3D"
+        ))
+        #expect(requests[1].body?.count == LiveCloudTraceUpload.maximumArchiveBytes)
+        #expect(requests[2].headers["Content-Type"] == "application/xml")
+        for request in requests {
+            #expect(request.headers["Authorization"]?.hasPrefix("AWS4-HMAC-SHA256 ") == true)
+            #expect(request.headers[xaiTokenAuthHeader] == nil)
+        }
+    }
+
+    @Test("real loopback S3 multipart requests preserve signing, ordering and XML-safe ETags")
+    func realLoopbackMultipartTransportCompletesEverySignedPart() async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let sessionID = "loopback-multipart"
+        let handler = CloudTraceRequestHandler { request in
+            if request.method == "POST", request.query == "uploads=" {
+                return HttpResponse(
+                    status: 200,
+                    body: .bytes(S3MultipartTraceFixture.initiation(sessionID: sessionID))
+                )
+            }
+            if request.method == "PUT" {
+                return HttpResponse(
+                    status: 200,
+                    headers: [("ETag", "\"part<&>\"")],
+                    body: .bytes(Data())
+                )
+            }
+            if request.method == "POST", request.query.hasPrefix("uploadId=") {
+                return HttpResponse(
+                    status: 200,
+                    body: .bytes(S3MultipartTraceFixture.completion(sessionID: sessionID))
+                )
+            }
+            return HttpResponse.text(status: 500, "unexpected multipart operation")
+        }
+        let server = HttpServer(handler: handler, basePath: "")
+        try server.start()
+        defer { server.stop() }
+        let environment = try fixture.environment(overrides: [
+            "GROK_TRACE_UPLOAD_ENDPOINT_URL": server.baseURL,
+            "AWS_SESSION_TOKEN": "PRIVATE_MULTIPART_TOKEN",
+        ])
+        let cloud = try LiveCloudTraceUpload.authorize(
+            sessionID: sessionID,
+            bucketURL: "s3://trace-private-bucket",
+            document: LiveManagedSetupComposition.trustedConfigDocument(environment: environment),
+            environment: environment
+        )
+
+        let result = try await LiveS3MultipartUpload.upload(
+            sessionID: sessionID,
+            archive: Data(repeating: 0xAB, count: 17),
+            authorization: cloud,
+            transport: LiveCloudTraceUpload.makeProductionTransport(),
+            limits: .init(partSize: 8, maximumPartCount: 10),
+            authorizeRequest: { cloud }
+        )
+
+        #expect(result == "s3://trace-private-bucket/loopback-multipart/trace_export.tar.gz")
+        let requests = handler.requests
+        #expect(requests.map(\.method) == ["POST", "PUT", "PUT", "PUT", "POST"])
+        #expect(requests[1].body.count == 8)
+        #expect(requests[2].body.count == 8)
+        #expect(requests[3].body.count == 1)
+        #expect(requests[1].query == "partNumber=1&uploadId=multipart%2Btoken%2F%3D")
+        #expect(requests[4].query == "uploadId=multipart%2Btoken%2F%3D")
+        let completion = String(decoding: requests[4].body, as: UTF8.self)
+        #expect(completion.contains("<PartNumber>1</PartNumber>"))
+        #expect(completion.contains("<PartNumber>2</PartNumber>"))
+        #expect(completion.contains("<PartNumber>3</PartNumber>"))
+        #expect(completion.contains("<ETag>&quot;part&lt;&amp;&gt;&quot;</ETag>"))
+        for request in requests {
+            #expect(request.authorization?.hasPrefix("AWS4-HMAC-SHA256 ") == true)
+            #expect(request.header("x-amz-security-token") == "PRIVATE_MULTIPART_TOKEN")
+            #expect(request.header(xaiTokenAuthHeader) == nil)
+        }
+    }
+
+    @Test("multipart archive and AWS part-count limits reject overflow before network I/O")
+    func multipartArchiveLimitsAreExplicitAndBounded() throws {
+        #expect(try LiveS3MultipartUpload.validatedPartCount(
+            archiveBytes: LiveCloudTraceUpload.maximumArchiveBytes
+        ) == 1)
+        #expect(try LiveS3MultipartUpload.validatedPartCount(
+            archiveBytes: LiveCloudTraceUpload.maximumArchiveBytes + 1
+        ) == 2)
+        #expect(throws: LiveCloudTraceUpload.Failure.archiveTooLarge) {
+            try LiveS3MultipartUpload.validatedPartCount(
+                archiveBytes: LiveCloudTraceUpload.maximumArchiveBytes * 10_000 + 1
+            )
+        }
+        #expect(throws: LiveCloudTraceUpload.Failure.archiveTooLarge) {
+            try LiveS3MultipartUpload.validatedPartCount(
+                archiveBytes: 8,
+                limits: .init(partSize: 8, maximumPartCount: 10_001)
+            )
+        }
+    }
+
+    @Test(
+        "missing, hostile and oversized S3 upload identifiers never reach an upload or abort request",
+        arguments: ["missing", "query-injection", "whitespace", "oversized", "doctype"]
+    )
+    func invalidMultipartIdentifiersStopBeforePartDispatch(_ scenario: String) async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let environment = try fixture.environment()
+        let cloud = try LiveCloudTraceUpload.authorize(
+            sessionID: "invalid-upload-id",
+            bucketURL: "s3://trace-private-bucket",
+            document: LiveManagedSetupComposition.trustedConfigDocument(environment: environment),
+            environment: environment
+        )
+        let body: Data
+        switch scenario {
+        case "missing":
+            body = Data("<InitiateMultipartUploadResult></InitiateMultipartUploadResult>".utf8)
+        case "query-injection":
+            body = S3MultipartTraceFixture.initiation(sessionID: "invalid-upload-id", uploadID: "bad&partNumber=9")
+        case "whitespace":
+            body = S3MultipartTraceFixture.initiation(sessionID: "invalid-upload-id", uploadID: "bad token")
+        case "oversized":
+            body = S3MultipartTraceFixture.initiation(
+                sessionID: "invalid-upload-id",
+                uploadID: String(repeating: "x", count: 2_049)
+            )
+        default:
+            body = Data("<!DOCTYPE x><InitiateMultipartUploadResult><UploadId>ok</UploadId></InitiateMultipartUploadResult>".utf8)
+        }
+        let transport = MockHTTPTransport(responses: [
+            .init(metadata: HTTPResponseMetadata(statusCode: 200), body: body),
+        ])
+
+        await #expect(throws: (any Error).self) {
+            try await LiveS3MultipartUpload.upload(
+                sessionID: "invalid-upload-id",
+                archive: Data(count: 8),
+                authorization: cloud,
+                transport: transport,
+                limits: .init(partSize: 8),
+                authorizeRequest: { cloud }
+            )
+        }
+        #expect(transport.recordedRequests.count == 1)
+        #expect(transport.recordedRequests[0].method == .post)
+    }
+
+    @Test(
+        "missing and malformed multipart ETags abort the initiated upload without completing it",
+        arguments: ["missing", "unquoted", "injected-newline", "embedded-quote"]
+    )
+    func invalidMultipartETagsTriggerBoundedAbort(_ scenario: String) async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let environment = try fixture.environment()
+        let cloud = try LiveCloudTraceUpload.authorize(
+            sessionID: "invalid-part-etag",
+            bucketURL: "s3://trace-private-bucket",
+            document: LiveManagedSetupComposition.trustedConfigDocument(environment: environment),
+            environment: environment
+        )
+        let headers: [String: String]
+        switch scenario {
+        case "missing": headers = [:]
+        case "unquoted": headers = ["ETag": "unquoted-tag"]
+        case "injected-newline": headers = ["ETag": "\"tag\nInjected: true\""]
+        default: headers = ["ETag": "\"tag\"injected\""]
+        }
+        let transport = MockHTTPTransport(responses: [
+            .init(
+                metadata: HTTPResponseMetadata(statusCode: 200),
+                body: S3MultipartTraceFixture.initiation(sessionID: "invalid-part-etag")
+            ),
+            .init(metadata: HTTPResponseMetadata(statusCode: 200, headers: headers)),
+            .init(metadata: HTTPResponseMetadata(statusCode: 204)),
+        ])
+
+        await #expect(throws: LiveCloudTraceUpload.Failure.invalidMultipartETag) {
+            try await LiveS3MultipartUpload.upload(
+                sessionID: "invalid-part-etag",
+                archive: Data(count: 8),
+                authorization: cloud,
+                transport: transport,
+                limits: .init(partSize: 8),
+                authorizeRequest: { cloud }
+            )
+        }
+        let requests = transport.recordedRequests
+        #expect(requests.map(\.method) == [.post, .put, .delete])
+        #expect(requests[2].url.absoluteString.hasSuffix("?uploadId=multipart%2Btoken%2F%3D"))
+        #expect(requests[2].timeout == 10)
+        #expect(requests[2].headers["Authorization"]?.hasPrefix("AWS4-HMAC-SHA256 ") == true)
+    }
+
+    @Test("a failing multipart part issues exactly one signed best-effort abort")
+    func rejectedMultipartPartAbortsExactlyOnce() async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let environment = try fixture.environment()
+        let cloud = try LiveCloudTraceUpload.authorize(
+            sessionID: "rejected-part",
+            bucketURL: "s3://trace-private-bucket",
+            document: LiveManagedSetupComposition.trustedConfigDocument(environment: environment),
+            environment: environment
+        )
+        let transport = MockHTTPTransport(responses: [
+            .init(
+                metadata: HTTPResponseMetadata(statusCode: 200),
+                body: S3MultipartTraceFixture.initiation(sessionID: "rejected-part")
+            ),
+            .init(metadata: HTTPResponseMetadata(statusCode: 503)),
+            .init(metadata: HTTPResponseMetadata(statusCode: 204)),
+        ])
+
+        await #expect(throws: LiveCloudTraceUpload.Failure.multipartRejected(503)) {
+            try await LiveS3MultipartUpload.upload(
+                sessionID: "rejected-part",
+                archive: Data(count: 8),
+                authorization: cloud,
+                transport: transport,
+                limits: .init(partSize: 8),
+                authorizeRequest: { cloud }
+            )
+        }
+        #expect(transport.recordedRequests.map(\.method) == [.post, .put, .delete])
+    }
+
+    @Test("a provider boundary closed after multipart creation suppresses both parts and abort")
+    func providerBoundaryClosurePreventsEveryFurtherMultipartRequest() async throws {
+        let fixture = try CloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let original = try await fixture.seed("revoked-multipart")
+        let environment = try fixture.environment()
+        let document = LiveManagedSetupComposition.trustedConfigDocument(environment: environment)
+        let initial = try await LiveTraceUpload.authorize(
+            sessionID: "revoked-multipart",
+            home: fixture.home,
+            document: document,
+            environment: environment,
+            uploadEnabled: true
+        )
+        let scripted = MockHTTPTransport(responses: [
+            .init(
+                metadata: HTTPResponseMetadata(statusCode: 200),
+                body: S3MultipartTraceFixture.initiation(sessionID: "revoked-multipart")
+            ),
+        ])
+        let home = fixture.home
+        let revoked = MultipartBoundaryRevokingTransport(wrapped: scripted) {
+            var changed = original
+            changed.currentProvider = .codex
+            changed.everUsedNonXAI = true
+            try await LiveConversationStore(openGrokHome: home).save(changed)
+        }
+        let services = LiveTraceUploadServices(makeTransport: { revoked }, sleep: { _ in })
 
         await #expect(throws: (any Error).self) {
             try await LiveTraceUpload.upload(
-                sessionID: "oversized-cloud",
+                sessionID: "revoked-multipart",
                 archive: Data(count: LiveCloudTraceUpload.maximumArchiveBytes),
-                initialAuthorization: authorization,
+                initialAuthorization: initial,
                 home: fixture.home,
                 document: document,
                 environment: environment,
                 uploadEnabled: true,
-                services: fixture.services(transport),
+                services: services,
                 retryNotice: nil
             )
         }
-        #expect(transport.recordedRequests.isEmpty)
+        #expect(scripted.recordedRequests.count == 1)
+        #expect(scripted.recordedRequests.first?.method == .post)
     }
 
     @Test("a provider boundary closed during S3 retry prevents every subsequent wire request")

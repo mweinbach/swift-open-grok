@@ -29,6 +29,13 @@ enum LiveCloudTraceUpload {
         case invalidEndpoint
         case invalidSession
         case archiveTooLarge
+        case invalidMultipartRequest
+        case invalidMultipartResponse
+        case invalidMultipartUploadID
+        case invalidMultipartETag
+        case multipartRejected(Int)
+        case multipartTransport
+        case authorizationChanged
 
         var message: String {
             switch self {
@@ -47,7 +54,21 @@ enum LiveCloudTraceUpload {
             case .invalidSession:
                 return "Direct S3 trace upload requires a safe session identifier."
             case .archiveTooLarge:
-                return "Direct S3 trace upload cannot safely upload an archive requiring AWS multipart support."
+                return "Direct S3 trace upload exceeds its bounded multipart archive or part limits."
+            case .invalidMultipartRequest:
+                return "Direct S3 trace upload rejected an unsafe multipart request."
+            case .invalidMultipartResponse:
+                return "Direct S3 trace upload received an unsafe or malformed multipart response."
+            case .invalidMultipartUploadID:
+                return "Direct S3 trace upload received an unsafe or missing multipart upload identifier."
+            case .invalidMultipartETag:
+                return "Direct S3 trace upload received an unsafe or missing multipart part ETag."
+            case .multipartRejected(let status):
+                return "S3 storage rejected the multipart upload (HTTP \(status))."
+            case .multipartTransport:
+                return "Direct S3 multipart trace upload could not complete its request safely."
+            case .authorizationChanged:
+                return "Direct S3 trace upload authorization changed before a multipart request."
             }
         }
     }
@@ -416,7 +437,25 @@ enum LiveCloudTraceUpload {
         guard archive.count < maximumArchiveBytes else {
             throw Failure.archiveTooLarge
         }
+        return try signedRequest(
+            authorization: authorization,
+            method: .put,
+            query: [],
+            body: archive,
+            contentType: "application/gzip",
+            now: now
+        )
+    }
 
+    static func signedRequest(
+        authorization: Authorization,
+        method: HTTPMethod,
+        query: [(name: String, value: String)],
+        body: Data,
+        contentType: String,
+        now: Date = Date(),
+        timeout: TimeInterval? = nil
+    ) throws -> HTTPRequest {
         guard isValidBucket(authorization.bucket),
               isValidRegion(authorization.region),
               isValidAccessKeyID(authorization.accessKeyID),
@@ -425,9 +464,23 @@ enum LiveCloudTraceUpload {
         else {
             throw Failure.invalidCredentials
         }
+        guard contentType == "application/gzip" || contentType == "application/xml" else {
+            throw Failure.invalidMultipartRequest
+        }
 
-        let components = try validatedEndpoint(authorization)
-        let payloadHash = SHA256.hexDigest(archive)
+        var components = try validatedEndpoint(authorization)
+        let canonicalQuery = try canonicalQueryString(method: method, query: query)
+        if !canonicalQuery.isEmpty {
+            components.percentEncodedQuery = canonicalQuery
+        }
+        guard let requestURL = components.url,
+              URLComponents(url: requestURL, resolvingAgainstBaseURL: false)?.percentEncodedQuery
+                == (canonicalQuery.isEmpty ? nil : canonicalQuery)
+        else {
+            throw Failure.invalidMultipartRequest
+        }
+
+        let payloadHash = SHA256.hexDigest(body)
         let timestampFormatter = DateFormatter()
         timestampFormatter.locale = Locale(identifier: "en_US_POSIX")
         timestampFormatter.timeZone = TimeZone(secondsFromGMT: 0)
@@ -444,7 +497,7 @@ enum LiveCloudTraceUpload {
         let hostHeader = components.port.map { "\(enclosedHost):\($0)" } ?? enclosedHost
 
         var headers = [
-            "Content-Type": "application/gzip",
+            "Content-Type": contentType,
             "Host": hostHeader,
             "X-Amz-Content-Sha256": payloadHash,
             "X-Amz-Date": timestamp,
@@ -463,9 +516,9 @@ enum LiveCloudTraceUpload {
             .map(\.0)
             .joined(separator: ";")
         let canonicalRequest = [
-            HTTPMethod.put.rawValue,
+            method.rawValue,
             components.percentEncodedPath,
-            "",
+            canonicalQuery,
             canonicalHeaders,
             signedHeaders,
             payloadHash,
@@ -496,12 +549,102 @@ enum LiveCloudTraceUpload {
             + "Signature=\(signature)"
 
         return HTTPRequest(
-            method: .put,
-            url: authorization.endpoint,
+            method: method,
+            url: requestURL,
             headers: headers,
-            body: archive,
-            timeout: requestTimeout
+            body: body,
+            timeout: timeout ?? requestTimeout
         )
+    }
+
+    private static func canonicalQueryString(
+        method: HTTPMethod,
+        query: [(name: String, value: String)]
+    ) throws -> String {
+        if query.isEmpty {
+            guard method == .put else { throw Failure.invalidMultipartRequest }
+            return ""
+        }
+
+        let names = Set(query.map(\.name))
+        guard names.count == query.count else { throw Failure.invalidMultipartRequest }
+
+        switch method {
+        case .post:
+            guard names == ["uploads"] || names == ["uploadId"] else {
+                throw Failure.invalidMultipartRequest
+            }
+        case .put:
+            guard names == ["partNumber", "uploadId"] else {
+                throw Failure.invalidMultipartRequest
+            }
+        case .delete:
+            guard names == ["uploadId"] else { throw Failure.invalidMultipartRequest }
+        default:
+            throw Failure.invalidMultipartRequest
+        }
+
+        for item in query {
+            switch item.name {
+            case "uploads":
+                guard item.value.isEmpty else { throw Failure.invalidMultipartRequest }
+            case "partNumber":
+                guard let number = Int(item.value), (1...10_000).contains(number),
+                      String(number) == item.value
+                else {
+                    throw Failure.invalidMultipartRequest
+                }
+            case "uploadId":
+                guard validMultipartUploadID(item.value) else {
+                    throw Failure.invalidMultipartUploadID
+                }
+            default:
+                throw Failure.invalidMultipartRequest
+            }
+        }
+
+        return query
+            .map { (percentEncodeQueryComponent($0.name), percentEncodeQueryComponent($0.value)) }
+            .sorted { lhs, rhs in
+                lhs.0 == rhs.0 ? lhs.1 < rhs.1 : lhs.0 < rhs.0
+            }
+            .map { "\($0.0)=\($0.1)" }
+            .joined(separator: "&")
+    }
+
+    static func validMultipartUploadID(_ value: String) -> Bool {
+        let bytes = Array(value.utf8)
+        guard !bytes.isEmpty, bytes.count <= 2_048 else { return false }
+        return bytes.allSatisfy {
+            isASCIIAlphanumeric($0)
+                || $0 == 0x2d
+                || $0 == 0x2e
+                || $0 == 0x5f
+                || $0 == 0x7e
+                || $0 == 0x2b
+                || $0 == 0x2f
+                || $0 == 0x3d
+        }
+    }
+
+    private static func percentEncodeQueryComponent(_ value: String) -> String {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(value.utf8.count)
+        for byte in value.utf8 {
+            if isASCIIAlphanumeric(byte)
+                || byte == 0x2d
+                || byte == 0x2e
+                || byte == 0x5f
+                || byte == 0x7e
+            {
+                bytes.append(byte)
+            } else {
+                bytes.append(0x25)
+                bytes.append(hexadecimalDigits[Int(byte >> 4)])
+                bytes.append(hexadecimalDigits[Int(byte & 0x0f)])
+            }
+        }
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     static func resultURL(authorization: Authorization, sessionID: String) -> String {

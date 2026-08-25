@@ -192,6 +192,37 @@ enum LiveTraceUpload {
         retryNotice: (@Sendable (TimeInterval) -> Void)?
     ) async throws -> String {
         let transport = services.makeTransport()
+        if let cloud = initialAuthorization.cloud,
+           archive.count >= LiveCloudTraceUpload.maximumArchiveBytes
+        {
+            do {
+                return try await LiveS3MultipartUpload.upload(
+                    sessionID: sessionID,
+                    archive: archive,
+                    authorization: cloud,
+                    transport: transport,
+                    authorizeRequest: {
+                        let current = try await authorize(
+                            sessionID: sessionID,
+                            home: home,
+                            document: document,
+                            environment: environment,
+                            uploadEnabled: uploadEnabled
+                        )
+                        guard current.endpoint == initialAuthorization.endpoint,
+                              current.cloud == initialAuthorization.cloud,
+                              let authorizedCloud = current.cloud
+                        else {
+                            throw LiveCloudTraceUpload.Failure.authorizationChanged
+                        }
+                        return authorizedCloud
+                    }
+                )
+            } catch let failure as LiveCloudTraceUpload.Failure {
+                throw LiveTraceUploadFailure.cloud(failure.message)
+            }
+        }
+
         let objectPath = "\(sessionID)/trace_export.tar.gz"
 
         for attempt in 0..<maximumAttempts {
