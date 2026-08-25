@@ -48,6 +48,13 @@ divergences, and still-unverified platforms. `CRATE_MAP.md` now enumerates all
   the handler, and disconnected carriers cannot mutate durable tasks
   (`xai-grok-shell/src/extensions/task.rs:431-474`;
   `agent/mvp_agent/acp_agent.rs:3343-3353`).
+- **LIVE — bounded startup worktree cleanup.** Empty registries, missing
+  worktrees, recent worktrees, and manually managed entries preserve the same
+  cleanup/throttle results without spawning a machine-wide process-working-
+  directory scan. Eligible live worktrees still perform the scan before any
+  age-based removal, preserving the fail-closed protection boundary
+  (`xai-fast-worktree/src/auto_gc.rs:15-35`;
+  `api.rs:1838-1865`).
 
 The focused serialized verification matrix passed **226 tests in 24 suites
 across 8 nonempty test-product summaries**, exit 0. The complete package gate,

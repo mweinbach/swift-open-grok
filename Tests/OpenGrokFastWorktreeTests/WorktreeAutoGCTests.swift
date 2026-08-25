@@ -33,6 +33,83 @@ struct WorktreeAutoGCTests {
         #expect(try fixture.registry.records().map(\.id) == ["stale"])
     }
 
+    @Test("empty registries are stamped and throttled without scanning system processes")
+    func emptyRegistrySkipsProcessScan() throws {
+        let fixture = try makeFixture()
+        defer { fixture.dispose() }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let policy = WorktreeAutoGCPolicy(minimumInterval: 600)
+        var scans = 0
+
+        let first = try WorktreeAutoGC.runIfDue(
+            registry: fixture.registry,
+            policy: policy,
+            protectedPaths: [fixture.root],
+            now: now,
+            activeProcessDirectories: {
+                scans += 1
+                return []
+            }
+        )
+        #expect(first.outcome == .ran)
+        #expect(first.candidates.isEmpty)
+        #expect(first.stamped)
+        #expect(scans == 0)
+
+        let second = try WorktreeAutoGC.runIfDue(
+            registry: fixture.registry,
+            policy: policy,
+            protectedPaths: [],
+            now: now.addingTimeInterval(30),
+            activeProcessDirectories: {
+                scans += 1
+                return []
+            }
+        )
+        #expect(second.outcome == .throttled)
+        #expect(scans == 0)
+    }
+
+    @Test("recent and manually managed live worktrees never trigger a process scan")
+    func ineligibleLiveWorktreesSkipProcessScan() throws {
+        let fixture = try makeFixture()
+        defer { fixture.dispose() }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        for (id, kind, age) in [
+            ("recent", WorktreeRecordKind.launch, TimeInterval(30)),
+            ("manual", WorktreeRecordKind.manual, TimeInterval(7_200)),
+        ] {
+            let directory = fixture.root.appendingPathComponent(id, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try fixture.registry.register(WorktreeRecord(
+                id: id,
+                path: directory,
+                sourceRepository: fixture.root,
+                repositoryName: "fixture",
+                kind: kind,
+                lastSeenAt: now.addingTimeInterval(-age)
+            ))
+        }
+        var scans = 0
+
+        let report = try WorktreeAutoGC.runIfDue(
+            registry: fixture.registry,
+            policy: WorktreeAutoGCPolicy(maxAge: 3_600),
+            protectedPaths: [],
+            now: now,
+            activeProcessDirectories: {
+                scans += 1
+                return []
+            }
+        )
+
+        #expect(report.outcome == .ran)
+        #expect(report.candidates.isEmpty)
+        #expect(report.stamped)
+        #expect(scans == 0)
+        #expect(Set(try fixture.registry.records().map(\.id)) == ["recent", "manual"])
+    }
+
     @Test("stale registry entries are removed and the next run is throttled")
     func staleRemovalAndThrottle() throws {
         let fixture = try makeFixture()
@@ -44,16 +121,23 @@ struct WorktreeAutoGCTests {
             maxAge: 3_600,
             minimumInterval: 600
         )
+        var scans = 0
         let first = try WorktreeAutoGC.runIfDue(
             registry: fixture.registry,
             policy: policy,
-            now: now
+            protectedPaths: [],
+            now: now,
+            activeProcessDirectories: {
+                scans += 1
+                return []
+            }
         )
         #expect(first.outcome == .ran)
         #expect(first.candidates == ["stale"])
         #expect(first.removed == ["stale"])
         #expect(first.stamped)
         #expect(try fixture.registry.records().isEmpty)
+        #expect(scans == 0)
 
         let second = try WorktreeAutoGC.runIfDue(
             registry: fixture.registry,
@@ -89,6 +173,7 @@ struct WorktreeAutoGCTests {
             lastSeenAt: now.addingTimeInterval(-7_200)
         ))
 
+        var scans = 0
         let report = try WorktreeAutoGC.runIfDue(
             registry: fixture.registry,
             policy: WorktreeAutoGCPolicy(
@@ -97,12 +182,17 @@ struct WorktreeAutoGCTests {
                 dryRun: true
             ),
             protectedPaths: [launch],
-            now: now
+            now: now,
+            activeProcessDirectories: {
+                scans += 1
+                return []
+            }
         )
 
         #expect(report.candidates == ["launch"])
         #expect(report.skippedProtected == ["launch"])
         #expect(report.removed.isEmpty)
+        #expect(scans == 1)
         #expect(Set(try fixture.registry.records().map(\.id)) == ["launch", "manual"])
     }
 

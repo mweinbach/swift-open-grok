@@ -68,6 +68,22 @@ public enum WorktreeAutoGC {
         protectedPaths: [URL] = [],
         now: Date = Date()
     ) throws -> WorktreeAutoGCReport {
+        try runIfDue(
+            registry: registry,
+            policy: policy,
+            protectedPaths: protectedPaths,
+            now: now,
+            activeProcessDirectories: processWorkingDirectories
+        )
+    }
+
+    static func runIfDue(
+        registry: WorktreeRegistry,
+        policy: WorktreeAutoGCPolicy,
+        protectedPaths: [URL],
+        now: Date,
+        activeProcessDirectories: () -> Set<String>
+    ) throws -> WorktreeAutoGCReport {
         guard policy.enabled else {
             return WorktreeAutoGCReport(outcome: .disabled)
         }
@@ -85,14 +101,19 @@ public enum WorktreeAutoGC {
 
         let records = try registry.records()
         let cutoff = now.addingTimeInterval(-policy.maxAge)
-        let activeDirectories = processWorkingDirectories().union(
-            protectedPaths.map { $0.standardizedFileURL.resolvingSymlinksInPath().path }
-        )
         let ageExpiryEnabled = supportsProcessWorkingDirectoryScan || policy.dryRun
         let candidates = records.filter { record in
             if !record.isLive { return true }
             guard ageExpiryEnabled, record.kind != .manual else { return false }
             return record.lastSeenAt < cutoff
+        }
+        let activeDirectories: Set<String>
+        if candidates.contains(where: \.isLive) {
+            activeDirectories = activeProcessDirectories().union(
+                protectedPaths.map { $0.standardizedFileURL.resolvingSymlinksInPath().path }
+            )
+        } else {
+            activeDirectories = []
         }
 
         var removed: [String] = []
