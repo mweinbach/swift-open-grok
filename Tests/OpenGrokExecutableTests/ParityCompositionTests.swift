@@ -954,7 +954,7 @@ struct ParityCompositionTests {
                 arguments: ["headless", "--prompt", "hello"],
                 environment: ["XAI_API_KEY": "xai-key"],
                 provider: .xai,
-                model: "grok-4.5",
+                model: "grok-4.6",
                 baseURL: "https://api.x.ai/v1",
                 apiBackend: .responses,
                 apiKey: "xai-key"
@@ -1650,9 +1650,9 @@ struct ParityCompositionTests {
         // budget runs out — and these are the only way to read, wait on, or stop
         // the task it hands back.
         //
-        // `web_search` / `web_fetch` / `x_search` follow the image-tool rule:
-        // this session's `XAI_API_KEY` resolves an xAI search backend, so all
-        // three are offered. `LiveWebToolsTests` pins the credential cases.
+        // `web_search` / `x_search` follow the image-tool rule: this session's
+        // `XAI_API_KEY` resolves an xAI search backend. `web_fetch` remains off
+        // until explicitly enabled, matching agent_ops.rs:2418-2429.
         // `todo_write` needs no credentials at all and is unconditional.
         //
         // `spawn_subagent` is the subagent stack's surface (upstream's
@@ -1672,7 +1672,7 @@ struct ParityCompositionTests {
             "list_agents", "send_message", "followup_task", "wait_agent",
             "list_sessions", "read_session", "message_session",
             "enter_plan_mode", "exit_plan_mode",
-            "web_search", "web_fetch", "x_search",
+            "web_search", "x_search",
             "search_tool", "use_tool",
             "todo_write"
         ]))

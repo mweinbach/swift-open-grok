@@ -88,6 +88,12 @@ private final class ImageToolSamplerFixture: @unchecked Sendable {
 }
 
 private let sampleImageBase64 = Data("PNG!".utf8).base64EncodedString()
+private let sampleReferenceImageBase64 = Data([
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+    0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x02, 0x00, 0x00, 0x00,
+]).base64EncodedString()
 
 private func scriptedImageResponse() -> MockHTTPTransport.ScriptedResponse {
     MockHTTPTransport.ScriptedResponse(
@@ -214,7 +220,7 @@ struct ImageToolCompositionTests {
     func imageEditModelOverride() async {
         let outcome = await runImageToolSession(
             toolName: "image_edit",
-            arguments: #"{"prompt":"make it blue","image":["data:image/png;base64,AAAA"]}"#,
+            arguments: "{\"prompt\":\"make it blue\",\"image\":[\"data:image/png;base64,\(sampleReferenceImageBase64)\"]}",
             extraEnvironment: ["GROK_IMAGE_EDIT_MODEL_OVERRIDE": "grok-imagine-image-edit-next"]
         )
         defer { try? FileManager.default.removeItem(at: outcome.root) }
@@ -231,7 +237,7 @@ struct ImageToolCompositionTests {
         // switches to the array form (and sends an aspect ratio) for multi-image
         // edits.
         #expect((body["image"] as? [String: Any])?["url"] as? String
-            == "data:image/png;base64,AAAA")
+            == "data:image/png;base64,\(sampleReferenceImageBase64)")
         #expect(body["images"] == nil)
         #expect(outcome.savedImages == ["1.jpg"])
     }
@@ -242,7 +248,7 @@ struct ImageToolCompositionTests {
     func genOverrideDoesNotAffectEdit() async {
         let outcome = await runImageToolSession(
             toolName: "image_edit",
-            arguments: #"{"prompt":"make it blue","image":["data:image/png;base64,AAAA"]}"#,
+            arguments: "{\"prompt\":\"make it blue\",\"image\":[\"data:image/png;base64,\(sampleReferenceImageBase64)\"]}",
             extraEnvironment: ["GROK_IMAGE_GEN_MODEL_OVERRIDE": "grok-imagine-custom"]
         )
         defer { try? FileManager.default.removeItem(at: outcome.root) }

@@ -5035,19 +5035,30 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         }
         let baseURL: String
         if let configuredEntry {
-            baseURL = configuredEntry.apiBaseURL
-                ?? configuredEntry.info.baseURL
+            if provider == .xai, configuredEntry.apiBaseURL == XAI_API_BASE_URL_DEFAULT {
+                baseURL = resolveProviderBaseURL(
+                    provider: provider,
+                    model: selectedProfile,
+                    environment: environment,
+                    configuredXaiBaseURL: endpointsXaiAPIBaseURL(in: trustedConfiguration)
+                )
+            } else if provider != .xai,
+                      let override = providerBaseURLEnvironmentOverride(
+                          provider: provider,
+                          environment: environment
+                      ) {
+                baseURL = override
+            } else {
+                baseURL = configuredEntry.apiBaseURL
+                    ?? configuredEntry.info.baseURL
+            }
         } else {
             baseURL = resolveProviderBaseURL(
                 provider: provider,
                 model: selectedProfile,
                 environment: environment,
                 configuredXaiBaseURL: provider == .xai
-                    ? configuredXaiAPIBaseURL(
-                        workingDirectory: workingDirectory,
-                        openGrokHome: openGrokHome,
-                        environment: environment
-                    )
+                    ? endpointsXaiAPIBaseURL(in: trustedConfiguration)
                     : nil
             )
         }
@@ -5407,9 +5418,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         openGrokHome: URL,
         environment: [String: String]
     ) -> String? {
+        var sessionEnvironment = environment
+        sessionEnvironment["OPENGROK_HOME"] = openGrokHome.path
         let security = LiveSecurityContext.resolve(
             workspaceRoot: workingDirectory,
-            environment: environment,
+            environment: sessionEnvironment,
             isInteractive: false
         )
         return endpointsXaiAPIBaseURL(in: security.document)

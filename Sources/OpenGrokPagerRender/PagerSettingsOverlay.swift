@@ -734,10 +734,10 @@ extension PagerSettingsOverlay {
     /// `validate_secret` (`input.rs:478-492`).
     func validateSecret(_ text: String) -> String? {
         if text.utf8.count > Self.maximumSecretBytes { return "Key is too long" }
-        if text.contains(where: \.isWhitespace) { return "Key cannot contain whitespace" }
         if text.unicodeScalars.contains(where: pagerIsUnsafeDisplayScalar) {
             return "Key contains control characters"
         }
+        if text.contains(where: \.isWhitespace) { return "Key cannot contain whitespace" }
         return nil
     }
 

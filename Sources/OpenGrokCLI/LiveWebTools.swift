@@ -26,6 +26,7 @@ import OpenGrokAuth
 import OpenGrokConfig
 import OpenGrokConfigTypes
 import OpenGrokHTTP
+import OpenGrokModels
 import OpenGrokSamplingTypes
 import OpenGrokShared
 import OpenGrokToolProtocol
@@ -554,7 +555,7 @@ enum LiveWebToolComposition {
         return .perplexity(apiKey: key)
     }
 
-    static let defaultWebSearchModel = "grok-4-fast-non-reasoning"
+    static let defaultWebSearchModel = OpenGrokModels.defaultWebSearchModel()
 
     // MARK: Flag plumbing
 

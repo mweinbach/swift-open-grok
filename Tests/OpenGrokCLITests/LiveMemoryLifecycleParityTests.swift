@@ -272,10 +272,22 @@ struct LiveMemoryClearParityTests {
             at: unrelatedDirectory,
             withIntermediateDirectories: true
         )
+        let unrelatedGitDirectory = unrelatedDirectory.appendingPathComponent(".git")
+        try FileManager.default.createDirectory(
+            at: unrelatedGitDirectory,
+            withIntermediateDirectories: true
+        )
+        try "[remote \"origin\"]\nurl = https://example.com/unrelated/workspace.git\n"
+            .write(
+                to: unrelatedGitDirectory.appendingPathComponent("config"),
+                atomically: true,
+                encoding: .utf8
+            )
         let unrelatedStorage = MemoryStorage(
             cwd: unrelatedDirectory,
             environment: fixture.environment
         )
+        #expect(unrelatedStorage.workspaceDir != fixture.storage.workspaceDir)
         try unrelatedStorage.ensureInitialized()
 
         let result = runMemoryClear(

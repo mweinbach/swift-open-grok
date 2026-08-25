@@ -452,6 +452,103 @@ struct LiveSessionSearchRustSQLiteInteropTests {
         ) == [-1, 1_725_000_123])
     }
 
+    @Test("same-second source mutations refresh search without changing Rust's timestamp schema")
+    func sameSecondMutationsRefreshWithoutRepeatedTranscriptLoads() throws {
+        let fixture = try RustSessionSearchSQLiteFixture()
+        defer { fixture.cleanup() }
+        let original = LiveSessionDocument(
+            sessionID: "same-second-session",
+            workingDirectory: fixture.workspace.path,
+            title: "Original title",
+            updatedAt: Date(timeIntervalSince1970: 1_725_000_123.125),
+            content: "beforemutation"
+        )
+        let revised = LiveSessionDocument(
+            sessionID: original.sessionID,
+            workingDirectory: original.workingDirectory,
+            title: "Revised title",
+            updatedAt: Date(timeIntervalSince1970: 1_725_000_123.875),
+            content: "aftermutation"
+        )
+        let environment = [
+            "HOME": fixture.root.path,
+            "OPENGROK_HOME": fixture.root.path,
+            "GROK_SESSION_SEARCH": "1",
+        ]
+        let gate = SessionSearchGate()
+        var loads = 0
+
+        func source(for document: LiveSessionDocument) -> LiveSessionSearchIndexSource {
+            LiveSessionSearchIndexSource(
+                sessionID: document.sessionID,
+                workingDirectory: document.workingDirectory,
+                updatedAt: document.updatedAt,
+                load: {
+                    loads += 1
+                    return document
+                }
+            )
+        }
+
+        let initial = try LiveSessionSearchIndex.search(
+            openGrokHome: fixture.root,
+            environment: environment,
+            query: "beforemutation",
+            workingDirectory: fixture.workspace,
+            limit: 20,
+            gate: gate,
+            sources: { [source(for: original)] }
+        )
+        #expect(initial.total == 1)
+        #expect(loads == 1)
+
+        let updated = try LiveSessionSearchIndex.search(
+            openGrokHome: fixture.root,
+            environment: environment,
+            query: "aftermutation",
+            workingDirectory: fixture.workspace,
+            limit: 20,
+            gate: gate,
+            sources: { [source(for: revised)] }
+        )
+        #expect(updated.total == 1)
+        #expect(loads == 2)
+
+        let unchanged = try LiveSessionSearchIndex.search(
+            openGrokHome: fixture.root,
+            environment: environment,
+            query: "aftermutation",
+            workingDirectory: fixture.workspace,
+            limit: 20,
+            gate: gate,
+            sources: { [source(for: revised)] }
+        )
+        #expect(unchanged.total == 1)
+        #expect(loads == 2)
+
+        let rust = try RustSessionSearchSQLiteConnection(path: fixture.database)
+        #expect(try rust.integers(
+            "SELECT updated_at FROM session_docs WHERE session_id = 'same-second-session'"
+        ) == [1_725_000_123])
+        #expect(try rust.strings(
+            "SELECT value FROM meta WHERE key = 'swift_source_timestamp:same-second-session'"
+        ) == [String(revised.updatedAt.timeIntervalSince1970.bitPattern)])
+
+        let deleted = try LiveSessionSearchIndex.search(
+            openGrokHome: fixture.root,
+            environment: environment,
+            query: "aftermutation",
+            workingDirectory: fixture.workspace,
+            limit: 20,
+            gate: gate,
+            sources: { [] }
+        )
+        #expect(deleted.total == 0)
+        #expect(try rust.strings(
+            "SELECT value FROM meta WHERE key = 'swift_source_timestamp:same-second-session'"
+        ).isEmpty)
+    }
+
     @Test("legacy seven-column Swift databases migrate atomically without losing rows or metadata")
     func migratesLegacySwiftSchemaAndRebuildsRustCompatibleHashes() throws {
         let fixture = try RustSessionSearchSQLiteFixture()

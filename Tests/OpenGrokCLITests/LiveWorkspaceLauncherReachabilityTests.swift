@@ -244,9 +244,9 @@ struct LiveWorkspaceLauncherReachabilityTests {
         // The negative control. Without it, the assertions above would pass
         // just as happily against a launcher that answered *every* command
         // with a WorkspaceRouteError — the test would be measuring nothing.
-        // `trace` remains a genuinely unhooked utility. `worktree` is now a
-        // live route and must not be used as a negative control here.
-        let command = try CLICommandParser.parseOrThrow(["trace", "--local"])
+        // Named production utilities become live as the port advances, so an
+        // explicitly synthetic route is the stable negative control.
+        let command = CLICommand.utility(CLIUtilityOptions(name: "unhooked-negative-control"))
         let (context, _, _) = launcherContext(environment: Self.gateOff)
         let launcher = OpenGrokLiveApplicationLauncher().launcher
 
@@ -254,7 +254,7 @@ struct LiveWorkspaceLauncherReachabilityTests {
             _ = try await launcher.start(command, context)
             Issue.record("expected an unhooked utility route to refuse")
         } catch let error as WorkspaceRouteError {
-            let detail = "the workspace route claimed `trace` — `handles` is "
+            let detail = "the workspace route claimed an unrelated utility — `handles` is "
                 + "matching too broadly. Got: \(error)"
             Issue.record(Comment(rawValue: detail))
         } catch {

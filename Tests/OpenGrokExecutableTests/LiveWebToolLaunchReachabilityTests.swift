@@ -22,7 +22,7 @@ private final class LiveWebToolSamplingRecorder: @unchecked Sendable {
 
 @Suite("live web-tool launch reachability")
 struct LiveWebToolLaunchReachabilityTests {
-    @Test("--disable-web-search launches and hides search without hiding fetch")
+    @Test("--disable-web-search launches and hides every upstream web capability")
     func disableWebSearchReachesLiveToolSurface() async {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("opengrok-web-tools-\(UUID().uuidString)")
@@ -72,6 +72,8 @@ struct LiveWebToolLaunchReachabilityTests {
         #expect(recorder.firstRequest != nil)
         #expect(!names.contains("web_search"))
         #expect(!names.contains("x_search"))
-        #expect(names.contains("web_fetch"))
+        // Rust's prepare_web_fetch_config rejects fetch before resolving its
+        // feature flag when disable_web_search is set (agent_ops.rs:2418-2427).
+        #expect(!names.contains("web_fetch"))
     }
 }

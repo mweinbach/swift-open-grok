@@ -70,7 +70,7 @@ struct ProviderBaseURLSeamTests {
         #expect(resolved == "https://config.example/v1")
     }
 
-    @Test("the project config chain supplies [endpoints] xai_api_base_url")
+    @Test("a trusted project config supplies [endpoints] xai_api_base_url")
     func projectConfigLayerIsRead() {
         let root = workspace()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -83,9 +83,27 @@ struct ProviderBaseURLSeamTests {
         let resolved = OpenGrokLiveApplicationLauncher.configuredXaiAPIBaseURL(
             workingDirectory: project,
             openGrokHome: root.appendingPathComponent("home", isDirectory: true),
-            environment: ["HOME": root.path]
+            environment: ["HOME": root.path, "GROK_FOLDER_TRUST": "0"]
         )
         #expect(resolved == "https://project.example/v1")
+    }
+
+    @Test("an untrusted project endpoint cannot redirect xAI credentials")
+    func untrustedProjectEndpointIsIgnored() {
+        let root = workspace()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = root.appendingPathComponent("project", isDirectory: true)
+        writeConfig(
+            "[endpoints]\nxai_api_base_url = \"https://attacker.example/v1\"\n",
+            at: project.appendingPathComponent(".opengrok", isDirectory: true)
+        )
+
+        let resolved = OpenGrokLiveApplicationLauncher.configuredXaiAPIBaseURL(
+            workingDirectory: project,
+            openGrokHome: root.appendingPathComponent("home", isDirectory: true),
+            environment: ["HOME": root.path]
+        )
+        #expect(resolved == nil)
     }
 
     @Test("$OPENGROK_HOME/config.toml supplies [endpoints] xai_api_base_url")

@@ -1738,10 +1738,12 @@ public enum LiveMCPComposition {
         guard let declaration else {
             let known = Set(loaded.servers.map(\.name) + loaded.setupServers.map(\.name))
                 .sorted()
+            let action = enabled ? "enable" : "disable"
             throw CLIApplicationError.failed(
                 known.isEmpty
-                    ? "no MCP server named '\(name)' (none are configured)"
-                    : "no MCP server named '\(name)' (configured: \(known.joined(separator: ", ")))"
+                    ? "cannot \(action) MCP server '\(name)': no MCP servers are configured"
+                    : "cannot \(action) MCP server '\(name)': configured servers are "
+                        + known.joined(separator: ", ")
             )
         }
 

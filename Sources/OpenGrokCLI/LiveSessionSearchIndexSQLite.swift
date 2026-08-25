@@ -8,6 +8,7 @@ import SQLite3
 final class LiveSessionSearchSQLite {
     private static let schemaVersion: UInt64 = 4
     private static let schemaVersionKey = "session_search_schema_version"
+    private static let sourceTimestampKeyPrefix = "swift_source_timestamp:"
     private static let canonicalColumns = [
         "session_id", "cwd", "updated_at", "title", "content", "content_hash",
     ]
@@ -18,6 +19,7 @@ final class LiveSessionSearchSQLite {
     struct Metadata {
         var updatedAt: Int64
         var workingDirectory: String
+        var sourceTimestampBits: UInt64?
     }
 
     private enum Value {
@@ -85,7 +87,14 @@ final class LiveSessionSearchSQLite {
     }
 
     func indexedMetadata() throws -> [String: Metadata] {
-        let rows = try query("SELECT session_id, cwd, updated_at FROM session_docs")
+        let rows = try query(
+            """
+            SELECT documents.session_id, documents.cwd, documents.updated_at, source.value
+            FROM session_docs AS documents
+            LEFT JOIN meta AS source ON source.key = ?1 || documents.session_id
+            """,
+            bindings: [.text(Self.sourceTimestampKeyPrefix)]
+        )
         var result: [String: Metadata] = [:]
         result.reserveCapacity(rows.count)
         for row in rows {
@@ -96,15 +105,25 @@ final class LiveSessionSearchSQLite {
                 throw LiveSessionSearchIndexError.sqlite("malformed session index metadata")
             }
             let (milliseconds, overflow) = updated.multipliedReportingOverflow(by: 1_000)
+            let rawSourceTimestamp = text(row, 3)
+            let sourceTimestampBits = rawSourceTimestamp.flatMap(UInt64.init)
+            guard rawSourceTimestamp == nil || sourceTimestampBits != nil else {
+                throw LiveSessionSearchIndexError.sqlite("malformed precise session source timestamp")
+            }
             result[sessionID] = Metadata(
                 updatedAt: overflow ? (updated < 0 ? .min : .max) : milliseconds,
-                workingDirectory: cwd
+                workingDirectory: cwd,
+                sourceTimestampBits: sourceTimestampBits
             )
         }
         return result
     }
 
-    func upsert(document: LiveSessionDocument, timestamp: Int64) throws {
+    func upsert(
+        document: LiveSessionDocument,
+        timestamp: Int64,
+        sourceUpdatedAt: Date? = nil
+    ) throws {
         let title = document.title ?? ""
         let content = String(document.content.prefix(LiveSessionDocument.contentLimit))
         let hash = Self.contentHash(title: title, content: content)
@@ -128,10 +147,25 @@ final class LiveSessionSearchSQLite {
                 .text(hash),
             ]
         )
+        let sourceTimestamp = sourceUpdatedAt ?? document.updatedAt
+        try perform(
+            """
+            INSERT INTO meta(key, value) VALUES (?1, ?2)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            bindings: [
+                .text(Self.sourceTimestampKeyPrefix + document.sessionID),
+                .text(String(sourceTimestamp.timeIntervalSince1970.bitPattern)),
+            ]
+        )
     }
 
     func delete(sessionID: String) throws {
         try perform("DELETE FROM session_docs WHERE session_id = ?1", bindings: [.text(sessionID)])
+        try perform(
+            "DELETE FROM meta WHERE key = ?1",
+            bindings: [.text(Self.sourceTimestampKeyPrefix + sessionID)]
+        )
     }
 
     func search(

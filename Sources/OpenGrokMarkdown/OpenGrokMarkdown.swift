@@ -451,6 +451,13 @@ private extension String {
             .filter { !$0.isEmpty }
         guard let last = blocks.last else { return .paragraph }
         let lines = last.components(separatedBy: "\n")
+        if let finalLine = lines.last?.trimmingCharacters(in: .whitespaces),
+           let marker = finalLine.first,
+           (marker == "`" || marker == "~"),
+           finalLine.count >= 3,
+           finalLine.allSatisfy({ $0 == marker }) {
+            return .codeBlock
+        }
         if lines.count >= 2,
            lines[0].contains("|"),
            lines[1].replacingOccurrences(of: "|", with: "")

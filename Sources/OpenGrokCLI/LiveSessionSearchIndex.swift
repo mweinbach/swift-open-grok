@@ -226,6 +226,7 @@ enum LiveSessionSearchIndex {
                 let timestamp = milliseconds(candidate.updatedAt)
                 if let old = existing[candidate.sessionID],
                    unixSeconds(old.updatedAt) == unixSeconds(timestamp),
+                   old.sourceTimestampBits == candidate.updatedAt.timeIntervalSince1970.bitPattern,
                    candidate.workingDirectory.isEmpty || old.workingDirectory == candidate.workingDirectory {
                     continue
                 }
@@ -249,7 +250,11 @@ enum LiveSessionSearchIndex {
                         "session document does not belong to its indexed owner or workspace"
                     )
                 }
-                try database.upsert(document: document, timestamp: timestamp)
+                try database.upsert(
+                    document: document,
+                    timestamp: timestamp,
+                    sourceUpdatedAt: candidate.updatedAt
+                )
             }
             for (sessionID, metadata) in existing where !retainedIDs.contains(sessionID) {
                 if sourcesAreComplete

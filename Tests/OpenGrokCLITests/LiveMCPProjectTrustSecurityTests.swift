@@ -44,8 +44,22 @@ private final class ProjectTrustHTTPTransport: HTTPTransport, @unchecked Sendabl
     }
 
     func stream(_ request: HTTPRequest) -> AsyncThrowingStream<HTTPStreamEvent, Error> {
-        _ = request
-        return AsyncThrowingStream { $0.finish() }
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let response = try await send(request)
+                    continuation.yield(.metadata(response.metadata))
+                    if !response.body.isEmpty {
+                        continuation.yield(.body(response.body))
+                    }
+                    continuation.yield(.end)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 }
 

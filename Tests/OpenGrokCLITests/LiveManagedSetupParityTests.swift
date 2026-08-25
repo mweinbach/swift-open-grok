@@ -1282,8 +1282,8 @@ struct LiveManagedSetupParityTests {
         #expect(fixture.stderr.contents.isEmpty)
     }
 
-    @Test("cancellation during a returning OAuth refresh never persists a new team or policy")
-    func cancelledOAuthRefreshCannotReplaceTeamCredentialsOrPolicy() async throws {
+    @Test("cancellation preserves rotated OAuth credentials without applying managed policy")
+    func cancelledOAuthRefreshPreservesRotatedCredentialsWithoutApplyingPolicy() async throws {
         let fixture = try ManagedSetupFixture()
         defer { fixture.dispose() }
         var expired = fixture.team(expiresAt: Date().addingTimeInterval(-600))
@@ -1318,7 +1318,8 @@ struct LiveManagedSetupParityTests {
             let outcome = try await task.value
             Issue.record("cancelled OAuth refresh unexpectedly returned: \(outcome)")
         } catch is CancellationError {
-            // AuthManager's own pre-write barrier keeps the prior credential.
+            // A completed token rotation remains durable even when this waiter
+            // is cancelled; cancellation still prevents managed-policy writes.
         } catch {
             Issue.record("cancelled OAuth refresh returned an unexpected error: \(error)")
         }
@@ -1326,7 +1327,11 @@ struct LiveManagedSetupParityTests {
         let request = await transport.request
         #expect(request?.url.absoluteString == "https://auth.x.ai/oauth2/token")
         let currentCredentials = try Data(contentsOf: authPath)
-        #expect(currentCredentials == originalCredentials)
+        #expect(currentCredentials != originalCredentials)
+        let refreshed = try #require(readAuthJSON(at: authPath).values.first)
+        #expect(refreshed.key == "late-refreshed-team-bearer")
+        #expect(refreshed.refreshToken == "late-refreshed-team-refresh-token")
+        #expect(refreshed.teamID == expired.teamID)
         #expect(!FileManager.default.fileExists(
             atPath: fixture.state.appendingPathComponent(MANAGED_CONFIG_FILENAME).path
         ))

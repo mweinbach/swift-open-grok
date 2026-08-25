@@ -180,6 +180,14 @@ struct ProviderExpansionWebMediaSecurityTests {
             disableWebSearch: false
         )
         #expect(!availability.webSearchEnabled)
-        #expect(!availability.xSearchEnabled)
+        // x_search uses the separately authenticated xAI candidate even when
+        // this provider selects native generic search (agent_rebuild.rs:400).
+        #expect(availability.xSearchEnabled)
+        guard case .enabled(let apiKey, let baseURL, _, _, _) = availability.xSearchConfig else {
+            Issue.record("expected independently authenticated xAI search")
+            return
+        }
+        #expect(apiKey == "isolated-xai-bearer")
+        #expect(baseURL == "https://api.x.ai/v1")
     }
 }
