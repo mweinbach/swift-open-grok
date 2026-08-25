@@ -5,8 +5,163 @@ import Testing
 
 @testable import OpenGrokVoice
 
+private final class WindowsVoiceCapabilityProbeGate: @unchecked Sendable {
+    let entered = DispatchSemaphore(value: 0)
+    let released = DispatchSemaphore(value: 0)
+    let completed = DispatchSemaphore(value: 0)
+
+    func waitForRelease() -> Bool {
+        entered.signal()
+        return released.wait(timeout: .now() + .seconds(3)) == .success
+    }
+}
+
+private final class WindowsVoiceCapabilityProbeObservations: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedResults: [Bool] = []
+    private var currentTime: UInt64 = 0
+    private var workerThreadNames: [String] = []
+
+    var results: [Bool] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedResults
+    }
+
+    var time: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return currentTime
+    }
+
+    var threadNames: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return workerThreadNames
+    }
+
+    func record(_ result: Bool) {
+        lock.lock()
+        recordedResults.append(result)
+        lock.unlock()
+    }
+
+    func advance(by nanoseconds: UInt64) {
+        lock.lock()
+        currentTime += nanoseconds
+        lock.unlock()
+    }
+
+    func recordWorkerThread() -> Int {
+        lock.lock()
+        workerThreadNames.append(Thread.current.name ?? "")
+        let count = workerThreadNames.count
+        lock.unlock()
+        return count
+    }
+}
+
 @Suite("Native Windows microphone parity", .serialized)
 struct WindowsVoiceCaptureParityTests {
+    @Test("a stalled COM capability probe fails closed before its explicit deadline")
+    func capabilityProbeTimeoutIsBounded() {
+        let gate = WindowsVoiceCapabilityProbeGate()
+        let probe = WindowsVoiceCapabilityProbe(deadlineMilliseconds: 25) {
+            gate.waitForRelease()
+        }
+        defer { gate.released.signal() }
+
+        let started = ContinuousClock.now
+        #expect(!probe.hasDefaultInputDevice())
+        #expect(started.duration(to: .now) < .seconds(1))
+        #expect(gate.entered.wait(timeout: .now() + .seconds(1)) == .success)
+        #expect(probe.workerLaunchCount == 1)
+    }
+
+    @Test("concurrent and repeated capability checks never multiply a stalled native worker")
+    func stalledCapabilityProbeRemainsSingleFlight() {
+        let gate = WindowsVoiceCapabilityProbeGate()
+        let observations = WindowsVoiceCapabilityProbeObservations()
+        let probe = WindowsVoiceCapabilityProbe(deadlineMilliseconds: 40) {
+            gate.waitForRelease()
+        }
+        defer { gate.released.signal() }
+
+        let callers = DispatchGroup()
+        for _ in 0..<12 {
+            callers.enter()
+            Thread {
+                observations.record(probe.hasDefaultInputDevice())
+                callers.leave()
+            }.start()
+        }
+
+        #expect(gate.entered.wait(timeout: .now() + .seconds(1)) == .success)
+        #expect(callers.wait(timeout: .now() + .seconds(2)) == .success)
+        #expect(observations.results.count == 12)
+        #expect(observations.results.allSatisfy { !$0 })
+
+        for _ in 0..<20 {
+            #expect(!probe.hasDefaultInputDevice())
+        }
+        #expect(probe.workerLaunchCount == 1)
+    }
+
+    @Test("a late native success updates the bounded capability cache without spawning another worker")
+    func lateCapabilityProbeCompletionBecomesVisible() {
+        let gate = WindowsVoiceCapabilityProbeGate()
+        let probe = WindowsVoiceCapabilityProbe(
+            deadlineMilliseconds: 25,
+            onCompletion: { _ in gate.completed.signal() }
+        ) {
+            gate.waitForRelease()
+        }
+
+        #expect(!probe.hasDefaultInputDevice())
+        #expect(gate.entered.wait(timeout: .now() + .seconds(1)) == .success)
+        gate.released.signal()
+        #expect(gate.completed.wait(timeout: .now() + .seconds(1)) == .success)
+        #expect(probe.hasDefaultInputDevice())
+        #expect(probe.hasDefaultInputDevice())
+        #expect(probe.workerLaunchCount == 1)
+    }
+
+    @Test("successful default-device detection stays native-thread confined and refreshes expired cache")
+    func successfulCapabilityProbeAndCacheRefresh() {
+        let observations = WindowsVoiceCapabilityProbeObservations()
+        let probe = WindowsVoiceCapabilityProbe(
+            deadlineMilliseconds: 250,
+            cacheLifetimeMilliseconds: 20,
+            clock: { observations.time }
+        ) {
+            observations.recordWorkerThread() == 1
+        }
+
+        #expect(probe.hasDefaultInputDevice())
+        #expect(probe.hasDefaultInputDevice())
+        #expect(probe.workerLaunchCount == 1)
+        #expect(observations.threadNames == ["opengrok-wasapi-capability"])
+
+        observations.advance(by: 20_000_000)
+        #expect(!probe.hasDefaultInputDevice())
+        #expect(probe.workerLaunchCount == 2)
+        #expect(observations.threadNames == [
+            "opengrok-wasapi-capability",
+            "opengrok-wasapi-capability",
+        ])
+    }
+
+    @Test("native capability failures remain unavailable and reuse their bounded negative cache")
+    func failedCapabilityProbeStaysFailClosed() {
+        let probe = WindowsVoiceCapabilityProbe {
+            throw VoiceError.configuration("microphone access denied")
+        }
+
+        #expect(!probe.hasDefaultInputDevice())
+        #expect(!probe.hasDefaultInputDevice())
+        #expect(probe.workerLaunchCount == 1)
+    }
+
     @Test("native Windows microphone failures are explicit and actionable")
     func nativeFailureClassification() {
         let scenarios: [(Int32, String)] = [

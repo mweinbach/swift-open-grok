@@ -36,13 +36,13 @@ enum WindowsVoiceCaptureFailure {
 }
 
 enum WindowsVoiceCaptureSupport {
-    static func hasDefaultInputDevice() -> Bool {
+    private static let capabilityProbe = WindowsVoiceCapabilityProbe {
         guard og_wasapi_is_available() == 1 else { return false }
-        do {
-            return !(try probe(includeFormat: false)).name.isEmpty
-        } catch {
-            return false
-        }
+        return !(try probe(includeFormat: false)).name.isEmpty
+    }
+
+    static func hasDefaultInputDevice() -> Bool {
+        capabilityProbe.hasDefaultInputDevice()
     }
 
     static func probe(includeFormat: Bool) throws -> InputDeviceInfo {
@@ -73,6 +73,118 @@ enum WindowsVoiceCaptureSupport {
         }
         let message = String(cString: detail)
         return message.isEmpty ? "unknown Windows microphone failure" : message
+    }
+}
+
+/// COM audio discovery can block inside a driver before capture's native
+/// startup deadline exists. Keep its buffers on the dedicated worker's own
+/// stack and retain one timed-out flight until that worker actually exits.
+final class WindowsVoiceCapabilityProbe: @unchecked Sendable {
+    private final class Flight: @unchecked Sendable {
+        let finished = DispatchGroup()
+        var result: Bool?
+        var timedOut = false
+
+        init() {
+            finished.enter()
+        }
+    }
+
+    private struct CachedResult {
+        let value: Bool
+        let completedAt: UInt64
+    }
+
+    private let stateLock = NSLock()
+    private let deadlineMilliseconds: Int
+    private let cacheLifetimeNanoseconds: UInt64
+    private let operation: @Sendable () throws -> Bool
+    private let clock: @Sendable () -> UInt64
+    private let onCompletion: @Sendable (Bool) -> Void
+    private var activeFlight: Flight?
+    private var cachedResult: CachedResult?
+    private var launchedWorkerCount = 0
+
+    init(
+        deadlineMilliseconds: Int = 1_000,
+        cacheLifetimeMilliseconds: Int = 2_000,
+        clock: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
+        onCompletion: @escaping @Sendable (Bool) -> Void = { _ in },
+        operation: @escaping @Sendable () throws -> Bool
+    ) {
+        self.deadlineMilliseconds = min(max(deadlineMilliseconds, 1), 2_000)
+        self.cacheLifetimeNanoseconds = UInt64(min(max(cacheLifetimeMilliseconds, 0), 60_000))
+            * 1_000_000
+        self.clock = clock
+        self.onCompletion = onCompletion
+        self.operation = operation
+    }
+
+    var workerLaunchCount: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return launchedWorkerCount
+    }
+
+    func hasDefaultInputDevice() -> Bool {
+        stateLock.lock()
+        let now = clock()
+        if let cachedResult,
+           now >= cachedResult.completedAt,
+           now - cachedResult.completedAt < cacheLifetimeNanoseconds {
+            stateLock.unlock()
+            return cachedResult.value
+        }
+
+        let flight: Flight
+        let shouldStartWorker: Bool
+        if let activeFlight {
+            guard !activeFlight.timedOut else {
+                stateLock.unlock()
+                return false
+            }
+            flight = activeFlight
+            shouldStartWorker = false
+        } else {
+            flight = Flight()
+            activeFlight = flight
+            launchedWorkerCount += 1
+            shouldStartWorker = true
+        }
+        stateLock.unlock()
+
+        if shouldStartWorker {
+            let worker = Thread { [self, flight] in
+                let available: Bool
+                do {
+                    available = try operation()
+                } catch {
+                    available = false
+                }
+
+                stateLock.lock()
+                flight.result = available
+                if activeFlight === flight {
+                    cachedResult = CachedResult(value: available, completedAt: clock())
+                    activeFlight = nil
+                }
+                stateLock.unlock()
+                onCompletion(available)
+                flight.finished.leave()
+            }
+            worker.name = "opengrok-wasapi-capability"
+            worker.start()
+        }
+
+        let outcome = flight.finished.wait(timeout: .now() + .milliseconds(deadlineMilliseconds))
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if outcome == .success {
+            return flight.result ?? false
+        }
+        if let result = flight.result { return result }
+        if activeFlight === flight { flight.timedOut = true }
+        return false
     }
 }
 
