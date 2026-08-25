@@ -303,29 +303,36 @@ public actor ACPAgentRuntime {
         setReverseSender { message in
             try await writer.send(message)
         }
-        // Each inbound message is dispatched on its own child task rather than
-        // inline. `session/prompt` does not return until the driver finishes,
-        // so a sequential loop could not read the `session/cancel` that is
-        // supposed to interrupt it — the cancel would sit in the transport
-        // until the prompt it was meant to stop had already completed. The
-        // actor still serializes the state each handler touches; only the
-        // reading of the next frame is decoupled. This matches upstream, where
-        // `AgentSideConnection` dispatches concurrently
-        // (`crates/codegen/xai-grok-shell/src/agent/server.rs:375`).
         let runtime = self
+        let dispatchAndSend: @Sendable (ACPMessage) async -> Void = { incoming in
+            let outgoing = await runtime.handle(incoming)
+            for message in outgoing {
+                do {
+                    try await writer.send(message)
+                } catch {
+                    await runtime.close()
+                    return
+                }
+            }
+        }
+
+        // Initialization is a protocol barrier: upstream guarantees it runs
+        // before any session-creating request (mvp_agent/acp_agent.rs:299-302),
+        // and reconnect replay explicitly awaits its response before restoring
+        // sessions (xai-grok-pager-bin/src/main.rs:822-845). Once that response
+        // is on the wire, requests must remain concurrent so session/cancel
+        // can interrupt a session/prompt that has not returned yet.
         await withTaskGroup(of: Void.self) { group in
             do {
                 while state != .closed {
                     let incoming = try await transport.receive()
-                    group.addTask {
-                        let outgoing = await runtime.handle(incoming)
-                        for message in outgoing {
-                            do {
-                                try await writer.send(message)
-                            } catch {
-                                await runtime.close()
-                                return
-                            }
+                    if case .request(_, let method, _) = incoming,
+                       method == AgentMethodNames.initialize
+                    {
+                        await dispatchAndSend(incoming)
+                    } else {
+                        group.addTask {
+                            await dispatchAndSend(incoming)
                         }
                     }
                 }

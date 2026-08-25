@@ -76,13 +76,25 @@ private struct GoldenPromptDriver: ACPPromptDriver {
 /// returning `nil` the moment the last request was read would close the
 /// runtime out from under the prompt that request started.
 private final class RecordingLineIO: ACPLineIO, @unchecked Sendable {
+    private struct InboundLine {
+        let line: String
+        let requiredResponse: AcpRequestId?
+    }
+
     private let lock = NSLock()
-    private var inbound: [String]
+    private var inbound: [InboundLine]
     private var outbound: [String] = []
+    private var completedResponses: Set<AcpRequestId> = []
     private let expectedWrites: Int
 
-    init(script: [String], expectedWrites: Int) {
-        inbound = script
+    init(
+        script: [String],
+        expectedWrites: Int,
+        responseDependencies: [Int: AcpRequestId] = [:]
+    ) {
+        inbound = script.enumerated().map { offset, line in
+            InboundLine(line: line, requiredResponse: responseDependencies[offset])
+        }
         self.expectedWrites = expectedWrites
     }
 
@@ -93,11 +105,11 @@ private final class RecordingLineIO: ACPLineIO, @unchecked Sendable {
     }
 
     func readLine() async throws -> String? {
-        if let line = nextScriptedLine() { return line }
         // Give the in-flight exchange a bounded window to finish. The bound
         // matters: without it a dropped frame would hang instead of failing.
         for _ in 0..<200 {
-            if writeCount() >= expectedWrites { break }
+            if let line = nextScriptedLine() { return line }
+            if writeCount() >= expectedWrites { return nil }
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         return nil
@@ -110,7 +122,13 @@ private final class RecordingLineIO: ACPLineIO, @unchecked Sendable {
     private func nextScriptedLine() -> String? {
         lock.lock()
         defer { lock.unlock() }
-        return inbound.isEmpty ? nil : inbound.removeFirst()
+        guard let next = inbound.first else { return nil }
+        if let requiredResponse = next.requiredResponse,
+           !completedResponses.contains(requiredResponse)
+        {
+            return nil
+        }
+        return inbound.removeFirst().line
     }
 
     private func writeCount() -> Int {
@@ -120,8 +138,19 @@ private final class RecordingLineIO: ACPLineIO, @unchecked Sendable {
     }
 
     private func record(_ line: String) {
+        let response: AcpRequestId?
+        if let message = try? ACPMessage(data: Data(line.utf8)),
+           case .response(let id, _, _) = message
+        {
+            response = id
+        } else {
+            response = nil
+        }
         lock.lock()
         outbound.append(line)
+        if let response {
+            completedResponses.insert(response)
+        }
         lock.unlock()
     }
 }
@@ -139,7 +168,14 @@ struct ACPStdioWireGoldenTests {
         ]
         // initialize + session/new + two notifications + prompt_complete +
         // the prompt response.
-        let io = RecordingLineIO(script: script, expectedWrites: 6)
+        // initialize and session/new are deliberately pipelined to exercise
+        // the initialization barrier. A real client cannot issue the prompt
+        // until session/new has returned its newly allocated session ID.
+        let io = RecordingLineIO(
+            script: script,
+            expectedWrites: 6,
+            responseDependencies: [2: .number(2)]
+        )
         let runtime = ACPAgentRuntime(
             promptDriver: GoldenPromptDriver(),
             makeSessionId: { ACPStdioWireGolden.sessionId },
@@ -169,6 +205,44 @@ struct ACPStdioWireGoldenTests {
         for frame in ACPStdioWireGolden.expected {
             #expect(rest.contains(frame), "missing golden frame: \(frame)")
         }
+    }
+
+    @Test("pipelined session creation never overtakes the initialize response")
+    func initializationResponsePrecedesPipelinedSessionCreation() async throws {
+        let cwd = FileManager.default.temporaryDirectory.standardizedFileURL.path
+        let io = RecordingLineIO(
+            script: [
+                #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#,
+                #"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"\#(cwd)","mcpServers":[]}}"#,
+            ],
+            expectedWrites: 2
+        )
+        let runtime = ACPAgentRuntime(
+            promptDriver: GoldenPromptDriver(),
+            makeSessionId: { ACPStdioWireGolden.sessionId },
+            timestamp: { ACPStdioWireGolden.timestamp }
+        )
+
+        await ACPStdioHost(runtime: runtime, transport: ACPStdioTransport(io: io)).run()
+
+        let written = io.written
+        #expect(written.count == 2)
+        let first = try ACPMessage(data: Data(try #require(written.first).utf8))
+        let second = try ACPMessage(data: Data(try #require(written.dropFirst().first).utf8))
+
+        guard case .response(let initializeID, let initializeResult, let initializeError) = first,
+              case .response(let sessionID, let sessionResult, let sessionError) = second
+        else {
+            Issue.record("expected initialize then session/new responses, got \(written)")
+            return
+        }
+        #expect(initializeID == .number(1))
+        #expect(initializeError == nil)
+        let initializeResponse = try #require(initializeResult).decode(InitializeResponse.self)
+        #expect(initializeResponse.protocolVersion == .v1)
+        #expect(sessionID == .number(2))
+        #expect(sessionError == nil)
+        #expect(sessionResult?["sessionId"] == .string(ACPStdioWireGolden.sessionId))
     }
 
     @Test("cancel produces the cancelled stop reason on the wire")
