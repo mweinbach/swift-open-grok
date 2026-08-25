@@ -198,7 +198,7 @@ struct PluginGitOperandTests {
         let started = Date()
         do {
             try PluginGitClient(gitPath: "/usr/bin/false").clone(
-                url: "file:///missing-plugin-repository",
+                url: root.absoluteString,
                 destination: root.appendingPathComponent("checkout", isDirectory: true),
                 ref: nil,
                 sha: nil
@@ -214,5 +214,33 @@ struct PluginGitOperandTests {
         }
 
         #expect(Date().timeIntervalSince(started) < 5)
+    }
+
+    @Test("missing file-URL repositories fail before a git child is launched")
+    func missingLocalRepositoryFailsWithoutLaunchingGit() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("plugin-missing-source-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let repository = root.appendingPathComponent("missing.git", isDirectory: true)
+        do {
+            try PluginGitClient(gitPath: "/missing/git-executable").clone(
+                url: repository.absoluteString,
+                destination: root.appendingPathComponent("checkout", isDirectory: true),
+                ref: nil,
+                sha: nil
+            )
+            Issue.record("a missing file-URL repository unexpectedly cloned")
+        } catch let error as PluginInstallError {
+            guard case .gitFailed(let command, let status, let output) = error else {
+                Issue.record("unexpected plugin failure: \(error)")
+                return
+            }
+            #expect(command == "clone")
+            #expect(status == 128)
+            #expect(output.contains("repository does not exist"))
+            #expect(output.contains(repository.path))
+        }
     }
 }

@@ -187,6 +187,19 @@ public struct PluginGitClient: Sendable {
         sha: String?
     ) throws {
         try Self.validateOperand(url)
+        if let repository = URL(string: url), repository.isFileURL {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(
+                atPath: repository.path,
+                isDirectory: &isDirectory
+            ), isDirectory.boolValue else {
+                throw PluginInstallError.gitFailed(
+                    command: "clone",
+                    status: 128,
+                    output: "repository does not exist: \(repository.path)"
+                )
+            }
+        }
         let (resolvedRef, resolvedSHA) = PluginPin.hoistPinSlots(ref: ref, sha: sha)
 
         if let resolvedSHA {

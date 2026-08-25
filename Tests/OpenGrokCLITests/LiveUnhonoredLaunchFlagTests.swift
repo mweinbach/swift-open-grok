@@ -18,6 +18,7 @@ struct LiveUnhonoredLaunchFlagTests {
             environment: [
                 "HOME": NSTemporaryDirectory(),
                 "OPENGROK_HOME": NSTemporaryDirectory(),
+                "GROK_SANDBOX": "off",
             ],
             streams: streams,
             application: OpenGrokApplication.live(control: .never)

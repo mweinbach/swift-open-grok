@@ -1328,7 +1328,9 @@ struct LiveManagedSetupParityTests {
         #expect(request?.url.absoluteString == "https://auth.x.ai/oauth2/token")
         let currentCredentials = try Data(contentsOf: authPath)
         #expect(currentCredentials != originalCredentials)
-        let refreshed = try #require(readAuthJSON(at: authPath).values.first)
+        let store = try readAuthJSON(at: authPath)
+        let scope = GrokComConfig.default(environment: environment).authScope
+        let refreshed = try #require(lookupAuth(store, scope: scope))
         #expect(refreshed.key == "late-refreshed-team-bearer")
         #expect(refreshed.refreshToken == "late-refreshed-team-refresh-token")
         #expect(refreshed.teamID == expired.teamID)
