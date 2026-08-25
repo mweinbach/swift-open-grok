@@ -7,18 +7,14 @@ the Open Grok branding while keeping all runtime/configuration state isolated
 to `$OPENGROK_HOME` or `~/.opengrok` (the legacy `~/.grok` path is never read
 or written).
 
-> **Status (2026-08-06):** The committed port is clean at checkpoint
-> `1c4ed0c55e0c39722925d026af46b8ed0936be65`, including R16–R19 work that
-> postdates the older status snapshot. The current Rust baseline is
-> `650c1db7c2e73c59cec88bf3c6359751d6cef1bd` (`0.1.220-open-grok.58`); see
-> `PORT_STATUS.md` for the pinned fixture provenance and remaining port drift.
+> **Status (2026-08-25):** The pinned Rust baseline is
+> `00e176c8fb4035701c24199bf9225973c1b13c20` (`1.0.0-open-grok.82`).
+> `CRATE_MAP.md` inventories all 93 root workspace members and the separately
+> rooted Markdown fuzz crate. `PORT_STATUS.md` and `PARITY_ROADMAP.md` record
+> which behaviors are live, unwired, absent, or deliberately diverged.
 > Workers must still **not** invoke
 > SwiftPM directly; the sole integration path is the serialized verifier below.
-> See `PORT_STATUS.md`, `PORT_PLAN.md`, and `CRATE_MAP.md` for exact scope and
-> remaining product gaps. Inventory (committed tree): **98** production source
-> targets, **42** bootstrap placeholders (≤15 non-comment LOC, excluding C
-> helpers), **100** test targets, **46** zero-test targets. Later waves still
-> own providers, tools runtime, sandbox, TUI, sessions, MCP, etc.
+> Complete cross-platform product parity is not yet claimed.
 
 ## Build and test (serialized safe verifier only)
 
@@ -31,7 +27,7 @@ scratch-path wrapper so only one process owns the SwiftPM cache:
 ```sh
 zsh workflows/swift-safe-verify.zsh build
 zsh workflows/swift-safe-verify.zsh build-tests
-zsh workflows/swift-safe-verify.zsh test
+zsh workflows/swift-safe-verify.zsh test --no-parallel
 zsh workflows/swift-safe-verify.zsh build --product open-grok
 ```
 
@@ -44,14 +40,16 @@ After a green product build, executable smokes:
 OPENGROK_HOME=/tmp/og .build/workflow-safe/out/Products/Debug/open-grok paths
 ```
 
-The bootstrap CLI surface is **version / help / paths** only. Other product
-commands (`login`, `sessions`, `models`, ACP serve, interactive TUI, …) remain
-explicitly **not yet implemented** and must not be presented as working.
+The live CLI includes authentication, model discovery, sessions, plugin and MCP
+management, command wrapping, ACP, the interactive pager, and coding-agent
+tools. Consult `open-grok help`, `PORT_STATUS.md`, and `PARITY_ROADMAP.md` for
+the exact supported routes and remaining behavioral or platform gaps.
 
 ## Protocol fixture validation
 
-Checked-in fixtures under `ProtocolFixtures/` are provenance-labelled against
-Rust ref `9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05` and cover:
+Checked-in fixtures under `ProtocolFixtures/` carry their own historical
+provenance; the current product reference is Rust commit
+`00e176c8fb4035701c24199bf9225973c1b13c20`. They cover:
 
 - ACP method names
 - Binary OTLP `ExportTraceServiceRequest` (HTTP protobuf + gRPC-framed) goldens
@@ -72,7 +70,7 @@ Prefer tests that re-encode/decode goldens (telemetry + BuildSupport) over
 digest-only checks. Regeneration (deterministic, network-free):
 
 ```sh
-scripts/regenerate-protocol-manifest.sh --reference-revision 9ed09e2ac3a2fd9147c7049ef4d75dcdcbd8fa05
+scripts/regenerate-protocol-manifest.sh --reference-revision 00e176c8fb4035701c24199bf9225973c1b13c20
 ```
 
 ## Package layout
@@ -99,9 +97,9 @@ Notable foundation targets (non-exhaustive; see `PORT_STATUS.md`):
 
 | Seam | Status |
 |---|---|
-| macOS | Primary development host; Seatbelt/sandbox still later-wave |
-| Linux | Intended full support; zlib via `COpenGrokZlib`; SQLite via system SQLite3; Secret Service incomplete |
-| Windows | Compile-checked branches only where present; ConPTY / Credential Manager / Job Objects later |
+| macOS | Primary verified host; native sandbox and interactive terminal routes are exercised |
+| Linux | Partial support; system SQLite/zlib and updater exist, but enterprise CA, graphics, and native runtime proof remain incomplete |
+| Windows | Partial conditional implementations only; interactive terminal, ConPTY, clipboard reads, and Job Objects remain incomplete |
 | Packed Git objects | Explicit `packedObjectUnsupported` — not silent success |
 | OTLP export | Real `ExportTraceServiceRequest` protobuf; gRPC TraceService Export path + framing + `grpc-status` (not JSON labeled protobuf) |
 
