@@ -7,6 +7,35 @@ import Testing
 
 @Suite("Windows named-pipe cooperative-executor isolation", .serialized)
 struct WindowsNamedPipeControlParityTests {
+    @Test("owner-private named pipes authenticate the current user in both directions", .timeLimit(.minutes(1)))
+    func secureNativePipeAuthenticatesBothEndpoints() async throws {
+        let path = "C:\\opengrok-private-pipe\\\(UUID().uuidString)\\leader.sock"
+        let name = WindowsNamedPipeName.fullName(forPath: path)
+        let listener = WindowsNamedPipeListener(pipeName: name, ownerOnly: true)
+        try listener.start()
+        defer { listener.close() }
+
+        let accepted = Task {
+            try await listener.accept()
+        }
+        let client = try await WindowsNamedPipeDialer.connect(
+            pipeName: name,
+            timeoutSeconds: 2,
+            requireCurrentUserPeer: true
+        )
+        let server = try await accepted.value
+        defer {
+            Task {
+                await server.close()
+                await client.close()
+            }
+        }
+
+        try await client.write(Array("owner-verified".utf8))
+        let received = try #require(try await server.read())
+        #expect(String(decoding: received, as: UTF8.self) == "owner-verified")
+    }
+
     @Test("registration and control acknowledgements progress beside blocked accepts and reads", .timeLimit(.minutes(1)))
     func nativeControlAcknowledgementDoesNotStarve() async throws {
         let path = "C:\\opengrok-pipe-parity\\\(UUID().uuidString)\\leader.sock"

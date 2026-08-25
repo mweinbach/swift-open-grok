@@ -10,6 +10,12 @@
 import Foundation
 import OpenGrokHTTP
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 // MARK: - Paths
 
 public enum ACPLeaderSocketPaths {
@@ -227,6 +233,67 @@ public final class ACPLeaderLock: @unchecked Sendable {
 
 // MARK: - Listener
 
+#if !os(Windows)
+private enum ACPLeaderSocketSecurity {
+    static func prepareDirectory(_ directory: URL) throws {
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: NSNumber(value: Int16(0o700))]
+        )
+        var metadata = try inspect(directory)
+        guard metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+              metadata.st_uid == geteuid()
+        else {
+            throw rejected(directory, reason: "socket directory is not owned by the current user")
+        }
+        if metadata.st_mode & 0o077 != 0 {
+            guard directory.path.withCString({ chmod($0, mode_t(0o700)) }) == 0 else {
+                throw rejected(directory, reason: "could not make socket directory owner-private")
+            }
+            metadata = try inspect(directory)
+        }
+        guard metadata.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+              metadata.st_uid == geteuid(),
+              metadata.st_mode & 0o077 == 0
+        else {
+            throw rejected(directory, reason: "socket directory is not owner-private")
+        }
+    }
+
+    static func protectSocket(_ socket: URL) throws {
+        let initial = try inspect(socket)
+        guard initial.st_mode & mode_t(S_IFMT) == mode_t(S_IFSOCK),
+              initial.st_uid == geteuid()
+        else {
+            throw rejected(socket, reason: "bound path is not a socket owned by the current user")
+        }
+        guard socket.path.withCString({ chmod($0, mode_t(0o600)) }) == 0 else {
+            throw rejected(socket, reason: "could not make leader socket owner-private")
+        }
+        let secured = try inspect(socket)
+        guard secured.st_mode & mode_t(S_IFMT) == mode_t(S_IFSOCK),
+              secured.st_uid == geteuid(),
+              secured.st_mode & 0o077 == 0
+        else {
+            throw rejected(socket, reason: "leader socket is not owner-private")
+        }
+    }
+
+    private static func inspect(_ url: URL) throws -> stat {
+        var metadata = stat()
+        guard url.path.withCString({ lstat($0, &metadata) }) == 0 else {
+            throw rejected(url, reason: "could not inspect leader socket authority")
+        }
+        return metadata
+    }
+
+    private static func rejected(_ url: URL, reason: String) -> UnixSocketListenerError {
+        .bindFailed(path: url.path, reason: reason)
+    }
+}
+#endif
+
 /// Accepts leader IPC clients on a Unix domain socket.
 ///
 /// A thin binding of `UnixSocketListener` to the leader's paths: the socket
@@ -250,7 +317,7 @@ public actor ACPLeaderSocketListener {
         #if os(Windows)
         let pipeName = WindowsNamedPipeName.fullName(forPath: path.path)
         self.pipeName = pipeName
-        self.listener = WindowsNamedPipeListener(pipeName: pipeName)
+        self.listener = WindowsNamedPipeListener(pipeName: pipeName, ownerOnly: true)
         #else
         self.listener = UnixSocketListener(path: path.path)
         #endif
@@ -282,12 +349,16 @@ public actor ACPLeaderSocketListener {
         }
         return stream
         #else
-        try FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
+        try ACPLeaderSocketSecurity.prepareDirectory(path.deletingLastPathComponent())
         try? FileManager.default.removeItem(at: path)
-        return try await listener.start()
+        do {
+            let incoming = try await listener.start()
+            try ACPLeaderSocketSecurity.protectSocket(path)
+            return incoming
+        } catch {
+            await listener.stop()
+            throw error
+        }
         #endif
     }
 
@@ -325,7 +396,8 @@ public enum ACPLeaderSocketDialer {
         #if os(Windows)
         return try await WindowsNamedPipeDialer.connect(
             pipeName: WindowsNamedPipeName.fullName(forPath: path.path),
-            timeoutSeconds: timeoutSeconds
+            timeoutSeconds: timeoutSeconds,
+            requireCurrentUserPeer: true
         )
         #else
         return try await UnixSocketDialer.connect(path: path.path)

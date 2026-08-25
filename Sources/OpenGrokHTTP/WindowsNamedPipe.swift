@@ -362,12 +362,14 @@ public final class WindowsNamedPipeChannel: WebSocketByteChannel, @unchecked Sen
 
 public final class WindowsNamedPipeListener: @unchecked Sendable {
     public let pipeName: String
+    public let ownerOnly: Bool
     private let stateLock = NSLock()
     private var handle: OGSocketHandle = -1
     private var closed = false
 
-    public init(pipeName: String) {
+    public init(pipeName: String, ownerOnly: Bool = false) {
         self.pipeName = pipeName
+        self.ownerOnly = ownerOnly
     }
 
     public func start() throws {
@@ -376,7 +378,9 @@ public final class WindowsNamedPipeListener: @unchecked Sendable {
         guard handle == -1 else { return }
         var listener: OGSocketHandle = -1
         let result = pipeName.withCString { pointer in
-            og_named_pipe_listener_create(pointer, &listener)
+            ownerOnly
+                ? og_named_pipe_secure_listener_create(pointer, &listener)
+                : og_named_pipe_listener_create(pointer, &listener)
         }
         guard result == 0 else { throw WindowsNamedPipeSupport.lastError() }
         handle = listener
@@ -390,6 +394,19 @@ public final class WindowsNamedPipeListener: @unchecked Sendable {
                 var accepted: OGSocketHandle = -1
                 guard og_named_pipe_listener_accept(listener, &accepted) == 0 else {
                     throw WindowsNamedPipeSupport.lastError()
+                }
+                if ownerOnly {
+                    let verified = og_named_pipe_peer_is_current_user(accepted, 1)
+                    guard verified == 1 else {
+                        _ = og_named_pipe_close(accepted)
+                        if verified == 0 {
+                            throw WindowsNamedPipeError.operationFailed(
+                                code: 5,
+                                reason: "named-pipe client is not the current user"
+                            )
+                        }
+                        throw WindowsNamedPipeSupport.lastError()
+                    }
                 }
                 return WindowsNamedPipeChannel(handle: accepted)
             }
@@ -432,7 +449,8 @@ public final class WindowsNamedPipeListener: @unchecked Sendable {
 public enum WindowsNamedPipeDialer {
     public static func connect(
         pipeName: String,
-        timeoutSeconds: Double = 10
+        timeoutSeconds: Double = 10,
+        requireCurrentUserPeer: Bool = false
     ) async throws -> WindowsNamedPipeChannel {
         try await WindowsNamedPipeBlockingExecutor.run {
             var handle: OGSocketHandle = -1
@@ -440,6 +458,19 @@ public enum WindowsNamedPipeDialer {
                 og_named_pipe_connect(pointer, timeoutSeconds, &handle)
             }
             guard result == 0 else { throw WindowsNamedPipeSupport.lastError() }
+            if requireCurrentUserPeer {
+                let verified = og_named_pipe_peer_is_current_user(handle, 0)
+                guard verified == 1 else {
+                    _ = og_named_pipe_close(handle)
+                    if verified == 0 {
+                        throw WindowsNamedPipeError.operationFailed(
+                            code: 5,
+                            reason: "named-pipe server is not the current user"
+                        )
+                    }
+                    throw WindowsNamedPipeSupport.lastError()
+                }
+            }
             return WindowsNamedPipeChannel(handle: handle)
         }
     }
