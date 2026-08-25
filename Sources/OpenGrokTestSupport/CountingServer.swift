@@ -14,6 +14,9 @@
 // own per-connection keep-alive read/write loop.
 
 import Foundation
+#if canImport(Glibc)
+import Glibc
+#endif
 #if os(Windows)
 import COpenGrokSockets
 #endif
@@ -178,7 +181,8 @@ private final class CountingServerImpl: @unchecked Sendable {
         acceptThread = nil
         #else
         if listenFD >= 0 {
-            close(listenFD)
+            _ = shutdown(listenFD, Int32(SHUT_RDWR))
+            _ = close(listenFD)
             listenFD = -1
         }
         acceptThread = nil

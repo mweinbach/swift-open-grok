@@ -15,6 +15,9 @@
 // client closes or sends a `Connection: close` header.
 
 import Foundation
+#if canImport(Glibc)
+import Glibc
+#endif
 #if os(Windows)
 import COpenGrokSockets
 #endif
@@ -214,7 +217,8 @@ public final class HttpServer: @unchecked Sendable {
         acceptThread = nil
         #else
         if listenFD >= 0 {
-            close(listenFD)
+            _ = shutdown(listenFD, Int32(SHUT_RDWR))
+            _ = close(listenFD)
             listenFD = -1
         }
         acceptThread = nil

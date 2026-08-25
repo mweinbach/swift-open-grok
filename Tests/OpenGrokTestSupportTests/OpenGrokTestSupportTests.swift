@@ -54,6 +54,12 @@ private func unsetTestEnvironment(_ key: String) {
     #endif
 }
 
+private struct StoppedHttpFixtureHandler: HttpRequestHandler {
+    func handle(_ request: HttpRequest) -> HttpResponse {
+        .text(status: 200, request.path)
+    }
+}
+
 #if os(Windows)
 private typealias CountingSocketHandle = OGSocketHandle
 
@@ -342,6 +348,23 @@ struct OpenGrokTestSupportTests {
     }
 
     // MARK: - MockInferenceServer (HTTP round-trip)
+
+    @Test("stopping a loopback fixture releases its blocked accept thread")
+    func stoppedHttpFixtureReleasesAcceptThread() async throws {
+        weak var released: HttpServer?
+        do {
+            let server = HttpServer(handler: StoppedHttpFixtureHandler(), basePath: "")
+            try server.start()
+            released = server
+            server.stop()
+        }
+
+        let deadline = Date().addingTimeInterval(2)
+        while released != nil, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(released == nil)
+    }
 
     @Test("MockInferenceServer echo mode echoes last user message over HTTP")
     func echoModeRoundTrip() throws {

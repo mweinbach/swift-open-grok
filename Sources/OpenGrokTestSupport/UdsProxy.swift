@@ -290,7 +290,8 @@ public final class UdsProxy: @unchecked Sendable {
         guard !stopped else { return }
         stopped = true
         if listenFD >= 0 {
-            close(listenFD)
+            _ = shutdown(listenFD, Int32(SHUT_RDWR))
+            _ = close(listenFD)
             listenFD = -1
         }
         unlink(proxyPath)
