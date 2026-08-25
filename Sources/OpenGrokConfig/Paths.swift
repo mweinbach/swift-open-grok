@@ -318,8 +318,16 @@ private func windowsOwnerDirectoryNativePath(_ directory: URL) throws -> String 
     return "\\\\?\\" + path
 }
 
-private func inspectWindowsOwnerDirectory(_ directory: URL) throws -> WindowsOwnerDirectoryKind {
-    let path = try windowsOwnerDirectoryNativePath(directory)
+private func inspectWindowsOwnerDirectory(
+    _ directory: URL,
+    nativePath: String? = nil
+) throws -> WindowsOwnerDirectoryKind {
+    let path: String
+    if let nativePath {
+        path = nativePath
+    } else {
+        path = try windowsOwnerDirectoryNativePath(directory)
+    }
     let attributes = path.withCString(encodedAs: UTF16.self) { GetFileAttributesW($0) }
     if attributes == DWORD(INVALID_FILE_ATTRIBUTES) {
         let code = GetLastError()
@@ -354,9 +362,11 @@ private func secureExistingWindowsOwnerDirectory(_ directory: URL) throws {
     }
 }
 
-private func windowsOwnerDirectoryIsVolumeRoot(_ directory: URL) throws -> Bool {
+func windowsOwnerDirectoryNativeAncestry(_ directory: URL) throws -> [String] {
     let native = try windowsOwnerDirectoryNativePath(directory)
     let uncPrefix = "\\\\?\\UNC\\"
+    let volumeRoot: String
+    let descendants: [Substring]
     if String(native.prefix(uncPrefix.count)).caseInsensitiveCompare(uncPrefix) == .orderedSame {
         let components = native.dropFirst(uncPrefix.count)
             .split(separator: "\\", omittingEmptySubsequences: true)
@@ -367,48 +377,97 @@ private func windowsOwnerDirectoryIsVolumeRoot(_ directory: URL) throws -> Bool 
                 detail: "UNC paths require an absolute server and share"
             )
         }
-        return components.count == 2
+        volumeRoot = uncPrefix + String(components[0]) + "\\" + String(components[1]) + "\\"
+        descendants = Array(components.dropFirst(2))
+    } else {
+        let prefix = "\\\\?\\"
+        guard native.hasPrefix(prefix) else {
+            throw windowsOwnerDirectoryError(
+                directory,
+                operation: "validate session directory",
+                detail: "path is not an absolute Windows volume path"
+            )
+        }
+        let drive = native.dropFirst(prefix.count)
+        let bytes = Array(drive.utf8)
+        guard bytes.count >= 3,
+              (65...90).contains(bytes[0]) || (97...122).contains(bytes[0]),
+              bytes[1] == 58,
+              bytes[2] == 92
+        else {
+            throw windowsOwnerDirectoryError(
+                directory,
+                operation: "validate session directory",
+                detail: "path is not an absolute Windows drive path"
+            )
+        }
+        volumeRoot = prefix + String(drive.prefix(3))
+        descendants = drive.dropFirst(3)
+            .split(separator: "\\", omittingEmptySubsequences: true)
     }
 
-    let prefix = "\\\\?\\"
-    guard native.hasPrefix(prefix) else {
-        throw windowsOwnerDirectoryError(
-            directory,
-            operation: "validate session directory",
-            detail: "path is not an absolute Windows volume path"
-        )
+    var ancestry = [volumeRoot]
+    var current = volumeRoot
+    for component in descendants {
+        guard component != ".", component != ".." else {
+            throw windowsOwnerDirectoryError(
+                directory,
+                operation: "validate session directory",
+                detail: "directory ancestry contains a relative path component"
+            )
+        }
+        if !current.hasSuffix("\\") { current += "\\" }
+        current += String(component)
+        ancestry.append(current)
     }
-    let drive = native.dropFirst(prefix.count)
-    let bytes = Array(drive.utf8)
-    guard bytes.count >= 3,
-          (65...90).contains(bytes[0]) || (97...122).contains(bytes[0]),
-          bytes[1] == 58,
-          bytes[2] == 92
+    return ancestry
+}
+
+private func windowsOwnerDirectoryURL(
+    forNativePath native: String,
+    reporting directory: URL
+) throws -> URL {
+    let uncPrefix = "\\\\?\\UNC\\"
+    let path: String
+    if String(native.prefix(uncPrefix.count)).caseInsensitiveCompare(uncPrefix) == .orderedSame {
+        path = "\\\\" + String(native.dropFirst(uncPrefix.count))
+    } else {
+        path = String(native.dropFirst("\\\\?\\".count))
+    }
+
+    let result = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+    guard try windowsOwnerDirectoryNativePath(result).caseInsensitiveCompare(native) == .orderedSame
     else {
         throw windowsOwnerDirectoryError(
             directory,
             operation: "validate session directory",
-            detail: "path is not an absolute Windows drive path"
+            detail: "Foundation changed an absolute Windows ancestor path"
         )
     }
-    return bytes.count == 3
+    return result
 }
 
 private func createWindowsOwnerOnlyDirectoryChain(_ directory: URL, stateRoot: URL?) throws {
-    var ancestry = [directory.standardizedFileURL]
-    while let current = ancestry.last {
-        if try windowsOwnerDirectoryIsVolumeRoot(current) { break }
-        let parent = current.deletingLastPathComponent()
-        guard parent.path != current.path else {
-            throw windowsOwnerDirectoryError(
-                current,
-                operation: "validate session directory",
-                detail: "directory ancestry did not reach an absolute Windows volume root"
-            )
-        }
-        ancestry.append(parent)
+    let nativeAncestry = try windowsOwnerDirectoryNativeAncestry(directory)
+    guard let volumeRoot = nativeAncestry.first,
+          nativeAncestry.count > 1
+    else {
+        throw windowsOwnerDirectoryError(
+            directory,
+            operation: "validate session directory",
+            detail: "volume roots cannot be private application-state directories"
+        )
     }
-    ancestry.reverse()
+    guard try inspectWindowsOwnerDirectory(directory, nativePath: volumeRoot) == .directory else {
+        throw windowsOwnerDirectoryError(
+            directory,
+            operation: "validate session directory",
+            detail: "Windows volume root does not exist"
+        )
+    }
+    let ancestry = try nativeAncestry.dropFirst().map {
+        try windowsOwnerDirectoryURL(forNativePath: $0, reporting: directory)
+    }
 
     var firstMissing: Int?
     for (index, component) in ancestry.enumerated() {
@@ -419,10 +478,15 @@ private func createWindowsOwnerOnlyDirectoryChain(_ directory: URL, stateRoot: U
 
     let stateAnchor: Int?
     if let stateRoot {
-        let expected = stateRoot.standardizedFileURL.path
-        guard let index = ancestry.firstIndex(where: {
-            $0.path.caseInsensitiveCompare(expected) == .orderedSame
-        }) else {
+        let expected = try windowsOwnerDirectoryNativePath(stateRoot)
+        var matchedIndex: Int?
+        for (index, component) in ancestry.enumerated() {
+            if try windowsOwnerDirectoryNativePath(component).caseInsensitiveCompare(expected) == .orderedSame {
+                matchedIndex = index
+                break
+            }
+        }
+        guard let index = matchedIndex else {
             throw windowsOwnerDirectoryError(
                 directory,
                 operation: "validate session directory",
