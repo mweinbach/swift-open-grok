@@ -32,6 +32,11 @@ jobs:
           GROK_COMMIT="$(git rev-parse --short HEAD)" \
             zsh workflows/swift-safe-verify.zsh build --product open-grok
       - name: Build tests
+        # A fresh runner compiles every test target here; the measured cold
+        # graph reached its final link just after the normal 600-second cap.
+        # Keep the wrapper's local default unchanged and bound this one run.
+        env:
+          SWIFT_SAFE_TIMEOUT_SECONDS: "1200"
         run: zsh workflows/swift-safe-verify.zsh build-tests
       # --no-parallel is the documented green gate (PORT_STATUS.md). Default
       # parallel is also green locally, but shared-runner load variance makes
@@ -115,6 +120,10 @@ jobs:
       - name: Product
         run: zsh workflows/swift-safe-verify.zsh build --product open-grok
       - name: Build tests
+        # The cold 106-product test graph exceeds the local 600-second ceiling
+        # on shared Linux runners even after the production build is warm.
+        env:
+          SWIFT_SAFE_TIMEOUT_SECONDS: "1200"
         run: zsh workflows/swift-safe-verify.zsh build-tests
       # Same reasoning as the macOS gate above.
       - name: Test (serial gate)
@@ -147,9 +156,15 @@ jobs:
         run: swift --version
       - name: Build
         shell: msys2 {0}
+        # Windows cold compilation was still making progress at 600 seconds;
+        # this runner-only override preserves the normal local watchdog.
+        env:
+          SWIFT_SAFE_TIMEOUT_SECONDS: "1200"
         run: zsh workflows/swift-safe-verify.zsh build
       - name: Build tests
         shell: msys2 {0}
+        env:
+          SWIFT_SAFE_TIMEOUT_SECONDS: "1200"
         run: zsh workflows/swift-safe-verify.zsh build-tests
 
   windows-diagnostic-tests:
@@ -179,4 +194,6 @@ jobs:
         run: swift --version
       - name: Test (diagnostic only)
         shell: msys2 {0}
+        env:
+          SWIFT_SAFE_TIMEOUT_SECONDS: "2400"
         run: zsh workflows/swift-safe-verify.zsh test --no-parallel
