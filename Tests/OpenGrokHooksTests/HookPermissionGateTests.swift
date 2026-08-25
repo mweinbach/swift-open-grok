@@ -412,18 +412,23 @@ struct HookPermissionGateTests {
         let command = try fixture.script(named: "capture", body: "cat > '\(capture)'")
         let gate = fixture.gate([fixture.spec(name: "capture", command: command)])
 
-        _ = await gate.runPreToolUse(
+        let decision = await gate.runPreToolUse(
             toolName: "search_replace",
             toolCallId: "call-42",
             access: .edit("/tmp/file.swift"),
             permissionMode: "acceptEdits"
         )
+        guard case .allow = decision else {
+            Issue.record("capture hook unexpectedly denied the real permission gate")
+            return
+        }
 
         let data = try Data(contentsOf: URL(fileURLWithPath: capture))
         let object = try #require(
             try JSONSerialization.jsonObject(with: data) as? [String: Any]
         )
         #expect(object["toolName"] as? String == "search_replace")
+        #expect(object["toolUseId"] as? String == "call-42")
         #expect(object["toolCallId"] as? String == "call-42")
         #expect(object["accessKind"] as? String == "edit")
         #expect(object["accessDetail"] as? String == "/tmp/file.swift")

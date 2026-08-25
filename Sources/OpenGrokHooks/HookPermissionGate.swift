@@ -260,6 +260,7 @@ public final class HookPermissionGate: PreToolUseHookRunner, @unchecked Sendable
         // feeds to a hook's matcher.
         var payload: [String: HookJSONValue] = [
             "toolName": .string(toolName),
+            "toolUseId": .string(toolCallId),
             "toolCallId": .string(toolCallId),
             "accessKind": .string(access.label),
         ]

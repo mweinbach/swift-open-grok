@@ -24,7 +24,9 @@ divergences, and still-unverified platforms. `CRATE_MAP.md` now enumerates all
   alias registrations are all retained; subagent-stop hooks match the actual
   agent type; each lifecycle event matches only its authentic payload field;
   real user interrupts and maximum-turn exits emit distinct `StopCancelled`
-  observe hooks (`xai-grok-hooks/src/event.rs:149-180,584-608`;
+  observe hooks; pre-tool commands receive Rust's canonical `toolUseId` while
+  legacy Swift `toolCallId` readers remain compatible
+  (`xai-grok-hooks/src/event.rs:149-180,465-475,584-608`;
   `config.rs:26-44,829-865`).
 - **LIVE — budget-safe provider retries and workflow output limits.** Workflow
   `max_output_tokens` is validated before child admission and reaches the
