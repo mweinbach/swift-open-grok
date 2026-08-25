@@ -16,11 +16,15 @@ struct LiveCodexTurnStateTests {
     private func inferenceResponse(
         status: Int = 200,
         headerState: String? = nil,
-        metadataState: String? = nil
+        metadataState: String? = nil,
+        shouldRetry: Bool? = nil
     ) -> MockHTTPTransport.ScriptedResponse {
         var headers: [String: String] = ["Content-Type": "text/event-stream"]
         if let headerState {
             headers[X_CODEX_TURN_STATE_HEADER] = headerState
+        }
+        if let shouldRetry {
+            headers["x-should-retry"] = shouldRetry ? "true" : "false"
         }
         guard (200..<300).contains(status) else {
             return .init(
@@ -188,7 +192,11 @@ struct LiveCodexTurnStateTests {
     @Test("a rejected inference response cannot poison its logical turn")
     func rejectedResponseCannotPoisonTurn() async throws {
         let transport = MockHTTPTransport(responses: [
-            inferenceResponse(status: 429, headerState: "rejected-state"),
+            inferenceResponse(
+                status: 429,
+                headerState: "rejected-state",
+                shouldRetry: false
+            ),
             inferenceResponse(headerState: "accepted-state"),
             inferenceResponse(),
         ])

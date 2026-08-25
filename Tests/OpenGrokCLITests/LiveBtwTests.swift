@@ -686,8 +686,8 @@ struct LiveBtwLiveSeamTests {
     func failedBtwRecordsFailureAndSessionSurvives() async throws {
         let fixture = try BtwFixture()
         defer { fixture.dispose() }
-        // A scripted 400 fails the ONE request deterministically (4xx never
-        // retries — and this port's side-call is one-shot by design).
+        // A scripted 400 fails its first one-shot attempt deterministically;
+        // client errors never enter the separate side-question retry budget.
         try fixture.server.enqueueResponse(
             path: "/v1/chat/completions",
             response: .json(status: 400, .object(["error": .string("bad btw request")]))
