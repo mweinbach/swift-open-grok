@@ -7,6 +7,61 @@ the current live classifications, verification evidence, intentional security
 divergences, and still-unverified platforms. `CRATE_MAP.md` now enumerates all
 93 root workspace members plus the separately rooted Markdown fuzz crate.
 
+**Pinned `.82` provider, trace, and terminal follow-on (2026-08-25):**
+
+- **LIVE — secure executable command wrapping and clipboard forwarding.**
+  `open-grok wrap <COMMAND> [ARGS...]` now reaches the asynchronous executable
+  route, repairing the previously unusable `doctor fix ssh-wrap` alias. Genuine
+  interactive Unix sessions run the child in a local PTY with serialized input,
+  bounded split-safe plain/tmux OSC 52 interception, native text/image
+  clipboard bridging, terminal resize forwarding, exact abandoned DEC/kitty
+  mode restoration, and the upstream `GROK_`/`LC_GROK_` sink/appearance
+  markers. Noninteractive commands retain raw binary stdout, separate stderr,
+  piped stdin, safely quoted shell fallback, bounded child drains, cancellation
+  isolation, and exact exit status. Windows deliberately remains direct-only
+  until its standard handles can be verified independently; externally
+  delivered termination-signal terminal restoration also remains deferred
+  (`xai-grok-pager-bin/src/main.rs:1820-1821`;
+  `xai-grok-pager/src/wrap_cmd.rs:30-76,99-166,199-224`;
+  `pty_wrap.rs:25-37,48-205`; `wrap_filter.rs:22-39,143-296,340-370`;
+  `wrap_restore.rs:105-250`; `diagnostics/fix.rs:25`).
+- **LIVE — provider-isolated Codex image preparation.** Real Codex requests
+  now replace unsupported remote URLs, malformed or unpadded image data, and
+  low-detail tool-output images with the exact upstream placeholders while
+  preserving valid images, conversation order, replacement counts, and
+  non-Codex wire payloads
+  (`xai-grok-sampling-types/src/conversation.rs:1751-1763,1859-2005`;
+  `xai-grok-sampler/src/client.rs:3329-3341`).
+- **LIVE — privacy-preserving redacted-thinking stream compatibility.**
+  Messages streams decode encrypted `redacted_thinking` blocks without
+  aborting the response or exposing their opaque payload as visible text,
+  reasoning, a first token, or durable conversation history; unrelated
+  unknown block types still fail closed
+  (`xai-grok-sampling-types/src/messages.rs:130-144,459-481`;
+  `xai-grok-sampler/src/stream/messages.rs:275-288`).
+- **LIVE — exact, secret-free trace capability snapshots.** Local trace
+  archives distinguish endpoint buckets from telemetry buckets, recognize
+  ambient Google Cloud/AWS credentials only for the upstream `gs://` and
+  `s3://` schemes, retain source precedence, and never embed bucket names or
+  credentials. **Remote trace upload remains ABSENT and fail-closed**
+  (`xai-grok-pager/src/trace_cmd.rs:182-203`;
+  `xai-grok-shell/src/agent/config.rs:529-563,593-605,629-632`).
+
+**Verified local macOS gate (2026-08-25):** `build-tests` exited 0, and the
+authoritative `test --no-parallel` passed **9,353 tests in 1,329 suites across
+106 nonempty test-product summaries**, exit 0, in approximately **419 seconds**
+under the unchanged 600-second watchdog. The real-executable product passed
+**231 tests in 37 suites** in 131.062 seconds; the complete CLI product passed
+**2,478 tests in 325 suites** in 140.531 seconds. The focused follow-on matrix
+separately passed **46 tests in 5 suites across 3 products**, including **20**
+real-wrapper/terminal-filter tests and **12** provider-wire privacy tests.
+Isolated real-binary smoke confirmed direct and safely shell-routed commands,
+piped stdin, separate stdout/stderr, exact child exit status `7`, lossless
+binary bytes `ff 00 41`, and an actual PTY observing both clipboard sink
+markers. Remote trace upload, externally delivered wrapper termination-signal
+restoration, Windows ConPTY handle verification, cross-platform execution,
+remote CI, and release certification remain separate unverified work.
+
 **Current upstream `.82` live-seam closure (2026-08-24):**
 
 - **LIVE — local session trace export.** The executable now reaches
