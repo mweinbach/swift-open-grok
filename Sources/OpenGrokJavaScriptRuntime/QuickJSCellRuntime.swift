@@ -201,6 +201,14 @@ final class QuickJSCellEngine {
 
         guard armForEntry() else { return CODE_MODE_EXECUTION_CEILING_ERROR }
         let source = configuration.source
+        // QuickJS retains an internal JS_TAG_MODULE in top-level-await module
+        // continuations, then destroys loaded modules before those closures
+        // during context teardown. An abandoned cell consequently dereferences
+        // freed memory or aborts in JS_FreeRuntime. Async global evaluation
+        // preserves top-level await and the same fail-closed import pipeline
+        // without creating that unsound module ownership cycle. The cost is
+        // module-only lexical/import.meta semantics, matching the existing
+        // JavaScriptCore async-wrapper backend rather than upstream V8.
         let evaluated = source.withCString { sourcePointer in
             value(
                 taking: ogq_eval(
@@ -208,7 +216,7 @@ final class QuickJSCellEngine {
                     sourcePointer,
                     source.utf8.count,
                     JavaScriptModuleLoader.mainModuleReferrer,
-                    1
+                    2
                 )
             )
         }

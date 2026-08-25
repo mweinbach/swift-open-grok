@@ -255,6 +255,79 @@ struct PortableJavaScriptHostParityTests {
 
 #if !canImport(JavaScriptCore)
 
+@Suite("QuickJS isolate teardown memory safety")
+struct QuickJSIsolateTeardownSafetyTests {
+    private let tool = EnabledToolMetadata(
+        toolName: .plain("teardown_probe"),
+        globalName: "teardown_probe",
+        description: "exercises host callback and pending-promise ownership",
+        kind: .function
+    )
+
+    /// QuickJS 0.15.1 asynchronous ES modules retain internal module values
+    /// inside C-function closures. Abandoning an unresolved module used to
+    /// free that value before its closure and abort during JS_FreeRuntime.
+    /// Constructing engines directly makes teardown synchronous and keeps a
+    /// worker-process exit from concealing allocator corruption.
+    @Test("completed and abandoned top-level awaits safely destroy repeated isolates")
+    func repeatedlyDisposesResolvedAndPendingIsolates() throws {
+        for round in 0..<32 {
+            try disposeIsolate(round: round, leavingPendingTool: false)
+            try disposeIsolate(round: round, leavingPendingTool: true)
+        }
+    }
+
+    private func disposeIsolate(round: Int, leavingPendingTool: Bool) throws {
+        let source: String
+        if leavingPendingTool {
+            source = """
+                const invocation = tools.teardown_probe({ round: \(round) });
+                invocation.onProgress((chunk) => text(chunk.text));
+                await invocation;
+                """
+        } else {
+            source = """
+                store("round", \(round));
+                await Promise.resolve();
+                text(String(load("round")));
+                """
+        }
+
+        var observed: [JavaScriptRuntimeEvent] = []
+        let mailbox = JavaScriptRuntimeMailbox<JavaScriptRuntimeCommand>()
+        var engine: QuickJSCellEngine? = try #require(QuickJSCellEngine(
+            configuration: JavaScriptCellConfiguration(
+                toolCallId: "teardown-\(round)",
+                enabledTools: [tool],
+                source: source
+            ),
+            commands: mailbox,
+            emit: { observed.append($0) }
+        ))
+
+        #expect(engine?.installGlobals() == nil)
+        #expect(engine?.evaluateSource() == nil)
+        if leavingPendingTool {
+            #expect(observed.contains { event in
+                if case .toolCall = event { return true }
+                return false
+            })
+            #expect(engine?.takeCompletion() == nil)
+        } else {
+            let completion = try #require(engine?.takeCompletion())
+            #expect(completion.errorText == nil)
+            #expect(observed.contains { event in
+                if case .contentItem(.inputText(let text)) = event {
+                    return text == String(round)
+                }
+                return false
+            })
+        }
+
+        engine = nil
+    }
+}
+
 @Suite("QuickJS hard-interrupt parity")
 struct QuickJSHardInterruptParityTests {
     /// Rust runtime/mod.rs:397 terminates an unbounded V8 entry immediately.
