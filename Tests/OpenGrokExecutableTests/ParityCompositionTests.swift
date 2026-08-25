@@ -1838,13 +1838,14 @@ struct ParityCompositionTests {
         #expect(outcome.toolResult?.contains("denied") == true)
     }
 
-    @Test("arrowing down to Yes and pressing Enter answers the permission sheet")
+    @Test("arrowing away from and back to Yes answers the permission sheet")
     func liveInteractivePermissionKeyboardNavigation() async {
-        // The sheet opens on option 1 ("allow all edits this session"); one
-        // Down lands on "Yes", and Enter confirms the highlighted row.
+        // The sheet safely opens on the one-shot "Yes" row. Move to rejection
+        // and back before Enter so navigation never depends on a broad default.
         let outcome = await runInteractivePermissionSession(
             answer: [
                 .key(KeyEvent(key: .down)),
+                .key(KeyEvent(key: .up)),
                 .key(KeyEvent(key: .enter))
             ]
         )

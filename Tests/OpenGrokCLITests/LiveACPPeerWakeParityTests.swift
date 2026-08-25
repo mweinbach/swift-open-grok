@@ -311,22 +311,44 @@ struct LiveACPPeerWakeParityTests {
                 $0.sessionID == fixture.rootSessionID
             }?.status == "busy")
 
-            let overlap = await fixture.runtime.handle(.request(
-                id: .string("overlapping-acp-user-prompt"),
-                method: AgentMethodNames.sessionPrompt,
-                params: try JSONValue.encode(PromptRequest(
-                    sessionId: fixture.wireSessionID,
-                    prompt: [.text("never start a second provider session turn")],
-                    messageId: "forbidden-concurrent-turn"
+            let overlap = Task {
+                await fixture.runtime.handle(.request(
+                    id: .string("overlapping-acp-user-prompt"),
+                    method: AgentMethodNames.sessionPrompt,
+                    params: try JSONValue.encode(PromptRequest(
+                        sessionId: fixture.wireSessionID,
+                        prompt: [.text("never start a second provider session turn")],
+                        messageId: "forbidden-concurrent-turn"
+                    ))
                 ))
-            ))
-            guard case .response(_, nil, let overlapError?)? = overlap.last else {
-                Issue.record("overlapping ACP prompt was not rejected")
+            }
+            let queueDeadline = Date().addingTimeInterval(5)
+            var queuedOverlap = false
+            while Date() < queueDeadline, !queuedOverlap {
+                let notifications = await fixture.runtime.pollNotifications()
+                queuedOverlap = notifications.contains { notification in
+                    guard notification.method == "x.ai/queue/changed",
+                          let entries = notification.params?.objectValue?["entries"]?.arrayValue
+                    else { return false }
+                    return entries.contains {
+                        $0.objectValue?["id"]?.stringValue == "forbidden-concurrent-turn"
+                    }
+                }
+                if !queuedOverlap {
+                    try await Task.sleep(nanoseconds: 10_000_000)
+                }
+            }
+            #expect(queuedOverlap)
+            #expect(await fixture.probe.requests.count == 1)
+            overlap.cancel()
+            let overlapResponse = try await overlap.value
+            guard case .response(_, let overlapPayload?, nil)? = overlapResponse.last else {
+                Issue.record("cancelled overlapping ACP prompt did not return a response")
                 await fixture.probe.release()
                 _ = try await task.value
                 return
             }
-            #expect(overlapError.message.contains("active prompt"))
+            #expect(try overlapPayload.decode(PromptResponse.self).stopReason == .cancelled)
 
             let status = try await fixture.sender.messageSession(
                 sessionID: fixture.rootSessionID,
