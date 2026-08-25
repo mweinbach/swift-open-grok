@@ -1509,8 +1509,6 @@ enum WindowsConPTY {
         let size = spec.initialSize ?? TerminalSize(width: 80, height: 24)
         let coord = COORD(X: Int16(clamping: size.width), Y: Int16(clamping: size.height))
         let hr = CreatePseudoConsole(coord, inputRead, outputWrite, 0, &pseudoConsole)
-        if let handle = inputRead { CloseHandle(handle); inputRead = nil }
-        if let handle = outputWrite { CloseHandle(handle); outputWrite = nil }
         guard hr >= 0, let console = pseudoConsole else {
             throw PTYError.spawnFailed("CreatePseudoConsole failed: \(hr)")
         }
@@ -1555,12 +1553,11 @@ enum WindowsConPTY {
         }
         defer { DeleteProcThreadAttributeList(attrList) }
 
-        var hpcRef = console
         guard UpdateProcThreadAttribute(
             attrList,
             0,
             DWORD_PTR(PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE),
-            &hpcRef,
+            console,
             SIZE_T(MemoryLayout<HPCON>.size),
             nil,
             nil
@@ -1604,6 +1601,8 @@ enum WindowsConPTY {
             throw PTYError.spawnFailed("CreateProcessW failed: \(GetLastError())")
         }
         processCreated = true
+        if let handle = inputRead { CloseHandle(handle); inputRead = nil }
+        if let handle = outputWrite { CloseHandle(handle); outputWrite = nil }
 
         guard AssignProcessToJobObject(job, processInformation.hProcess) else {
             throw PTYError.spawnFailed("AssignProcessToJobObject failed: \(GetLastError())")

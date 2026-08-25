@@ -59,8 +59,10 @@ struct WindowsPTYParityTests {
             }
             return bytes
         }
-        #expect(try await process.waitForExit() == .code(0))
-        #expect(try await String(decoding: output.value, as: UTF8.self).contains("1-1"))
+        let exit = try await process.waitForExit()
+        let text = try await String(decoding: output.value, as: UTF8.self)
+        #expect(exit == .code(0), "ConPTY child exited with \(exit): \(text.debugDescription)")
+        #expect(text.contains("1-1"), "ConPTY child output: \(text.debugDescription)")
     }
     #endif
 }
