@@ -195,7 +195,8 @@ public struct ACPLeaderClientCapabilities: Sendable, Hashable, Codable {
 /// would turn a clean `UnsupportedControl` into a hang. `control_v1` and
 /// `workspace_exposure` are claimed: `get_leader_info` and the workspace
 /// control commands and bounded update relaunches are implemented by the live
-/// IPC host. CPU profiling is absent and therefore remains unadvertised.
+/// IPC host. Runtime CPU profiling is advertised only by compositions that
+/// inject a genuinely available native profiler.
 public struct ACPLeaderCapabilities: Sendable, Hashable, Codable {
     public var controlV1: Bool
     public var runtimeCPUProfile: Bool
@@ -240,9 +241,10 @@ public struct ACPLeaderCapabilities: Sendable, Hashable, Codable {
     /// `workspace_exposure` unconditionally because the feature is in the
     /// binary (`server.rs:153-160`); both are set here for the same reason now
     /// that `ACPLeaderControlPlane` exists. `relaunch_v1` is backed by the
-    /// host's bounded, acknowledgement-first shutdown. `runtime_cpu_profile`
-    /// stays false because this port has no profiler; `profile_formats` is
-    /// empty on both sides (`cpu_profile.rs:658-664`).
+    /// host's bounded, acknowledgement-first shutdown. The default leaves
+    /// `runtime_cpu_profile` false because only a live composition knows
+    /// whether it actually injected an available profiler; `profile_formats`
+    /// is empty on both sides (`cpu_profile.rs:658-664`).
     public static let supported = ACPLeaderCapabilities(
         controlV1: true,
         workspaceExposure: true,
@@ -442,9 +444,7 @@ extension ACPLeaderInfo: Codable {
     }
 }
 
-/// `protocol.rs:245-251` — `ControlPayload::CpuProfileStatus`. This build has
-/// no profiler, so the only payload it ever produces is the all-inactive one;
-/// the type exists so that answer is upstream-shaped rather than an error.
+/// `protocol.rs:245-251` — `ControlPayload::CpuProfileStatus`.
 public struct ACPLeaderCpuProfileStatus: Sendable, Hashable {
     public var active: Bool
     public var stopping: Bool
@@ -509,12 +509,96 @@ extension ACPLeaderCpuProfileStatus: Codable {
     }
 }
 
+/// `protocol.rs:253-258` — the exact legacy `svg_path` wire key is retained
+/// even though current upstream and this port both produce folded stacks.
+public struct ACPLeaderCpuProfileStarted: Sendable, Hashable, Codable {
+    public var pid: UInt32
+    public var svgPath: String
+    public var frequencyHz: Int32
+    public var startedAt: String
+
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case pid
+        case svgPath = "svg_path"
+        case frequencyHz = "frequency_hz"
+        case startedAt = "started_at"
+    }
+
+    public init(pid: UInt32, svgPath: String, frequencyHz: Int32, startedAt: String) {
+        self.pid = pid
+        self.svgPath = svgPath
+        self.frequencyHz = frequencyHz
+        self.startedAt = startedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        pid = try container.decode(UInt32.self, forKey: .pid)
+        svgPath = try container.decode(String.self, forKey: .svgPath)
+        frequencyHz = try container.decode(Int32.self, forKey: .frequencyHz)
+        startedAt = try container.decode(String.self, forKey: .startedAt)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode("cpu_profile_started", forKey: .type)
+        try container.encode(pid, forKey: .pid)
+        try container.encode(svgPath, forKey: .svgPath)
+        try container.encode(frequencyHz, forKey: .frequencyHz)
+        try container.encode(startedAt, forKey: .startedAt)
+    }
+}
+
+/// `protocol.rs:259-264` — a stop is acknowledged only after a genuine,
+/// nonempty folded-stack artifact has been durably finalized.
+public struct ACPLeaderCpuProfileStopped: Sendable, Hashable, Codable {
+    public var pid: UInt32
+    public var svgPath: String
+    public var startedAt: String
+    public var stoppedAt: String
+
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case pid
+        case svgPath = "svg_path"
+        case startedAt = "started_at"
+        case stoppedAt = "stopped_at"
+    }
+
+    public init(pid: UInt32, svgPath: String, startedAt: String, stoppedAt: String) {
+        self.pid = pid
+        self.svgPath = svgPath
+        self.startedAt = startedAt
+        self.stoppedAt = stoppedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        pid = try container.decode(UInt32.self, forKey: .pid)
+        svgPath = try container.decode(String.self, forKey: .svgPath)
+        startedAt = try container.decode(String.self, forKey: .startedAt)
+        stoppedAt = try container.decode(String.self, forKey: .stoppedAt)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode("cpu_profile_stopped", forKey: .type)
+        try container.encode(pid, forKey: .pid)
+        try container.encode(svgPath, forKey: .svgPath)
+        try container.encode(startedAt, forKey: .startedAt)
+        try container.encode(stoppedAt, forKey: .stoppedAt)
+    }
+}
+
 /// `protocol.rs:227-287` — the `Ok` half of a control result. Only the
 /// variants this port can produce are modeled; a foreign payload fails to
 /// decode rather than being approximated.
 public enum ACPLeaderControlPayload: Sendable, Hashable {
     case leaderInfo(ACPLeaderInfo)
     case cpuProfileStatus(ACPLeaderCpuProfileStatus)
+    case cpuProfileStarted(ACPLeaderCpuProfileStarted)
+    case cpuProfileStopped(ACPLeaderCpuProfileStopped)
     case workspaceStatus(ACPLeaderWorkspaceStatus)
     case relaunching(fromVersion: String, toVersion: String, graceMilliseconds: UInt64)
     case relaunchDeclined(reason: String)
@@ -536,6 +620,10 @@ extension ACPLeaderControlPayload: Codable {
             self = .leaderInfo(try ACPLeaderInfo(from: decoder))
         case "cpu_profile_status":
             self = .cpuProfileStatus(try ACPLeaderCpuProfileStatus(from: decoder))
+        case "cpu_profile_started":
+            self = .cpuProfileStarted(try ACPLeaderCpuProfileStarted(from: decoder))
+        case "cpu_profile_stopped":
+            self = .cpuProfileStopped(try ACPLeaderCpuProfileStopped(from: decoder))
         case "workspace_status":
             self = .workspaceStatus(try ACPLeaderWorkspaceStatus(from: decoder))
         case "relaunching":
@@ -560,6 +648,10 @@ extension ACPLeaderControlPayload: Codable {
             try info.encode(to: encoder)
         case .cpuProfileStatus(let status):
             try status.encode(to: encoder)
+        case .cpuProfileStarted(let started):
+            try started.encode(to: encoder)
+        case .cpuProfileStopped(let stopped):
+            try stopped.encode(to: encoder)
         case .workspaceStatus(let status):
             try status.encode(to: encoder)
         case .relaunching(let fromVersion, let toVersion, let graceMilliseconds):

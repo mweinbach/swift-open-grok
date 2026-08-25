@@ -359,7 +359,7 @@ private func targets() -> [Target] {
     t.append(contentsOf: libs(w7s2, dep(w0s2, w0s3, w0s4, w1s3, w2s2, w6s2, w6s3, w6s4, ["COpenGrokSockets"])))
     t.append(contentsOf: libs(w7s3, dep(w0s2, w1s3, w1s5, w3s1, w3s2, w3s3, w5s2, w6s1, w6s2, w6s3, w6s4)))
     t.append(contentsOf: libs(w7s4, dep(w0s2, w1s2, w1s3, w4s2, w4s3, w5s3, w6s4, w6s5)))
-    t.append(contentsOf: libs(w7s5, dep(w0s2, w0s3, w0s4, w1s2, w1s4, w2s1, w4s3, w6s4)))
+    t.append(contentsOf: libs(w7s5, dep(w0s2, w0s3, w0s4, w1s2, w1s4, w2s1, w4s3, w6s4, ["OpenGrokCrashHandlerC"])))
 
     // ---- Wave 8 ----
     // W8-S1: MarkdownCore base; Markdown -> MarkdownCore.

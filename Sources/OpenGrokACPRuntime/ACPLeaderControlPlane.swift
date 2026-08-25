@@ -38,11 +38,25 @@ import OpenGrokVersion
 public enum ACPLeaderControlErrorCode {
     /// The frame could not be parsed as a control command.
     public static let invalidCommand = 100
-    /// A real command this build does not implement, such as CPU profiling.
+    /// A real command whose backing capability is unavailable in this build.
     public static let unsupportedCommand = 101
     /// The workspace backend refused or failed; upstream's
     /// `ControlErrorCode::InternalError` side (`server.rs:1000-1006`).
     public static let workspaceError = 102
+    /// `ControlErrorCode::ProfileAlreadyActive`.
+    public static let profileAlreadyActive = 103
+    /// `ControlErrorCode::ProfileNotActive`.
+    public static let profileNotActive = 104
+    /// `ControlErrorCode::ProfileStopInProgress`.
+    public static let profileStopInProgress = 105
+    /// `ControlErrorCode::InvalidFrequency`.
+    public static let invalidFrequency = 106
+    /// `ControlErrorCode::OutputPathCollision`.
+    public static let outputPathCollision = 107
+    /// `ControlErrorCode::ArtifactWriteFailed`.
+    public static let artifactWriteFailed = 108
+    /// `ControlErrorCode::InternalError`.
+    public static let internalError = 109
 }
 
 /// A typed control-plane failure; becomes the `Err` half of the result.
@@ -200,8 +214,8 @@ public struct ACPLeaderControlMetadata: Sendable, Hashable {
     public var lockPath: String
     public var wsURLSuffix: String
     public var binaryVersion: String
-    /// False everywhere in this port: there is no CPU profiler, where
-    /// upstream compiles pprof in on unix (`cpu_profile.rs:650-655`).
+    /// The resolved composition's native backend availability; a control
+    /// plane without an injected profiler still reports unsupported.
     public var profilingSupported: Bool
     public var profilingCompiledIn: Bool
     /// Empty on both sides during the two-phase wire migration
@@ -261,6 +275,7 @@ public final class ACPLeaderControlPlane: @unchecked Sendable {
     private let defaultHubURL: String?
     private let connector: ACPWorkspaceExposureConnector?
     private let nowNanoseconds: @Sendable () -> UInt64
+    private let profiler: ACPLeaderCPUProfiler?
 
     /// One live exposure, `server.rs:272-278`. The `startedAt` instant
     /// survives pause/resume so uptime keeps accruing through a pause,
@@ -284,12 +299,14 @@ public final class ACPLeaderControlPlane: @unchecked Sendable {
         metadata: ACPLeaderControlMetadata = ACPLeaderControlMetadata(),
         defaultHubURL: String? = nil,
         connector: ACPWorkspaceExposureConnector? = nil,
-        nowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
+        nowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
+        profiler: ACPLeaderCPUProfiler? = nil
     ) {
         self.metadata = metadata
         self.defaultHubURL = defaultHubURL
         self.connector = connector
         self.nowNanoseconds = nowNanoseconds
+        self.profiler = profiler
     }
 
     // MARK: Dispatch
@@ -312,16 +329,39 @@ public final class ACPLeaderControlPlane: @unchecked Sendable {
         case .getLeaderInfo:
             return .success(leaderInfoPayload())
         case .cpuProfileStatus:
-            // A profiler-less build has no active profile, so the honest
-            // answer is upstream's `CpuProfileStatus::Inactive`
-            // (`cpu_profile.rs:107-117`), not a refusal.
-            return .success(.cpuProfileStatus(ACPLeaderCpuProfileStatus()))
-        case .startCpuProfile, .stopCpuProfile:
-            return .failure(
-                code: ACPLeaderControlErrorCode.unsupportedCommand,
-                // `cpu_profile.rs:707-709`.
-                message: "runtime CPU profiling is not supported in this build"
-            )
+            return .success(.cpuProfileStatus(profiler?.status() ?? ACPLeaderCpuProfileStatus()))
+        case .startCpuProfile(let output, let frequencyHz):
+            guard let profiler else { return Self.unsupportedProfilingOutcome }
+            do {
+                return .success(
+                    .cpuProfileStarted(
+                        try profiler.start(
+                            pid: metadata.pid,
+                            output: output,
+                            frequencyHz: frequencyHz
+                        )
+                    )
+                )
+            } catch let error as ACPLeaderControlError {
+                return .failure(code: error.code, message: error.message)
+            } catch {
+                return .failure(
+                    code: ACPLeaderControlErrorCode.internalError,
+                    message: String(describing: error)
+                )
+            }
+        case .stopCpuProfile:
+            guard let profiler else { return Self.unsupportedProfilingOutcome }
+            do {
+                return .success(.cpuProfileStopped(try await profiler.stop(pid: metadata.pid)))
+            } catch let error as ACPLeaderControlError {
+                return .failure(code: error.code, message: error.message)
+            } catch {
+                return .failure(
+                    code: ACPLeaderControlErrorCode.internalError,
+                    message: String(describing: error)
+                )
+            }
         case .relaunchForUpdate(let version):
             return .success(decideRelaunch(toVersion: version))
         case .workspaceStatus:
@@ -342,6 +382,7 @@ public final class ACPLeaderControlPlane: @unchecked Sendable {
     /// Drain any live exposure with the leader
     /// (`server.rs:1228-1235`, `finalize_workspace_on_shutdown`).
     public func finalize() async {
+        await profiler?.finalize()
         _ = try? await serialize {
             if let old = self.swap(nil) {
                 await old.connection.disconnect()
@@ -408,7 +449,9 @@ public final class ACPLeaderControlPlane: @unchecked Sendable {
 
     /// `server.rs:975-997` (`leader_info_payload`).
     private func leaderInfoPayload() -> ACPLeaderControlPayload {
-        .leaderInfo(
+        let status = profiler?.status() ?? ACPLeaderCpuProfileStatus()
+        let profilingSupported = profiler?.isSupported ?? false
+        return .leaderInfo(
             ACPLeaderInfo(
                 pid: metadata.pid,
                 socketPath: metadata.socketPath,
@@ -416,13 +459,20 @@ public final class ACPLeaderControlPlane: @unchecked Sendable {
                 wsURLSuffix: metadata.wsURLSuffix,
                 leaderProtocolVersion: ACPLeaderProtocolLimits.protocolVersion,
                 leaderBinaryVersion: metadata.binaryVersion,
-                profilingSupported: metadata.profilingSupported,
-                profilingCompiledIn: metadata.profilingCompiledIn,
-                cpuProfileActive: false,
-                cpuProfileStopping: false,
-                profileStartedAt: nil,
-                profileFormats: metadata.profileFormats
+                profilingSupported: profilingSupported,
+                profilingCompiledIn: profilingSupported,
+                cpuProfileActive: status.active,
+                cpuProfileStopping: status.stopping,
+                profileStartedAt: status.startedAt,
+                profileFormats: []
             )
+        )
+    }
+
+    private static var unsupportedProfilingOutcome: ACPLeaderControlOutcome {
+        .failure(
+            code: ACPLeaderControlErrorCode.unsupportedCommand,
+            message: "runtime CPU profiling is not supported in this build"
         )
     }
 

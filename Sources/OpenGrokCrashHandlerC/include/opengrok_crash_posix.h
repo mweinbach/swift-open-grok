@@ -3,6 +3,8 @@
 #ifndef OPENGROK_CRASH_POSIX_H
 #define OPENGROK_CRASH_POSIX_H
 
+#include "opengrok_cpu_profile_posix.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

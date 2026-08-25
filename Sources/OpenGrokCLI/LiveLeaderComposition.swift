@@ -171,6 +171,15 @@ public enum LiveLeaderComposition {
         let environment = context.environment
         let cwd = try resolveWorkingDirectory(options.common.cwd)
         let home = OpenGrokHomeResolver.resolve(environment: environment)
+        #if os(macOS) || os(Linux)
+        do {
+            try LiveSessionBusSocketSupport.secureDirectory(at: home)
+        } catch {
+            throw CLIApplicationError.failed(
+                "leader state directory must be private to its current owner: \(error)"
+            )
+        }
+        #endif
         let relay = resolveRelayEndpoint(options: options, environment: environment)
 
         if options.noAutoUpdate {
@@ -423,19 +432,33 @@ public enum LiveLeaderComposition {
         productionExposureConnector: @escaping ACPWorkspaceExposureConnector
     ) -> ACPLeaderIPCConfiguration {
         let version = OpenGrokCLIVersion.installed(environment: environment)
+        let openGrokHome = OpenGrokHomeResolver.resolve(environment: environment)
+        let profiler = ACPLeaderCPUProfiler(openGrokHome: openGrokHome)
+        let profilingSupported = profiler.isSupported
         let metadata = ACPLeaderControlMetadata(
             socketPath: paths.socket.path,
             lockPath: paths.lock.path,
             wsURLSuffix: ACPLeaderSocketPaths.suffix(forRelayURL: relayURL),
-            binaryVersion: version
+            binaryVersion: version,
+            profilingSupported: profilingSupported,
+            profilingCompiledIn: profilingSupported,
+            profileFormats: []
         )
         let controlPlane = ACPLeaderControlPlane(
             metadata: metadata,
             defaultHubURL: ACPLeaderControlPlane.productionComputerHubURL,
-            connector: productionExposureConnector
+            connector: productionExposureConnector,
+            profiler: profiler
         )
         return ACPLeaderIPCConfiguration(
             binaryVersion: version,
+            capabilities: ACPLeaderCapabilities(
+                controlV1: true,
+                runtimeCPUProfile: profilingSupported,
+                profileFormats: [],
+                workspaceExposure: true,
+                relaunchV1: true
+            ),
             controlPlane: controlPlane
         )
     }
