@@ -196,14 +196,15 @@ struct OpenGrokCLITests {
 
     @Test("version, paths, and embedded model listing are supported built-ins")
     func supportedBuiltIns() {
+        let installedVersion = OpenGrokCLIVersion.installedWithCommit(environment: [:])
         let (versionStreams, versionOut, versionErr) = CLIStreams.buffered()
         #expect(CLIRunner.main(["--version"], environment: [:], streams: versionStreams) == 0)
-        #expect(versionOut.contents == "Open Grok 1.0.0-open-grok.82\n")
+        #expect(versionOut.contents == "Open Grok \(installedVersion)\n")
         #expect(versionErr.contents.isEmpty)
 
         let (versionJSONStreams, versionJSONOut, versionJSONErr) = CLIStreams.buffered()
         #expect(CLIRunner.main(["version", "--json"], environment: [:], streams: versionJSONStreams) == 0)
-        #expect(versionJSONOut.contents == "{\"version\":\"1.0.0-open-grok.82\"}\n")
+        #expect(versionJSONOut.contents == "{\"version\":\"\(installedVersion)\"}\n")
         #expect(versionJSONErr.contents.isEmpty)
 
         let (pathStreams, pathOut, pathErr) = CLIStreams.buffered()

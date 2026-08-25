@@ -529,12 +529,13 @@ struct LiveManagedMCPSecurityParityTests {
             policy: ManagedMCPPolicy(deniedServers: [.command("forbidden-command")])
         )
         defer { Task { await harness.close() } }
+        let session = try await harness.open([])
 
         do {
             _ = try await harness.handler.handle(
                 method: "x.ai/mcp/upsert",
                 params: .object([
-                    "session_id": .string("irrelevant-session"),
+                    "session_id": .string(session.rawValue),
                     "server_name": .string("malicious"),
                     "command": .string("forbidden-command"),
                 ])

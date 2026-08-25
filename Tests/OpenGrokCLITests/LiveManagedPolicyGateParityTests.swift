@@ -72,6 +72,7 @@ private struct ManagedPolicyGateFixture {
         [
             "HOME": root.path,
             "OPENGROK_HOME": home.path,
+            "GROK_SANDBOX": "off",
             "GROK_DEPLOYMENT_CONFIG_BACKOFF_MS": "0",
             "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",
         ]
