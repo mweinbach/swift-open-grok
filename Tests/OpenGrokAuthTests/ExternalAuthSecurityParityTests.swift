@@ -199,6 +199,35 @@ struct ExternalAuthSecurityParityTests {
         #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty)
     }
 
+    @Test("external helpers never inherit unrelated open parent descriptors")
+    func helperCannotInheritParentFileDescriptors() throws {
+        let sourceDescriptor = open("/dev/null", O_RDONLY)
+        #expect(sourceDescriptor >= 0)
+        guard sourceDescriptor >= 0 else { return }
+        defer { close(sourceDescriptor) }
+
+        let inheritedDescriptor = fcntl(sourceDescriptor, F_DUPFD, 64)
+        #expect(inheritedDescriptor >= 64)
+        guard inheritedDescriptor >= 64 else { return }
+        defer { close(inheritedDescriptor) }
+        #expect(fcntl(inheritedDescriptor, F_GETFD) & FD_CLOEXEC == 0)
+
+        let execution = try #require(
+            DefaultExternalAuthProcessRunner(environment: ["PATH": "/usr/bin:/bin"]).run(
+                command: "if [ -e /dev/fd/\(inheritedDescriptor) ]; then"
+                    + " printf 'inherited-parent-descriptor'; exit 89; fi;"
+                    + " printf 'isolated-parent-descriptor'",
+                args: nil,
+                cwd: nil,
+                timeout: 5,
+                refreshToken: nil
+            )
+        )
+
+        #expect(execution.exitCode == 0)
+        #expect(execution.stdout == "isolated-parent-descriptor")
+    }
+
     @Test("stdout above the 1 MiB ceiling fails closed without returning bearer fragments")
     func oversizedOutputFailsVisiblyAndDoesNotPersist() throws {
         let directory = try makePrivateTemporaryDirectory()

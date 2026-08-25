@@ -9,6 +9,12 @@ import OpenGrokConfig
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+
+@_silgen_name("posix_spawn_file_actions_addclosefrom_np")
+private func openGrokPosixSpawnAddCloseFrom(
+    _ actions: UnsafeMutablePointer<posix_spawn_file_actions_t>,
+    _ firstDescriptor: Int32
+) -> Int32
 #endif
 
 /// Parsed external provider output.
@@ -266,7 +272,7 @@ public struct DefaultExternalAuthProcessRunner: ExternalAuthProcessRunner, Senda
         guard posix_spawnattr_init(&attributes) == 0 else { return nil }
         defer { posix_spawnattr_destroy(&attributes) }
 
-        let actionResults = [
+        var actionResults = [
             posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0),
             posix_spawn_file_actions_adddup2(
                 &actions,
@@ -283,11 +289,21 @@ public struct DefaultExternalAuthProcessRunner: ExternalAuthProcessRunner, Senda
             posix_spawn_file_actions_addclose(&actions, stdoutPipe.fileHandleForWriting.fileDescriptor),
             posix_spawn_file_actions_addclose(&actions, stderrPipe.fileHandleForWriting.fileDescriptor),
         ]
+        #if canImport(Glibc)
+        // File actions run in insertion order: close inherited descriptors
+        // only after both private pipes have become stdout and stderr.
+        actionResults.append(
+            openGrokPosixSpawnAddCloseFrom(&actions, STDERR_FILENO + 1)
+        )
+        #endif
         var unblockedSignals = sigset_t()
         var defaultSignals = sigset_t()
-        let spawnFlags = Int16(
+        var spawnFlags = Int16(
             POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF
         )
+        #if canImport(Darwin)
+        spawnFlags |= Int16(POSIX_SPAWN_CLOEXEC_DEFAULT)
+        #endif
         guard actionResults.allSatisfy({ $0 == 0 }),
               sigemptyset(&unblockedSignals) == 0,
               sigemptyset(&defaultSignals) == 0,
@@ -390,8 +406,24 @@ public struct DefaultExternalAuthProcessRunner: ExternalAuthProcessRunner, Senda
             process.executableURL = URL(fileURLWithPath: command)
             process.arguments = args
         } else {
+            #if os(Windows)
+            let commandInterpreter = environment.first(where: {
+                $0.key.caseInsensitiveCompare("ComSpec") == .orderedSame && !$0.value.isEmpty
+            })?.value ?? {
+                let systemRoot = environment.first(where: {
+                    $0.key.caseInsensitiveCompare("SystemRoot") == .orderedSame && !$0.value.isEmpty
+                })?.value ?? #"C:\Windows"#
+                return URL(fileURLWithPath: systemRoot, isDirectory: true)
+                    .appendingPathComponent("System32", isDirectory: true)
+                    .appendingPathComponent("cmd.exe", isDirectory: false)
+                    .path
+            }()
+            process.executableURL = URL(fileURLWithPath: commandInterpreter)
+            process.arguments = ["/C", command]
+            #else
             process.executableURL = URL(fileURLWithPath: "/bin/sh")
             process.arguments = ["-c", command]
+            #endif
         }
         if let cwd, !cwd.isEmpty {
             process.currentDirectoryURL = expandedCWD(cwd)
