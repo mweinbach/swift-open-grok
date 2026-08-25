@@ -3,7 +3,7 @@
 // `/btw` — the real side-question semantics (Wave 15 item 7).
 //
 // A side question NEVER mutates the conversation: it snapshots the live
-// conversation, appends ONE instruction+question user turn, makes ONE
+// conversation, appends ONE instruction+question user turn, makes a bounded
 // tool-free model call on the ACTIVE session route, and surfaces the answer
 // for display only (`handle_side_question`,
 // acp_session_impl/recap.rs:70-180). Every asked question — answered or
@@ -24,6 +24,16 @@ import OpenGrokSamplingTypes
 import OpenGrokShared
 
 enum LiveBtw {
+    struct SamplingResult: Sendable {
+        let response: OpenGrokLiveSamplingResponse
+        let attempts: UInt32
+    }
+
+    struct SamplingFailure: Error {
+        let underlying: any Error
+        let attempts: UInt32
+    }
+
     // MARK: - Instruction
 
     /// The instruction+question user turn appended to the conversation
@@ -88,6 +98,49 @@ enum LiveBtw {
         "xai-btw-\(UUID().uuidString.lowercased())"
     }
 
+    /// Side questions bypass the turn actor and own at most three one-shot attempts.
+    /// Empty completed answers are terminal; only transient typed failures retry.
+    static func sampleSideQuestion(
+        sampler: OpenGrokLiveSampler,
+        sessionID: String,
+        model: String,
+        question: String,
+        items: [ConversationItem]
+    ) async throws -> SamplingResult {
+        var attempts: UInt32 = 0
+        while true {
+            attempts += 1
+            do {
+                let response = try await sampler.sample(
+                    OpenGrokLiveSamplingRequest(
+                        sessionID: sessionID,
+                        turnID: makeRequestID(),
+                        model: model,
+                        prompt: instruction(tag: "system-reminder", question: question),
+                        items: items,
+                        tools: [],
+                        isSideQuestion: true
+                    )
+                ) { _ in }
+                return SamplingResult(response: response, attempts: attempts)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                guard let samplingError = error as? SamplingError,
+                      samplingError.isRetryable,
+                      !samplingError.isRateLimited,
+                      samplingError.shouldRetryHeader != false,
+                      !samplingError.isContextLengthError,
+                      attempts < 3
+                else {
+                    throw SamplingFailure(underlying: error, attempts: attempts)
+                }
+                let floor: UInt64 = attempts == 1 ? 500_000_000 : 750_000_000
+                try await Task.sleep(nanoseconds: UInt64.random(in: floor...1_000_000_000))
+            }
+        }
+    }
+
     /// The empty-answer failure, upstream's `SideQuestionError::EmptyResponse`
     /// display copy (`#[error("No response from model")]`, commands.rs:34-35).
     static let emptyResponseCopy = "No response from model"
@@ -130,9 +183,7 @@ struct LiveBtwEntry: Codable, Equatable, Sendable {
     let success: Bool
     /// Error message if failed.
     let error: String?
-    /// Model-call attempts made (1 = no retry). This port makes exactly one
-    /// attempt — upstream's overload-only retry (recap.rs:9-28) has no
-    /// error-classification seam here — so the honest value is always 1.
+    /// Model-call attempts made under the separate bounded `/btw` retry policy.
     let attempts: UInt32
 
     init(
@@ -325,8 +376,8 @@ struct LiveBtwACPHandler: ACPAgentExtensionHandler, Sendable {
             tag: "system-reminder",
             stripReasoning: route.configuration.apiBackend == .messages
         )
-        let persist: @Sendable (String, Bool, String?) async -> Void = {
-            answer, success, error in
+        let persist: @Sendable (String, Bool, String?, UInt32) async -> Void = {
+            answer, success, error, attempts in
             do {
                 try await history.append(LiveBtwEntry(
                     btwSessionId: btwSessionID,
@@ -336,7 +387,8 @@ struct LiveBtwACPHandler: ACPAgentExtensionHandler, Sendable {
                     answer: answer,
                     model: route.configuration.model,
                     success: success,
-                    error: error
+                    error: error,
+                    attempts: attempts
                 ))
             } catch {
                 // Upstream warns and continues on a failed btw append
@@ -345,6 +397,7 @@ struct LiveBtwACPHandler: ACPAgentExtensionHandler, Sendable {
             }
         }
         let answer: String
+        let attempts: UInt32
         do {
             // Tool-free side-call. RECORDED DIVERGENCE (shared with the
             // recap arm): upstream ships the main turn's tool specs so the
@@ -352,20 +405,31 @@ struct LiveBtwACPHandler: ACPAgentExtensionHandler, Sendable {
             // the instruction text alone (recap.rs:106-108, :210-219); this
             // seam has no reach into the live tool surface. Deltas never
             // stream anywhere — display-only.
-            let response = try await route.sampler.sample(
-                OpenGrokLiveSamplingRequest(
-                    sessionID: sessionID,
-                    turnID: LiveBtw.makeRequestID(),
-                    model: route.configuration.model,
-                    prompt: LiveBtw.instruction(tag: "system-reminder", question: question),
-                    items: items,
-                    tools: []
-                )
-            ) { _ in }
-            answer = response.output
+            let sampled = try await LiveBtw.sampleSideQuestion(
+                sampler: route.sampler,
+                sessionID: sessionID,
+                model: route.configuration.model,
+                question: question,
+                items: items
+            )
+            answer = sampled.response.output
+            attempts = sampled.attempts
+        } catch let failure as LiveBtw.SamplingFailure {
+            let detail = String(describing: failure.underlying)
+            await persist(
+                "",
+                false,
+                "side question model call failed: \(detail)",
+                failure.attempts
+            )
+            throw AcpError(
+                code: .internalError,
+                message: "side question model call failed: \(detail)",
+                data: nil
+            )
         } catch {
             let detail = String(describing: error)
-            await persist("", false, "side question model call failed: \(detail)")
+            await persist("", false, "side question model call failed: \(detail)", 1)
             // The non-model arm's shape (feedback.rs:84-91): readable
             // message, no data. See the header for the typed-mapping
             // divergence.
@@ -376,14 +440,14 @@ struct LiveBtwACPHandler: ACPAgentExtensionHandler, Sendable {
             )
         }
         guard !answer.isEmpty else {
-            await persist("", false, LiveBtw.emptyResponseCopy)
+            await persist("", false, LiveBtw.emptyResponseCopy, attempts)
             throw AcpError(
                 code: .internalError,
                 message: LiveBtw.emptyResponseCopy,
                 data: nil
             )
         }
-        await persist(answer, true, nil)
+        await persist(answer, true, nil, attempts)
         // `to_ext_response(Ok(json!({"answer": answer})))` — the answer
         // inside upstream's ExtMethodResult envelope (feedback.rs:74-77).
         return .object(["result": .object(["answer": .string(answer)])])

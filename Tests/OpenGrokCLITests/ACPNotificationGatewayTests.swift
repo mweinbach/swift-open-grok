@@ -1035,6 +1035,7 @@ struct ACPBtwExtensionTests {
         #expect(error.code == .internalError)
         #expect(error.message == "No response from model")
         #expect(error.data == nil)
+        #expect(stack.inferenceTransport.recordedRequests.count == 1)
 
         let entries = await LiveBtwHistoryStore(openGrokHome: home).load(sessionID: "btw-empty")
         #expect(entries.count == 1)
@@ -1042,6 +1043,7 @@ struct ACPBtwExtensionTests {
         #expect(entry.success == false)
         #expect(entry.answer.isEmpty)
         #expect(entry.error == "No response from model")
+        #expect(entry.attempts == 1)
     }
 }
 
@@ -1111,4 +1113,3 @@ struct ACPSubagentMessageNotificationTests {
         #expect(update?["created_at_ms"]?.int64Value == 42)
     }
 }
-

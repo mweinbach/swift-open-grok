@@ -195,6 +195,131 @@ struct LiveSamplingRuntimeParityTests {
         })
     }
 
+    @Test("side-question collection returns an empty answer without turn-actor retries")
+    func sideQuestionCollectsEmptyResponseExactlyOnce() async throws {
+        let transport = MockHTTPTransport(responses: [chatResponse("")])
+        let sampler = try makeSampler(transport: transport, maxRetries: 15)
+
+        let response = try await sampler.sample(
+            OpenGrokLiveSamplingRequest(
+                sessionID: "side-session",
+                turnID: "xai-btw-empty",
+                model: "test-model",
+                prompt: "anything?",
+                isSideQuestion: true
+            ),
+            emit: { _ in }
+        )
+
+        #expect(response.output.isEmpty)
+        #expect(response.latencyStats?.attempts == 1)
+        #expect(transport.recordedRequests.count == 1)
+    }
+
+    @Test("side questions retry transient failures under their separate bounded policy")
+    func sideQuestionRetriesTransientFailureWithoutTurnActor() async throws {
+        let transport = MockHTTPTransport(responses: [
+            failedResponse(status: 500),
+            chatResponse("side question recovered"),
+        ])
+        let sampler = try makeSampler(transport: transport, maxRetries: 15)
+
+        let result = try await LiveBtw.sampleSideQuestion(
+            sampler: sampler,
+            sessionID: "side-session",
+            model: "test-model",
+            question: "did it recover?",
+            items: [.user("did it recover?")]
+        )
+
+        #expect(result.response.output == "side question recovered")
+        #expect(result.attempts == 2)
+        #expect(transport.recordedRequests.count == 2)
+    }
+
+    @Test("side-question overload retries stop after exactly three attempts")
+    func sideQuestionRetriesAreBoundedToThreeAttempts() async throws {
+        let transport = MockHTTPTransport(responses: [
+            failedResponse(status: 500),
+            failedResponse(status: 502),
+            failedResponse(status: 503),
+        ])
+        let sampler = try makeSampler(transport: transport, maxRetries: 15)
+
+        do {
+            let response = try await LiveBtw.sampleSideQuestion(
+                sampler: sampler,
+                sessionID: "side-session",
+                model: "test-model",
+                question: "still overloaded?",
+                items: [.user("still overloaded?")]
+            )
+            Issue.record("exhausted side question unexpectedly returned \(response.response.output)")
+        } catch let failure as LiveBtw.SamplingFailure {
+            #expect(failure.attempts == 3)
+        }
+
+        #expect(transport.recordedRequests.count == 3)
+    }
+
+    @Test("rate-limited side questions never enter the main actor retry budget")
+    func sideQuestionNeverRetriesRateLimits() async throws {
+        let transport = MockHTTPTransport(responses: [
+            failedResponse(status: 429, message: "rate limited"),
+        ])
+        let sampler = try makeSampler(transport: transport, maxRetries: 15)
+
+        do {
+            let response = try await LiveBtw.sampleSideQuestion(
+                sampler: sampler,
+                sessionID: "side-session",
+                model: "test-model",
+                question: "rate limited?",
+                items: [.user("rate limited?")]
+            )
+            Issue.record("rate-limited side question unexpectedly returned \(response.response.output)")
+        } catch let failure as LiveBtw.SamplingFailure {
+            #expect(failure.attempts == 1)
+            if let samplingError = failure.underlying as? SamplingError,
+               case .api(let status, _, _, _, _, _) = samplingError {
+                #expect(status.code == 429)
+            } else {
+                Issue.record("rate-limit error lost its typed sampling failure")
+            }
+        }
+
+        #expect(transport.recordedRequests.count == 1)
+    }
+
+    @Test("provider retry veto is honored by the independent side-question policy")
+    func sideQuestionHonorsProviderRetryVeto() async throws {
+        let transport = MockHTTPTransport(responses: [
+            .init(
+                metadata: HTTPResponseMetadata(
+                    statusCode: 500,
+                    headers: ["x-should-retry": "false"]
+                ),
+                body: Data(#"{"error":{"message":"do not retry"}}"#.utf8)
+            ),
+        ])
+        let sampler = try makeSampler(transport: transport, maxRetries: 15)
+
+        do {
+            let response = try await LiveBtw.sampleSideQuestion(
+                sampler: sampler,
+                sessionID: "side-session",
+                model: "test-model",
+                question: "retry veto?",
+                items: [.user("retry veto?")]
+            )
+            Issue.record("vetoed side question unexpectedly returned \(response.response.output)")
+        } catch let failure as LiveBtw.SamplingFailure {
+            #expect(failure.attempts == 1)
+        }
+
+        #expect(transport.recordedRequests.count == 1)
+    }
+
     @Test("rate-limit retries use the authoritative actor and emit one typed retry")
     func productionRetriesRateLimitBeforeOutput() async throws {
         let transport = MockHTTPTransport(responses: [

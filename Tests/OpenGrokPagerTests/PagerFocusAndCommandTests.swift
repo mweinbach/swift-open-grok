@@ -73,7 +73,15 @@ struct PagerFocusAndCommandTests {
         let required = OpenGrokPagerInteractiveController.builtinCommands
             .filter(\.requiresArguments)
             .map(\.name)
-        #expect(Set(required) == Set(["effort", "rename", "btw", "recall", "flush"]))
+        #expect(Set(required) == Set([
+            "add-dir",
+            "btw",
+            "effort",
+            "flush",
+            "recall",
+            "remove-dir",
+            "rename",
+        ]))
     }
 
     @Test("the focused scrollback never leaks a keystroke to the composer")
@@ -322,7 +330,14 @@ struct PagerFocusAndCommandTests {
 
     @Test("every registered command dispatches to something other than 'unknown'")
     func noRegisteredCommandIsUnknown() async throws {
-        for command in OpenGrokPagerInteractiveController.builtinCommands {
+        let commands = OpenGrokPagerInteractiveController.sessionBuiltinCommands(
+            workflowsEnabled: true,
+            mouseReportingToggleEnabled: false,
+            backedSlashCommandsEnabled: false,
+            autoPermissionModeAvailable: false,
+            workingDirectoryCommandsAvailable: false
+        )
+        for command in commands {
             // `/quit` and `/new` end or reset the run rather than emitting an
             // overlay, and are covered by their own tests.
             guard command.name != "quit" else { continue }

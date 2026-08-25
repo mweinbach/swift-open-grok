@@ -3116,11 +3116,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// and no epoch cancel — upstream spawns each side question
     /// independently (run_loop.rs:1913-1919) and carries neither.
     ///
-    /// Recorded divergences (beyond the shared tool-free one at the call):
-    ///   * No overload-only retry (recap.rs:9-28): the port has no
-    ///     sampling-error classification seam, so the call is one-shot and
-    ///     the persisted `attempts` is honestly always 1. Cost: a transient
-    ///     overload fails a side question upstream would have retried twice.
+    /// Recorded divergence (beyond the shared tool-free one at the call):
     ///   * Presentation: upstream shows a dismissible panel
     ///     (`BtwOverlayState`, views/btw_overlay.rs) titled
     ///     "/btw <question>"; this port has no side panel, so the running
@@ -3170,25 +3166,22 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             // reach into the live tool surface. Cost: the provider's prefix
             // cache diverges from the main turn at the tools block.
             let result: Result<String, any Error>
+            let attempts: UInt32
             do {
-                let response = try await route.sampler.sample(
-                    OpenGrokLiveSamplingRequest(
-                        sessionID: sessionID,
-                        turnID: LiveBtw.makeRequestID(),
-                        model: route.configuration.model,
-                        prompt: LiveBtw.instruction(
-                            tag: "system-reminder",
-                            question: question
-                        ),
-                        items: items,
-                        tools: []
-                    )
-                ) { _ in
-                    // Display-only side-call: deltas must never stream into
-                    // the transcript as assistant text.
-                }
-                result = .success(response.output)
+                let sampled = try await LiveBtw.sampleSideQuestion(
+                    sampler: route.sampler,
+                    sessionID: sessionID,
+                    model: route.configuration.model,
+                    question: question,
+                    items: items
+                )
+                attempts = sampled.attempts
+                result = .success(sampled.response.output)
+            } catch let failure as LiveBtw.SamplingFailure {
+                attempts = failure.attempts
+                result = .failure(failure.underlying)
             } catch {
+                attempts = 1
                 result = .failure(error)
             }
             // Persist BEFORE painting, success and failure alike — the
@@ -3209,7 +3202,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                     answer: answer,
                     model: route.configuration.model,
                     success: true,
-                    error: nil
+                    error: nil,
+                    attempts: attempts
                 )
             case .success:
                 record = LiveBtwEntry(
@@ -3220,7 +3214,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                     answer: "",
                     model: route.configuration.model,
                     success: false,
-                    error: LiveBtw.emptyResponseCopy
+                    error: LiveBtw.emptyResponseCopy,
+                    attempts: attempts
                 )
             case .failure(let error):
                 record = LiveBtwEntry(
@@ -3231,7 +3226,8 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
                     answer: "",
                     model: route.configuration.model,
                     success: false,
-                    error: "side question model call failed: \(String(describing: error))"
+                    error: "side question model call failed: \(String(describing: error))",
+                    attempts: attempts
                 )
             }
             do {

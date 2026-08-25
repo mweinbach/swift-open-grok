@@ -321,6 +321,9 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
     public let maxOutputTokens: UInt32?
     /// Budgeted children must never replay a provider request after output.
     public let retryOnlyBeforeOutput: Bool
+    /// `/btw` owns its short retry budget and must collect each attempt directly.
+    /// Routing it through the turn actor would retry empty answers as turn failures.
+    public let isSideQuestion: Bool
 
     public init(
         sessionID: String,
@@ -336,7 +339,8 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
         reasoningEffort: ReasoningEffort? = nil,
         codexPermissions: CodexPermissions? = nil,
         maxOutputTokens: UInt32? = nil,
-        retryOnlyBeforeOutput: Bool = false
+        retryOnlyBeforeOutput: Bool = false,
+        isSideQuestion: Bool = false
     ) {
         self.sessionID = sessionID
         self.cacheAffinityID = cacheAffinityID
@@ -352,6 +356,7 @@ public struct OpenGrokLiveSamplingRequest: Sendable, Equatable {
         self.codexPermissions = codexPermissions
         self.maxOutputTokens = maxOutputTokens
         self.retryOnlyBeforeOutput = retryOnlyBeforeOutput
+        self.isSideQuestion = isSideQuestion
     }
 }
 
@@ -682,14 +687,42 @@ public struct OpenGrokLiveSampler: Sendable {
                 reasoningEffort: requestedReasoningEffort,
                 jsonSchema: request.jsonSchema
             )
-            let result = try await runtime.sample(
-                conversationRequest,
-                codexTurnState: turnState,
-                codexPermissions: request.codexPermissions ?? configuration.codexPermissions,
-                retryOnlyBeforeOutput: request.retryOnlyBeforeOutput,
-                onEvent: emit
-            )
-            let response = result.response
+            let response: ConversationResponse
+            let metrics: InferenceLatencyStats
+            if request.isSideQuestion {
+                var sideQuestionConfig = samplerConfig
+                sideQuestionConfig.codexPermissions = configuration.provider == .codex
+                    ? request.codexPermissions ?? configuration.codexPermissions
+                    : nil
+                if sideQuestionConfig.attributionCallback == nil {
+                    sideQuestionConfig.attributionCallback = LiveSamplingAuth401Attribution(
+                        resolver: sideQuestionConfig.bearerResolver,
+                        staticBearer: sideQuestionConfig.apiKey
+                    )
+                }
+                let client = try SamplingClient(
+                    config: sideQuestionConfig,
+                    transport: transport,
+                    codexTurnState: turnState
+                )
+                response = try await client.conversationCollect(
+                    conversationRequest,
+                    idleTimeout: .seconds(Int64(
+                        sideQuestionConfig.idleTimeoutSecs ?? 300
+                    ))
+                )
+                metrics = InferenceLatencyStats(attempts: 1)
+            } else {
+                let result = try await runtime.sample(
+                    conversationRequest,
+                    codexTurnState: turnState,
+                    codexPermissions: request.codexPermissions ?? configuration.codexPermissions,
+                    retryOnlyBeforeOutput: request.retryOnlyBeforeOutput,
+                    onEvent: emit
+                )
+                response = result.response
+                metrics = result.metrics
+            }
             let output = response.assistantText()
             return OpenGrokLiveSamplingResponse(
                 output: output,
@@ -701,7 +734,7 @@ public struct OpenGrokLiveSampler: Sendable {
                 messageID: response.messageID,
                 rawStopReason: response.rawStopReason,
                 stopSequence: response.stopSequence,
-                latencyStats: result.metrics
+                latencyStats: metrics
             )
         }
     }
