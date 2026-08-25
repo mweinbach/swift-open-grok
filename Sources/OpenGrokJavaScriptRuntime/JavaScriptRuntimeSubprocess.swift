@@ -4,6 +4,8 @@ import Foundation
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif os(Windows)
+import WinSDK
 #endif
 
 enum JavaScriptWorkerInbound: Codable, Sendable {
@@ -131,15 +133,8 @@ final class JavaScriptRuntimeSubprocess: @unchecked Sendable {
         }
         #if os(Linux) || os(Windows)
         DispatchQueue.global(qos: .utility).async {
-            while true {
-                do {
-                    guard let data = try output.read(upToCount: 64 << 10), !data.isEmpty else {
-                        break
-                    }
-                    worker.consume(data)
-                } catch {
-                    break
-                }
+            while let data = readWorkerOutputChunk(output) {
+                worker.consume(data)
             }
             worker.finish()
         }
@@ -157,6 +152,42 @@ final class JavaScriptRuntimeSubprocess: @unchecked Sendable {
         }
         return worker
     }
+
+    #if os(Linux) || os(Windows)
+    /// Foundation fills its requested count before returning on redirected
+    /// pipes. The worker's short readiness frame would therefore wait for EOF;
+    /// one native pipe read instead returns as soon as any bytes are present.
+    private static func readWorkerOutputChunk(_ handle: FileHandle) -> Data? {
+        var bytes = [UInt8](repeating: 0, count: 64 << 10)
+        #if os(Linux)
+        while true {
+            let count = bytes.withUnsafeMutableBytes { buffer in
+                Glibc.read(handle.fileDescriptor, buffer.baseAddress, buffer.count)
+            }
+            if count > 0 {
+                return Data(bytes.prefix(Int(count)))
+            }
+            if count == 0 { return nil }
+            if errno == EINTR { continue }
+            return nil
+        }
+        #else
+        var count: DWORD = 0
+        let succeeded = bytes.withUnsafeMutableBytes { buffer in
+            ReadFile(handle._handle, buffer.baseAddress, DWORD(buffer.count), &count, nil)
+        }
+        if !succeeded {
+            let error = GetLastError()
+            if error == ERROR_BROKEN_PIPE || error == ERROR_HANDLE_EOF {
+                return nil
+            }
+            return nil
+        }
+        guard count > 0 else { return nil }
+        return Data(bytes.prefix(Int(count)))
+        #endif
+    }
+    #endif
 
     func send(_ message: JavaScriptWorkerInbound) {
         guard let data = try? JSONEncoder().encode(message) else { return }
