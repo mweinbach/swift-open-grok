@@ -320,7 +320,7 @@ struct SessionEventLogParityTests {
                 currentModelID: "grok-code-fast-1"
             )
         ))
-        let directoryMetadata = try #require(WindowsSecurePath.metadata(at: session))
+        let directoryMetadata = try #require(try WindowsSecurePath.metadata(at: session))
         #expect(directoryMetadata.isDirectory)
         #expect(!directoryMetadata.isReparsePoint)
 
