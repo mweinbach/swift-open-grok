@@ -245,6 +245,60 @@ public enum WindowsNamedPipeError: Error, Sendable, Hashable, CustomStringConver
 }
 
 #if os(Windows)
+private enum WindowsNamedPipeBlockingExecutor {
+    private static let budget = WindowsNamedPipeOperationBudget(maximum: 128)
+
+    static func run<Value: Sendable>(
+        _ operation: @escaping @Sendable () throws -> Value
+    ) async throws -> Value {
+        try Task.checkCancellation()
+        return try await withCheckedThrowingContinuation { continuation in
+            guard budget.acquire() else {
+                continuation.resume(throwing: WindowsNamedPipeError.operationFailed(
+                    code: 8,
+                    reason: "too many concurrent blocking named-pipe operations"
+                ))
+                return
+            }
+
+            let worker = Thread {
+                defer { budget.release() }
+                do {
+                    continuation.resume(returning: try operation())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+            worker.name = "opengrok-named-pipe-io"
+            worker.start()
+        }
+    }
+}
+
+private final class WindowsNamedPipeOperationBudget: @unchecked Sendable {
+    private let maximum: Int
+    private let lock = NSLock()
+    private var active = 0
+
+    init(maximum: Int) {
+        self.maximum = maximum
+    }
+
+    func acquire() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard active < maximum else { return false }
+        active += 1
+        return true
+    }
+
+    func release() {
+        lock.lock()
+        defer { lock.unlock() }
+        active -= 1
+    }
+}
+
 public final class WindowsNamedPipeChannel: WebSocketByteChannel, @unchecked Sendable {
     private let handle: OGSocketHandle
     private let stateLock = NSLock()
@@ -256,28 +310,30 @@ public final class WindowsNamedPipeChannel: WebSocketByteChannel, @unchecked Sen
 
     public func read() async throws -> [UInt8]? {
         guard !isClosed else { return nil }
-        let handle = self.handle
-        return try await Task.detached(priority: .utility) {
-            var buffer = [UInt8](repeating: 0, count: 64 * 1024)
-            let count = buffer.withUnsafeMutableBytes { rawBuffer -> Int64 in
-                og_named_pipe_read(handle, rawBuffer.baseAddress, rawBuffer.count)
+        return try await WindowsNamedPipeBlockingExecutor.run { [self] in
+            try withExtendedLifetime(self) {
+                var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+                let count = buffer.withUnsafeMutableBytes { rawBuffer -> Int64 in
+                    og_named_pipe_read(handle, rawBuffer.baseAddress, rawBuffer.count)
+                }
+                if count == 0 { return nil }
+                guard count > 0 else { throw Self.lastError() }
+                return Array(buffer.prefix(Int(count)))
             }
-            if count == 0 { return nil }
-            guard count > 0 else { throw Self.lastError() }
-            return Array(buffer.prefix(Int(count)))
-        }.value
+        }
     }
 
     public func write(_ bytes: [UInt8]) async throws {
         guard !isClosed else { throw WindowsNamedPipeError.closed }
         guard !bytes.isEmpty else { return }
-        let handle = self.handle
-        try await Task.detached(priority: .utility) {
-            let count = bytes.withUnsafeBytes { rawBuffer -> Int64 in
-                og_named_pipe_write_all(handle, rawBuffer.baseAddress, rawBuffer.count)
+        try await WindowsNamedPipeBlockingExecutor.run { [self] in
+            try withExtendedLifetime(self) {
+                let count = bytes.withUnsafeBytes { rawBuffer -> Int64 in
+                    og_named_pipe_write_all(handle, rawBuffer.baseAddress, rawBuffer.count)
+                }
+                guard count == Int64(bytes.count) else { throw Self.lastError() }
             }
-            guard count == Int64(bytes.count) else { throw Self.lastError() }
-        }.value
+        }
     }
 
     public func close() async {
@@ -328,14 +384,16 @@ public final class WindowsNamedPipeListener: @unchecked Sendable {
     }
 
     public func accept() async throws -> WindowsNamedPipeChannel {
-        let listener = try activeHandle()
-        return try await Task.detached(priority: .utility) {
-            var accepted: OGSocketHandle = -1
-            guard og_named_pipe_listener_accept(listener, &accepted) == 0 else {
-                throw WindowsNamedPipeSupport.lastError()
+        return try await WindowsNamedPipeBlockingExecutor.run { [self] in
+            try withExtendedLifetime(self) {
+                let listener = try activeHandle()
+                var accepted: OGSocketHandle = -1
+                guard og_named_pipe_listener_accept(listener, &accepted) == 0 else {
+                    throw WindowsNamedPipeSupport.lastError()
+                }
+                return WindowsNamedPipeChannel(handle: accepted)
             }
-            return WindowsNamedPipeChannel(handle: accepted)
-        }.value
+        }
     }
 
     public func close() {
@@ -376,14 +434,14 @@ public enum WindowsNamedPipeDialer {
         pipeName: String,
         timeoutSeconds: Double = 10
     ) async throws -> WindowsNamedPipeChannel {
-        try await Task.detached(priority: .utility) {
+        try await WindowsNamedPipeBlockingExecutor.run {
             var handle: OGSocketHandle = -1
             let result = pipeName.withCString { pointer in
                 og_named_pipe_connect(pointer, timeoutSeconds, &handle)
             }
             guard result == 0 else { throw WindowsNamedPipeSupport.lastError() }
             return WindowsNamedPipeChannel(handle: handle)
-        }.value
+        }
     }
 
     public static func isReady(pipeName: String) -> Bool {
