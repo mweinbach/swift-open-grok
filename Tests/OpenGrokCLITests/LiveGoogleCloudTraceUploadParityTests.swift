@@ -57,9 +57,15 @@ private struct GoogleCloudTraceUploadFixture {
         )
         home = root.appendingPathComponent("state", isDirectory: true)
         workspace = root.appendingPathComponent("workspace", isDirectory: true)
+        #if os(Windows)
         try OpenGrokConfig.createDirAllOwnerOnly(root, stateRoot: root)
         try OpenGrokConfig.createDirAllOwnerOnly(home, stateRoot: home)
         try OpenGrokConfig.createDirAllOwnerOnly(workspace, stateRoot: root)
+        #else
+        for directory in [root, home, workspace] {
+            try OpenGrokConfig.createDirAllOwnerOnly(directory)
+        }
+        #endif
         try SecureFile.write(
             at: home.appendingPathComponent("config.toml"),
             contents: "[telemetry]\ntrace_upload = true\n"
@@ -586,7 +592,7 @@ struct LiveGoogleCloudTraceUploadParityTests {
         let directory = fixture.root
             .appendingPathComponent(".config", isDirectory: true)
             .appendingPathComponent("gcloud", isDirectory: true)
-        try OpenGrokConfig.createDirAllOwnerOnly(directory, stateRoot: fixture.root)
+        try OpenGrokConfig.createDirAllOwnerOnly(directory)
         try SecureFile.write(
             at: directory.appendingPathComponent("application_default_credentials.json"),
             contents: GoogleCloudTraceUploadFixture.credentials()
