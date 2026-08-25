@@ -135,6 +135,7 @@ private struct AgentRelayFixture {
             authMode: authMode,
             userID: userID,
             teamBlockedReasons: zdr ? ["BLOCKED_REASON_NO_LOGS"] : [],
+            refreshToken: authMode == .oidc ? "first-party-refresh-token" : nil,
             expiresAt: Date().addingTimeInterval(3600),
             oidcIssuer: issuer,
             oidcClientID: defaultOAuth2ClientID
