@@ -60,6 +60,10 @@ spawn $binary
 # verbatim marker of a started TUI.
 expect {
     timeout { puts "PROOF-FAIL: TUI never entered the alt screen"; exit 1 }
+    -ex "Do you trust the contents of this directory?" {
+        send -- "y\r"
+        exp_continue
+    }
     -ex "\x1b\[?1049h"
 }
 sleep 1

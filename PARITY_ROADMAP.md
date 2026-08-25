@@ -1,11 +1,92 @@
 # Parity Roadmap — remaining feature gap to full Rust parity
 
 **Current reference:** `00e176c8fb4035701c24199bf9225973c1b13c20`
-(`1.0.0-open-grok.82`), reaudited 2026-08-24. The historical roadmap below
+(`1.0.0-open-grok.82`), reaudited 2026-08-25. The historical roadmap below
 preserves its original audit context; `PORT_STATUS.md` is authoritative for
 the current live classifications, verification evidence, intentional security
 divergences, and still-unverified platforms. `CRATE_MAP.md` now enumerates all
 93 root workspace members plus the separately rooted Markdown fuzz crate.
+
+**Exhaustive Rust-first behavioral audit (2026-08-25): full parity is NOT yet
+achieved.** The complete pinned Rust workspace was re-enumerated from upstream
+before independently auditing CLI/configuration, providers/authentication,
+session/agent runtime, workspace/security, tools/media, terminal/platform,
+pager/Markdown/Mermaid, protocols/workflows, persistence/memory, and
+telemetry/upload. Mapping every crate is necessary, but does not prove that its
+behavior is implemented or reachable from the executable.
+
+- **Implemented in this follow-on; authoritative verification recorded below:**
+  exact pinned Grok 4.6 model catalog and remote model metadata; managed xAI
+  authentication, device login, signed-token team pinning, refresh locking and
+  rotation; fail-closed project configuration, version policy, shell grants,
+  workspace trust, external authentication, hook/plugin writes, patch deletion,
+  worktree GC, terminal/Markdown injection, and web-fetch DNS/redirect policy;
+  canonical Rust-compatible SQLite/BLAKE3 memory and session search, including
+  exact same-second source freshness without changing Rust's SQLite schema;
+  real Codex/Claude foreign-session discovery; MCP `2025-11-25`, secure
+  setup/management and incremental SSE transport; plugin/marketplace
+  management; standalone Codex `web__run`; image attachments and image-tool
+  output; authenticated privacy-gated trace proxy uploads; dashboard startup;
+  live goal tools; trusted opt-in compaction; subagent context inheritance;
+  embedded ACP resources; protected rewind and durable session deletion;
+  secure clipboard transport; crash bootstrap and terminal restoration;
+  grep multiline/context/type filtering; Mermaid class/ER/sequence support;
+  CRLF framing; and Linux x86_64 updater metadata.
+- **ABSENT — provider and session orchestration:** complete account `/user`
+  enrichment and privacy discovery; upstream laziness detector/TodoGate;
+  full planner/evaluator/strategist/skeptic goal orchestration; ACP queue
+  synchronization; provider quotas and adaptive swarm retries; subagent
+  interactive questions; and image-bearing ACP interjections
+  (`xai-grok-shell/src/session/acp_session_impl/goal.rs:1548-1757`;
+  `xai-grok-pager/src/app/acp_handler/follow_ups.rs:50-108`).
+- **ABSENT — tool and callback features:** operational authenticated
+  tools-callback host (protobuf types alone are insufficient); PDF/PPTX file
+  extraction; recursive directory listing; semantic LSP tools; and several
+  Rust tool presets/per-tool parameters
+  (`xai-grok-tools-api/proto/grok-tools.proto:325-415`;
+  `xai-grok-tools/src/implementations/grok_build/read_file/mod.rs:103-149`;
+  `xai-grok-tools/src/implementations/grok_build/list_dir/mod.rs:283-335`).
+- **ABSENT — pager workflows and settings:** `/auto`, `/add-dir`,
+  `/remove-dir`, `/edit-prompt`, `/share`, `/yolo-2`, and `/import-claude`;
+  live follow-up suggestion chips; complete custom-model TOML persistence;
+  OpenCode/auxiliary model choosers; remembered approval/default-selection
+  policy; Mermaid SVG actions and additional diagram families; and settings
+  that currently have no runtime reader
+  (`xai-grok-pager/src/slash/commands/`;
+  `xai-grok-pager/src/app/agent_view/render.rs:2459-2468`;
+  `xai-grok-shell/src/util/config/settings_writes.rs:776-796`;
+  `third_party/mermaid-to-svg/src/lib.rs:49-138`).
+- **DIVERGED — Linux enterprise trust roots fail closed.** Darwin installs
+  extra trust roots per URLSession. Linux refuses additional roots instead of
+  mutating process-global TLS trust or silently ignoring enterprise policy;
+  this preserves security but does not provide upstream functional parity.
+- **ABSENT — direct cloud trace destinations.** Authenticated, privacy-gated
+  proxy upload is live; direct ambient-credential `gs://` and `s3://` uploads
+  deliberately remain unavailable until equivalent scoped credential and
+  provider-boundary controls exist
+  (`xai-grok-shell/src/agent/config.rs:529-563`).
+- **UNVERIFIED / ABSENT — cross-platform completion.** Only the macOS host is
+  exercised by the local gate. Native Linux and Windows execution, Windows
+  ConPTY/console input/Job Objects, unsupported JavaScriptCore equivalents,
+  Linux aarch64 updating, CI required-check conclusions, and release
+  certification remain separate work. No claim of full cross-platform or
+  complete behavioral parity is justified until those gaps close.
+
+**Latest authoritative local macOS gate (2026-08-25):**
+`zsh workflows/swift-safe-verify.zsh test --no-parallel --quiet` exited 0 with
+**10,053 tests in 1,412 suites across 106 nonempty test-product summaries**,
+approximately **429 seconds** under the unchanged 600-second watchdog. The
+complete CLI product passed **2,778 tests / 356 suites**; the actual executable
+product passed **232 tests / 37 suites**. One product summary straddled output
+buffers: the other 105 observed products totaled **9,914 tests / 1,389
+suites**, and an independent `OpenGrokHTTPTests` rerun passed **139 tests /
+23 suites**, exit 0, confirming the exact complete-package count. The actual
+executable separately proved isolated `.82` version/model/doctor/session paths,
+full MCP add/list/disable/enable/remove, hostile-symlink-safe plugin
+install/details/disable/enable/uninstall, and real `/transcript` PTY
+suspend/resume with the production directory-trust prompt. These results
+supersede the historical gate counts below without claiming complete parity,
+cross-platform execution, current remote CI, or release certification.
 
 **Pinned `.82` provider, trace, and terminal follow-on (2026-08-25):**
 
@@ -43,11 +124,12 @@ divergences, and still-unverified platforms. `CRATE_MAP.md` now enumerates all
   archives distinguish endpoint buckets from telemetry buckets, recognize
   ambient Google Cloud/AWS credentials only for the upstream `gs://` and
   `s3://` schemes, retain source precedence, and never embed bucket names or
-  credentials. **Remote trace upload remains ABSENT and fail-closed**
+  credentials. A later follow-on enables authenticated, privacy-gated proxy
+  uploads; direct cloud-bucket uploads remain absent and fail-closed
   (`xai-grok-pager/src/trace_cmd.rs:182-203`;
   `xai-grok-shell/src/agent/config.rs:529-563,593-605,629-632`).
 
-**Verified local macOS gate (2026-08-25):** `build-tests` exited 0, and the
+**Earlier historical local macOS gate (2026-08-25):** `build-tests` exited 0, and the
 authoritative `test --no-parallel` passed **9,353 tests in 1,329 suites across
 106 nonempty test-product summaries**, exit 0, in approximately **419 seconds**
 under the unchanged 600-second watchdog. The real-executable product passed
@@ -71,9 +153,9 @@ remote CI, and release certification remain separate unverified work.
   bounded, process-ordered memory traces. The portable real GNU-tar/gzip
   writer supports long Unicode paths and multi-block streams; unsafe source
   files, symbolic-link destinations, traversal, and oversized archives fail
-  closed. Disabled uploads fall back to local export. **Remote trace upload
-  remains ABSENT:** when upload is enabled, the command refuses to send private
-  data and requires explicit `--local` (`xai-grok-pager/src/trace_cmd.rs:35-73,
+  closed. Disabled uploads fall back to local export. A later follow-on adds
+  authenticated, privacy-gated proxy upload; direct ambient-cloud destinations
+  still refuse safely (`xai-grok-pager/src/trace_cmd.rs:35-73,
   80-153,351-420`; `memory_trace.rs:573-659`).
 - **LIVE — complete cancellation and lifecycle hook matching.** Canonical and
   alias registrations are all retained; subagent-stop hooks match the actual

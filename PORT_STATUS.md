@@ -1,14 +1,137 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-22. The authoritative local macOS serial package gate passed **8,304 Swift Testing cases in 1,227 suites across 106 nonempty test-product summaries**, exit 0, after the upstream `.81`, ACP peer wake, Windows IPC, nested streaming, provider-policy, persistence-security, and SQLite-contention closures below. The unchanged 600-second verification ceiling remained in force; the complete run finished in approximately 503 seconds. Native Windows ARM64 additionally built the actual executable and passed **7 named-pipe tests in 2 suites**. These local results do not establish current Linux execution, full Windows-suite health, remote CI, or release readiness.
+**As of:** 2026-08-25. The authoritative local macOS serial package gate passed **10,053 Swift Testing cases in 1,412 suites across 106 nonempty test-product summaries**, exit 0, after the exhaustive pinned Rust `.82` provider, authentication, protocol, security, persistence, live-executable, and terminal closures recorded immediately below. The unchanged 600-second verification ceiling remained in force; the complete run finished in approximately 429 seconds. Historical native Windows ARM64 evidence remains **7 named-pipe tests in 2 suites**, but was not refreshed against this exact head. These local results do not establish complete behavioral parity, current Linux execution, full Windows-suite health, remote CI, or release readiness.
 
-**Overall state:** First-class RunInfra, direct Google Gemini, explicitly enabled OpenRouter, machine-local session collaboration, ACP-hosted peer wake/interjection, owner-secure Windows named-pipe session transport, live MCP server changes and correlated tool progress, reverse ACP-hosted MCP servers, native Messages output, and upstream `.81` nested Code Mode streaming now reach their production seams. The executable version, protocol fixtures, release reference, and macOS/Windows/Linux distribution metadata are synchronized to the audited Rust commit. This remains **not complete parity or a release certification**: platform-coverage and remote-CI limits are recorded below.
+**Overall state:** The audited Rust `.82` model catalog, managed authentication, fail-closed permission and media boundaries, canonical SQLite/BLAKE3 session and memory persistence, real MCP/plugin management, provider-isolated web/image/video tools, ACP/goal/session orchestration foundations, interactive terminal rendering, and explicitly enabled trace proxy uploads reach their production seams. The executable version, protocol fixtures, release reference, and platform distribution metadata agree with the exact pinned Rust commit. This remains **not complete parity or a release certification**: absent runtime, callback, pager, diagram, platform, and CI capabilities are explicitly recorded below and in `PARITY_ROADMAP.md`.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `00e176c8fb4035701c24199bf9225973c1b13c20` (release `v1.0.0-open-grok.82`); historical original reference `650c1db7c2e73c59cec88bf3c6359751d6cef1bd`.
 **Current audited Rust snapshot:** `00e176c8fb4035701c24199bf9225973c1b13c20`, product version `1.0.0-open-grok.82`, **190 commits beyond the historical original pin**.
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 
-## Current upstream `.81` foundational closure (2026-08-22)
+## Exhaustive pinned Rust `.82` parity closure (2026-08-25)
+
+The current reference is exactly `00e176c8fb4035701c24199bf9225973c1b13c20`,
+not the mutable neighboring Rust checkout. The audit re-enumerated all **93
+root Rust workspace members plus the separately rooted Markdown fuzz crate**
+and independently followed each major behavior from the Rust side through the
+actual Swift executable. Crate presence, passing composition tests, and
+implemented-but-unwired APIs were not treated as proof of live parity.
+
+### Verified local macOS gates and real executable evidence
+
+| Verification | Result |
+| --- | --- |
+| `zsh workflows/swift-safe-verify.zsh test --no-parallel --quiet` | **Exit 0: 10,053 tests / 1,412 suites / 106 nonempty test products**, approximately 429 seconds, unchanged 600-second watchdog. |
+| `OpenGrokHTTPTests` summary reconciliation | **Exit 0: 139 tests / 23 suites**. One full-suite product summary straddled two output buffers; the other 105 observed summaries contained **9,914 tests / 1,389 suites**, and the independently rerun missing HTTP product establishes the exact total above. |
+| `OpenGrokCLITests` in the authoritative suite | **2,778 tests / 356 suites**, 153.387 seconds. |
+| `OpenGrokExecutableTests` in the authoritative suite | **232 tests / 37 suites**, 136.159 seconds. |
+| `OpenGrokPagerRenderTests` in the authoritative suite | **842 tests / 131 suites**, 3.369 seconds. |
+| Release, integration, and repair filters | **44 tests / 1 suite**, **118 tests / 11 suites**, **79 tests / 15 suites**, and final **58 tests / 3 suites**, each exit 0. |
+| `zsh workflows/swift-safe-verify.zsh build --product open-grok` | Exit 0; actual `open-grok` executable linked in 1.78 seconds. |
+| Isolated real CLI, run `20260825-040143-25038` | `version --json`, `paths --json`, `help`, `models --json`, `models default`, `sessions list --json`, `mcp list --json`, `plugin list`, `plugin marketplace list`, `doctor`, `inspect --json`, `du --json`, `wrap /bin/echo rust-parity`, and `memory clear --all --yes` all exited 0 under a fresh `/tmp/open-grok-verify-*` home. Version was exactly `1.0.0-open-grok.82`; the default model was `grok-4.6`. |
+| Actual MCP management lifecycle | Real executable `mcp add`, JSON list inspection, `mcp disable`, `mcp enable`, `mcp remove`, and final empty JSON list all exited 0. |
+| Actual plugin management and hostile fixture | Real executable `plugin install --trust`, `plugin details`, `plugin disable`, `plugin enable`, `plugin uninstall`, and final empty list all exited 0. A hostile source file symlink and directory symlink were absent from the installed copy. |
+| `env GROK_XAI_API_BASE_URL=http://127.0.0.1:9/v1 zsh workflows/verify-transcript-pager.zsh` | Exit 0: **`PROOF-OK: /transcript suspended into $PAGER and the child saw the transcript`**, 96 transcript bytes. The PTY driver now explicitly answers the real folder-trust prompt; production trust enforcement remains intact. |
+
+### Landed production behavior
+
+1. **Pinned provider catalog and managed authentication.** The exact bundled
+   Rust model catalog, Grok 4.6 defaults, provider metadata, vision routing,
+   remote discovery, managed login policy, browser/device authentication,
+   signed-token team pinning, lock-protected OAuth refresh, and durable refresh
+   rotation now connect to real provider selection without crossing account or
+   provider boundaries (`Sources/OpenGrokModels/DefaultModelsJSON.swift:14`;
+   `Sources/OpenGrokAuth/AuthManager.swift:381` and `:579`; Rust
+   `xai-grok-models/default_models.json:2`;
+   `xai-grok-shell/src/auth/config.rs:89` and `src/auth/manager.rs:674`).
+
+2. **Fail-closed authorization, filesystem mutation, and remote-media policy.**
+   Shell grants normalize CRLF before parsing, managed project policy and
+   folder trust cannot silently disappear, hook/plugin destinations and
+   session/worktree mutations resist symbolic links, and web/media fetches
+   reject noncanonical numeric addresses, private DNS resolutions, unsafe
+   redirects, cross-provider credentials, and prohibited ZDR video. The
+   security decisions are visible in the landed code itself
+   (`Sources/OpenGrokWorkspace/PermissionManager.swift:150`;
+   `Sources/OpenGrokFileTools/ApplyPatchTool.swift:797`;
+   `Sources/OpenGrokWebMediaTools/WebFetchAndMedia.swift:706`):
+
+   ```swift
+   command
+       .replacingOccurrences(of: "\r\n", with: "\n")
+       .replacingOccurrences(of: "\r", with: "\n")
+   ```
+
+   ```swift
+   openat(parent, $0, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+   ```
+
+3. **Rust-interoperable persistence without same-second stale search results.**
+   Memory and session search use the canonical Rust SQLite layouts, FTS5,
+   BLAKE3 hashes, owner-private storage, integer-second `session_docs`, and
+   foreign Codex/Claude session discovery. Exact source timestamp bit patterns
+   live in Rust's existing `meta` table rather than adding a Swift-only column
+   to the canonical six-column session table. This fixes same-second updates,
+   avoids reloading unchanged sessions forever, and deletes companion metadata
+   together with the session (`Sources/OpenGrokCLI/LiveSessionSearchIndex.swift:229`;
+   `Sources/OpenGrokCLI/LiveSessionSearchIndexSQLite.swift:149`; Rust
+   `xai-grok-shell/src/session/storage/search_fts.rs:9` and `:58`):
+
+   ```swift
+   old.sourceTimestampBits == candidate.updatedAt.timeIntervalSince1970.bitPattern
+   ```
+
+4. **Reachable MCP, plugins, and provider-isolated tools.** MCP negotiates the
+   pinned `2025-11-25` protocol, secure setup/CRUD, incremental SSE, bounded
+   correlated progress, and ACP reverse transport; real marketplace/plugin
+   lifecycle operations reject hostile source links. Standalone Codex models,
+   `web__run`, image attachment/output/edit references, authenticated image
+   generation, and privacy-gated video follow their actual authorization and
+   provider boundaries (`Sources/OpenGrokMCP/MCPModels.swift:17`;
+   `Sources/OpenGrokCLI/LivePluginComposition.swift:27`; Rust
+   `xai-grok-mcp/src/servers_tests.rs:1875`).
+
+5. **Live session, goal, agent, and terminal seams.** Goal-control tools,
+   opt-in compaction reminders, parent-to-subagent context, embedded ACP
+   resources, protected rewind/deletion, secure clipboard copy/paste,
+   dashboard startup, crash restoration, multiline/context-aware grep,
+   Markdown control-character filtering, CRLF stream framing, and Mermaid
+   class/ER/sequence diagrams now reach real runtime paths. The `/transcript`
+   suspend-into-`$PAGER` behavior was separately proven through an actual PTY,
+   including the production directory-trust prompt
+   (`Sources/OpenGrokMermaid/OpenGrokMermaid.swift:65`;
+   `workflows/verify-transcript-pager.zsh:60`).
+
+6. **Trace upload preserves explicit authorization and privacy.** The real
+   authenticated proxy path refuses uploads without explicit enablement,
+   enforces managed account/team and data-collection policy, and rejects
+   direct `gs://`/`s3://` destinations until scoped cloud credentials exist
+   (`Sources/OpenGrokCLI/LiveTraceUpload.swift:84`; Rust
+   `xai-grok-shell/src/agent/config.rs:529`):
+
+   ```swift
+   guard uploadEnabled else {
+       throw refusal("trace uploads have not been explicitly enabled")
+   }
+   ```
+
+### Honest remaining parity boundary
+
+**Complete Rust parity is not established.** Still absent are complete account
+privacy enrichment; planner/evaluator/strategist/skeptic orchestration and
+TodoGate; ACP queue synchronization, adaptive provider quotas, interactive
+subagent questions, and image interjections; an operational authenticated
+tools-callback server; PDF/PPTX extraction, recursive listing, and semantic
+LSP tools; multiple upstream slash commands, follow-up chips, model chooser
+and approval persistence; and additional Mermaid families/SVG actions.
+Linux enterprise certificate roots deliberately fail closed rather than widen
+process-global trust, and direct cloud-bucket trace upload deliberately remains
+unavailable. Native Linux execution, full current Windows runtime, Linux
+aarch64 updating, remote CI, signed distribution, and release certification
+were not verified. `PARITY_ROADMAP.md` records exact Rust citations and the
+LIVE / ABSENT / DIVERGED / UNVERIFIED classifications.
+
+## Historical upstream `.81` foundational closure (2026-08-22)
 
 The previous wave left three explicit gaps: ACP-hosted roots rejected peer wakeups, Windows lacked a session-bus transport, and the executable/fixture pin lagged the Rust checkout. Advancing to `538a16dfb6b5989d835bc1503b600b4d2be9aad6` also exposed provider-private streamed-tool policy, end-to-end nested progress, durable transport-secret isolation, SQLite contention, and Linux release artifacts. The production closures are:
 
