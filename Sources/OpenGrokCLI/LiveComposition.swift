@@ -3240,7 +3240,6 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         // `--tools` / `--disallowed-tools` are honored by
         // `LiveAgentToolPolicy.resolveLaunchPolicy` at tool-executor
         // construction — not refused here.
-        if options.restoreCode { return "--restore-code" }
         if options.advanced.reauthenticate { return "--reauth" }
         if let storageMode = options.advanced.storageMode, storageMode != "local" {
             return "--storage-mode"
@@ -3292,24 +3291,6 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         if options.chat {
             throw CLIApplicationError.unsupported(
                 route: "--chat gateway frontend, which is unavailable in this build"
-            )
-        }
-        // `--restore-code` gets its own message because the generic one is
-        // actively misleading now that rewind exists: a user who has seen
-        // `/rewind` work will reasonably read "not honored yet" as "code
-        // restoration is missing", when in fact it is present and this flag
-        // means something else. Rust's `--restore-code` checks out the git
-        // commit the session was pinned to; the rewind store restores file
-        // snapshots. Same intent, different mechanism, and silently serving one
-        // when the user asked for the other would be the wrong answer rather
-        // than a missing one.
-        if options.restoreCode {
-            throw CLIApplicationError.unsupported(
-                route: """
-                --restore-code, which checks out the session's git commit — \
-                not ported. To undo edits made in a session, resume it and use \
-                /rewind, which restores files from per-prompt snapshots
-                """
             )
         }
         if let flag = unhonoredLaunchFlag(options) {
@@ -3639,6 +3620,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             invocationWorkingDirectory: invocationCwd,
             openGrokHome: openGrokHome
         )
+        let restoreSource = try await LiveRestoreCodeLaunch.capture(
+            options: options,
+            workingDirectory: sourceCwd,
+            openGrokHome: openGrokHome
+        )
         let autoGCPolicy = WorktreeAutoGCPolicy(
             enabled: GrokEnvGates.worktreeAutoGc(environment: context.environment) ?? true,
             maxAge: GrokEnvGates.worktreeAutoGcMaxAge(environment: context.environment)
@@ -3678,6 +3664,13 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let conversationStore = LiveConversationStore(openGrokHome: openGrokHome)
         var conversationRecord: LiveConversationRecord
         do {
+            try LiveRestoreCodeLaunch.restore(
+                options: options,
+                source: restoreSource,
+                workingDirectory: cwd,
+                preparation: worktreePreparation,
+                openGrokHome: openGrokHome
+            )
             conversationRecord = try await resolveConversationRecord(
                 options: options,
                 lookupWorkingDirectory: sourceCwd,

@@ -21,6 +21,9 @@ enum LiveWorktreeLaunch {
                 "--fork-session cannot be combined with --worktree"
             )
         }
+        if options.restoreCode {
+            try LiveRestoreCodeLaunch.preparePrivateManagedPool(openGrokHome: openGrokHome)
+        }
 
         let identity = try discoverGitRepo(at: sourceDirectory)
         guard let sourceRoot = identity.toplevel else {
