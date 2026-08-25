@@ -247,6 +247,59 @@ private struct ManagedSetupFixture {
 
 @Suite("live managed setup security and Rust CLI parity", .serialized)
 struct LiveManagedSetupParityTests {
+    @Test("production managed setup preserves its exact 15-second transport deadlines")
+    func productionTransportRetainsManagedSetupTimeouts() {
+        let transport = LiveManagedSetupServices.makeProductionTransport(
+            configuration: HTTPTransportConfiguration(
+                connectTimeout: 15,
+                requestTimeout: 15,
+                tls: HTTPTLSConfiguration(extraRootCertificates: [])
+            )
+        )
+        let snapshot = transport.appliedConfigurationSnapshot
+
+        #expect(snapshot.connectTimeout == 15)
+        #expect(snapshot.requestTimeout == 15)
+        #expect(snapshot.tlsExtraRootCertificateCount == 0)
+    }
+
+    #if os(Linux) || os(Windows)
+    @Test("malformed enterprise roots reject managed enrollment before bearer-bearing network I/O")
+    func malformedEnterpriseRootFailsClosedBeforeManagedEnrollment() async throws {
+        let enrollmentSecret = "managed-enrollment-must-never-egress"
+        let configuration = HTTPTransportConfiguration(
+            connectTimeout: 15,
+            requestTimeout: 15,
+            tls: HTTPTLSConfiguration(extraRootCertificates: [Data("invalid-root".utf8)])
+        )
+        let transport = LiveManagedSetupServices.makeProductionTransport(
+            configuration: configuration
+        )
+        let snapshot = transport.appliedConfigurationSnapshot
+        let endpoint = try #require(URL(string: "https://127.0.0.1:1/v1/deployment/config"))
+
+        #expect(snapshot.connectTimeout == 15)
+        #expect(snapshot.requestTimeout == 15)
+        #expect(snapshot.tlsExtraRootCertificateCount == 1)
+
+        do {
+            _ = try await transport.send(HTTPRequest(
+                method: .get,
+                url: endpoint,
+                headers: ["Authorization": "Bearer \(enrollmentSecret)"]
+            ))
+            Issue.record("malformed enterprise roots unexpectedly authorized enrollment")
+        } catch let error as HTTPError {
+            guard case .transport(let failure) = error else {
+                Issue.record("expected a permanent trust refusal, got \(error)")
+                return
+            }
+            #expect(failure.kind == .permanent)
+            #expect(!failure.detail.contains(enrollmentSecret))
+        }
+    }
+    #endif
+
     @Test("production setup redirects are rejected before credentials can leave the trusted host")
     func productionRedirectDelegateFailsClosedAcrossFoundationImplementations() async throws {
         let trustedURL = try #require(URL(string: "https://cli-chat-proxy.grok.com/v1/deployment/config"))

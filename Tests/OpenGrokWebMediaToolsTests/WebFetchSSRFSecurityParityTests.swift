@@ -457,6 +457,58 @@ struct WebFetchSSRFSecurityParityTests {
         #expect(rejected)
     }
 
+    #if os(Linux) || os(Windows)
+    @Test("Enterprise trust roots remain owned by the first-party fetch transport")
+    func enterpriseTrustConfigurationIsPreserved() throws {
+        let root = Data([0x30, 0x03, 0x02, 0x01, 0x00])
+        let configuration = HTTPTransportConfiguration(
+            userAgent: "enterprise-fetch",
+            proxy: HTTPProxyConfiguration(host: "proxy.example", port: 8443),
+            tls: HTTPTLSConfiguration(extraRootCertificates: [root]),
+            additionalHeaders: ["Authorization": "Bearer private-fetch-token"]
+        )
+        let client = WebFetchClient(
+            params: WebFetchParams(allowedDomains: ["docs.example"]),
+            transport: URLSessionHTTPTransport(configuration: configuration)
+        )
+        let transport = try #require(client.transport as? URLSessionHTTPTransport)
+
+        #expect(transport.configuration.tls.extraRootCertificates == [root])
+        #expect(transport.configuration.userAgent == "enterprise-fetch")
+        #expect(transport.configuration.additionalHeaders["Authorization"] == "Bearer private-fetch-token")
+        #expect(transport.appliedConfigurationSnapshot.proxyHost == "proxy.example")
+        #expect(transport.appliedConfigurationSnapshot.proxyPort == 8443)
+        #expect(transport.appliedConfigurationSnapshot.tlsExtraRootCertificateCount == 1)
+    }
+
+    @Test("Malformed enterprise roots fail closed before fetch credentials can leave")
+    func malformedEnterpriseRootsFailBeforeCredentialEgress() async throws {
+        let configuration = HTTPTransportConfiguration(
+            tls: HTTPTLSConfiguration(extraRootCertificates: [Data("not-a-certificate".utf8)]),
+            additionalHeaders: ["Authorization": "Bearer private-fetch-token"]
+        )
+        let client = WebFetchClient(
+            params: WebFetchParams(allowedDomains: ["docs.example"]),
+            transport: URLSessionHTTPTransport(configuration: configuration)
+        )
+        let request = HTTPRequest(
+            method: .get,
+            url: try #require(URL(string: "https://127.0.0.1:9/private")),
+            headers: ["Authorization": "Bearer private-fetch-token"]
+        )
+
+        do {
+            let output = try await client.transport.send(request)
+            Issue.record("Malformed enterprise root unexpectedly returned \(output)")
+        } catch HTTPError.transport(let failure) {
+            #expect(failure.kind == .permanent)
+            #expect(!failure.detail.contains("private-fetch-token"))
+        } catch {
+            Issue.record("Expected permanent enterprise trust rejection, received \(error)")
+        }
+    }
+    #endif
+
     @Test("Configured authenticated proxy is applied to the fetch transport")
     func appliesConfiguredProxy() throws {
         let client = WebFetchClient(

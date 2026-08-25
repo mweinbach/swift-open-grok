@@ -37,18 +37,31 @@ public struct LiveManagedSetupServices: Sendable {
     }
 
     public static let production = LiveManagedSetupServices(
-        makeTransport: {
-            let configuration = URLSessionConfiguration.ephemeral
-            configuration.timeoutIntervalForRequest = 15
-            configuration.timeoutIntervalForResource = 15
-            let session = URLSession(
-                configuration: configuration,
-                delegate: ManagedSetupNoRedirectDelegate(),
-                delegateQueue: nil
-            )
-            return URLSessionHTTPTransport(session: session)
-        }
+        makeTransport: { makeProductionTransport() }
     )
+
+    static func makeProductionTransport(
+        configuration: HTTPTransportConfiguration = HTTPTransportConfiguration(
+            connectTimeout: 15,
+            requestTimeout: 15
+        )
+    ) -> URLSessionHTTPTransport {
+        #if os(Linux) || os(Windows)
+        if !configuration.tls.extraRootCertificates.isEmpty {
+            return URLSessionHTTPTransport(configuration: configuration)
+        }
+        #endif
+
+        let sessionConfiguration = HTTPSessionConfigurationBuilder.makeEphemeral(configuration)
+        sessionConfiguration.timeoutIntervalForRequest = 15
+        sessionConfiguration.timeoutIntervalForResource = 15
+        let session = URLSession(
+            configuration: sessionConfiguration,
+            delegate: ManagedSetupNoRedirectDelegate(),
+            delegateQueue: nil
+        )
+        return URLSessionHTTPTransport(configuration: configuration, session: session)
+    }
 }
 
 public enum LiveManagedSetupOutcome: Sendable, Equatable {

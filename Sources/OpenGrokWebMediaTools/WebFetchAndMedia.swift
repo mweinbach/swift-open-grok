@@ -463,17 +463,34 @@ public struct WebFetchClient: Sendable {
         if let sessionTransport = transport as? URLSessionHTTPTransport {
             var configuration = sessionTransport.configuration
             if let configuredProxy { configuration.proxy = configuredProxy }
-            let session = URLSession(
-                configuration: HTTPSessionConfigurationBuilder.makeEphemeral(configuration),
-                delegate: WebFetchNoRedirectDelegate(configuration: configuration),
-                delegateQueue: nil
-            )
-            self.transport = URLSessionHTTPTransport(configuration: configuration, session: session)
+            #if os(Linux) || os(Windows)
+            if !configuration.tls.extraRootCertificates.isEmpty {
+                // An injected session bypasses the transport's platform trust gate.
+                // Its owned Linux backend already disables automatic redirects;
+                // unsupported Windows trust fails before network dispatch.
+                self.transport = URLSessionHTTPTransport(configuration: configuration)
+            } else {
+                self.transport = Self.makeNoRedirectTransport(configuration)
+            }
+            #else
+            self.transport = Self.makeNoRedirectTransport(configuration)
+            #endif
         } else {
             self.transport = transport
         }
         self.artifactDirectory = artifactDirectory ?? Self.defaultArtifactDirectory(environment: environment)
         self.cache = WebFetchCache(ttl: params.cacheTTL, capacity: params.cacheEntryLimit)
+    }
+
+    private static func makeNoRedirectTransport(
+        _ configuration: HTTPTransportConfiguration
+    ) -> URLSessionHTTPTransport {
+        let session = URLSession(
+            configuration: HTTPSessionConfigurationBuilder.makeEphemeral(configuration),
+            delegate: WebFetchNoRedirectDelegate(configuration: configuration),
+            delegateQueue: nil
+        )
+        return URLSessionHTTPTransport(configuration: configuration, session: session)
     }
 
     public static func defaultArtifactDirectory(
