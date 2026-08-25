@@ -142,14 +142,24 @@ private struct FolderTrustPromptFixture {
     init(git: Bool = true, executableConfiguration: Bool = true) throws {
         let temporary = FileManager.default.temporaryDirectory
             .appendingPathComponent("open-grok-trust-prompt-\(UUID().uuidString)")
+        #if os(Windows)
+        try OpenGrokConfig.createDirAllOwnerOnly(temporary, stateRoot: temporary)
+        #else
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+        #endif
         root = temporary.standardizedFileURL.resolvingSymlinksInPath()
         home = root.appendingPathComponent("owner")
         ownerState = home.appendingPathComponent(".opengrok")
         workspace = root.appendingPathComponent("workspace")
+        #if os(Windows)
+        try OpenGrokConfig.createDirAllOwnerOnly(home, stateRoot: root)
+        try OpenGrokConfig.createDirAllOwnerOnly(ownerState, stateRoot: ownerState)
+        try OpenGrokConfig.createDirAllOwnerOnly(workspace, stateRoot: root)
+        #else
         for directory in [ownerState, workspace] {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         }
+        #endif
         if git {
             let initialized = try runGit(["init", "--quiet"], cwd: workspace)
             guard initialized.exitCode == 0 else {
@@ -460,8 +470,29 @@ struct LiveFolderTrustPromptParityTests {
         await input?.close()
 
         let persisted = try String(contentsOf: fixture.trustPath, encoding: .utf8)
+        #if os(Windows)
+        let document = try parseTOML(persisted)
+        guard case .table(let documentRoot) = document,
+              case .table(let folders)? = documentRoot["folders"]
+        else {
+            Issue.record("folder-trust store did not contain a readable folders table")
+            return
+        }
+        let normalizePath = { (path: String) in
+            URL(fileURLWithPath: path, isDirectory: true)
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+                .path
+                .replacingOccurrences(of: "\\", with: "/")
+                .lowercased()
+        }
+        let persistedRoots = folders.pairs.map { normalizePath($0.0) }
+        #expect(persistedRoots.contains(normalizePath(fixture.workspace.path)))
+        #expect(!persistedRoots.contains(normalizePath(nested.path)))
+        #else
         #expect(persisted.contains(fixture.workspace.path))
         #expect(!persisted.contains(nested.path))
+        #endif
         #expect(PersistentFolderTrustStore(environment: fixture.environment).isTrusted(nested))
     }
 
