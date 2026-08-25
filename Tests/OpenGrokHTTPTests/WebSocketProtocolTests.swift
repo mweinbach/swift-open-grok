@@ -46,14 +46,14 @@ struct WebSocketSHA1Tests {
 @Suite("WebSocket handshake")
 struct WebSocketHandshakeTests {
     @Test func computesTheAcceptToken() {
-        // Goldens computed with an independent SHA-1 (Python `hashlib`) over
-        // `key + WebSocketHandshake.magicGUID`, so this pins the derivation
-        // against something other than the implementation under test.
+        // The first pair is RFC 6455 §1.3's published interoperability vector.
+        // Hashing against this implementation's GUID would also bless a typo
+        // shared by the Swift client and server while every real peer refused it.
         #expect(WebSocketHandshake.acceptToken(forKey: "dGhlIHNhbXBsZSBub25jZQ==")
-            == "7NQHw21/u2y5o3iigl/YosUutlE=")
+            == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
         #expect(WebSocketHandshake.acceptToken(forKey: "x3JJHMbDL1EzLkh9GBhXDw==")
-            == "NDr7YQKnBMADxvXsIVpb/rafc98=")
-        #expect(WebSocketHandshake.magicGUID == "258EAFA5-E914-47DA-95CA-5AB0DC85B11D")
+            == "HSmrc0sMlYUkAGmm5OPpG2HaGWk=")
+        #expect(WebSocketHandshake.magicGUID == "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
     }
 
     @Test func parsesARequestHeadAndReportsBytesConsumed() throws {
@@ -129,7 +129,21 @@ struct WebSocketHandshakeTests {
 
     @Test func validatesAWellFormedUpgrade() throws {
         let accept = try WebSocketHandshake.validateUpgrade(request(), expectedPath: "/ws")
-        #expect(accept == "7NQHw21/u2y5o3iigl/YosUutlE=")
+        #expect(accept == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+    }
+
+    @Test func matchesPinnedRustTungsteniteHandshakeVector() throws {
+        let accept = try WebSocketHandshake.validateUpgrade(
+            request(key: "x3JJHMbDL1EzLkh9GBhXDw=="),
+            expectedPath: "/ws"
+        )
+        #expect(accept == "HSmrc0sMlYUkAGmm5OPpG2HaGWk=")
+
+        let response = String(
+            decoding: WebSocketHandshake.acceptResponse(accept: accept),
+            as: UTF8.self
+        )
+        #expect(response.contains("Sec-WebSocket-Accept: HSmrc0sMlYUkAGmm5OPpG2HaGWk=\r\n"))
     }
 
     @Test func acceptsAConnectionHeaderWithMultipleTokens() throws {
@@ -138,7 +152,7 @@ struct WebSocketHandshakeTests {
             request(connection: "keep-alive, Upgrade"),
             expectedPath: "/ws"
         )
-        #expect(accept == "7NQHw21/u2y5o3iigl/YosUutlE=")
+        #expect(accept == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
     }
 
     @Test func rejectsABadKey() {
@@ -187,12 +201,12 @@ struct WebSocketHandshakeTests {
     }
 
     @Test func rendersTheAcceptResponseVerbatim() {
-        let bytes = WebSocketHandshake.acceptResponse(accept: "7NQHw21/u2y5o3iigl/YosUutlE=")
+        let bytes = WebSocketHandshake.acceptResponse(accept: "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
         let text = String(decoding: bytes, as: UTF8.self)
         #expect(text == "HTTP/1.1 101 Switching Protocols\r\n"
             + "Upgrade: websocket\r\n"
             + "Connection: Upgrade\r\n"
-            + "Sec-WebSocket-Accept: 7NQHw21/u2y5o3iigl/YosUutlE=\r\n\r\n")
+            + "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
     }
 
     @Test func rendersRejectionsWithTheRightStatusAndBody() {

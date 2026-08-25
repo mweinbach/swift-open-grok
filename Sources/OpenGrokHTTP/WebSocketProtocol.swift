@@ -616,7 +616,7 @@ public struct WebSocketHandshakeRequest: Sendable, Hashable {
 
 public enum WebSocketHandshake {
     /// RFC 6455 §1.3.
-    public static let magicGUID = "258EAFA5-E914-47DA-95CA-5AB0DC85B11D"
+    public static let magicGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
     /// `base64(SHA1(key + GUID))`.
     public static func acceptToken(forKey key: String) -> String {
