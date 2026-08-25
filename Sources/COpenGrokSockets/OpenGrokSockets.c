@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "OpenGrokSockets.h"
 
 #include <errno.h>
@@ -129,6 +133,17 @@ static int og_set_nonblocking(SOCKET socket_value, int enabled) {
     return ioctlsocket(socket_value, FIONBIO, &mode);
 }
 
+static SOCKET og_create_socket(int family, int type, int protocol) {
+    return WSASocketW(
+        family,
+        type,
+        protocol,
+        NULL,
+        0,
+        WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT
+    );
+}
+
 #else
 
 static int og_socket_value(OGSocketHandle handle) {
@@ -147,6 +162,30 @@ static int og_set_nonblocking(int socket_value, int enabled) {
     int flags = fcntl(socket_value, F_GETFL, 0);
     if (flags < 0) return -1;
     return fcntl(socket_value, F_SETFL, enabled ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK));
+}
+
+#if !defined(__linux__) || !defined(SOCK_CLOEXEC)
+static int og_set_close_on_exec(int socket_value) {
+    int flags = fcntl(socket_value, F_GETFD, 0);
+    if (flags < 0) return -1;
+    return fcntl(socket_value, F_SETFD, flags | FD_CLOEXEC);
+}
+#endif
+
+static int og_create_socket(int family, int type, int protocol) {
+#ifdef SOCK_CLOEXEC
+    return socket(family, type | SOCK_CLOEXEC, protocol);
+#else
+    int socket_value = socket(family, type, protocol);
+    if (socket_value < 0) return -1;
+    if (og_set_close_on_exec(socket_value) != 0) {
+        int error = errno;
+        close(socket_value);
+        errno = error;
+        return -1;
+    }
+    return socket_value;
+#endif
 }
 
 #endif
@@ -295,7 +334,7 @@ int og_socket_tcp_listen(
     int result = -1;
     for (struct addrinfo *entry = results; entry; entry = entry->ai_next) {
 #ifdef _WIN32
-        SOCKET socket_value = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
+        SOCKET socket_value = og_create_socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
         if (socket_value == INVALID_SOCKET) continue;
         BOOL exclusive = TRUE;
         setsockopt(
@@ -316,7 +355,7 @@ int og_socket_tcp_listen(
             continue;
         }
 #else
-        int socket_value = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
+        int socket_value = og_create_socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
         if (socket_value < 0) continue;
         int reuse = 1;
         setsockopt(socket_value, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -379,11 +418,11 @@ int og_socket_tcp_connect(
     int result = -1;
     for (struct addrinfo *entry = results; entry; entry = entry->ai_next) {
 #ifdef _WIN32
-        SOCKET socket_value = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
+        SOCKET socket_value = og_create_socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
         if (socket_value == INVALID_SOCKET) continue;
         OGSocketHandle candidate = og_socket_handle(socket_value);
 #else
-        int socket_value = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
+        int socket_value = og_create_socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
         if (socket_value < 0) continue;
         OGSocketHandle candidate = og_socket_handle(socket_value);
 #endif
@@ -431,7 +470,7 @@ int og_socket_unix_listen(const char *path, OGSocketHandle *handle) {
     struct sockaddr_un address;
     socklen_t length;
     if (og_fill_unix_address(path, &address, &length) != 0) return -1;
-    int socket_value = socket(AF_UNIX, SOCK_STREAM, 0);
+    int socket_value = og_create_socket(AF_UNIX, SOCK_STREAM, 0);
     if (socket_value < 0) {
         og_set_system_error(NULL);
         return -1;
@@ -457,7 +496,7 @@ int og_socket_unix_connect(
     struct sockaddr_un address;
     socklen_t length;
     if (og_fill_unix_address(path, &address, &length) != 0) return -1;
-    int socket_value = socket(AF_UNIX, SOCK_STREAM, 0);
+    int socket_value = og_create_socket(AF_UNIX, SOCK_STREAM, 0);
     if (socket_value < 0) {
         og_set_system_error(NULL);
         return -1;
@@ -510,12 +549,31 @@ int og_socket_accept(OGSocketHandle listener, OGSocketHandle *handle) {
         og_set_system_error(NULL);
         return -1;
     }
+    if (!SetHandleInformation((HANDLE)(uintptr_t)accepted, HANDLE_FLAG_INHERIT, 0)) {
+        DWORD error = GetLastError();
+        closesocket(accepted);
+        og_set_error((int)error, "could not prevent accepted socket inheritance");
+        return -1;
+    }
+#else
+#if defined(__linux__) && defined(SOCK_CLOEXEC)
+    int accepted = accept4(og_socket_value(listener), NULL, NULL, SOCK_CLOEXEC);
 #else
     int accepted = accept(og_socket_value(listener), NULL, NULL);
+#endif
     if (accepted < 0) {
         og_set_system_error(NULL);
         return -1;
     }
+#if !defined(__linux__) || !defined(SOCK_CLOEXEC)
+    if (og_set_close_on_exec(accepted) != 0) {
+        int error = errno;
+        close(accepted);
+        errno = error;
+        og_set_system_error("could not prevent accepted socket inheritance");
+        return -1;
+    }
+#endif
 #endif
     og_disable_sigpipe(og_socket_handle(accepted));
     *handle = og_socket_handle(accepted);
