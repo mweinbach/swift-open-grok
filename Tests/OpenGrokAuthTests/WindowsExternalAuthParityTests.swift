@@ -46,10 +46,10 @@ struct WindowsExternalAuthParityTests {
 
     @Test("explicit executable arguments bypass the Windows command-string wrapper")
     func explicitArgumentsRemainDirect() throws {
-        let commandInterpreter = try #require(commandInterpreter())
+        let interpreter = try #require(commandInterpreter())
         let execution = try #require(
             DefaultExternalAuthProcessRunner().run(
-                command: commandInterpreter,
+                command: interpreter,
                 args: ["/C", "echo direct-provider-token"],
                 cwd: nil,
                 timeout: 10,
@@ -122,8 +122,8 @@ struct WindowsExternalAuthParityTests {
 
     @Test("timed-out direct Windows helpers are terminated within their bounded budget")
     func timeoutTerminatesDirectProviderProcess() throws {
-        let commandInterpreter = try #require(commandInterpreter())
-        let powershell = URL(fileURLWithPath: commandInterpreter)
+        let interpreter = try #require(commandInterpreter())
+        let powershell = URL(fileURLWithPath: interpreter)
             .deletingLastPathComponent()
             .appendingPathComponent("WindowsPowerShell", isDirectory: true)
             .appendingPathComponent("v1.0", isDirectory: true)
