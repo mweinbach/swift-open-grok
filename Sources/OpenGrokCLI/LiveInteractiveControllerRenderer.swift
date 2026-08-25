@@ -198,6 +198,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     var dashboardInputText = ""
     var dashboardDispatchWorkingDirectory: String
     var dashboardWorktreeEnabled = false
+    var pendingDashboardStartup = false
     /// The active-only divergence still keeps the dashboard visible for a
     /// send-without-open: the session switch replaces the transcript but the
     /// roster remains foregrounded and follows the new active tab.
@@ -1431,7 +1432,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         let env = environment
         let manager = AuthManager(
             grokHome: openGrokHome,
-            config: GrokComConfig.default(environment: env),
+            config: liveManagedAuthenticationConfiguration(environment: env),
             environment: env
         )
         let auth = await manager.currentOrExpired()
@@ -2399,7 +2400,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         }
         if let clipboard = outcome.clipboard {
             do {
-                try LivePagerClipboard.copy(clipboard) { data in
+                try LivePagerClipboard.copy(clipboard, environment: environment) { data in
                     try sink.write(String(decoding: data, as: UTF8.self))
                 }
                 try sink.flush()
@@ -2688,7 +2689,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         let env = environment
         let manager = AuthManager(
             grokHome: openGrokHome,
-            config: GrokComConfig.default(environment: env),
+            config: liveManagedAuthenticationConfiguration(environment: env),
             environment: env
         )
         let transport = authServices.makeTransport()
@@ -3242,7 +3243,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     func performXAILogout() async {
         let manager = AuthManager(
             grokHome: openGrokHome,
-            config: GrokComConfig.default(environment: environment),
+            config: liveManagedAuthenticationConfiguration(environment: environment),
             environment: environment
         )
         let result: LogoutResult
@@ -3412,7 +3413,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
         case .overlay(let overlay):
             overlays.push(overlay)
         case .rewound(let targetPromptIndex, _, let summary):
-            await commitRewind(toPromptIndex: targetPromptIndex, summary: summary)
+            await commitCanonicalRewind(toPromptIndex: targetPromptIndex, summary: summary)
         }
     }
 
@@ -3425,36 +3426,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     /// already moved and a session whose history disagrees with its working tree
     /// is worse than one that says so.
     func commitRewind(toPromptIndex targetPromptIndex: Int, summary: String) async {
-        note(summary)
-        guard let conversationHistory else { return }
-        let sessionDir = openGrokHome.appendingPathComponent("sessions").appendingPathComponent(sessionID)
-        let truncated = liveTruncateConversation(
-            await conversationHistory.items,
-            toPromptIndex: targetPromptIndex,
-            sessionDir: sessionDir
-        )
-        do {
-            try await conversationHistory.commit(sessionID: sessionID, items: truncated)
-        } catch {
-            appendMessage(PagerMessage(
-                role: .error,
-                text: "Files were restored, but the conversation could not be truncated: \(error)"
-            ))
-            return
-        }
-        let marker = SessionUpdateRecord.rewindMarker(targetPromptIndex: targetPromptIndex)
-        if let data = try? JSONEncoder().encode(marker),
-           let line = String(data: data, encoding: .utf8) {
-            let updatesURL = sessionDir.appendingPathComponent("updates.jsonl")
-            if let handle = try? FileHandle(forWritingTo: updatesURL) {
-                handle.seekToEndOfFile()
-                if let lineData = (line + "\n").data(using: .utf8) {
-                    handle.write(lineData)
-                }
-                try? handle.close()
-            }
-        }
-        truncateRenderedTranscript(toPromptIndex: targetPromptIndex)
+        await commitCanonicalRewind(toPromptIndex: targetPromptIndex, summary: summary)
     }
 
     /// `/delete` — remove this session's stored transcript.
@@ -3472,6 +3444,15 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             overlays.push(LiveSessionDeleteConfirmation.overlay(
                 sessionID: sessionID,
                 itemCount: await conversationHistory?.items.count ?? 0
+            ))
+            return
+        }
+        do {
+            try await prepareLiveSessionDeletion()
+        } catch {
+            appendMessage(PagerMessage(
+                role: .error,
+                text: "Could not stop the active session, so nothing was deleted: \(error)"
             ))
             return
         }
@@ -3689,7 +3670,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
     func deliver(_ text: String, to filePath: String?, label: String) throws {
         guard let filePath, !filePath.isEmpty else {
             do {
-                try LivePagerClipboard.copy(text) { data in
+                try LivePagerClipboard.copy(text, environment: environment) { data in
                     try sink.write(String(decoding: data, as: UTF8.self))
                 }
                 try sink.flush()
@@ -4236,7 +4217,7 @@ actor LiveInteractiveControllerRenderer: OpenGrokPagerInteractiveRenderAdapter {
             case .overlay(let overlay):
                 overlays.push(overlay)
             case .rewound(let index, _, let summary):
-                await commitRewind(toPromptIndex: index, summary: summary)
+                await commitCanonicalRewind(toPromptIndex: index, summary: summary)
             }
         default:
             break

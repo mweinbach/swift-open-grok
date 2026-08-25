@@ -45,8 +45,21 @@ struct LivePagerAuthServices: Sendable {
     /// The xAI browser + local-callback OAuth flow. Defaulted so existing
     /// memberwise constructions (tests with inert codex flows) keep building.
     var xaiBrowserLogin: XAILoginFlow = { manager, environment, transport, openBrowser in
-        try await loginXAIBrowser(
-            manager: manager,
+        let trustedConfiguration = try LiveAuthComposition.effectiveGrokComConfig(
+            environment: environment
+        )
+        let trustedManager: AuthManager
+        if await manager.grokComConfig == trustedConfiguration {
+            trustedManager = manager
+        } else {
+            trustedManager = AuthManager(
+                grokHome: OpenGrokHomeResolver.resolve(environment: environment),
+                config: trustedConfiguration,
+                environment: environment
+            )
+        }
+        return try await loginXAIBrowser(
+            manager: trustedManager,
             environment: environment,
             transport: transport,
             openBrowser: openBrowser

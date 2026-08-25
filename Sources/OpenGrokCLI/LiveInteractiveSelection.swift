@@ -639,7 +639,7 @@ extension LiveInteractiveControllerRenderer {
 
     func copyTextSelectionToClipboard(_ text: String) {
         do {
-            try LivePagerClipboard.copy(text) { data in
+            try LivePagerClipboard.copy(text, environment: environment) { data in
                 try sink.write(String(decoding: data, as: UTF8.self))
             }
             try sink.flush()

@@ -110,7 +110,7 @@ struct ClaudeSessionScannerTests {
         defer { dispose(configDir) }
         let projectDir = configDir
             .appendingPathComponent("projects", isDirectory: true)
-            .appendingPathComponent("test-project", isDirectory: true)
+            .appendingPathComponent("-work-repo", isDirectory: true)
         try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
         let sessionID = UUID().uuidString
         let sessionFile = projectDir.appendingPathComponent("\(sessionID).jsonl")
@@ -139,7 +139,7 @@ struct ClaudeSessionScannerTests {
         defer { dispose(configDir) }
         let projectDir = configDir
             .appendingPathComponent("projects", isDirectory: true)
-            .appendingPathComponent("proj", isDirectory: true)
+            .appendingPathComponent("-work-repo", isDirectory: true)
         try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
         let sessionID = UUID().uuidString
         let sessionFile = projectDir.appendingPathComponent("\(sessionID).jsonl")
@@ -158,7 +158,7 @@ struct ClaudeSessionScannerTests {
         defer { dispose(configDir) }
         let projectDir = configDir
             .appendingPathComponent("projects", isDirectory: true)
-            .appendingPathComponent("proj", isDirectory: true)
+            .appendingPathComponent("-work-repo", isDirectory: true)
         try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
         let sessionID = UUID().uuidString
         let sessionFile = projectDir.appendingPathComponent("\(sessionID).jsonl")
@@ -181,7 +181,7 @@ struct ClaudeSessionScannerTests {
         defer { dispose(configDir) }
         let projectDir = configDir
             .appendingPathComponent("projects", isDirectory: true)
-            .appendingPathComponent("proj", isDirectory: true)
+            .appendingPathComponent("-work-repo", isDirectory: true)
         try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
         let sessionFile = projectDir.appendingPathComponent("not-a-uuid.jsonl")
         try "{\"cwd\":\"/work/repo\"}\n".write(to: sessionFile, atomically: true, encoding: .utf8)
@@ -199,7 +199,7 @@ struct ClaudeSessionScannerTests {
         defer { dispose(configDir) }
         let projectDir = configDir
             .appendingPathComponent("projects", isDirectory: true)
-            .appendingPathComponent("proj", isDirectory: true)
+            .appendingPathComponent("-work-repo", isDirectory: true)
         try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
         let sessionID = UUID().uuidString
         let sessionFile = projectDir.appendingPathComponent("\(sessionID).jsonl")
@@ -250,7 +250,7 @@ struct ClaudeSessionScannerTests {
         defer { dispose(configDir) }
         let projectDir = configDir
             .appendingPathComponent("projects", isDirectory: true)
-            .appendingPathComponent("proj", isDirectory: true)
+            .appendingPathComponent("-work-repo", isDirectory: true)
         try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
         let sessionID = UUID().uuidString
         let sessionFile = projectDir.appendingPathComponent("\(sessionID).jsonl")

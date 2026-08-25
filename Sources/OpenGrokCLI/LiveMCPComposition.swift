@@ -13,10 +13,14 @@
 // integration slice owns.
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import OpenGrokACPRuntime
 import OpenGrokConfig
 import OpenGrokConfigTypes
 import OpenGrokComputerHubMCPAdapter
+import OpenGrokFileUtils
 import OpenGrokHTTP
 import OpenGrokMCP
 import OpenGrokShared
@@ -757,7 +761,9 @@ public enum LiveMCPComposition {
     /// `x.ai/mcp/auth_trigger` ext method (xai-grok-shell/src/extensions/
     /// mcp.rs:40,1526-1578 → `force_reauth(true)`), which has no ACP surface
     /// in this port.
-    public static let actions: Set<String> = ["list", "get", "add", "remove", "login"]
+    public static let actions: Set<String> = [
+        "list", "get", "add", "remove", "enable", "disable", "doctor", "login",
+    ]
 
     public static func handles(_ command: CLICommand) -> Bool {
         if case .mcp = command { return true }
@@ -803,7 +809,10 @@ public enum LiveMCPComposition {
         managedMCPPolicy: ManagedMCPPolicy? = nil
     ) async -> [MCPServerConnection] {
         guard let document else { return [] }
-        let loaded = MCPConfigLoader.load(from: document)
+        let preferences = userGrokHome(environment: environment).map {
+            MCPSetupPreferencesStore.load(home: $0).file
+        }
+        let loaded = MCPConfigLoader.load(from: document, preferences: preferences)
 
         var results: [MCPServerConnection] = loaded.problems.map {
             MCPServerConnection(name: $0.server, failure: $0.message)
@@ -848,7 +857,10 @@ public enum LiveMCPComposition {
             environment: environment,
             isInteractive: false
         )
-        let loaded = MCPConfigLoader.load(from: security.document)
+        let preferences = userGrokHome(environment: environment).map {
+            MCPSetupPreferencesStore.load(home: $0).file
+        }
+        let loaded = MCPConfigLoader.load(from: security.document, preferences: preferences)
         let disabledServers = disabledMCPServers(in: security.document)
 
         var entries: [HubMCPClientEntry] = []
@@ -1057,6 +1069,16 @@ public enum LiveMCPComposition {
             try runAdd(options: options, environment: environment, streams: streams)
         case "remove":
             try runRemove(options: options, environment: environment, streams: streams)
+        case "enable":
+            try runSetEnabled(
+                options: options, enabled: true, environment: environment, streams: streams
+            )
+        case "disable":
+            try runSetEnabled(
+                options: options, enabled: false, environment: environment, streams: streams
+            )
+        case "doctor":
+            try runDoctor(options: options, environment: environment, streams: streams)
         case "login":
             // Reachable only through `CLIRunner.main`'s synchronous seam; the
             // executable's async path dispatches login in `session` above.
@@ -1094,7 +1116,11 @@ public enum LiveMCPComposition {
         guard let name = options.target, !name.isEmpty else {
             throw CLIApplicationError.failed("`mcp login` needs a server name")
         }
-        let loaded = try loadDeclarations(environment: environment, cwd: cwd)
+        let loaded = try loadDeclarations(
+            environment: environment,
+            cwd: workingDirectory(options: options, fallback: cwd),
+            options: options
+        )
         guard let declaration = loaded.servers.first(where: { $0.name == name }) else {
             let known = loaded.servers.map(\.name).sorted()
             throw CLIApplicationError.failed(
@@ -1169,21 +1195,105 @@ public enum LiveMCPComposition {
 
     // MARK: add / remove
 
-    /// The config file `add` / `remove` edit.
-    ///
-    /// Upstream picks between user and project scope with `--scope`
-    /// (`mcp_cmd.rs:478`, `scope_target`). This CLI's resource parser has no
-    /// `--scope` flag, so the default is user scope and `--config <path>`
-    /// selects an explicit file instead.
+    /// Resolve the session cwd instead of silently falling back to the host
+    /// process cwd when a root-level `--cwd` was supplied.
+    static func workingDirectory(options: CLIResourceOptions, fallback: URL) -> URL {
+        guard let supplied = options.common.cwd, !supplied.isEmpty else {
+            return fallback.standardizedFileURL
+        }
+        return URL(fileURLWithPath: supplied, relativeTo: fallback).standardizedFileURL
+    }
+
+    private static func scope(options: CLIResourceOptions) throws -> String? {
+        guard let value = options.options["--scope"] else { return nil }
+        guard value == "user" || value == "project" else {
+            throw CLIApplicationError.failed(
+                "invalid MCP config scope '\(value)' (expected: user or project)"
+            )
+        }
+        return value
+    }
+
+    /// Project MCP config is executable configuration. Merely creating the
+    /// first project file cannot grant itself folder trust: otherwise the
+    /// write succeeds but the next process correctly refuses to load it.
+    private static func requireTrustedProject(
+        cwd: URL,
+        environment: [String: String],
+        permissions: CLIPermissionOptions
+    ) throws {
+        let security = LiveSecurityContext.resolve(
+            workspaceRoot: cwd,
+            environment: environment,
+            isInteractive: false,
+            cli: permissions
+        )
+        guard security.projectTrusted else {
+            throw CLIApplicationError.failed(
+                "project-scoped MCP configuration requires a trusted folder; "
+                    + "trust '\(cwd.path)' before reading or modifying .opengrok/config.toml"
+            )
+        }
+
+        if folderTrustEnabled(document: security.document, environment: environment) {
+            let identity = LiveWorkspaceTrustIdentity.resolve(
+                workingDirectory: cwd, environment: environment
+            )
+            guard PersistentFolderTrustStore(environment: environment).isTrusted(identity) else {
+                throw CLIApplicationError.failed(
+                    "project-scoped MCP configuration requires persisted folder trust; "
+                        + "rerun with --trust before the mcp subcommand"
+                )
+            }
+        }
+    }
+
+    /// The exact user/project file selected by `--scope`; `--config` remains
+    /// the port's backwards-compatible explicit-file escape hatch.
     static func editTarget(
         options: CLIResourceOptions,
         environment: [String: String],
         cwd: URL
     ) throws -> URL {
+        let effectiveCWD = workingDirectory(options: options, fallback: cwd)
+        let requestedScope = try scope(options: options)
         if let explicit = options.options["--config"], !explicit.isEmpty {
-            let url = URL(fileURLWithPath: explicit, relativeTo: cwd)
-            return url.standardizedFileURL
+            guard requestedScope == nil else {
+                throw CLIApplicationError.failed(
+                    "--config and --scope select different configuration authorities; use only one"
+                )
+            }
+            let path = URL(fileURLWithPath: explicit, relativeTo: effectiveCWD)
+                .standardizedFileURL
+            if sameConfigPath(path, projectConfigPath(cwd: effectiveCWD)) {
+                try requireTrustedProject(
+                    cwd: effectiveCWD,
+                    environment: environment,
+                    permissions: options.common.permissions
+                )
+            }
+            return path
         }
+
+        if requestedScope == "project" {
+            try requireTrustedProject(
+                cwd: effectiveCWD,
+                environment: environment,
+                permissions: options.common.permissions
+            )
+            let path = projectConfigPath(cwd: effectiveCWD).standardizedFileURL
+            let canonicalWorkspace = effectiveCWD.resolvingSymlinksInPath()
+                .standardizedFileURL.path
+            let canonicalParent = path.deletingLastPathComponent()
+                .resolvingSymlinksInPath().standardizedFileURL.path
+            guard canonicalParent.hasPrefix(canonicalWorkspace + "/") else {
+                throw CLIApplicationError.failed(
+                    "project MCP config directory resolves outside its trusted workspace"
+                )
+            }
+            return path
+        }
+
         guard let home = userGrokHome(environment: environment) else {
             throw CLIApplicationError.failed(
                 "cannot resolve the user config directory; pass --config <path> to choose a file"
@@ -1194,16 +1304,52 @@ public enum LiveMCPComposition {
 
     /// Read a config file as a raw TOML document for editing.
     ///
-    /// Mirrors upstream (`mcp.rs:865-868`): an unparseable file yields an empty
-    /// root rather than failing, because the write replaces the document
-    /// wholesale. A *missing* file returns `nil` so the two callers can differ —
-    /// `add` treats it as an empty document, `remove` reports "not found"
-    /// instead of writing a stub.
+    /// Compatibility inspection seam used by ACP callers. CLI mutations use
+    /// `loadForMutation` instead so corrupt existing config never becomes an
+    /// empty replacement document.
     static func loadForEdit(at path: URL) -> TOMLValue? {
         guard let text = try? String(contentsOf: path, encoding: .utf8) else {
             return nil
         }
         return (try? parseTOML(text)) ?? .table(TOMLTable())
+    }
+
+    /// Unlike the legacy inspection helper, mutations never replace a corrupt
+    /// or unreadable existing owner configuration with an empty document.
+    private static func loadForMutation(at path: URL) throws -> TOMLValue? {
+        if (try? FileManager.default.destinationOfSymbolicLink(atPath: path.path)) != nil {
+            throw CLIApplicationError.failed("refusing to edit a symlinked MCP config file")
+        }
+        guard FileManager.default.fileExists(atPath: path.path) else {
+            return nil
+        }
+        do {
+            let text = try String(contentsOf: path, encoding: .utf8)
+            return try parseTOML(text)
+        } catch {
+            throw CLIApplicationError.failed(
+                "cannot safely edit unreadable or invalid MCP config at \(path.path): \(error)"
+            )
+        }
+    }
+
+    /// Environment variables and Authorization headers are credentials. Use
+    /// the no-follow, durable owner-only writer instead of the generic TOML
+    /// writer, whose temporary file inherits the process umask.
+    static func writePrivateConfigFile(_ root: TOMLValue, to path: URL) throws {
+        guard root.isTable else { throw TOMLWriteError.rootIsNotATable }
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(),
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try AtomicFile.write(path, contents: TOMLEncoder.encode(root), options: .ownerOnly)
+        try SecureFile.ensureOwnerOnlyPermissions(at: path)
+    }
+
+    private static func sameConfigPath(_ first: URL, _ second: URL) -> Bool {
+        first.standardizedFileURL.resolvingSymlinksInPath().path
+            == second.standardizedFileURL.resolvingSymlinksInPath().path
     }
 
     /// A `KEY=VALUE` positional, per upstream's `looks_like_env_pair`
@@ -1215,61 +1361,202 @@ public enum LiveMCPComposition {
         return (String(token[..<separator]), String(token[token.index(after: separator)...]))
     }
 
-    /// Build the server config from the parsed CLI surface.
-    ///
-    /// `--url` (or `--transport http`/`sse`) selects the streamable-HTTP
-    /// transport; otherwise the leading `KEY=VALUE` positionals become `env`
-    /// and the remainder is the command and its arguments, matching upstream's
-    /// `resolve_add` (`mcp_cmd.rs:275`).
+    private static func validateServerName(_ name: String) throws {
+        guard !name.isEmpty,
+              name.unicodeScalars.allSatisfy({ scalar in
+                  scalar.isASCII && (
+                      CharacterSet.alphanumerics.contains(scalar)
+                          || scalar == "-" || scalar == "_"
+                  )
+              })
+        else {
+            throw CLIApplicationError.failed(
+                "invalid MCP server name; use only ASCII letters, numbers, hyphens, and underscores"
+            )
+        }
+    }
+
+    private static func validatedEnvironment(
+        _ entries: [String]
+    ) throws -> [String: String] {
+        var values: [String: String] = [:]
+        for entry in entries {
+            guard let (key, value) = envPair(entry),
+                  let first = key.unicodeScalars.first,
+                  first.isASCII,
+                  CharacterSet.letters.contains(first) || first == "_",
+                  key.unicodeScalars.dropFirst().allSatisfy({ scalar in
+                      scalar.isASCII && (
+                          CharacterSet.alphanumerics.contains(scalar) || scalar == "_"
+                      )
+                  }),
+                  !value.unicodeScalars.contains(where: { $0.value == 0 })
+            else {
+                throw CLIApplicationError.failed(
+                    "invalid environment variable; pass each value as -e KEY=value "
+                        + "with an ASCII variable name"
+                )
+            }
+            values[key] = value
+        }
+        return values
+    }
+
+    private static func validatedHeaders(_ entries: [String]) throws -> [String: String] {
+        var values: [String: String] = [:]
+        var names: Set<String> = []
+        let punctuation = "!#$%&'*+-.^_`|~"
+        for entry in entries {
+            guard let separator = entry.firstIndex(of: ":") else {
+                throw CLIApplicationError.failed(
+                    "invalid HTTP header; expected -H 'Name: value'"
+                )
+            }
+            let name = entry[..<separator].trimmingCharacters(in: .whitespaces)
+            let value = entry[entry.index(after: separator)...]
+                .trimmingCharacters(in: .whitespaces)
+            guard !name.isEmpty,
+                  name.unicodeScalars.allSatisfy({ scalar in
+                      scalar.isASCII && (
+                          CharacterSet.alphanumerics.contains(scalar)
+                              || punctuation.unicodeScalars.contains(scalar)
+                      )
+                  }),
+                  !value.unicodeScalars.contains(where: { scalar in
+                      scalar.value == 0 || scalar.value == 10 || scalar.value == 13
+                  })
+            else {
+                throw CLIApplicationError.failed(
+                    "invalid HTTP header name or value; control characters are not permitted"
+                )
+            }
+            guard names.insert(name.lowercased()).inserted else {
+                throw CLIApplicationError.failed("duplicate HTTP header '\(name)'")
+            }
+            values[name] = value
+        }
+        return values
+    }
+
+    private static func validatedEndpoint(_ raw: String) throws -> URL {
+        guard let components = URLComponents(string: raw),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = components.host, !host.isEmpty,
+              components.user == nil, components.password == nil,
+              let url = components.url
+        else {
+            throw CLIApplicationError.failed(
+                "invalid MCP server URL; use an http:// or https:// endpoint "
+                    + "without embedded credentials"
+            )
+        }
+        return url
+    }
+
+    /// Upstream `mcp_cmd.rs:275-398`: transport chooses the positional source;
+    /// repeated environment/header options cannot silently cross transports.
     static func resolveAdd(options: CLIResourceOptions) throws -> McpServerConfig {
-        let transportType = options.options["--transport"]?
+        if let name = options.target { try validateServerName(name) }
+
+        let suppliedTransport = options.options["--transport"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
+        if let suppliedTransport,
+           !["stdio", "http", "sse"].contains(suppliedTransport) {
+            throw CLIApplicationError.failed(
+                "invalid MCP transport '\(suppliedTransport)' (expected: stdio, http, or sse)"
+            )
+        }
 
-        if let url = options.options["--url"], !url.isEmpty {
+        let legacyURL = options.options["--url"]
+        let legacyCommand = options.options["--command"]
+        let legacySource = options.options["--source"]
+        let legacyType = options.options["--type"]?.lowercased()
+        let legacyArguments = options.repeatedOptions["--args"] ?? []
+
+        if legacyType != nil && legacyURL == nil {
+            throw CLIApplicationError.failed(
+                "--type is valid only together with --url; use --transport instead"
+            )
+        }
+        if let legacyType, !["http", "sse"].contains(legacyType) {
+            throw CLIApplicationError.failed("invalid legacy MCP transport type '\(legacyType)'")
+        }
+        if !legacyArguments.isEmpty && legacyCommand == nil {
+            throw CLIApplicationError.failed("--args requires --command")
+        }
+
+        let namedSources = [legacyURL, legacyCommand, legacySource].compactMap { $0 }
+        if namedSources.count > 1 || (!namedSources.isEmpty && !options.values.isEmpty) {
+            throw CLIApplicationError.failed(
+                "choose exactly one MCP server source: a positional command/URL, --command, or --url"
+            )
+        }
+
+        let transport = suppliedTransport
+            ?? (legacyURL != nil ? (legacyType == "sse" ? "sse" : "http") : "stdio")
+        if legacyURL != nil && transport == "stdio" {
+            throw CLIApplicationError.failed("--url cannot be combined with --transport stdio")
+        }
+
+        let source = namedSources.first ?? options.values.first
+        guard let source, !source.isEmpty else {
+            throw CLIApplicationError.failed(
+                """
+                `mcp add` needs a transport: pass a command (\
+                `open-grok mcp add NAME -- npx server`) or a URL (\
+                `open-grok mcp add --transport http NAME https://example.com/mcp`).
+                """
+            )
+        }
+
+        let arguments = legacyCommand == nil
+            ? Array(options.values.dropFirst())
+            : legacyArguments
+        let environment = options.repeatedOptions["--env"] ?? []
+        let headers = options.repeatedOptions["--header"] ?? []
+
+        if transport == "stdio" {
+            guard headers.isEmpty else {
+                throw CLIApplicationError.failed(
+                    "--header can only be used with HTTP or SSE servers"
+                )
+            }
+            if envPair(source) != nil {
+                throw CLIApplicationError.failed(
+                    "the server command looks like an environment variable; "
+                        + "pass each variable separately as -e KEY=value"
+                )
+            }
+            let values = try validatedEnvironment(environment)
             return McpServerConfig(
-                transport: .streamableHttp(
-                    url: url,
-                    transportType: transportType,
-                    bearerTokenEnvVar: nil,
-                    headers: nil,
-                    oauthClientId: nil,
-                    oauthClientSecretEnvVar: nil,
-                    oauthScopes: nil
+                transport: .stdio(
+                    command: source,
+                    args: arguments,
+                    env: values.isEmpty ? nil : values,
+                    cwd: nil
                 )
             )
         }
 
-        var tokens = options.values
-        if let command = options.options["--command"], !command.isEmpty {
-            tokens.insert(command, at: 0)
+        guard arguments.isEmpty else {
+            throw CLIApplicationError.failed("HTTP and SSE MCP servers accept exactly one URL")
         }
-
-        var env: [String: String] = [:]
-        while let first = tokens.first, let pair = envPair(first) {
-            env[pair.0] = pair.1
-            tokens.removeFirst()
+        guard environment.isEmpty else {
+            throw CLIApplicationError.failed("--env can only be used with stdio servers")
         }
-
-        guard let command = tokens.first, !command.isEmpty else {
-            throw CLIApplicationError.failed(
-                """
-                `mcp add` needs a transport: pass a command (\
-                `open-grok mcp add NAME -- npx server`) or `--url <endpoint>`.
-                """
-            )
-        }
-        if transportType == "http" || transportType == "sse" {
-            throw CLIApplicationError.failed(
-                "`--transport \(transportType!)` needs `--url <endpoint>`, not a command"
-            )
-        }
+        let endpoint = try validatedEndpoint(source)
+        let values = try validatedHeaders(headers)
         return McpServerConfig(
-            transport: .stdio(
-                command: command,
-                args: Array(tokens.dropFirst()),
-                env: env.isEmpty ? nil : env,
-                cwd: nil
+            transport: .streamableHttp(
+                url: endpoint.absoluteString,
+                transportType: transport == "sse" ? "sse" : nil,
+                bearerTokenEnvVar: nil,
+                headers: values.isEmpty ? nil : values,
+                oauthClientId: nil,
+                oauthClientSecretEnvVar: nil,
+                oauthScopes: nil
             )
         )
     }
@@ -1278,15 +1565,25 @@ public enum LiveMCPComposition {
         options: CLIResourceOptions,
         environment: [String: String],
         streams: CLIStreams,
-        cwd: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        cwd: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
+        managedMCPPolicy: ManagedMCPPolicy? = nil
     ) throws {
         guard let name = options.target, !name.isEmpty else {
             throw CLIApplicationError.failed("`mcp add` needs a server name")
         }
+        try validateServerName(name)
         let path = try editTarget(options: options, environment: environment, cwd: cwd)
         let config = try resolveAdd(options: options)
 
-        var root = loadForEdit(at: path) ?? .table(TOMLTable())
+        let policy = managedMCPPolicy ?? LiveSecurityContext.currentManagedMCPPolicy()
+        let identity = ManagedMCPServerIdentity(name: name, transport: config.transport)
+        if let reason = policy.blockReason(for: identity) {
+            throw CLIApplicationError.failed(
+                "MCP server '\(name)' is blocked by managed policy: \(reason)"
+            )
+        }
+
+        var root = try loadForMutation(at: path) ?? .table(TOMLTable())
         let replacing = mcpServerIsDefined(name, in: root)
         if replacing && !options.force {
             throw CLIApplicationError.failed(
@@ -1295,7 +1592,7 @@ public enum LiveMCPComposition {
         }
         do {
             try upsertMCPServer(name, config: config, in: &root)
-            try writeConfigFile(root, to: path)
+            try writePrivateConfigFile(root, to: path)
         } catch {
             throw CLIApplicationError.failed(
                 "could not update \(path.path): \(error)"
@@ -1304,6 +1601,19 @@ public enum LiveMCPComposition {
         streams.out(
             "\(replacing ? "Replaced" : "Added") MCP server '\(name)' in \(path.path)\n"
         )
+        if options.options["--transport"] == nil,
+           options.options["--url"] == nil,
+           case .stdio(let command, _, _, _) = config.transport,
+           command.hasPrefix("http://") || command.hasPrefix("https://")
+                || command.hasPrefix("localhost") {
+            let endpoint = command.hasPrefix("http://") || command.hasPrefix("https://")
+                ? command
+                : "http://\(command)"
+            streams.err(
+                "warning: '\(redactedEndpoint(endpoint))' looks like a URL but was added as "
+                    + "a stdio command; use --transport http for a remote MCP server\n"
+            )
+        }
     }
 
     static func runRemove(
@@ -1315,15 +1625,18 @@ public enum LiveMCPComposition {
         guard let name = options.target, !name.isEmpty else {
             throw CLIApplicationError.failed("`mcp remove` needs a server name")
         }
-        let path = try editTarget(options: options, environment: environment, cwd: cwd)
+        let effectiveCWD = workingDirectory(options: options, fallback: cwd)
+        let path = try removalTarget(
+            name: name, options: options, environment: environment, cwd: effectiveCWD
+        )
 
-        guard var root = loadForEdit(at: path) else {
+        guard var root = try loadForMutation(at: path) else {
             throw CLIApplicationError.failed("no MCP server named '\(name)' in \(path.path)")
         }
         let removed: Bool
         do {
             removed = try removeMCPServer(name, from: &root)
-            if removed { try writeConfigFile(root, to: path) }
+            if removed { try writePrivateConfigFile(root, to: path) }
         } catch {
             throw CLIApplicationError.failed("could not update \(path.path): \(error)")
         }
@@ -1334,7 +1647,7 @@ public enum LiveMCPComposition {
 
         // A scoped delete can leave the name defined in another layer, where it
         // still resolves for sessions (upstream `mcp_cmd.rs:672-682`).
-        if let survivors = try? loadDeclarations(environment: environment, cwd: cwd),
+        if let survivors = try? loadDeclarations(environment: environment, cwd: effectiveCWD),
            let survivor = survivors.servers.first(where: { $0.name == name }) {
             streams.err(
                 "note: '\(name)' is still defined in the \(survivor.scope ?? "merged") config\n"
@@ -1342,25 +1655,194 @@ public enum LiveMCPComposition {
         }
     }
 
+    private static func removalTarget(
+        name: String,
+        options: CLIResourceOptions,
+        environment: [String: String],
+        cwd: URL
+    ) throws -> URL {
+        if options.options["--config"] != nil {
+            return try editTarget(options: options, environment: environment, cwd: cwd)
+        }
+        if try scope(options: options) != nil {
+            return try editTarget(options: options, environment: environment, cwd: cwd)
+        }
+
+        let userPath = try editTarget(options: options, environment: environment, cwd: cwd)
+        let userDefined = (try loadForMutation(at: userPath)).map {
+            mcpServerIsDefined(name, in: $0)
+        } ?? false
+
+        let security = LiveSecurityContext.resolve(
+            workspaceRoot: cwd,
+            environment: environment,
+            isInteractive: false,
+            cli: options.common.permissions
+        )
+        let projectPath = projectConfigPath(cwd: cwd)
+        let projectDefined: Bool
+        if security.projectTrusted,
+           let project = try loadForMutation(at: projectPath) {
+            projectDefined = mcpServerIsDefined(name, in: project)
+        } else {
+            projectDefined = false
+        }
+
+        if userDefined && projectDefined {
+            throw CLIApplicationError.failed(
+                "MCP server '\(name)' exists in both user and project config; "
+                    + "specify --scope user or --scope project"
+            )
+        }
+        if projectDefined {
+            var projectOptions = options
+            projectOptions.options["--scope"] = "project"
+            return try editTarget(options: projectOptions, environment: environment, cwd: cwd)
+        }
+        return userPath
+    }
+
+    /// Disable is always personal: shared project declarations stay untouched.
+    /// Enabling clears both the user's disabled list and a trusted project's
+    /// sticky `enabled = false`, matching `mcp.rs:678-708`.
+    static func runSetEnabled(
+        options: CLIResourceOptions,
+        enabled: Bool,
+        environment: [String: String],
+        streams: CLIStreams,
+        cwd: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
+        managedMCPPolicy: ManagedMCPPolicy? = nil
+    ) throws {
+        guard let name = options.target, !name.isEmpty else {
+            throw CLIApplicationError.failed(
+                "`mcp \(enabled ? "enable" : "disable")` needs a server name"
+            )
+        }
+        guard !name.contains(":") else {
+            throw CLIApplicationError.failed(
+                "gateway MCP connectors cannot be toggled through the CLI"
+            )
+        }
+        if try scope(options: options) == "project" {
+            throw CLIApplicationError.failed(
+                "MCP enable/disable preferences are user-scoped and never disable a shared project"
+            )
+        }
+
+        let effectiveCWD = workingDirectory(options: options, fallback: cwd)
+        let loaded = try loadDeclarations(
+            environment: environment, cwd: effectiveCWD, options: options
+        )
+        let declaration = loaded.servers.first { $0.name == name }
+            ?? loaded.setupServers.first { $0.name == name }
+        guard let declaration else {
+            let known = Set(loaded.servers.map(\.name) + loaded.setupServers.map(\.name))
+                .sorted()
+            throw CLIApplicationError.failed(
+                known.isEmpty
+                    ? "no MCP server named '\(name)' (none are configured)"
+                    : "no MCP server named '\(name)' (configured: \(known.joined(separator: ", ")))"
+            )
+        }
+
+        if enabled {
+            let policy = managedMCPPolicy ?? LiveSecurityContext.currentManagedMCPPolicy()
+            let identity = ManagedMCPServerIdentity(
+                name: name, transport: declaration.config.transport
+            )
+            if let reason = policy.blockReason(for: identity) {
+                throw CLIApplicationError.failed(
+                    "MCP server '\(name)' is blocked by managed policy: \(reason)"
+                )
+            }
+        }
+
+        var userOptions = options
+        userOptions.options.removeValue(forKey: "--scope")
+        let userPath = try editTarget(
+            options: userOptions, environment: environment, cwd: effectiveCWD
+        )
+        let previousUser = try loadForMutation(at: userPath)
+        var userRoot = previousUser ?? .table(TOMLTable())
+        try applyMCPServerEnabled(name, enabled: enabled, in: &userRoot)
+        let userChanged = TOMLEncoder.encode(userRoot)
+            != TOMLEncoder.encode(previousUser ?? .table(TOMLTable()))
+        if userChanged {
+            try writePrivateConfigFile(userRoot, to: userPath)
+        }
+
+        if enabled,
+           options.options["--config"] == nil,
+           declaration.scope == "project" {
+            do {
+                let projectPath = projectConfigPath(cwd: effectiveCWD)
+                if var projectRoot = try loadForMutation(at: projectPath),
+                   mcpServerIsDefined(name, in: projectRoot) {
+                    let previous = TOMLEncoder.encode(projectRoot)
+                    try applyMCPServerEnabled(name, enabled: true, in: &projectRoot)
+                    if TOMLEncoder.encode(projectRoot) != previous {
+                        try requireTrustedProject(
+                            cwd: effectiveCWD,
+                            environment: environment,
+                            permissions: options.common.permissions
+                        )
+                        try writePrivateConfigFile(projectRoot, to: projectPath)
+                    }
+                }
+            } catch {
+                if userChanged {
+                    if let previousUser {
+                        try? writePrivateConfigFile(previousUser, to: userPath)
+                    } else {
+                        try? FileManager.default.removeItem(at: userPath)
+                    }
+                }
+                throw CLIApplicationError.failed(
+                    "could not enable MCP server '\(name)' without modifying trusted project config: \(error)"
+                )
+            }
+        }
+
+        let refreshed = try loadDeclarations(
+            environment: environment, cwd: effectiveCWD, options: options
+        )
+        let actual = refreshed.servers.first { $0.name == name }
+            ?? refreshed.setupServers.first { $0.name == name }
+        guard actual?.isEnabled == enabled else {
+            throw CLIApplicationError.failed(
+                "MCP server '\(name)' remains \(enabled ? "disabled" : "enabled") after updating its configuration"
+            )
+        }
+        streams.out("\(enabled ? "Enabled" : "Disabled") MCP server '\(name)'.\n")
+    }
+
     static func runList(
         options: CLIResourceOptions,
         environment: [String: String],
         streams: CLIStreams
     ) throws {
-        let loaded = try loadDeclarations(environment: environment)
+        let cwd = workingDirectory(
+            options: options,
+            fallback: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        )
+        let loaded = try loadDeclarations(environment: environment, cwd: cwd, options: options)
 
         if options.json {
             streams.out(jsonList(loaded) + "\n")
             return
         }
 
-        if loaded.servers.isEmpty {
+        if loaded.servers.isEmpty && loaded.setupRequiredServers.isEmpty {
             streams.out("No MCP servers configured.\n")
         } else {
             for declaration in loaded.servers {
                 let status = declaration.isEnabled ? "" : " (disabled)"
                 let scope = declaration.scope.map { " (\($0))" } ?? ""
                 streams.out("  \(declaration.name): \(declaration.transportSummary)\(status)\(scope)\n")
+            }
+            for declaration in loaded.setupRequiredServers {
+                let scope = declaration.scope.map { " (\($0))" } ?? ""
+                streams.out("  \(declaration.name): setup required\(scope)\n")
             }
         }
         for problem in loaded.problems {
@@ -1376,9 +1858,18 @@ public enum LiveMCPComposition {
         guard let name = options.target, !name.isEmpty else {
             throw CLIApplicationError.failed("`mcp get` needs a server name")
         }
-        let loaded = try loadDeclarations(environment: environment)
+        let cwd = workingDirectory(
+            options: options,
+            fallback: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        )
+        let loaded = try loadDeclarations(environment: environment, cwd: cwd, options: options)
 
         guard let declaration = loaded.servers.first(where: { $0.name == name }) else {
+            if loaded.setupRequiredServers.contains(where: { $0.name == name }) {
+                throw CLIApplicationError.failed(
+                    "MCP server '\(name)' requires setup before its transport can be used"
+                )
+            }
             if let problem = loaded.problems.first(where: { $0.server == name }) {
                 throw CLIApplicationError.failed(
                     "MCP server '\(name)' is configured but unusable: \(problem.message)"
@@ -1410,6 +1901,393 @@ public enum LiveMCPComposition {
         }
     }
 
+    // MARK: Doctor
+
+    private struct DoctorCheck {
+        let label: String
+        let passed: Bool
+        let detail: String
+        let hint: String?
+
+        var object: [String: Any] {
+            var result: [String: Any] = [
+                "label": label,
+                "passed": passed,
+                "detail": detail,
+            ]
+            if let hint { result["hint"] = hint }
+            return result
+        }
+    }
+
+    /// A HEAD probe observes HTTP reachability without starting stdio commands
+    /// or forwarding configured Authorization headers/environment secrets.
+    private final class DoctorHTTPProbeState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var statusCode: Int?
+        private var failure: String?
+
+        func complete(response: URLResponse?, error: (any Error)?) {
+            lock.lock()
+            statusCode = (response as? HTTPURLResponse)?.statusCode
+            if let error {
+                if let network = error as? URLError {
+                    failure = "network probe failed (code \(network.code.rawValue))"
+                } else {
+                    failure = "network probe failed before an HTTP response arrived"
+                }
+            }
+            lock.unlock()
+        }
+
+        var snapshot: (statusCode: Int?, failure: String?) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (statusCode, failure)
+        }
+    }
+
+    static func runDoctor(
+        options: CLIResourceOptions,
+        environment: [String: String],
+        streams: CLIStreams,
+        cwd: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
+        managedMCPPolicy: ManagedMCPPolicy? = nil
+    ) throws {
+        let effectiveCWD = workingDirectory(options: options, fallback: cwd)
+        let loaded = try loadDeclarations(
+            environment: environment, cwd: effectiveCWD, options: options
+        )
+        let setupRequired = Set(loaded.setupRequiredServers.map(\.name))
+        let allDeclarations = loaded.servers + loaded.setupRequiredServers
+        let allNames = Set(
+            allDeclarations.map(\.name) + loaded.problems.map(\.server)
+        ).sorted()
+
+        if let name = options.target, !allNames.contains(name) {
+            throw CLIApplicationError.failed(
+                allNames.isEmpty
+                    ? "MCP server '\(name)' not found; no servers are configured"
+                    : "MCP server '\(name)' not found; available servers: \(allNames.joined(separator: ", "))"
+            )
+        }
+
+        let policy = managedMCPPolicy ?? LiveSecurityContext.currentManagedMCPPolicy()
+        var servers: [[String: Any]] = []
+
+        for declaration in allDeclarations.sorted(by: { $0.name < $1.name }) {
+            if let filter = options.target, declaration.name != filter { continue }
+            var checks: [DoctorCheck] = []
+            let identity = ManagedMCPServerIdentity(
+                name: declaration.name,
+                transport: declaration.config.transport
+            )
+            if let reason = policy.blockReason(for: identity) {
+                checks.append(DoctorCheck(
+                    label: "blocked by organization policy",
+                    passed: false,
+                    detail: reason,
+                    hint: "ask your administrator to authorize this MCP server"
+                ))
+            } else if !declaration.isEnabled {
+                checks.append(DoctorCheck(
+                    label: "disabled in config",
+                    passed: false,
+                    detail: "server is disabled in owner or project configuration",
+                    hint: "run open-grok mcp enable \(declaration.name)"
+                ))
+            } else if setupRequired.contains(declaration.name) {
+                checks.append(DoctorCheck(
+                    label: "setup required",
+                    passed: false,
+                    detail: "server configuration must be completed before it can connect",
+                    hint: "complete the server's MCP setup"
+                ))
+            } else {
+                checks.append(doctorTransportCheck(
+                    declaration: declaration,
+                    cwd: effectiveCWD,
+                    environment: environment
+                ))
+            }
+
+            let transport: String
+            let target: String
+            switch declaration.config.transport {
+            case .stdio(let command, _, _, _):
+                transport = "stdio"
+                target = command
+            case .streamableHttp(let url, let type, _, _, _, _, _):
+                transport = type ?? "http"
+                target = redactedEndpoint(url)
+            }
+
+            servers.append([
+                "name": declaration.name,
+                "transport": transport,
+                "target": target,
+                "source": declaration.scope ?? "user",
+                "checks": checks.map(\.object),
+                "healthy": checks.allSatisfy(\.passed),
+            ])
+        }
+
+        for problem in loaded.problems.sorted(by: { $0.server < $1.server }) {
+            if let filter = options.target, problem.server != filter { continue }
+            servers.append([
+                "name": problem.server,
+                "transport": "unknown",
+                "target": "",
+                "source": "config",
+                "checks": [DoctorCheck(
+                    label: "valid configuration",
+                    passed: false,
+                    detail: problem.message,
+                    hint: "repair the server's MCP configuration"
+                ).object],
+                "healthy": false,
+            ])
+        }
+
+        let healthyCount = servers.filter { $0["healthy"] as? Bool == true }.count
+        let failingCount = servers.count - healthyCount
+        let report: [String: Any] = [
+            "sources": try doctorSources(
+                options: options,
+                loaded: loaded,
+                environment: environment,
+                cwd: effectiveCWD
+            ),
+            "servers": servers,
+            "healthy_count": healthyCount,
+            "failing_count": failingCount,
+        ]
+
+        if options.json {
+            streams.out(encode(report) + "\n")
+        } else if servers.isEmpty {
+            streams.out("No MCP servers configured.\n")
+        } else {
+            for server in servers {
+                let healthy = server["healthy"] as? Bool == true
+                let name = server["name"] as? String ?? "unknown"
+                streams.out("\(healthy ? "✓" : "✗") \(name)\n")
+                for check in server["checks"] as? [[String: Any]] ?? [] {
+                    let passed = check["passed"] as? Bool == true
+                    let label = check["label"] as? String ?? "check"
+                    let detail = check["detail"] as? String ?? ""
+                    streams.out("  \(passed ? "✓" : "✗") \(label): \(detail)\n")
+                    if let hint = check["hint"] as? String {
+                        streams.out("    hint: \(hint)\n")
+                    }
+                }
+            }
+            streams.out("\(healthyCount) healthy, \(failingCount) failing\n")
+        }
+
+        if failingCount > 0 {
+            throw CLIApplicationError.failed(
+                "\(failingCount) MCP server\(failingCount == 1 ? "" : "s") failed diagnostic checks"
+            )
+        }
+    }
+
+    private static func doctorSources(
+        options: CLIResourceOptions,
+        loaded: MCPConfigLoadResult,
+        environment: [String: String],
+        cwd: URL
+    ) throws -> [[String: Any]] {
+        let declarations = loaded.servers + loaded.setupRequiredServers
+        if options.options["--config"] != nil {
+            let path = try editTarget(options: options, environment: environment, cwd: cwd)
+            let found = FileManager.default.fileExists(atPath: path.path)
+            var source: [String: Any] = [
+                "path": path.path,
+                "status": found ? "found" : "not_found",
+            ]
+            if found { source["server_count"] = declarations.count }
+            return [source]
+        }
+
+        var sources: [[String: Any]] = []
+        if let home = userGrokHome(environment: environment) {
+            let path = home.appendingPathComponent("config.toml")
+            let found = FileManager.default.fileExists(atPath: path.path)
+            var source: [String: Any] = [
+                "path": path.path,
+                "status": found ? "found" : "not_found",
+            ]
+            if found {
+                source["server_count"] = declarations.filter { $0.scope == "user" }.count
+            }
+            sources.append(source)
+        }
+
+        let project = projectConfigPath(cwd: cwd)
+        if FileManager.default.fileExists(atPath: project.path) {
+            let security = LiveSecurityContext.resolve(
+                workspaceRoot: cwd,
+                environment: environment,
+                isInteractive: false,
+                cli: options.common.permissions
+            )
+            if security.projectTrusted {
+                sources.append([
+                    "path": project.path,
+                    "status": "found",
+                    "server_count": declarations.filter { $0.scope == "project" }.count,
+                ])
+            } else {
+                sources.append([
+                    "path": project.path,
+                    "status": "skipped",
+                    "reason": "project folder is not trusted",
+                ])
+            }
+        }
+        return sources
+    }
+
+    private static func doctorTransportCheck(
+        declaration: MCPServerDeclaration,
+        cwd: URL,
+        environment: [String: String]
+    ) -> DoctorCheck {
+        switch declaration.config.transport {
+        case .stdio(let command, _, _, let serverCWD):
+            let commandCWD = serverCWD.map {
+                URL(fileURLWithPath: $0, relativeTo: cwd).standardizedFileURL
+            } ?? cwd
+            guard FileManager.default.fileExists(atPath: commandCWD.path) else {
+                return DoctorCheck(
+                    label: "working directory exists",
+                    passed: false,
+                    detail: "configured command working directory does not exist",
+                    hint: "create the working directory or update the server config"
+                )
+            }
+            guard let executable = executablePath(
+                command, cwd: commandCWD, environment: environment
+            ) else {
+                return DoctorCheck(
+                    label: "command available",
+                    passed: false,
+                    detail: "command '\(command)' is not executable or was not found in PATH",
+                    hint: "install the command or provide its absolute executable path"
+                )
+            }
+            return DoctorCheck(
+                label: "command available",
+                passed: true,
+                detail: "executable exists at \(executable); no process was started",
+                hint: nil
+            )
+
+        case .streamableHttp(let raw, _, _, _, _, _, _):
+            let endpoint: URL
+            do {
+                endpoint = try validatedEndpoint(raw)
+            } catch {
+                return DoctorCheck(
+                    label: "valid HTTP endpoint",
+                    passed: false,
+                    detail: "server URL is not a valid HTTP(S) endpoint",
+                    hint: "configure a URL with an http:// or https:// scheme"
+                )
+            }
+            let probe = probeEndpoint(endpoint)
+            if let statusCode = probe.statusCode {
+                return DoctorCheck(
+                    label: "HTTP endpoint reachable",
+                    passed: true,
+                    detail: "server answered an unauthenticated HEAD request (HTTP \(statusCode))",
+                    hint: nil
+                )
+            }
+            return DoctorCheck(
+                label: "HTTP endpoint reachable",
+                passed: false,
+                detail: probe.failure ?? "server did not answer within the diagnostic timeout",
+                hint: "confirm the server is running and its URL is reachable"
+            )
+        }
+    }
+
+    private static func executablePath(
+        _ command: String,
+        cwd: URL,
+        environment: [String: String]
+    ) -> String? {
+        let manager = FileManager.default
+        if command.contains("/") || command.contains("\\") {
+            let candidate = URL(fileURLWithPath: command, relativeTo: cwd).standardizedFileURL
+            return manager.isExecutableFile(atPath: candidate.path) ? candidate.path : nil
+        }
+
+        #if os(Windows)
+        let separator: Character = ";"
+        let extensions = (environment["PATHEXT"] ?? ".COM;.EXE;.BAT;.CMD")
+            .split(separator: ";").map(String.init)
+        #else
+        let separator: Character = ":"
+        let extensions: [String] = [""]
+        #endif
+
+        for directory in (environment["PATH"] ?? "").split(separator: separator) {
+            for suffix in extensions {
+                let candidate = URL(fileURLWithPath: String(directory), relativeTo: cwd)
+                    .appendingPathComponent(command + suffix)
+                if manager.isExecutableFile(atPath: candidate.path) {
+                    return candidate.path
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func probeEndpoint(_ endpoint: URL) -> (
+        statusCode: Int?, failure: String?
+    ) {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpShouldSetCookies = false
+        configuration.urlCache = nil
+        configuration.timeoutIntervalForRequest = 2
+        configuration.timeoutIntervalForResource = 2
+        let session = URLSession(configuration: configuration)
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 2
+        let state = DoctorHTTPProbeState()
+        let semaphore = DispatchSemaphore(value: 0)
+        let task = session.dataTask(with: request) { _, response, error in
+            state.complete(response: response, error: error)
+            semaphore.signal()
+        }
+        task.resume()
+        if semaphore.wait(timeout: .now() + 3) == .timedOut {
+            task.cancel()
+            session.invalidateAndCancel()
+            return (nil, "server did not answer within the diagnostic timeout")
+        }
+        session.finishTasksAndInvalidate()
+        return state.snapshot
+    }
+
+    private static func redactedEndpoint(_ raw: String) -> String {
+        guard var components = URLComponents(string: raw) else { return "<invalid endpoint>" }
+        components.user = nil
+        components.password = nil
+        if let items = components.queryItems {
+            components.queryItems = items.map { item in
+                let sensitive = ["token", "key", "secret", "password", "auth", "signature"]
+                    .contains { item.name.localizedCaseInsensitiveContains($0) }
+                return sensitive ? URLQueryItem(name: item.name, value: "[REDACTED]") : item
+            }
+        }
+        return components.string ?? "<invalid endpoint>"
+    }
+
     // MARK: Loading
 
     /// Merge the user and project layers, tagging each server with its scope so
@@ -1417,31 +2295,83 @@ public enum LiveMCPComposition {
     /// collision, matching config layering.
     static func loadDeclarations(
         environment: [String: String],
-        cwd: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        cwd: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
+        options: CLIResourceOptions? = nil
     ) throws -> MCPConfigLoadResult {
         var servers: [MCPServerDeclaration] = []
+        var setupServers: [MCPServerDeclaration] = []
         var problems: [MCPConfigProblem] = []
+        var disabled: Set<String> = []
+        let preferences = userGrokHome(environment: environment).map {
+            MCPSetupPreferencesStore.load(home: $0).file
+        }
 
-        for (scope, document) in try configLayers(environment: environment, cwd: cwd) {
-            let loaded = MCPConfigLoader.load(from: document, scope: scope)
+        for (scope, document) in try configLayers(
+            environment: environment, cwd: cwd, options: options
+        ) {
+            let loaded = MCPConfigLoader.load(
+                from: document, scope: scope, preferences: preferences
+            )
+            disabled.formUnion(disabledMCPServers(in: document))
+            let replaced = Set(loaded.servers.map(\.name) + loaded.setupServers.map(\.name))
+            servers.removeAll { replaced.contains($0.name) }
+            setupServers.removeAll { replaced.contains($0.name) }
             for declaration in loaded.servers {
-                servers.removeAll { $0.name == declaration.name }
                 servers.append(declaration)
             }
+            setupServers.append(contentsOf: loaded.setupServers)
             problems.append(contentsOf: loaded.problems)
         }
-        return MCPConfigLoadResult(servers: servers, problems: problems)
+        for index in servers.indices where disabled.contains(servers[index].name) {
+            servers[index].config.enabled = false
+        }
+        for index in setupServers.indices where disabled.contains(setupServers[index].name) {
+            setupServers[index].config.enabled = false
+        }
+        return MCPConfigLoadResult(
+            servers: servers, setupServers: setupServers, problems: problems
+        )
     }
 
     private static func configLayers(
         environment: [String: String],
-        cwd: URL
+        cwd: URL,
+        options: CLIResourceOptions? = nil
     ) throws -> [(String, TOMLValue)] {
         var layers: [(String, TOMLValue)] = []
-        if let user = try? loadFromDisk(environment: environment) {
+        let requestedScope: String?
+        if let options {
+            requestedScope = try scope(options: options)
+        } else {
+            requestedScope = nil
+        }
+
+        if let options, options.options["--config"] != nil {
+            let path = try editTarget(options: options, environment: environment, cwd: cwd)
+            if let document = try loadForMutation(at: path) {
+                let label = sameConfigPath(path, projectConfigPath(cwd: cwd)) ? "project" : "user"
+                layers.append((label, document))
+            }
+            return layers
+        }
+
+        if requestedScope != "project", let user = try? loadFromDisk(environment: environment) {
             layers.append(("user", user))
         }
-        if let project = try? loadProjectConfig(cwd: cwd) {
+
+        guard requestedScope != "user" else { return layers }
+        let permissions = options?.common.permissions ?? CLIPermissionOptions()
+        let security = LiveSecurityContext.resolve(
+            workspaceRoot: cwd,
+            environment: environment,
+            isInteractive: false,
+            cli: permissions
+        )
+        if requestedScope == "project" {
+            try requireTrustedProject(cwd: cwd, environment: environment, permissions: permissions)
+        }
+        if security.projectTrusted,
+           let project = try? loadProjectConfig(cwd: cwd, environment: environment) {
             layers.append(("project", project))
         }
         return layers
@@ -1450,7 +2380,16 @@ public enum LiveMCPComposition {
     // MARK: JSON rendering
 
     static func jsonList(_ loaded: MCPConfigLoadResult) -> String {
-        let servers = loaded.servers.map(serverObject)
+        var servers = loaded.servers.map(serverObject)
+        for declaration in loaded.setupRequiredServers {
+            var entry: [String: Any] = [
+                "name": declaration.name,
+                "enabled": declaration.isEnabled,
+                "setup_required": true,
+            ]
+            if let scope = declaration.scope { entry["scope"] = scope }
+            servers.append(entry)
+        }
         let problems = loaded.problems.map { problem in
             ["server": problem.server, "error": problem.message]
         }
@@ -1484,7 +2423,7 @@ public enum LiveMCPComposition {
     private static func encode(_ value: Any) -> String {
         guard let data = try? JSONSerialization.data(
             withJSONObject: value,
-            options: [.prettyPrinted, .sortedKeys]
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         ), let text = String(data: data, encoding: .utf8) else {
             return "{}"
         }

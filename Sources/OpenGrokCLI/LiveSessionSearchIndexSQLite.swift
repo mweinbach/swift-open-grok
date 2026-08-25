@@ -1,10 +1,20 @@
 import Foundation
+import OpenGrokConfig
 import OpenGrokFileUtils
 
 #if canImport(SQLite3)
 import SQLite3
 
 final class LiveSessionSearchSQLite {
+    private static let schemaVersion: UInt64 = 4
+    private static let schemaVersionKey = "session_search_schema_version"
+    private static let canonicalColumns = [
+        "session_id", "cwd", "updated_at", "title", "content", "content_hash",
+    ]
+    private static let legacySwiftColumns = [
+        "session_id", "cwd", "cwd_key", "updated_at", "title", "content", "content_hash",
+    ]
+
     struct Metadata {
         var updatedAt: Int64
         var workingDirectory: String
@@ -29,6 +39,7 @@ final class LiveSessionSearchSQLite {
         } else {
             try SecureFile.write(at: databasePath, contents: Data())
         }
+        try Self.validateSidecars(for: databasePath)
 
         var opened: OpaquePointer?
         // SQLITE_OPEN_NOFOLLOW is 0x01000000 in SQLite's stable C ABI. Spell
@@ -54,53 +65,10 @@ final class LiveSessionSearchSQLite {
                 throw LiveSessionSearchIndexError.insecure("database is not owner-private")
             }
             sqlite3_busy_timeout(opened, 5_000)
-            try executeBatch("""
-                PRAGMA journal_mode = DELETE;
-                PRAGMA foreign_keys = ON;
-
-                CREATE TABLE IF NOT EXISTS meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS session_docs (
-                    session_id TEXT PRIMARY KEY,
-                    cwd TEXT NOT NULL,
-                    cwd_key TEXT NOT NULL,
-                    updated_at INTEGER NOT NULL,
-                    title TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    content_hash TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS session_docs_cwd_key ON session_docs(cwd_key);
-
-                CREATE VIRTUAL TABLE IF NOT EXISTS session_docs_fts USING fts5(
-                    title,
-                    content,
-                    content = 'session_docs',
-                    content_rowid = 'rowid'
-                );
-
-                CREATE TRIGGER IF NOT EXISTS session_docs_ai AFTER INSERT ON session_docs BEGIN
-                    INSERT INTO session_docs_fts(rowid, title, content)
-                    VALUES (new.rowid, new.title, new.content);
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS session_docs_ad AFTER DELETE ON session_docs BEGIN
-                    INSERT INTO session_docs_fts(session_docs_fts, rowid, title, content)
-                    VALUES ('delete', old.rowid, old.title, old.content);
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS session_docs_au AFTER UPDATE ON session_docs BEGIN
-                    INSERT INTO session_docs_fts(session_docs_fts, rowid, title, content)
-                    VALUES ('delete', old.rowid, old.title, old.content);
-                    INSERT INTO session_docs_fts(rowid, title, content)
-                    VALUES (new.rowid, new.title, new.content);
-                END;
-
-                INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1');
-                """)
+            try configureJournalMode()
+            try registerCanonicalWorkspaceFunction(on: opened)
+            try initializeSchema()
+            try Self.validateSidecars(for: databasePath)
         } catch {
             sqlite3_close(opened)
             handle = nil
@@ -127,23 +95,25 @@ final class LiveSessionSearchSQLite {
             else {
                 throw LiveSessionSearchIndexError.sqlite("malformed session index metadata")
             }
-            result[sessionID] = Metadata(updatedAt: updated, workingDirectory: cwd)
+            let (milliseconds, overflow) = updated.multipliedReportingOverflow(by: 1_000)
+            result[sessionID] = Metadata(
+                updatedAt: overflow ? (updated < 0 ? .min : .max) : milliseconds,
+                workingDirectory: cwd
+            )
         }
         return result
     }
 
     func upsert(document: LiveSessionDocument, timestamp: Int64) throws {
         let title = document.title ?? ""
-        let hash = FileChecksum.sha256Hex("\(title)\n\(document.content)")
-        let workspaceKey = URL(fileURLWithPath: document.workingDirectory)
-            .resolvingSymlinksInPath().standardizedFileURL.path
+        let content = String(document.content.prefix(LiveSessionDocument.contentLimit))
+        let hash = Self.contentHash(title: title, content: content)
         try perform(
             """
-            INSERT INTO session_docs(session_id, cwd, cwd_key, updated_at, title, content, content_hash)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            INSERT INTO session_docs(session_id, cwd, updated_at, title, content, content_hash)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(session_id) DO UPDATE SET
                 cwd = excluded.cwd,
-                cwd_key = excluded.cwd_key,
                 updated_at = excluded.updated_at,
                 title = excluded.title,
                 content = excluded.content,
@@ -152,10 +122,9 @@ final class LiveSessionSearchSQLite {
             bindings: [
                 .text(document.sessionID),
                 .text(document.workingDirectory),
-                .text(workspaceKey),
-                .integer(timestamp),
+                .integer(Self.unixSeconds(timestamp)),
                 .text(title),
-                .text(String(document.content.prefix(LiveSessionDocument.contentLimit))),
+                .text(content),
                 .text(hash),
             ]
         )
@@ -215,7 +184,7 @@ final class LiveSessionSearchSQLite {
         let base = """
             FROM session_docs d
             WHERE instr(lower(d.session_id), lower(?1)) > 0
-              AND (?2 IS NULL OR d.cwd_key = ?2)
+              AND (?2 IS NULL OR d.cwd = ?2 OR opengrok_canonical_cwd(d.cwd) = ?2)
             """
         let count = try count("SELECT COUNT(*) \(base)", bindings: [.text(needle), workspace])
         guard count > 0 else { return .empty }
@@ -242,7 +211,7 @@ final class LiveSessionSearchSQLite {
             FROM session_docs_fts
             JOIN session_docs d ON d.rowid = session_docs_fts.rowid
             WHERE session_docs_fts MATCH ?1
-              AND (?2 IS NULL OR d.cwd_key = ?2)
+              AND (?2 IS NULL OR d.cwd = ?2 OR opengrok_canonical_cwd(d.cwd) = ?2)
             """
         let count = try count("SELECT COUNT(*) \(base)", bindings: [.text(match), workspace])
         guard count > 0 else { return .empty }
@@ -282,7 +251,7 @@ final class LiveSessionSearchSQLite {
             else {
                 throw LiveSessionSearchIndexError.sqlite("malformed session search result")
             }
-            let updatedAt = Date(timeIntervalSince1970: Double(timestamp) / 1_000)
+            let updatedAt = Date(timeIntervalSince1970: Double(timestamp))
             let document = LiveSessionDocument(
                 sessionID: sessionID,
                 workingDirectory: cwd,
@@ -339,6 +308,226 @@ final class LiveSessionSearchSQLite {
         let stripped = query.filter { $0 != "-" }
         return stripped.count >= 8 && stripped.allSatisfy {
             $0.isASCII && "0123456789abcdefABCDEF".contains($0)
+        }
+    }
+
+    private func configureJournalMode() throws {
+        let current = try query("PRAGMA journal_mode").first.flatMap { text($0, 0) }?.lowercased()
+        let environment = ProcessInfo.processInfo.environment
+        let override = (
+            environment["OPENGROK_SQLITE_JOURNAL_MODE"]
+                ?? environment["GROK_SQLITE_JOURNAL_MODE"]
+        )?.lowercased()
+        let mode: String
+        switch override {
+        case "truncate": mode = "TRUNCATE"
+        case "wal": mode = "WAL"
+        default:
+            mode = current == "truncate" ? "TRUNCATE" : "WAL"
+        }
+        try executeBatch("PRAGMA journal_mode = \(mode); PRAGMA foreign_keys = ON;")
+    }
+
+    private func registerCanonicalWorkspaceFunction(on handle: OpaquePointer) throws {
+        // Canonicalization is connection-local: Rust must never encounter an
+        // extra required column, expression index, or persisted Swift callback.
+        let status = sqlite3_create_function_v2(
+            handle,
+            "opengrok_canonical_cwd",
+            1,
+            SQLITE_UTF8,
+            nil,
+            { context, count, arguments in
+                guard let context,
+                      count == 1,
+                      let arguments,
+                      let argument = arguments[0],
+                      let bytes = sqlite3_value_text(argument)
+                else {
+                    sqlite3_result_null(context)
+                    return
+                }
+                let path = URL(fileURLWithPath: String(cString: bytes))
+                    .resolvingSymlinksInPath().standardizedFileURL.path
+                path.withCString { value in
+                    sqlite3_result_text(
+                        context,
+                        value,
+                        -1,
+                        unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+                    )
+                }
+            },
+            nil,
+            nil,
+            nil
+        )
+        guard status == SQLITE_OK else {
+            throw databaseError("workspace canonicalization registration failed")
+        }
+    }
+
+    private func initializeSchema() throws {
+        try executeBatch("BEGIN IMMEDIATE")
+        var committed = false
+        defer {
+            if !committed { try? executeBatch("ROLLBACK") }
+        }
+
+        try executeBatch("""
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """)
+        let versionRows = try query(
+            "SELECT value FROM meta WHERE key = ?1",
+            bindings: [.text(Self.schemaVersionKey)]
+        )
+        let storedVersion = versionRows.first.flatMap { text($0, 0) }
+            .map { UInt64($0) ?? 0 }
+        let columns = try query("PRAGMA table_info(session_docs)").compactMap { text($0, 1) }
+
+        if columns == Self.legacySwiftColumns {
+            guard storedVersion.map({ $0 <= Self.schemaVersion }) ?? true else {
+                throw LiveSessionSearchIndexError.sqlite(
+                    "newer session search schema has incompatible legacy columns"
+                )
+            }
+            try migrateLegacySwiftSchema()
+        } else if !columns.isEmpty, columns != Self.canonicalColumns {
+            guard storedVersion.map({ $0 > Self.schemaVersion }) ?? false,
+                  Set(Self.canonicalColumns).isSubset(of: Set(columns))
+            else {
+                throw LiveSessionSearchIndexError.sqlite("incompatible session search schema")
+            }
+        }
+
+        try createCanonicalSchema()
+
+        if let storedVersion, storedVersion < Self.schemaVersion {
+            try perform(
+                "DELETE FROM meta WHERE key = ?1 OR key = ?2",
+                bindings: [.text("last_bootstrap_at"), .text("bootstrap_claimed_at")]
+            )
+        }
+        if storedVersion.map({ $0 <= Self.schemaVersion }) ?? true {
+            try perform(
+                """
+                INSERT INTO meta(key, value) VALUES (?1, ?2)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                bindings: [.text(Self.schemaVersionKey), .text(String(Self.schemaVersion))]
+            )
+        }
+        try perform("DELETE FROM meta WHERE key = ?1", bindings: [.text("schema_version")])
+        try executeBatch("COMMIT")
+        committed = true
+    }
+
+    private func migrateLegacySwiftSchema() throws {
+        try executeBatch("""
+            DROP TRIGGER IF EXISTS session_docs_ai;
+            DROP TRIGGER IF EXISTS session_docs_ad;
+            DROP TRIGGER IF EXISTS session_docs_au;
+            DROP TABLE IF EXISTS session_docs_fts;
+            ALTER TABLE session_docs RENAME TO session_docs_swift_legacy;
+            """)
+        try createCanonicalSchema()
+        let legacyRows = try query("""
+            SELECT rowid, session_id, cwd, updated_at, title, content
+            FROM session_docs_swift_legacy
+            """)
+        for row in legacyRows {
+            guard let rowID = integer(row, 0),
+                  let sessionID = text(row, 1),
+                  let cwd = text(row, 2),
+                  let timestamp = integer(row, 3),
+                  let title = text(row, 4),
+                  let content = text(row, 5)
+            else {
+                throw LiveSessionSearchIndexError.sqlite("malformed legacy session search row")
+            }
+            try perform(
+                """
+                INSERT INTO session_docs(
+                    rowid, session_id, cwd, updated_at, title, content, content_hash
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                """,
+                bindings: [
+                    .integer(rowID),
+                    .text(sessionID),
+                    .text(cwd),
+                    .integer(Self.unixSeconds(timestamp)),
+                    .text(title),
+                    .text(content),
+                    .text(Self.contentHash(title: title, content: content)),
+                ]
+            )
+        }
+        try executeBatch("DROP TABLE session_docs_swift_legacy")
+    }
+
+    private func createCanonicalSchema() throws {
+        try executeBatch("""
+            CREATE TABLE IF NOT EXISTS session_docs (
+                session_id TEXT PRIMARY KEY,
+                cwd TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS session_docs_fts USING fts5(
+                title,
+                content,
+                content = 'session_docs',
+                content_rowid = 'rowid'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS session_docs_ai AFTER INSERT ON session_docs BEGIN
+                INSERT INTO session_docs_fts(rowid, title, content)
+                VALUES (new.rowid, new.title, new.content);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS session_docs_ad AFTER DELETE ON session_docs BEGIN
+                INSERT INTO session_docs_fts(session_docs_fts, rowid, title, content)
+                VALUES ('delete', old.rowid, old.title, old.content);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS session_docs_au AFTER UPDATE ON session_docs BEGIN
+                INSERT INTO session_docs_fts(session_docs_fts, rowid, title, content)
+                VALUES ('delete', old.rowid, old.title, old.content);
+                INSERT INTO session_docs_fts(rowid, title, content)
+                VALUES (new.rowid, new.title, new.content);
+            END;
+            """)
+    }
+
+    private static func contentHash(title: String, content: String) -> String {
+        var bytes = Array(title.utf8)
+        bytes.append(0)
+        bytes.append(contentsOf: content.utf8)
+        return Blake3.hexDigest(bytes)
+    }
+
+    private static func unixSeconds(_ milliseconds: Int64) -> Int64 {
+        let seconds = milliseconds / 1_000
+        return milliseconds < 0 && milliseconds % 1_000 != 0 ? seconds - 1 : seconds
+    }
+
+    private static func validateSidecars(for databasePath: URL) throws {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = URL(fileURLWithPath: databasePath.path + suffix)
+            if (try? FileManager.default.destinationOfSymbolicLink(atPath: sidecar.path)) != nil {
+                throw LiveSessionSearchIndexError.insecure("SQLite sidecar must not be a symlink")
+            }
+            guard FileManager.default.fileExists(atPath: sidecar.path) else { continue }
+            try SecureFile.ensureOwnerOnlyPermissions(at: sidecar)
+            guard try SecureFile.isOwnerOnly(at: sidecar) else {
+                throw LiveSessionSearchIndexError.insecure("SQLite sidecar is not owner-private")
+            }
         }
     }
 

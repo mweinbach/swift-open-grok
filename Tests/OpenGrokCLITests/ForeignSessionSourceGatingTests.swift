@@ -59,9 +59,17 @@ private func plantResumeSkill(
 }
 
 private func plantClaudeSession(configDir: URL, cwd: String, nativeID: String) throws {
+    let projectName = cwd.unicodeScalars.map { scalar in
+        switch scalar.value {
+        case 48...57, 65...90, 97...122:
+            String(scalar)
+        default:
+            "-"
+        }
+    }.joined()
     let projectDir = configDir
         .appendingPathComponent("projects", isDirectory: true)
-        .appendingPathComponent("gate-proj", isDirectory: true)
+        .appendingPathComponent(projectName, isDirectory: true)
     try FileManager.default.createDirectory(at: projectDir, withIntermediateDirectories: true)
     let jsonl = """
     {"cwd":\(jsonString(cwd)),"type":"system"}

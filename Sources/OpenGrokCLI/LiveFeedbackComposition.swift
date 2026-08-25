@@ -238,7 +238,7 @@ public struct LiveFeedbackComposition: Sendable {
         )
         let manager = AuthManager(
             grokHome: openGrokHome,
-            config: GrokComConfig.default(environment: environment),
+            config: liveManagedAuthenticationConfiguration(environment: environment),
             environment: environment
         )
         let token = await manager.current()?.key

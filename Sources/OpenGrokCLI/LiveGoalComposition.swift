@@ -22,19 +22,45 @@
 // for the schema, and `xai-grok-shell/src/session/acp_session_impl/goal.rs` for
 // the drain loop the tool blocks on.
 //
-// Not ported: the classifier. Rust verifies a `completed: true` claim by
-// running a separate model pass that decides whether the goal was actually
-// achieved, with its own cap, stall detection and fail-open rules. This port
-// has no classifier, so `applyUpdate` takes the model at its word — which is
-// exactly the `CompletedWithoutClassifier` branch Rust itself falls back to
-// when the classifier policy is disabled. The behaviour is a documented Rust
-// mode, not an invention.
+// Not ported: the independent goal verifier. At the pinned Rust reference,
+// `goal.rs:176-185` pauses an active goal for infrastructure reasons when that
+// verifier is unavailable; it never accepts the worker model's completion
+// claim as independent evidence. Preserve that fail-closed boundary until the
+// actual verifier exists.
 
 import Foundation
+import OpenGrokFileUtils
 import OpenGrokGoalState
 import OpenGrokSamplingTypes
+import OpenGrokSessionPersistence
 import OpenGrokShared
 import OpenGrokToolsAPI
+
+enum LiveGoalPersistenceError: Error, Sendable, CustomStringConvertible {
+    case invalidSessionDirectory(String)
+    case stateOutsideRoot(path: String, root: String)
+    case symbolicLink(String)
+    case readFailed(path: String, reason: String)
+    case writeFailed(path: String, reason: String)
+    case invalidTransition(String)
+
+    var description: String {
+        switch self {
+        case .invalidSessionDirectory(let reason):
+            return "goal session storage is unavailable: \(reason)"
+        case .stateOutsideRoot(let path, let root):
+            return "goal state path \(path) escapes the session state root \(root)"
+        case .symbolicLink(let path):
+            return "goal state refuses to follow a symbolic link at \(path)"
+        case .readFailed(let path, let reason):
+            return "goal state could not be read at \(path): \(reason)"
+        case .writeFailed(let path, let reason):
+            return "goal state could not be persisted at \(path): \(reason)"
+        case .invalidTransition(let reason):
+            return reason
+        }
+    }
+}
 
 /// Serializes access to the tracker and persists it across turns.
 ///
@@ -43,26 +69,58 @@ import OpenGrokToolsAPI
 /// every mutation so a goal survives a crash mid-pursuit, which is when a goal
 /// is most worth surviving.
 actor LiveGoalCoordinator {
-    private var tracker: GoalTracker
-    private let stateURL: URL
+    static let verificationUnavailableMessage =
+        "Goal verification is unavailable. Resume after enabling the verifier."
 
-    init(sessionDirectory: URL) {
+    private var tracker: GoalTracker
+    private let stateRoot: URL
+    private let stateURL: URL
+    private let initializationError: LiveGoalPersistenceError?
+
+    init(
+        sessionDirectory: URL,
+        stateRoot: URL? = nil,
+        initializationError: LiveGoalPersistenceError? = nil
+    ) {
         let directory = sessionDirectory.standardizedFileURL
-        self.stateURL = directory
+        let root = (stateRoot ?? directory).standardizedFileURL
+        let stateURL = directory
             .appendingPathComponent("goal", isDirectory: true)
             .appendingPathComponent("state.json")
+        self.stateRoot = root
+        self.stateURL = stateURL
         // Restore rather than start empty: `GoalTracker.fromSnapshot` also
         // applies the resume rules (an active goal comes back user-paused, any
         // in-flight phase is cleared), which is what keeps a resumed session
         // from believing a subagent is still running.
-        if let data = try? Data(contentsOf: stateURL),
-           let snapshot = try? JSONDecoder().decode(GoalOrchestration.self, from: data) {
+        if let initializationError {
+            self.tracker = GoalTracker(sessionDirectory: directory)
+            self.initializationError = initializationError
+            return
+        }
+
+        do {
+            try Self.validateExistingStatePath(stateURL, under: root)
+            let data = try PathSecurity.readNoFollow(
+                stateURL,
+                maximumBytes: 8 * 1_024 * 1_024,
+                requireOwnerOnly: true
+            )
+            let snapshot = try JSONDecoder().decode(GoalOrchestration.self, from: data)
             self.tracker = GoalTracker.fromSnapshot(
                 sessionDirectory: directory,
                 snapshot: snapshot
             )
-        } else {
+            self.initializationError = nil
+        } catch FileUtilsError.notFound {
             self.tracker = GoalTracker(sessionDirectory: directory)
+            self.initializationError = nil
+        } catch {
+            self.tracker = GoalTracker(sessionDirectory: directory)
+            self.initializationError = .readFailed(
+                path: stateURL.path,
+                reason: String(describing: error)
+            )
         }
     }
 
@@ -72,53 +130,194 @@ actor LiveGoalCoordinator {
     var snapshot: GoalOrchestration? { tracker.snapshotValue }
 
     /// Start pursuing `objective`. Backs `/goal <objective>`.
-    func createGoal(objective: String) {
-        tracker.createGoal(
-            goalID: UUID().uuidString,
-            objective: objective
-        )
-        persist()
-    }
-
-    func pause() {
-        _ = tracker.pause(.user)
-        persist()
-    }
-
-    func resume() {
-        _ = tracker.resume()
-        persist()
-    }
-
-    func clear() {
-        tracker.clear()
-        persist()
-    }
-
-    /// Apply one `update_goal` call and report the verdict the model sees.
-    func applyUpdate(_ input: UpdateGoalInput) -> Result<GoalUpdateOutcome, Error> {
+    @discardableResult
+    func createGoal(objective: String) -> Result<Void, Error> {
+        let previous = tracker
         do {
-            let outcome = try tracker.applyUpdate(input)
-            persist()
-            return .success(outcome)
+            try ensureStorageAvailable()
+            // GoalTracker creates its goal directory internally. Establish the
+            // owner-only, no-symlink boundary before that unguarded creation.
+            try prepareStateDirectory()
+            tracker.createGoal(
+                goalID: UUID().uuidString,
+                objective: objective
+            )
+            try persist()
+            return .success(())
         } catch {
+            tracker = previous
             return .failure(error)
         }
     }
 
-    private func persist() {
+    @discardableResult
+    func pause() -> Result<Void, Error> {
+        mutateAndPersist { tracker in
+            guard tracker.pause(.user) else {
+                throw LiveGoalPersistenceError.invalidTransition("goal is not active")
+            }
+        }
+    }
+
+    @discardableResult
+    func resume() -> Result<Void, Error> {
+        mutateAndPersist { tracker in
+            guard tracker.resume() else {
+                throw LiveGoalPersistenceError.invalidTransition("goal is not paused")
+            }
+        }
+    }
+
+    @discardableResult
+    func clear() -> Result<Void, Error> {
+        mutateAndPersist { tracker in
+            tracker.clear()
+        }
+    }
+
+    /// Apply one `update_goal` call and report the verdict the model sees.
+    func applyUpdate(_ input: UpdateGoalInput) -> Result<GoalUpdateOutcome, Error> {
+        let previous = tracker
+        do {
+            try ensureStorageAvailable()
+            try input.validate()
+
+            let outcome: GoalUpdateOutcome
+            if input.completed == true {
+                guard tracker.isActive else {
+                    throw GoalUpdateValidationError.nonActiveGoal
+                }
+                guard tracker.pauseWithMessage(
+                    .infra,
+                    message: Self.verificationUnavailableMessage
+                ) else {
+                    throw GoalUpdateValidationError.nonActiveGoal
+                }
+                outcome = .accepted(
+                    summary: "Goal cannot be completed: \(Self.verificationUnavailableMessage)"
+                )
+            } else {
+                outcome = try tracker.applyUpdate(input)
+            }
+
+            try persist()
+            return .success(outcome)
+        } catch {
+            tracker = previous
+            return .failure(error)
+        }
+    }
+
+    private func mutateAndPersist(
+        _ mutation: (inout GoalTracker) throws -> Void
+    ) -> Result<Void, Error> {
+        let previous = tracker
+        do {
+            try ensureStorageAvailable()
+            try mutation(&tracker)
+            try persist()
+            return .success(())
+        } catch {
+            tracker = previous
+            return .failure(error)
+        }
+    }
+
+    private func ensureStorageAvailable() throws {
+        if let initializationError {
+            throw initializationError
+        }
+    }
+
+    private func persist() throws {
         guard let snapshot = tracker.snapshotValue else {
-            try? FileManager.default.removeItem(at: stateURL)
+            try Self.validateExistingStatePath(stateURL, under: stateRoot)
+            guard FileManager.default.fileExists(atPath: stateURL.path) else { return }
+            do {
+                try FileManager.default.removeItem(at: stateURL)
+                try AtomicFile.fsyncDirectory(at: stateURL.deletingLastPathComponent())
+            } catch {
+                throw LiveGoalPersistenceError.writeFailed(
+                    path: stateURL.path,
+                    reason: String(describing: error)
+                )
+            }
             return
         }
-        try? FileManager.default.createDirectory(
-            at: stateURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
+
+        try prepareStateDirectory()
+        try Self.rejectSymbolicLinkIfPresent(stateURL)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        guard let data = try? encoder.encode(snapshot) else { return }
-        try? data.write(to: stateURL, options: .atomic)
+        do {
+            let data = try encoder.encode(snapshot)
+            try AtomicFile.write(stateURL, data: data, options: .ownerOnly)
+        } catch {
+            throw LiveGoalPersistenceError.writeFailed(
+                path: stateURL.path,
+                reason: String(describing: error)
+            )
+        }
+    }
+
+    private func prepareStateDirectory() throws {
+        let destination = stateURL.deletingLastPathComponent()
+        let rootComponents = stateRoot.pathComponents
+        let destinationComponents = destination.pathComponents
+        guard destinationComponents.starts(with: rootComponents) else {
+            throw LiveGoalPersistenceError.stateOutsideRoot(
+                path: destination.path,
+                root: stateRoot.path
+            )
+        }
+
+        var directory = stateRoot
+        try prepareOwnerOnlyDirectory(directory)
+        for component in destinationComponents.dropFirst(rootComponents.count) {
+            directory.appendPathComponent(component, isDirectory: true)
+            try prepareOwnerOnlyDirectory(directory)
+        }
+    }
+
+    private func prepareOwnerOnlyDirectory(_ directory: URL) throws {
+        try Self.rejectSymbolicLinkIfPresent(directory)
+        do {
+            try RelocationFS.createDirectoryDurable(directory, stateRoot: stateRoot)
+            try RelocationFS.requireDirectory(directory)
+        } catch {
+            throw LiveGoalPersistenceError.writeFailed(
+                path: stateURL.path,
+                reason: String(describing: error)
+            )
+        }
+    }
+
+    private static func validateExistingStatePath(_ path: URL, under root: URL) throws {
+        let rootComponents = root.pathComponents
+        let pathComponents = path.pathComponents
+        guard pathComponents.starts(with: rootComponents) else {
+            throw LiveGoalPersistenceError.stateOutsideRoot(
+                path: path.path,
+                root: root.path
+            )
+        }
+
+        var componentPath = root
+        try rejectSymbolicLinkIfPresent(componentPath)
+        for component in pathComponents.dropFirst(rootComponents.count) {
+            componentPath.appendPathComponent(component)
+            try rejectSymbolicLinkIfPresent(componentPath)
+        }
+    }
+
+    private static func rejectSymbolicLinkIfPresent(_ path: URL) throws {
+        do {
+            if try PathSecurity.isSymlink(path) {
+                throw LiveGoalPersistenceError.symbolicLink(path.path)
+            }
+        } catch FileUtilsError.notFound {
+            return
+        }
     }
 }
 
@@ -260,29 +459,58 @@ enum LiveGoalCommands {
             case "status":
                 return .message(await statusText(coordinator: coordinator))
             case "pause":
-                await coordinator.pause()
-                return .message("Goal paused.")
+                return operationOutcome(
+                    await coordinator.pause(),
+                    success: "Goal paused.",
+                    failure: "Goal was not paused"
+                )
             case "resume":
-                await coordinator.resume()
-                return .message("Goal resumed.")
+                return operationOutcome(
+                    await coordinator.resume(),
+                    success: "Goal resumed.",
+                    failure: "Goal was not resumed"
+                )
             case "clear":
-                await coordinator.clear()
-                return .message("Goal cleared.")
+                return operationOutcome(
+                    await coordinator.clear(),
+                    success: "Goal cleared.",
+                    failure: "Goal was not cleared"
+                )
             case "edit":
                 return .message("Editing a goal in place is not supported; use /goal <objective> to replace it.")
             default:
                 break
             }
         }
-        await coordinator.createGoal(objective: trimmed)
-        return .submitPrompt(goalInstruction(trimmed))
+        switch await coordinator.createGoal(objective: trimmed) {
+        case .success:
+            return .submitPrompt(goalInstruction(trimmed))
+        case .failure(let error):
+            return .message("Goal was not created: \(error)")
+        }
     }
 
     static func statusText(coordinator: LiveGoalCoordinator) async -> String {
-        guard let objective = await coordinator.objective else {
+        guard let snapshot = await coordinator.snapshot else {
             return goalUsageMessage()
         }
-        let status = await coordinator.status?.rawValue ?? "unknown"
-        return "Goal (\(status)): \(objective)"
+        let summary = "Goal (\(snapshot.status.rawValue)): \(snapshot.objective)"
+        guard let pauseMessage = snapshot.pauseMessage, !pauseMessage.isEmpty else {
+            return summary
+        }
+        return "\(summary)\n\(pauseMessage)"
+    }
+
+    private static func operationOutcome(
+        _ result: Result<Void, Error>,
+        success: String,
+        failure: String
+    ) -> Outcome {
+        switch result {
+        case .success:
+            return .message(success)
+        case .failure(let error):
+            return .message("\(failure): \(error)")
+        }
     }
 }

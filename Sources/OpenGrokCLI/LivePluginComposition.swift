@@ -10,8 +10,8 @@
 // The trust model is the reason this file is careful. Installing a plugin runs
 // third-party code, so:
 //
-//   * A **remote** install requires explicit `--trust`. The first invocation
-//     prints what would be fetched and stops.
+//   * Every install requires explicit `--trust`, including local directories
+//     and marketplace entries. Hooks and skills are executable in every case.
 //   * When `marketplace.require_sha` (or `OPENGROK_MARKETPLACE_REQUIRE_SHA`) is
 //     on, an unpinned remote is refused *before* anything is fetched.
 //   * A pinned clone re-reads `HEAD` and aborts on mismatch.
@@ -27,7 +27,8 @@ import OpenGrokPluginMarketplace
 public enum LivePluginComposition {
     /// Actions this composition implements.
     public static let actions: Set<String> = [
-        "list", "install", "uninstall", "remove", "rm", "update", "marketplace"
+        "list", "install", "uninstall", "remove", "rm", "update",
+        "enable", "disable", "details", "validate", "tag", "marketplace"
     ]
 
     public static func handles(_ command: CLICommand) -> Bool {
@@ -49,9 +50,13 @@ public enum LivePluginComposition {
     public static func run(
         options: CLIResourceOptions,
         environment: [String: String],
-        streams: CLIStreams
+        streams: CLIStreams,
+        managedSettingsPath: URL? = nil
     ) throws {
-        let context = PluginContext(environment: environment)
+        let context = try PluginContext(
+            environment: environment,
+            managedSettingsPath: managedSettingsPath ?? claudeManagedSettingsPath()
+        )
         switch options.action {
         case "list":
             try listPlugins(options: options, context: context, streams: streams)
@@ -61,6 +66,14 @@ public enum LivePluginComposition {
             try removePlugin(options: options, context: context, streams: streams)
         case "update":
             try updatePlugins(options: options, context: context, streams: streams)
+        case "enable", "disable":
+            try setPluginEnabled(options: options, context: context, streams: streams)
+        case "details":
+            try describePlugin(options: options, context: context, streams: streams)
+        case "validate":
+            try validatePlugin(options: options, streams: streams)
+        case "tag":
+            try tagPlugin(options: options, context: context, streams: streams)
         case "marketplace":
             try showMarketplace(options: options, context: context, streams: streams)
         default:
@@ -75,8 +88,12 @@ public enum LivePluginComposition {
         context: PluginContext,
         streams: CLIStreams
     ) throws {
-        let registry = PluginInstallRegistry.load(from: context.location.registryURL)
+        let registry = try PluginInstallRegistry.loadOrThrow(from: context.location.registryURL)
         if options.json {
+            if options.options["--available"] == "true" {
+                try listAvailablePlugins(registry: registry, context: context, streams: streams)
+                return
+            }
             writeJSON(
                 registry.repositories.map { record in
                     PluginListEntry(
@@ -125,24 +142,37 @@ public enum LivePluginComposition {
                     + "Provide a marketplace plugin name, a git URL, or a local directory."
             )
         }
-        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        let source = PluginInstallSource.parse(raw, cwd: cwd)
         let trusted = options.options["--trust"] == "true"
-
-        // Remote code needs an explicit second look. Print what would happen and
-        // stop, rather than fetching on the first invocation.
-        if source.isRemote && !trusted {
-            guard case .git(let url, let ref, _) = source else { return }
-            streams.out("About to install plugin from remote git repo: \(url)\n")
-            if let ref { streams.out("Ref: \(ref)\n") }
-            streams.out(
-                "Installing a plugin runs third-party code with your session's permissions.\n"
+        if let reference = parseMarketplaceReference(raw) {
+            let resolved = try resolveMarketplacePlugin(reference, context: context)
+            guard trusted else {
+                throw explicitPluginTrustError(
+                    subject: "\"\(reference.name)\" from marketplace \"\(resolved.source.name)\"",
+                    argument: raw
+                )
+            }
+            try installResolvedMarketplacePlugin(
+                resolved,
+                raw: raw,
+                force: options.force,
+                context: context,
+                streams: streams
             )
-            streams.out("To proceed, re-run with --trust:\n  open-grok plugin install \(raw) --trust\n")
             return
         }
 
-        let registry = PluginInstallRegistry.load(from: context.location.registryURL)
+        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let source = PluginInstallSource.parse(raw, cwd: cwd)
+        guard trusted else {
+            let subject: String
+            switch source {
+            case .local(let path, _): subject = "from directory \(path)"
+            case .git(let url, _, _): subject = "from git repo \(url)"
+            }
+            throw explicitPluginTrustError(subject: subject, argument: raw)
+        }
+
+        let registry = try PluginInstallRegistry.loadOrThrow(from: context.location.registryURL)
         let identifier = source.identifier
         if registry.record(named: PluginInstallLocation.repoKey(sourceIdentifier: identifier)) != nil,
            !options.force {
@@ -150,78 +180,13 @@ public enum LivePluginComposition {
             return
         }
 
-        var record: PluginInstallRecord
-        switch source {
-        case .local(let path, let subdirectory):
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
-                  isDirectory.boolValue else {
-                throw CLIApplicationError.failed("Failed to install plugin: \(path) is not a directory")
-            }
-            let destination = context.location.directory(forSourceIdentifier: identifier)
-            try? FileManager.default.removeItem(at: destination)
-            do {
-                try FileManager.default.createDirectory(
-                    at: destination.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
-                // A recursive copy, not a symlink: a symlinked plugin would let
-                // later edits outside the install dir change what runs.
-                try FileManager.default.copyItem(at: URL(fileURLWithPath: path), to: destination)
-            } catch {
-                throw CLIApplicationError.failed("Failed to install plugin: \(error)")
-            }
-            record = PluginInstallRecord(
-                repoKey: PluginInstallLocation.repoKey(sourceIdentifier: identifier),
-                sourceIdentifier: identifier,
-                path: path,
-                pluginNames: pluginNames(in: destination, subdirectory: subdirectory)
-            )
-
-        case .git(let url, let ref, let subdirectory):
-            // The pin gate runs before any fetch.
-            let (hoistedRef, hoistedSHA) = PluginPin.hoistPinSlots(ref: ref, sha: nil)
-            try PluginPinGate.ensurePinned(
-                requireSHA: context.requireSHA,
-                sha: hoistedSHA,
-                plugin: raw,
-                url: url
-            )
-            let destination = context.location.directory(forSourceIdentifier: identifier)
-            try? FileManager.default.removeItem(at: destination)
-            do {
-                try PluginGitClient().clone(
-                    url: url,
-                    destination: destination,
-                    ref: hoistedRef,
-                    sha: hoistedSHA
-                )
-            } catch let error as PluginInstallError {
-                try? FileManager.default.removeItem(at: destination)
-                throw CLIApplicationError.failed("Failed to install plugin: \(error.description)")
-            }
-            record = PluginInstallRecord(
-                repoKey: PluginInstallLocation.repoKey(sourceIdentifier: identifier),
-                sourceIdentifier: identifier,
-                url: url,
-                ref: hoistedRef,
-                sha: hoistedSHA ?? PluginGitClient().head(at: destination),
-                pluginNames: pluginNames(in: destination, subdirectory: subdirectory)
-            )
-        }
-
-        var updated = registry
-        updated.repositories.removeAll { $0.repoKey == record.repoKey }
-        updated.repositories.append(record)
-        do {
-            try updated.save(to: context.location.registryURL)
-        } catch {
-            throw CLIApplicationError.failed("Failed to record plugin install: \(error)")
-        }
-
-        let names = record.pluginNames.isEmpty
-            ? record.repoKey
-            : record.pluginNames.joined(separator: ", ")
+        let record = try installPluginTransaction(
+            source: source,
+            raw: raw,
+            context: context,
+            provenance: nil
+        )
+        let names = record.pluginNames.joined(separator: ", ")
         streams.out("Installed \(record.pluginNames.count) plugin(s) from \(raw): \(names)\n")
         if context.requireSHA, let sha = record.sha {
             streams.out("Pinned at \(sha)\n")
@@ -238,7 +203,7 @@ public enum LivePluginComposition {
         guard let name = options.target else {
             throw CLIApplicationError.failed("Usage: open-grok plugin remove <name>")
         }
-        var registry = PluginInstallRegistry.load(from: context.location.registryURL)
+        let registry = try PluginInstallRegistry.loadOrThrow(from: context.location.registryURL)
         guard let record = registry.record(named: name) else {
             throw CLIApplicationError.failed(
                 "Plugin \"\(name)\" not found in install registry.\n"
@@ -257,16 +222,12 @@ public enum LivePluginComposition {
             streams.out("To remove all of them:\n  open-grok plugin remove \(name) --confirm\n")
             return
         }
-        let directory = context.location.directory(forSourceIdentifier: record.sourceIdentifier)
-        try? FileManager.default.removeItem(at: directory)
-        registry.repositories.removeAll { $0.repoKey == record.repoKey }
-        do {
-            try registry.save(to: context.location.registryURL)
-        } catch {
-            throw CLIApplicationError.failed("Failed to update plugin registry: \(error)")
-        }
+        let keepData = options.options["--keep-data"] == "true"
+        try uninstallPluginTransaction(record, keepData: keepData, context: context)
+        let suffix = keepData ? " (data preserved)" : ""
         streams.out(
-            "Uninstalled repo \"\(record.repoKey)\" (\(record.pluginNames.count) plugin(s))\n"
+            "Uninstalled \(record.pluginNames.count) plugin(s): "
+                + "\(record.pluginNames.joined(separator: ", "))\(suffix)\n"
         )
     }
 
@@ -277,7 +238,7 @@ public enum LivePluginComposition {
         context: PluginContext,
         streams: CLIStreams
     ) throws {
-        var registry = PluginInstallRegistry.load(from: context.location.registryURL)
+        let registry = try PluginInstallRegistry.loadOrThrow(from: context.location.registryURL)
         guard !registry.repositories.isEmpty else {
             streams.out("No installed plugins to update.\n")
             return
@@ -290,8 +251,21 @@ public enum LivePluginComposition {
         }
 
         let client = PluginGitClient()
-        var changed = false
         for record in targets {
+            if let installedFrom = record.marketplace {
+                do {
+                    try updateMarketplacePlugin(
+                        record,
+                        provenance: installedFrom,
+                        context: context,
+                        streams: streams
+                    )
+                } catch {
+                    streams.err("\(record.repoKey): update failed: \(error)\n")
+                    throw error
+                }
+                continue
+            }
             guard let url = record.url else {
                 streams.out("\(record.repoKey): local install (already live, no update needed)\n")
                 continue
@@ -321,14 +295,27 @@ public enum LivePluginComposition {
                 continue
             }
 
-            let directory = context.location.directory(forSourceIdentifier: record.sourceIdentifier)
+            let directory = try validatedInstalledPluginDirectory(record, context: context)
             let previous = client.head(at: directory)
             do {
-                try? FileManager.default.removeItem(at: directory)
-                try client.clone(url: url, destination: directory, ref: record.ref, sha: nil)
-            } catch let error as PluginInstallError {
-                streams.out("\(record.repoKey): update failed: \(error.description)\n")
-                continue
+                let source = PluginInstallSource.git(
+                    url: url,
+                    ref: record.ref,
+                    subdirectory: record.subdirectory
+                )
+                let updated = try installPluginTransaction(
+                    source: source,
+                    raw: record.repoKey,
+                    context: context,
+                    provenance: nil,
+                    preserving: record
+                )
+                guard updated.repoKey == record.repoKey else {
+                    throw CLIApplicationError.failed("Plugin update changed its repository identity")
+                }
+            } catch {
+                streams.err("\(record.repoKey): update failed: \(error)\n")
+                throw error
             }
             let current = client.head(at: directory)
             if previous == current {
@@ -337,14 +324,7 @@ public enum LivePluginComposition {
                 streams.out(
                     "\(record.repoKey): updated (\(short(previous)) -> \(short(current)))\n"
                 )
-                changed = true
             }
-            if let index = registry.repositories.firstIndex(where: { $0.repoKey == record.repoKey }) {
-                registry.repositories[index].sha = current
-            }
-        }
-        if changed {
-            try? registry.save(to: context.location.registryURL)
         }
     }
 
@@ -360,53 +340,7 @@ public enum LivePluginComposition {
         context: PluginContext,
         streams: CLIStreams
     ) throws {
-        let root = options.options["--source"].map { URL(fileURLWithPath: $0) }
-            ?? context.marketplaceCacheDirectory
-        let scan = scanMarketplace(root)
-        if options.json {
-            writeJSON(
-                scan.entries.map { entry in
-                    MarketplaceListEntry(
-                        name: entry.name,
-                        version: entry.version,
-                        description: entry.description,
-                        remoteURL: entry.remoteURL,
-                        remoteSHA: entry.remoteSHA,
-                        pinned: entry.remoteSHA.map(PluginPin.isFullCommitSHA) ?? false
-                    )
-                },
-                streams: streams
-            )
-            return
-        }
-        guard !scan.entries.isEmpty else {
-            streams.out("No marketplace entries found under \(root.path).\n")
-            if context.requireSHA {
-                streams.out("SHA pinning is required; unpinned entries would be refused.\n")
-            }
-            return
-        }
-        streams.out("Marketplace entries (\(scan.entries.count)):\n")
-        for entry in scan.entries {
-            let version = entry.version.map { " v\($0)" } ?? ""
-            streams.out("  \(entry.name)\(version)\n")
-            if let description = entry.description {
-                streams.out("    \(description)\n")
-            }
-            if let url = entry.remoteURL {
-                let pinned = entry.remoteSHA.map(PluginPin.isFullCommitSHA) ?? false
-                // Surfacing the pin state matters: with require_sha on, an
-                // unpinned entry is not installable, and the user should see
-                // that here rather than at install time.
-                let marker = pinned
-                    ? " [pinned \(short(entry.remoteSHA))]"
-                    : (context.requireSHA ? " [UNPINNED — refused by require_sha]" : " [unpinned]")
-                streams.out("    \(url)\(marker)\n")
-            }
-        }
-        if context.requireSHA {
-            streams.out("\nSHA pinning is required (marketplace.require_sha).\n")
-        }
+        try runMarketplaceManagement(options: options, context: context, streams: streams)
     }
 
     // MARK: - Helpers
@@ -452,8 +386,9 @@ struct PluginContext {
     let location: PluginInstallLocation
     let requireSHA: Bool
     let marketplaceCacheDirectory: URL
+    let managedMarketplacePolicy: ManagedPluginMarketplacePolicy
 
-    init(environment: [String: String]) {
+    init(environment: [String: String], managedSettingsPath: URL?) throws {
         self.environment = environment
         let home = OpenGrokHomeResolver.resolve(environment: environment)
         self.location = PluginInstallLocation(grokHome: home)
@@ -461,17 +396,30 @@ struct PluginContext {
             "marketplace-cache",
             isDirectory: true
         )
-        // Config read failure degrades to environment-only, never to "off with
-        // a config that asked for on" — the config might be the thing turning
-        // pinning on, so failing open there would be the wrong default.
-        let configured: Bool?
-        if let layers = try? ConfigLayers.load(environment: environment),
-           case .boolean(let value)? = layers.effectiveConfigBase()[
-            path: ["marketplace", "require_sha"]
-           ] {
-            configured = value
-        } else {
-            configured = nil
+        self.managedMarketplacePolicy = try ManagedPluginMarketplacePolicy.load(
+            from: managedSettingsPath
+        )
+        // Losing any layer can hide a managed SHA-pinning requirement. A
+        // malformed owner config therefore refuses the whole plugin action;
+        // falling back to environment-only would silently install unpinned code.
+        let layers: ConfigLayers
+        do {
+            layers = try ConfigLayers.load(environment: environment)
+        } catch {
+            throw CLIApplicationError.failed(
+                "Cannot safely resolve plugin trust policy from configuration: \(error)"
+            )
+        }
+        let documents = [layers.systemManaged, layers.managed, layers.user]
+            + [layers.userRequirements, layers.systemRequirements, layers.mdmRequirements]
+                .compactMap { $0 }
+        var configured: Bool?
+        for document in documents {
+            guard case .boolean(let value)? = document[path: ["marketplace", "require_sha"]]
+            else { continue }
+            // SHA pinning is tighten-only across authority tiers. A lower-tier
+            // explicit `false` must never erase a managed or requirements `true`.
+            configured = (configured ?? false) || value
         }
         self.requireSHA = PluginTrustPolicy.requireSHA(
             configuredValue: configured,

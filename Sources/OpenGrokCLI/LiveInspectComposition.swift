@@ -288,6 +288,15 @@ public enum LiveInspectComposition {
         let managedExists = managedPath.map {
             FileManager.default.fileExists(atPath: $0.path)
         } ?? false
+        let managedMarketplaceAllowlist: [String]
+        do {
+            managedMarketplaceAllowlist = try ManagedPluginMarketplacePolicy.load(
+                from: claudeManagedSettingsPath()
+            ).allowedURLs
+        } catch {
+            streams.err("open-grok: cannot safely inspect managed marketplace policy.\n")
+            return CLIRunner.ExitCode.failure.rawValue
+        }
         let enforced: [LiveInspectEnforcedPolicy] = security.permissions.yoloPinReason == nil
             ? []
             : [LiveInspectEnforcedPolicy(
@@ -304,9 +313,7 @@ public enum LiveInspectComposition {
             mcpServerAllowlist: stringArray(
                 security.document[path: ["permissions", "mcp_server_allowlist"]]
             ),
-            marketplaceAllowlist: stringArray(
-                security.document[path: ["marketplace", "allowlist"]]
-            ),
+            marketplaceAllowlist: managedMarketplaceAllowlist,
             managedSettingsPath: managedPath?.path,
             managedSettingsExists: managedExists,
             managedSettingsActive: security.permissions.sources.contains("managed-settings.json"),

@@ -1323,6 +1323,7 @@ actor LiveConversationHistory {
     private var usageCancellationToken: ChatStateCancellationToken
     private var usageSamplingConfig: SamplingConfig
     private var activeUsagePromptID: String?
+    private var stagedPromptImages: [String: [PastedImage]] = [:]
     private var eventTracker: SessionEventTracker?
     private(set) var eventLoggingFailure: String?
 
@@ -1373,6 +1374,15 @@ actor LiveConversationHistory {
 
     func snapshot() -> LiveConversationRecord { record }
 
+    func stagePromptImages(promptID: String, images: [PastedImage]) {
+        stagedPromptImages[promptID] = images
+    }
+
+    @discardableResult
+    func consumePromptImages(promptID: String) -> [PastedImage] {
+        stagedPromptImages.removeValue(forKey: promptID) ?? []
+    }
+
     /// Switch the in-memory spine only after the replacement record is
     /// durably written. The old record remains available through the store.
     func replace(with record: LiveConversationRecord) throws {
@@ -1398,6 +1408,7 @@ actor LiveConversationHistory {
         activeUsagePromptID = nil
         eventTracker = nil
         eventLoggingFailure = nil
+        stagedPromptImages.removeAll()
         self.record = record
         if record.everUsedNonXAI != false {
             self.exportBoundary.sync(everUsedNonXAI: true)
@@ -1971,7 +1982,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         // the next turn, never to half of this one.
         let active = await modelSwitch.snapshot()
         let sampler = active.sampler
-        let currentTools = toolExecutor.currentToolSpecs()
+        let currentTools = await toolExecutor.currentActiveToolSpecs()
         let activeToolSurface = LiveCodeModeToolSurface(
             mode: toolSurface.mode,
             baseTools: currentTools,
@@ -1996,6 +2007,37 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             ),
             agentMessage: request.isAgentMessage
         )
+        let stagedImages = await conversationHistory.consumePromptImages(
+            promptID: request.promptID
+        )
+        let imageReferences = toolExecutor.mcpToolset.resources.extras
+        imageReferences.insert(LiveImageTurnReferences(
+            sessionID: context.sessionID,
+            turnID: request.promptID,
+            attachments: stagedImages
+        ))
+        defer {
+            imageReferences.remove(LiveImageTurnReferences.self)
+        }
+        if !stagedImages.isEmpty {
+            guard LivePromptImageCapability.supports(modelID: active.modelID),
+                  let lastIndex = items.indices.last,
+                  case .user(var user) = items[lastIndex],
+                  user.syntheticReason == nil
+            else {
+                throw CLIApplicationError.failed(LivePromptImageCapability.textOnlyError)
+            }
+            try OpenGrokPagerImageAttachmentValidator.validate(stagedImages)
+            for image in stagedImages {
+                guard let data = image.encodedBytes else {
+                    throw OpenGrokPagerImageAttachmentError.missingImageData
+                }
+                user.addImage(
+                    "data:\(image.mimeType);base64,\(data.base64EncodedString())"
+                )
+            }
+            items[lastIndex] = .user(user)
+        }
         if let pending = await conversationHistory.pendingFirstPrompt {
             guard pending.sessionID == context.sessionID,
                   request.text == pending.directive,
@@ -2386,11 +2428,6 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                     if remainingCalls.isEmpty {
                         continue
                     }
-                    guard toolRoundCount < 16 else {
-                        throw CLIApplicationError.failed(
-                            "tool loop exceeded 16 rounds"
-                        )
-                    }
                     toolRoundCount += 1
                     let toolResults = try await LiveSubagentParentPromptContext.$promptID.withValue(
                         request.promptID
@@ -2398,6 +2435,9 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                         try await executeToolCalls(
                             remainingCalls,
                             sessionID: context.sessionID,
+                            supportsImageOutput: LivePromptImageCapability.supports(
+                                modelID: active.modelID
+                            ),
                             emit: emit
                         )
                     }
@@ -2580,6 +2620,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
     private func executeToolCalls(
         _ calls: [ToolCall],
         sessionID: String,
+        supportsImageOutput: Bool,
         emit: @escaping @Sendable (OpenGrokShellTurnUpdateKind) async -> Void
     ) async throws -> [ConversationItem] {
         // Feed the auto-mode classifier the recent conversation (Rust refreshes
@@ -2639,7 +2680,7 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         ) { group in
             for (index, call) in dispatched {
                 group.addTask {
-                    let result = await toolExecutor.invoke(
+                    let invocation = await toolExecutor.invoke(
                         sessionID: sessionID,
                         workingDirectory: workingDirectory,
                         call: call,
@@ -2654,10 +2695,24 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                             )))
                         }
                     )
+                    let result: Result<OpenGrokShellToolCallResult, OpenGrokShellToolRuntimeError>
+                    if case .success(let successful) = invocation,
+                       !successful.images.isEmpty,
+                       !supportsImageOutput {
+                        result = .failure(.failed(
+                            "image output is not supported by the active model"
+                        ))
+                    } else {
+                        result = invocation
+                    }
                     let content: String
+                    var images: [OpenGrokSamplingTypes.ContentPart] = []
                     switch result {
                     case .success(let result):
                         content = result.promptText
+                        images = result.images.map { image in
+                            .image(url: "data:\(image.mimeType);base64,\(image.base64Data)")
+                        }
                         let structuredOutput = LiveToolResultText.structuredOutput(for: result)
                         // Keep the success result (promptText / PostToolUse)
                         // and only flip the *display* state when structured
@@ -2756,7 +2811,8 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
                     }
                     return (index, ToolResultItem(
                         toolCallId: call.callId,
-                        content: content
+                        content: content,
+                        images: images
                     ))
                 }
             }

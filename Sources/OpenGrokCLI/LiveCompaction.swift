@@ -200,41 +200,56 @@ struct LiveCompactionContract: Sendable, Equatable {
         model: String,
         provider: ModelProvider,
         openGrokHome: URL,
-        hasCompactionSummary: Bool = false
+        hasCompactionSummary: Bool = false,
+        activeContextWindow: UInt64? = nil,
+        trustedAutoCompactThresholdPercent: UInt8? = nil,
+        environment: [String: String] = [:]
     ) -> LiveCompactionContract {
         let profile = embeddedDefaultModels().models.first {
             $0.model == model || ($0.id ?? $0.model) == model
         }
-        let contextWindow = profile?.contextWindow ?? NEW_MODEL_DEFAULT_CONTEXT_WINDOW
-        let threshold = profile?.autoCompactThresholdPercent ?? DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT
-        let explicit = profile?.compactionAtTokens?.resolve(
-            contextWindow: contextWindow,
-            thresholdPercent: threshold
-        )
-        let remaining = profile?.compactionsRemaining?
-            .resolve(hasCompactionSummary: hasCompactionSummary)
-            .map(UInt64.init)
-
-        var compactionHash: String?
+        let cachedCodexModel: CodexCatalogModel?
         if provider == .codex {
-            // The cached Codex catalog is the only place `comp_hash` lives. It
-            // is read without verifying the account fingerprint on purpose: a
-            // hash from another account is rejected server-side, which degrades
-            // this compaction to the local fallback — strictly better than
-            // sending no hash at all and having the server reject the request
-            // for a missing contract.
-            compactionHash = CodexModelsCacheManager(grokHome: openGrokHome)
+            cachedCodexModel = CodexModelsCacheManager(grokHome: openGrokHome)
                 .loadAny()?
                 .models
-                .first { $0.entry.info.model == model || $0.entry.info.id == model }?
-                .compHash
+                .first { $0.entry.info.model == model || $0.entry.info.id == model }
+        } else {
+            cachedCodexModel = nil
         }
+
+        let contextWindow = activeContextWindow.flatMap { $0 > 0 ? $0 : nil }
+            ?? cachedCodexModel?.entry.info.contextWindow
+            ?? profile?.contextWindow
+            ?? NEW_MODEL_DEFAULT_CONTEXT_WINDOW
+        let environmentThreshold = environment["GROK_AUTO_COMPACT_THRESHOLD_PERCENT"]
+            .flatMap { UInt8($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            .flatMap { (1...100).contains($0) ? $0 : nil }
+        let trustedThreshold = trustedAutoCompactThresholdPercent
+            .flatMap { (1...100).contains($0) ? $0 : nil }
+        let modelThreshold = cachedCodexModel?.entry.info.autoCompactThresholdPercent
+            ?? profile?.autoCompactThresholdPercent
+        let threshold = environmentThreshold
+            ?? trustedThreshold
+            ?? modelThreshold.flatMap { (1...100).contains($0) ? $0 : nil }
+            ?? DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT
+        let configuredTokenLimit = cachedCodexModel?.entry.info.compactionAtTokens
+            ?? profile?.compactionAtTokens
+        let explicit = configuredTokenLimit?.resolve(
+            contextWindow: contextWindow,
+            thresholdPercent: threshold
+        ) ?? cachedCodexModel?.autoCompactTokenLimit
+            .flatMap { $0 > 0 ? UInt64($0) : nil }
+        let remaining = (cachedCodexModel?.entry.info.compactionsRemaining
+            ?? profile?.compactionsRemaining)?
+            .resolve(hasCompactionSummary: hasCompactionSummary)
+            .map(UInt64.init)
 
         return LiveCompactionContract(
             contextWindow: contextWindow,
             thresholdPercent: threshold,
             explicitTokenLimit: explicit,
-            compactionHash: compactionHash,
+            compactionHash: cachedCodexModel?.compHash,
             compactionsRemaining: remaining
         )
     }
@@ -271,6 +286,11 @@ actor LiveCompactionCoordinator {
     /// Off switches Codex sessions to the legacy unary `/responses/compact`
     /// protocol, which upstream documents as the compatibility option.
     private let codexRemoteV2Enabled: Bool
+    /// Speculative compaction spends a provider call before the threshold is
+    /// reached. Upstream makes that cost explicitly opt-in (config.rs:2627).
+    private let twoPassCompactionEnabled: Bool
+    private let trustedAutoCompactThresholdPercent: UInt8?
+    private let stateSnapshotProvider: LiveCompactionStateSnapshotProvider?
 
     private let prefire = PrefireState()
     private var compactionCount: UInt64 = 0
@@ -293,6 +313,9 @@ actor LiveCompactionCoordinator {
         openGrokHome: URL,
         toolExecutor: LiveToolExecutor? = nil,
         codexRemoteV2Enabled: Bool = true,
+        twoPassCompactionEnabled: Bool = false,
+        trustedAutoCompactThresholdPercent: UInt8? = nil,
+        stateSnapshotProvider: LiveCompactionStateSnapshotProvider? = nil,
         makeCodexTransport: @escaping @Sendable (
             OpenGrokLiveSamplingConfiguration,
             ResponsesRequestPolicy,
@@ -348,6 +371,9 @@ actor LiveCompactionCoordinator {
         self.openGrokHome = openGrokHome
         self.toolExecutor = toolExecutor
         self.codexRemoteV2Enabled = codexRemoteV2Enabled
+        self.twoPassCompactionEnabled = twoPassCompactionEnabled
+        self.trustedAutoCompactThresholdPercent = trustedAutoCompactThresholdPercent
+        self.stateSnapshotProvider = stateSnapshotProvider
         self.makeCodexTransport = makeCodexTransport
     }
 
@@ -365,6 +391,7 @@ actor LiveCompactionCoordinator {
 
     /// Speculatively prefire Pass 1 in background if token usage is within lead percentage.
     func maybePrefire(items: [ConversationItem]) async {
+        guard twoPassCompactionEnabled else { return }
         guard !autoCompactSuppressed else { return }
         guard !prefire.hasCache && !prefire.isInFlight else { return }
         guard items.count >= 4 else { return }
@@ -375,7 +402,10 @@ actor LiveCompactionCoordinator {
             model: snapshot.modelID,
             provider: snapshot.provider,
             openGrokHome: openGrokHome,
-            hasCompactionSummary: compactionCount > 0
+            hasCompactionSummary: compactionCount > 0,
+            activeContextWindow: snapshot.configuration.tuning.contextWindow,
+            trustedAutoCompactThresholdPercent: trustedAutoCompactThresholdPercent,
+            environment: snapshot.configuration.environment
         )
         let totalTokens = items.map(estimateItemTokens).reduce(0, &+)
         guard shouldPrefireTwoPass(
@@ -399,6 +429,7 @@ actor LiveCompactionCoordinator {
         snapshot: LiveModelSwitchCoordinator.Snapshot
     ) async {
         defer { prefire.finish() }
+        guard twoPassCompactionEnabled else { return }
         guard items.count >= 4 else { return }
         let split = splitConversationForTwoPass(items, splitFraction: TWO_PASS_DEFAULT_SPLIT_FRACTION)
         guard !split.prefix.isEmpty && !split.tail.isEmpty else { return }
@@ -473,13 +504,15 @@ actor LiveCompactionCoordinator {
         let snapshot = await modelSwitch.snapshot()
         let engine = await makeEngine(snapshot: snapshot, items: items, turnID: turnID)
         guard engine.trigger(items: items, step: step) != nil else {
-            await maybePrefire(items: items)
+            if twoPassCompactionEnabled {
+                await maybePrefire(items: items)
+            }
             return .notNeeded(engine.usage(items: items, compactionCount: compactionCount))
         }
         await willCompact?()
 
         // 1. Try Two-Pass Prefire Pass 2 Apply
-        if prefire.hasCache || prefire.isInFlight {
+        if twoPassCompactionEnabled && (prefire.hasCache || prefire.isInFlight) {
             let sampler = LiveCompactionSampler(
                 sampler: snapshot.sampler,
                 model: snapshot.modelID,
@@ -505,7 +538,8 @@ actor LiveCompactionCoordinator {
                     userMessagePrefix: preamble,
                     lastUserQuery: extractLastRealUserQuery(older),
                     recentMessages: retained,
-                    compactionSummary: summaryText
+                    compactionSummary: summaryText,
+                    systemReminder: await liveStateReminder(for: items)
                 ))
                 let sanitized = sanitizeCompactedHistory(replacement).items
                 let tokensAfter = sanitized.map(estimateItemTokens).reduce(0, &+)
@@ -551,7 +585,11 @@ actor LiveCompactionCoordinator {
         case .unableToCompact(let reason):
             autoCompactSuppressed = true
             return .unableToCompact(reason: reason)
-        case .compacted(let replacement, let report):
+        case .compacted(let compactedItems, let compactedReport):
+            let replacement = await addingLiveStateReminder(to: compactedItems, source: items)
+            var report = compactedReport
+            report.itemsAfter = replacement.count
+            report.tokensAfter = replacement.map(estimateItemTokens).reduce(0, &+)
             // Refuse a replacement built against a history that moved. The
             // in-flight array is owned by one turn, so this only fires if a
             // future caller shares it — but the guard costs nothing and the
@@ -593,7 +631,7 @@ actor LiveCompactionCoordinator {
         let snapshot = await modelSwitch.snapshot()
 
         // 1. Try Two-Pass Prefire Pass 2 Apply if available
-        if prefire.hasCache || prefire.isInFlight {
+        if twoPassCompactionEnabled && (prefire.hasCache || prefire.isInFlight) {
             let sampler = LiveCompactionSampler(
                 sampler: snapshot.sampler,
                 model: snapshot.modelID,
@@ -619,7 +657,8 @@ actor LiveCompactionCoordinator {
                     userMessagePrefix: preamble,
                     lastUserQuery: extractLastRealUserQuery(older),
                     recentMessages: retained,
-                    compactionSummary: summaryText
+                    compactionSummary: summaryText,
+                    systemReminder: await liveStateReminder(for: items)
                 ))
                 let sanitized = sanitizeCompactedHistory(replacement).items
                 let tokensAfter = sanitized.map(estimateItemTokens).reduce(0, &+)
@@ -669,7 +708,11 @@ actor LiveCompactionCoordinator {
             return .notNeeded(usage)
         case .unableToCompact(let reason):
             return .unableToCompact(reason: reason)
-        case .compacted(let replacement, let report):
+        case .compacted(let compactedItems, let compactedReport):
+            let replacement = await addingLiveStateReminder(to: compactedItems, source: items)
+            var report = compactedReport
+            report.itemsAfter = replacement.count
+            report.tokensAfter = replacement.map(estimateItemTokens).reduce(0, &+)
             let current = await history.items
             guard commitCompactionReplacement(
                 snapshot: items,
@@ -695,6 +738,37 @@ actor LiveCompactionCoordinator {
 
     private func systemMessage(in items: [ConversationItem]) -> ConversationItem {
         items.first(where: { if case .system = $0 { return true } else { return false } }) ?? .system("You are Open Grok.")
+    }
+
+    private func liveStateReminder(for items: [ConversationItem]) async -> String? {
+        let lastUserQuery = extractLastRealUserQuery(items)
+        let snapshot: LiveCompactionStateSnapshot
+        if let stateSnapshotProvider {
+            snapshot = await stateSnapshotProvider(sessionID, lastUserQuery)
+        } else if let toolExecutor {
+            snapshot = await LiveCompactionStateReminder.snapshot(
+                sessionID: sessionID,
+                lastUserQuery: lastUserQuery,
+                toolExecutor: toolExecutor
+            )
+        } else {
+            return nil
+        }
+        return LiveCompactionStateReminder.render(snapshot)
+    }
+
+    private func addingLiveStateReminder(
+        to replacement: [ConversationItem],
+        source: [ConversationItem]
+    ) async -> [ConversationItem] {
+        guard let reminder = await liveStateReminder(for: source) else { return replacement }
+        guard !replacement.contains(where: { item in
+            guard case .user(let user) = item,
+                  user.syntheticReason == .systemReminder
+            else { return false }
+            return item.textContent() == reminder
+        }) else { return replacement }
+        return replacement + [.systemReminder(reminder)]
     }
 
     private func recordCompactionCheckpoint(
@@ -765,7 +839,10 @@ actor LiveCompactionCoordinator {
             model: snapshot.modelID,
             provider: snapshot.provider,
             openGrokHome: openGrokHome,
-            hasCompactionSummary: compactionCount > 0
+            hasCompactionSummary: compactionCount > 0,
+            activeContextWindow: snapshot.configuration.tuning.contextWindow,
+            trustedAutoCompactThresholdPercent: trustedAutoCompactThresholdPercent,
+            environment: snapshot.configuration.environment
         )
         var policy = CompactionPolicy()
         policy.enabled = true

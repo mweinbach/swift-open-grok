@@ -137,6 +137,14 @@ public enum LiveServeComposition {
             ),
             makeRuntime: {
                 let runtime = ACPAgentRuntime(
+                    configuration: ACPAgentConfiguration(
+                        agentCapabilities: ACPAgentConfiguration.defaultAgentCapabilities(
+                            supportsEmbeddedContext: true
+                        ),
+                        initializationMetadata: OpenGrokInitializeMetadata(
+                            currentWorkingDirectory: cwd.path
+                        )
+                    ),
                     store: store,
                     promptDriver: promptDriver,
                     workspaceBoundary: boundary,

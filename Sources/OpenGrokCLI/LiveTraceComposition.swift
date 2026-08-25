@@ -8,12 +8,16 @@ import OpenGrokShellSessionSupport
 private struct LiveTraceResult: Encodable {
     let sessionID: String
     let status: String
-    let localPath: String
+    let url: String?
+    let localPath: String?
+    let error: String?
 
     private enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
         case status
+        case url
         case localPath = "local_path"
+        case error
     }
 }
 
@@ -90,9 +94,9 @@ private struct LiveMemoryTraceCandidate {
     let dumpSequence: UInt64
 }
 
-/// Rust: `xai-grok-pager/src/trace_cmd.rs:35-73,80-153,351-420`.
-/// Remote uploading remains deliberately unavailable and never falls back to
-/// an unauthorized request; disabled uploads retain Rust's local-export path.
+/// Rust: `xai-grok-pager/src/trace_cmd.rs:35-73,80-153,351-534`.
+/// Every remote path authorizes before constructing an archive; disabled
+/// uploads retain Rust's local-export path.
 public enum LiveTraceComposition {
     private static let maximumSessionFiles = 2_048
     private static let maximumSessionFileBytes = 16 * 1_024 * 1_024
@@ -108,20 +112,31 @@ public enum LiveTraceComposition {
 
     public static func session(
         for command: CLICommand,
-        context: CLIApplicationContext
+        context: CLIApplicationContext,
+        services: LiveTraceUploadServices = .production
     ) throws -> CLIApplicationSession {
         guard case .utility(let options) = command, options.name == "trace" else {
             throw CLIApplicationError.unsupported(route: command.routeName)
         }
-        try run(options: options, environment: context.environment, streams: context.streams)
-        return CLIApplicationSession(waitForExit: {}, shutdown: {})
+        return CLIApplicationSession(
+            waitForExit: {
+                try await run(
+                    options: options,
+                    environment: context.environment,
+                    streams: context.streams,
+                    services: services
+                )
+            },
+            shutdown: {}
+        )
     }
 
     public static func run(
         options: CLIUtilityOptions,
         environment: [String: String],
-        streams: CLIStreams
-    ) throws {
+        streams: CLIStreams,
+        services: LiveTraceUploadServices = .production
+    ) async throws {
         guard options.values.count == 1, let sessionID = options.values.first else {
             throw CLIApplicationError.failed(
                 "trace requires exactly one session id: "
@@ -141,18 +156,25 @@ public enum LiveTraceComposition {
             environment: environment
         )).traceUpload.value
 
-        if !options.isSet("--local"), uploadEnabled {
-            throw CLIApplicationError.failed(
-                "Trace upload is enabled, but the upload client is not available; "
-                    + "rerun with --local to export without sending session data."
+        let uploadsRemotely = !options.isSet("--local") && uploadEnabled
+        let authorization: LiveTraceUpload.Authorization?
+        if uploadsRemotely {
+            authorization = try await LiveTraceUpload.authorize(
+                sessionID: sessionID,
+                home: home,
+                document: document,
+                environment: environment,
+                uploadEnabled: uploadEnabled
             )
-        }
-        if !options.isSet("--local"), !options.json {
-            streams.err(
-                "Trace uploads disabled. Set [telemetry] trace_upload = true in "
-                    + "\(home.appendingPathComponent("config.toml").path)\n"
-            )
-            streams.err("Falling back to local export.\n")
+        } else {
+            authorization = nil
+            if !options.isSet("--local"), !options.json {
+                streams.err(
+                    "Trace uploads disabled. Set [telemetry] trace_upload = true in "
+                        + "\(home.appendingPathComponent("config.toml").path)\n"
+                )
+                streams.err("Falling back to local export.\n")
+            }
         }
 
         let sessionDirectory = try findSessionDirectory(id: sessionID, home: home)
@@ -212,6 +234,107 @@ public enum LiveTraceComposition {
             home: home,
             environment: environment
         )
+
+        if let authorization {
+            if !options.json {
+                streams.err("Uploading session trace (\(archive.count / 1_024) KB)...\n")
+            }
+
+            let uploadedURL: String
+            let retryNotice: (@Sendable (TimeInterval) -> Void)?
+            if options.json {
+                retryNotice = nil
+            } else {
+                retryNotice = { seconds in
+                    streams.err("  Upload failed, retrying in \(Int(seconds))s...\n")
+                }
+            }
+            do {
+                uploadedURL = try await LiveTraceUpload.upload(
+                    sessionID: sessionID,
+                    archive: archive,
+                    initialAuthorization: authorization,
+                    home: home,
+                    document: document,
+                    environment: environment,
+                    uploadEnabled: uploadEnabled,
+                    services: services,
+                    retryNotice: retryNotice
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                let failure = LiveTraceUpload.failureMessage(error)
+                try writeArchive(archive, to: destination)
+                let logPath = try writeUploadFailureLog(
+                    sessionID: sessionID,
+                    archiveSize: archive.count,
+                    failure: failure,
+                    home: home,
+                    environment: environment
+                )
+
+                if options.json {
+                    try emitResult(
+                        LiveTraceResult(
+                            sessionID: sessionID,
+                            status: "failed",
+                            url: nil,
+                            localPath: destination.path,
+                            error: failure
+                        ),
+                        streams: streams
+                    )
+                } else {
+                    streams.err("\nTrace upload failed: \(failure)\n")
+                    streams.err("  Bundle: \(destination.path)\n")
+                    streams.err("  Log:    \(logPath.path)\n")
+                    streams.err("  Retry:  open-grok trace \(sessionID)\n")
+                    streams.out(destination.path + "\n")
+                }
+                throw CLIApplicationError.failed("Trace upload failed for session \(sessionID)")
+            }
+
+            if options.json {
+                try emitResult(
+                    LiveTraceResult(
+                        sessionID: sessionID,
+                        status: "uploaded",
+                        url: uploadedURL,
+                        localPath: nil,
+                        error: nil
+                    ),
+                    streams: streams
+                )
+            } else {
+                streams.err("\nSession trace uploaded successfully.\n")
+                streams.err("  \(uploadedURL)\n")
+                streams.out(uploadedURL + "\n")
+            }
+            return
+        }
+
+        try writeArchive(archive, to: destination)
+
+        if options.json {
+            try emitResult(
+                LiveTraceResult(
+                    sessionID: sessionID,
+                    status: "exported",
+                    url: nil,
+                    localPath: destination.path,
+                    error: nil
+                ),
+                streams: streams
+            )
+        } else {
+            streams.err("Session trace exported (\(archive.count / 1_024) KB):\n")
+            streams.err("  \(destination.path)\n")
+            streams.out(destination.path + "\n")
+        }
+    }
+
+    private static func writeArchive(_ archive: Data, to destination: URL) throws {
         do {
             try FileManager.default.createDirectory(
                 at: destination.deletingLastPathComponent(),
@@ -225,22 +348,54 @@ public enum LiveTraceComposition {
                 "Failed to securely write trace archive \(destination.path): \(error)"
             )
         }
+    }
 
-        if options.json {
-            let result = LiveTraceResult(
-                sessionID: sessionID,
-                status: "exported",
-                localPath: destination.path
+    private static func emitResult(_ result: LiveTraceResult, streams: CLIStreams) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let encoded = try encoder.encode(result)
+        streams.out(String(decoding: encoded, as: UTF8.self) + "\n")
+    }
+
+    private static func writeUploadFailureLog(
+        sessionID: String,
+        archiveSize: Int,
+        failure: String,
+        home: URL,
+        environment: [String: String]
+    ) throws -> URL {
+        let directory = home.appendingPathComponent("trace-exports", isDirectory: true)
+        let destination = directory.appendingPathComponent("\(sessionID).upload.log")
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let contents = """
+        Trace upload debug log
+        ======================
+        Timestamp:         \(timestamp)
+        Open Grok version: \(OpenGrokCLIVersion.installedWithCommit(environment: environment))
+        OS:                \(operatingSystem) \(architecture)
+        Session ID:        \(sessionID)
+        Archive size:      \(archiveSize) bytes
+        Object path:       \(sessionID)/trace_export.tar.gz
+        Upload method:     authenticated storage proxy
+
+        Error:
+          \(failure)
+
+        """
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
             )
-            let machineEncoder = JSONEncoder()
-            machineEncoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-            let encoded = try machineEncoder.encode(result)
-            streams.out(String(decoding: encoded, as: UTF8.self) + "\n")
-        } else {
-            streams.err("Session trace exported (\(archive.count / 1_024) KB):\n")
-            streams.err("  \(destination.path)\n")
-            streams.out(destination.path + "\n")
+            try rejectSymbolicLinkDestination(destination)
+            try SecureFile.write(at: destination, contents: Data(contents.utf8))
+        } catch {
+            throw CLIApplicationError.failed(
+                "Trace upload failed and its private diagnostic log could not be saved."
+            )
         }
+        return destination
     }
 
     private static func findSessionDirectory(id: String, home: URL) throws -> URL {

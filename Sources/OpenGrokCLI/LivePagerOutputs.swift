@@ -7,6 +7,7 @@ import OpenGrokCodeMode
 import OpenGrokCompaction
 import OpenGrokConfig
 import OpenGrokConfigTypes
+import OpenGrokCrashHandler
 import OpenGrokDiagnostics
 import OpenGrokFileTools
 import OpenGrokFastWorktree
@@ -45,7 +46,48 @@ import OpenGrokWebMediaTools
 import OpenGrokWorkspace
 
 
-actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPagerRuntimeAdapter {
+enum LivePromptImageCapability {
+    static let textOnlyError = "Error: this model is text-only and cannot accept image input."
+
+    static func supports(modelID: String) -> Bool {
+        let lowercased = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let slug = lowercased.split(whereSeparator: { $0 == "/" || $0 == ":" })
+            .last.map(String.init) ?? lowercased
+        let normalized: String
+        if slug.hasPrefix("glm-5p"),
+           let next = slug.dropFirst("glm-5p".count).first,
+           next.isNumber {
+            normalized = "glm-5." + slug.dropFirst("glm-5p".count)
+        } else {
+            normalized = slug
+        }
+        guard normalized.hasPrefix("glm-5") else { return true }
+
+        let remainder = normalized.dropFirst("glm-5".count)
+        var visionSuffix = remainder
+        if let first = visionSuffix.first, first == "." || first == "-" || first == "_" {
+            visionSuffix.removeFirst()
+        }
+        while visionSuffix.first?.isNumber == true {
+            visionSuffix.removeFirst()
+        }
+        while let first = visionSuffix.first, first == "." || first == "-" || first == "_" {
+            visionSuffix.removeFirst()
+        }
+        if visionSuffix.hasPrefix("v") || visionSuffix.contains("vision") {
+            return true
+        }
+        if remainder.isEmpty || remainder.hasPrefix("-") || remainder.hasPrefix("_") {
+            return false
+        }
+        guard remainder.hasPrefix(".") else { return true }
+        let revision = remainder.dropFirst()
+        return !(revision.hasPrefix("1") || revision.hasPrefix("2") || revision.hasPrefix("3"))
+    }
+}
+
+actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter,
+    OpenGrokPagerImageAttachmentRuntimeAdapter {
     let shell: OpenGrokShell
     let cwd: URL
     private var providerConfiguration: ProviderSessionConfiguration
@@ -92,6 +134,13 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
 
     func makeSession(
         for request: OpenGrokPagerMinimalRequest
+    ) async throws -> any OpenGrokPagerMinimalSessionAdapter {
+        try await makeSession(for: request, attachments: [])
+    }
+
+    private func makeSession(
+        for request: OpenGrokPagerMinimalRequest,
+        attachments: [PastedImage]
     ) async throws -> any OpenGrokPagerMinimalSessionAdapter {
         let sessionID = SessionID(request.sessionID ?? providerConfiguration.sessionID)
         let record = await conversationHistory.snapshot()
@@ -181,10 +230,22 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
         } else {
             turnRequest = OpenGrokShellTurnRequest(promptID: promptID, text: request.prompt)
         }
-        let handle = try await shell.submitTurn(
-            sessionID: sessionID,
-            request: turnRequest
-        )
+        if !attachments.isEmpty {
+            try await validateImageAttachments(attachments)
+            await conversationHistory.stagePromptImages(promptID: promptID, images: attachments)
+        }
+        let handle: OpenGrokShellTurnHandle
+        do {
+            handle = try await shell.submitTurn(
+                sessionID: sessionID,
+                request: turnRequest
+            )
+        } catch {
+            if !attachments.isEmpty {
+                _ = await conversationHistory.consumePromptImages(promptID: promptID)
+            }
+            throw error
+        }
         return LivePagerSession(shell: shell, handle: handle, shellEvents: shellEvents)
     }
 
@@ -212,6 +273,56 @@ actor LivePagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGrokPager
         for request: OpenGrokPagerRequest
     ) async throws -> any OpenGrokPagerSessionAdapter {
         try await makeSession(for: request.sessionRequest)
+    }
+
+    func makeSession(
+        for request: OpenGrokPagerRequest,
+        attachments: [PastedImage]
+    ) async throws -> any OpenGrokPagerSessionAdapter {
+        try await makeSession(for: request.sessionRequest, attachments: attachments)
+    }
+
+    func validateImageAttachments(_ attachments: [PastedImage]) async throws {
+        try OpenGrokPagerImageAttachmentValidator.validate(attachments)
+
+        let activeModelID: String
+        if let modelSwitch {
+            activeModelID = await modelSwitch.snapshot().modelID
+        } else {
+            activeModelID = providerConfiguration.initialModelID
+        }
+        let wireModelID = providerConfiguration.modelCatalog[activeModelID]?.model
+        guard LivePromptImageCapability.supports(modelID: activeModelID),
+              wireModelID.map(LivePromptImageCapability.supports(modelID:)) ?? true else {
+            throw CLIApplicationError.failed(LivePromptImageCapability.textOnlyError)
+        }
+
+        for attachment in attachments {
+            guard let bytes = attachment.encodedBytes else {
+                throw OpenGrokPagerImageAttachmentError.missingImageData
+            }
+            let expectedFormat: ImageFormat
+            switch attachment.mimeType.lowercased() {
+            case "image/png": expectedFormat = .png
+            case "image/jpeg": expectedFormat = .jpeg
+            case "image/webp": expectedFormat = .webp
+            case "image/gif": expectedFormat = .gif
+            default:
+                throw OpenGrokPagerImageAttachmentError.unsupportedMIMEType(
+                    attachment.mimeType
+                )
+            }
+            guard ImageNormalizer.detectFormat(in: bytes) == expectedFormat,
+                  let detected = ImageNormalizer.detectDimensions(in: bytes),
+                  let width = UInt32(exactly: detected.width),
+                  let height = UInt32(exactly: detected.height) else {
+                throw OpenGrokPagerImageAttachmentError.invalidImageData
+            }
+            try OpenGrokPagerImageAttachmentValidator.validateDimensions(
+                width: width,
+                height: height
+            )
+        }
     }
 
     func replaceSession(from request: OpenGrokPagerRequest) async throws -> String {
@@ -669,6 +780,7 @@ actor LiveInteractiveInputResource {
         guard !closed, !suspended else { return false }
         guard await input.pauseReads() else { return false }
         suspended = true
+        disableTerminalEscapeRestore()
         await lease.release()
         return true
     }
@@ -685,6 +797,7 @@ actor LiveInteractiveInputResource {
             // reader paused and surface the error rather than resuming into
             // a cooked tty silently.
             lease = try await rawModeTTY.enterRawMode()
+            enableTerminalEscapeRestore()
         }
         suspended = false
         input.discardPendingInput()
@@ -704,6 +817,7 @@ actor LiveInteractiveInputResource {
         if let resizeTask {
             _ = await resizeTask.value
         }
+        disableTerminalEscapeRestore()
         await lease.release()
     }
 }

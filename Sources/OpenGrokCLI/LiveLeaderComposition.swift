@@ -238,7 +238,7 @@ public enum LiveLeaderComposition {
             workspaceBoundary: workspace.acpBoundary
         )
 
-        let authConfig = GrokComConfig.default(environment: environment)
+        let authConfig = liveManagedAuthenticationConfiguration(environment: environment)
         let manager = AuthManager(
             grokHome: home,
             config: authConfig,

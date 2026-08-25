@@ -137,7 +137,7 @@ enum LiveShareHTTPSupport {
         let home = OpenGrokHomeResolver.resolve(environment: environment)
         let manager = AuthManager(
             grokHome: home,
-            config: GrokComConfig.default(environment: environment),
+            config: liveManagedAuthenticationConfiguration(environment: environment),
             environment: environment
         )
         do {

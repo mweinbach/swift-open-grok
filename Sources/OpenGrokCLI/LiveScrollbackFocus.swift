@@ -479,19 +479,31 @@ enum LivePagerContextReport {
 
 // MARK: - Clipboard
 
-/// Put text on the user's clipboard from inside the alt screen.
-///
-/// OSC 52 rather than a subprocess: it is the only mechanism that also works
-/// over SSH and inside tmux, which is exactly where a TUI's copy is most
-/// needed, and it costs one write to the sink already in hand.
+/// Route copies through the native clipboard, terminal, and private recovery
+/// file; an escape write alone cannot establish that a terminal accepted it.
 enum LivePagerClipboard {
+    @discardableResult
+    static func copy(
+        _ text: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        nativeWrite: LiveClipboardCopy.NativeWriter? = nil,
+        _ write: (Data) throws -> Void
+    ) throws -> LiveClipboardCopy.Delivery {
+        try LiveClipboardCopy.copy(
+            text,
+            environment: environment,
+            nativeWrite: nativeWrite,
+            writeEscape: write
+        )
+    }
+
+    @discardableResult
     static func copy(
         _ text: String,
         to write: (Data) throws -> Void,
         environment: [String: String] = ProcessInfo.processInfo.environment
-    ) throws {
-        let insideTmux = environment["TMUX"] != nil
-        try write(osc52Sequence(text: text, tmuxPassthrough: insideTmux))
+    ) throws -> LiveClipboardCopy.Delivery {
+        try copy(text, environment: environment, write)
     }
 
     /// A `/copy` or `/export` destination, relative to the session's directory.

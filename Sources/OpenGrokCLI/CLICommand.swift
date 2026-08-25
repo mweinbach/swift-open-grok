@@ -1079,11 +1079,13 @@ public enum CLICommandParser {
                     // Retained from this port's earlier grammar so existing
                     // callers and tests keep working.
                     "--command": "--command", "--url": "--url", "--source": "--source",
+                    "--type": "--type",
                     "--config": "--config"
                 ]
                 grammar.repeated = [
                     "--env": "--env", "-e": "--env",
-                    "--header": "--header", "-H": "--header"
+                    "--header": "--header", "-H": "--header",
+                    "--args": "--args"
                 ]
                 grammar.flags = ["--json": "--json", "--force": "--force"]
                 grammar.acceptsTrailingValues = true
@@ -1171,6 +1173,12 @@ public enum CLICommandParser {
                 options[canonical] = try cursor.value(for: option)
             } else if let canonical = grammar.repeated[option.name] {
                 repeatedOptions[canonical, default: []].append(try cursor.value(for: option))
+                if canonical == "--args" {
+                    while let argument = cursor.peek, !argument.hasPrefix("-") {
+                        guard let next = cursor.pop() else { break }
+                        repeatedOptions[canonical, default: []].append(next)
+                    }
+                }
             } else if let canonical = grammar.flags[option.name] {
                 switch canonical {
                 case "--json": json = true

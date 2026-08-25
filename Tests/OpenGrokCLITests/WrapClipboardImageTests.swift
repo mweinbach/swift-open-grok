@@ -65,8 +65,8 @@ struct WrapClipboardImageTests {
     @Test("Decode GROK_WRAP_NONE returns .noImage")
     func decodeWrapNone() {
         #expect(decodeWrapImagePaste(payload: MAGIC_NONE) == .noImage)
-        #expect(decodeWrapImagePaste(payload: "\(MAGIC_NONE)\n") == .noImage)
-        #expect(decodeWrapImagePaste(payload: "\(MAGIC_NONE)\r\n") == .noImage)
+        #expect(decodeWrapImagePaste(payload: "\(MAGIC_NONE)\n") == nil)
+        #expect(decodeWrapImagePaste(payload: "\(MAGIC_NONE)\r\n") == nil)
     }
 
     @Test("Non-wrap plain text returns nil")

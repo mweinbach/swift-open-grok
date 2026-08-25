@@ -7,15 +7,14 @@
 // forward routes at the pin are list / call / read_resource / auth_status /
 // auth_trigger / setup / toggle / toggle_tool / upsert / delete
 // (`mcp_methods`, mcp.rs:33-50; `route_mcp_method`, mcp.rs:358-372). This
-// port routes the nine with real backings and refuses the rest:
+// port routes the ten with real backings and refuses unknown names:
 //
 //   * `list` (mcp.rs:899-1185) — the local server catalog (trust-gated
 //     config layers) annotated with the live session's connection state.
-//     NOT ported inside it: managed connectors, the managed gateway tool
-//     catalog, setup-schema rows, and disabled-name placeholders — those
-//     subsystems (cli-chat-proxy fetch, `mcp_preferences.json`,
-//     `disabled_mcp_servers`) do not exist in this port, so their rows are
-//     absent rather than invented. `cache:false`'s managed-cache
+//     Includes unresolved setup-schema rows and persisted setup values.
+//     Managed connectors, the managed gateway tool catalog, and
+//     disabled-name placeholders remain outside this slice. `cache:false`'s
+//     managed-cache
 //     invalidation is likewise a no-op — there is no managed cache.
 //   * `call` (`wire::MCP_CALL`, mcp.rs:1189-1223, 825-895) — invoke a tool
 //     on a connected server directly, outside the LLM loop, through the
@@ -31,8 +30,12 @@
 //   * `auth_trigger` (mcp.rs:1526-1578; acp_session_impl/mcp.rs:405-514) —
 //     the REAL E7 browser flow (`mcpAuthenticateServer(force: true)`), then
 //     a live reconnect that registers the server's tools into the running
-//     toolset. The setup-schema pre-check (mcp.rs:1541-1562) is skipped:
-//     no setup surface exists here.
+//     toolset. Unresolved setup schemas return upstream's `setup_required`
+//     payload before any browser or transport is started.
+//   * `setup` (mcp.rs:1529-1712) — validate an owned session's actual
+//     setup schema, persist filtered selections atomically in the separate
+//     owner-private `mcp_preferences.json`, resolve templates, enforce
+//     managed policy, and roll preferences/disable state back on failure.
 //   * `upsert` (mcp.rs:1874-1900) — after authenticating the owning ACP
 //     session, persist to the user `config.toml`
 //     (`upsertMCPServer` + `writeConfigFile`, the same write `mcp add`
@@ -51,11 +54,6 @@
 //
 // Refused, with the shape upstream itself uses for the prefix:
 //
-//   * `setup` — upstream serves this; this port has no
-//     `mcp_preferences.json` setup-values surface and no setup-schema
-//     resolution, so the schema cannot be driven. Refused with the
-//     port's terminal ext-method error (data naming the method) so a peer
-//     can tell "not ported" from upstream's bare unknown-name refusal below.
 //   * Anything else under the prefix — including an inbound copy of the
 //     emit-only reverse method `x.ai/mcp/sdk_call` — gets upstream's OWN
 //     refusal for unknown `x.ai/mcp/*` names: bare `method_not_found`, NO
@@ -422,7 +420,12 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
                 cli: cli,
                 managedSettingsPath: managedSettingsPath
             )
-            var loaded = MCPConfigLoader.load(from: security.document)
+            let preferences = userGrokHome(environment: environment)
+                .map { MCPSetupPreferencesStore.load(home: $0).file }
+            var loaded = MCPConfigLoader.load(
+                from: security.document,
+                preferences: preferences
+            )
             var problems = loaded.problems
             loaded.servers.removeAll { declaration in
                 let server = ManagedMCPServerIdentity(
@@ -457,12 +460,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         case "x.ai/mcp/delete":
             return try await handleDelete(params)
         case "x.ai/mcp/setup":
-            // Upstream serves setup; this port has no setup-schema surface or
-            // `mcp_preferences.json` setup-values layer — the schema cannot
-            // resolve and the preference cannot persist. Refused with the
-            // data-carrying terminal error (distinguishes "not ported" from
-            // the bare unknown-name refusal below).
-            throw ACPExtensionMethodRouter.unknownExtensionMethodError(method)
+            return try await handleSetup(params)
         case "x.ai/mcp/toggle":
             return try await handleToggle(params)
         case "x.ai/mcp/toggle_tool":
@@ -593,6 +591,7 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         }
 
         let loaded = declarations()
+        let preferences = MCPSetupPreferencesStore.load(home: openGrokHome).file
         var servers: [JSONValue] = []
         for declaration in loaded.servers {
             let identity = ManagedMCPServerIdentity(
@@ -605,6 +604,44 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
                 annotate: annotate,
                 sessionID: sessionID
             ))
+        }
+        for declaration in loaded.setupRequiredServers {
+            let identity = ManagedMCPServerIdentity(
+                name: declaration.name,
+                transport: declaration.config.transport
+            )
+            guard managedMCPPolicy.isServerAllowed(identity),
+                  let setup = declaration.config.setup
+            else { continue }
+            let schema: JSONValue
+            do {
+                schema = try JSONValue.encode(setup)
+            } catch {
+                throw internalError("failed to encode MCP setup schema")
+            }
+
+            let disabled: Bool
+            if let root = LiveMCPComposition.loadForEdit(at: userConfigPath) {
+                disabled = disabledMCPServers(in: root).contains(declaration.name)
+            } else {
+                disabled = !declaration.isEnabled
+            }
+            var entry: [String: JSONValue] = [
+                "name": .string(declaration.name),
+                "source": .string("local"),
+                "type": .string("http"),
+                "url": .string(""),
+                "setup": schema,
+                "session": .object([
+                    "enabled": .bool(!disabled && declaration.isEnabled),
+                    "status": .string("setuprequired"),
+                    "setupRequired": .bool(true),
+                ]),
+            ]
+            if let saved = preferences.servers[declaration.name] {
+                entry["setupValues"] = .object(saved.values.mapValues(JSONValue.string))
+            }
+            servers.append(.object(entry))
         }
         return envelope(.object(["servers": .array(servers)]))
     }
@@ -913,12 +950,29 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
         }
         try await requireOwnedSession(sessionID)
 
+        let loaded = declarations()
+        if let setupDeclaration = loaded.setupServers.first(where: { $0.name == serverName }) {
+            let preferences = MCPSetupPreferencesStore.load(home: openGrokHome)
+                .file.servers[serverName]
+            switch setupDeclaration.config.resolveSetup(preferences: preferences) {
+            case .required(let schema):
+                return try authTriggerSetupRequired(schema: schema, reason: nil)
+            case .invalid(let reason):
+                return try authTriggerSetupRequired(
+                    schema: setupDeclaration.config.setup,
+                    reason: reason
+                )
+            case .resolved:
+                break
+            }
+        }
+
         // Managed connectors authenticate at grok.com, byte-copy of the
         // refusal (acp_session_impl/mcp.rs:406-408).
         if serverName.hasPrefix(Self.managedServerPrefix) {
             return authTriggerFailure("To authenticate, visit grok.com")
         }
-        guard let declaration = declarations().servers.first(where: { $0.name == serverName })
+        guard let declaration = loaded.servers.first(where: { $0.name == serverName })
         else {
             // `recreate_http_client_with_oauth`'s missing-config arm
             // (acp_session_impl/mcp.rs:459).
@@ -1013,6 +1067,280 @@ struct LiveMCPACPHandler: ACPAgentExtensionHandler, Sendable {
             "status": .string("failed"),
             "error": .string(error),
         ]))
+    }
+
+    private func authTriggerSetupRequired(
+        schema: McpSetupConfig?,
+        reason: String?
+    ) throws -> JSONValue {
+        var result: [String: JSONValue] = ["status": .string("setup_required")]
+        if let schema {
+            do {
+                result["setup"] = try JSONValue.encode(schema)
+            } catch {
+                throw internalError("failed to encode MCP setup schema")
+            }
+        }
+        if let reason {
+            result["error"] = .string(reason)
+        }
+        return envelope(.object(result))
+    }
+
+    // MARK: x.ai/mcp/setup
+
+    /// Validate and authorize before touching either durable file. Once the
+    /// preference is published, every failure restores that exact selection
+    /// and any personal disable state before reporting the error.
+    private func handleSetup(_ params: JSONValue) async throws -> JSONValue {
+        let sessionID = try canonicalSessionID(in: params)
+        let camelServer = params["serverName"]?.stringValue
+        let snakeServer = params["server_name"]?.stringValue
+        if let camelServer, let snakeServer, camelServer != snakeServer {
+            throw invalidParams(
+                "invalid params: conflicting fields `serverName` and `server_name`"
+            )
+        }
+        guard let serverName = camelServer ?? snakeServer, !serverName.isEmpty else {
+            throw invalidParams("invalid params: missing field `serverName`")
+        }
+        guard let supplied = params["values"]?.objectValue else {
+            throw invalidParams("invalid params: missing or invalid field `values`")
+        }
+        var values: [String: String] = [:]
+        for (key, value) in supplied {
+            guard let string = value.stringValue else {
+                throw invalidParams("invalid params: setup values must be strings")
+            }
+            values[key] = string
+        }
+
+        try await requireOwnedSession(sessionID)
+
+        let loaded = declarations()
+        guard let declaration = loaded.setupServers.first(where: { $0.name == serverName }),
+              let schema = declaration.config.setup
+        else {
+            throw invalidParams("server setup not found")
+        }
+
+        let filteredValues = Dictionary(
+            uniqueKeysWithValues: schema.fields.compactMap { field in
+                values[field.id].map { (field.id, $0) }
+            }
+        )
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let pending = McpServerPreferences(
+            values: filteredValues,
+            source: McpPreferenceSource(
+                kind: "config",
+                scope: setupSourceScope(declaration)
+            ),
+            updatedAt: timestamp
+        )
+        let resolved: McpServerConfig
+        switch declaration.config.resolveSetup(preferences: pending) {
+        case .resolved(let configuration):
+            resolved = configuration
+        case .required:
+            throw invalidParams("setup values incomplete")
+        case .invalid(let reason):
+            throw invalidParams(reason)
+        }
+        if let blank = MCPConfigLoader.blankTransportField(resolved) {
+            throw invalidParams("invalid params: missing or empty '\(blank)'")
+        }
+
+        let identity = ManagedMCPServerIdentity(name: serverName, transport: resolved.transport)
+        if let reason = managedMCPPolicy.blockReason(for: identity) {
+            throw invalidParams("MCP server '\(serverName)' blocked by managed policy: \(reason)")
+        }
+
+        let previousDeclaration = loaded.servers.first(where: { $0.name == serverName })
+        let previousOutcome = await state.outcome(for: serverName)
+        let previousWasConnected = await state.connections.client(named: serverName) != nil
+        let originalRoot = LiveMCPComposition.loadForEdit(at: userConfigPath)
+        if FileManager.default.fileExists(atPath: userConfigPath.path), originalRoot == nil {
+            throw internalError("MCP user config is unreadable")
+        }
+        let wasDisabled = originalRoot.map { disabledMCPServers(in: $0).contains(serverName) }
+            ?? false
+
+        let previousPreferences: McpServerPreferences?
+        do {
+            previousPreferences = try MCPSetupPreferencesStore.updateServer(
+                named: serverName,
+                preferences: pending,
+                home: openGrokHome
+            )
+        } catch let error as MCPSetupPreferencesError {
+            throw internalError(error.description)
+        } catch {
+            throw internalError("failed to save MCP preferences")
+        }
+
+        do {
+            if wasDisabled {
+                guard var root = originalRoot else {
+                    throw internalError("MCP user config is unreadable")
+                }
+                do {
+                    try applyMCPServerEnabled(serverName, enabled: true, in: &root)
+                    try writeConfigFile(root, to: userConfigPath)
+                } catch {
+                    throw internalError(
+                        "failed to clear disabled MCP server entry after setup resolve"
+                    )
+                }
+            }
+
+            guard let discovered = declarations().servers.first(where: { $0.name == serverName }),
+                  discovered.isEnabled
+            else {
+                throw internalError("server did not resolve after setup")
+            }
+            let discoveredIdentity = ManagedMCPServerIdentity(
+                name: serverName,
+                transport: discovered.config.transport
+            )
+            if let reason = managedMCPPolicy.blockReason(for: discoveredIdentity) {
+                throw invalidParams(
+                    "MCP server '\(serverName)' blocked by managed policy: \(reason)"
+                )
+            }
+
+            let connections = state.connections
+            let toolset = state.toolset
+            await connections.markServerShuttingDown(serverName)
+            MCPToolBridge.unregister(server: serverName, from: toolset)
+            if let previous = await connections.release(named: serverName) {
+                try? await previous.shutdown()
+                await previous.close()
+            }
+            await connections.markServerAvailable(serverName)
+
+            let disabledTools: Set<String>
+            if let root = LiveMCPComposition.loadForEdit(at: userConfigPath) {
+                disabledTools = allDisabledMCPTools(in: root)[serverName] ?? []
+            } else {
+                disabledTools = []
+            }
+            let makeHTTPTransport = self.makeHTTPTransport
+            let outcome = await LiveMCPComposition.connect(
+                declaration: discovered,
+                toolset: toolset,
+                connections: connections,
+                environment: environment,
+                makeHTTPTransport: { makeHTTPTransport() },
+                disabledToolNames: disabledTools,
+                managedMCPPolicy: managedMCPPolicy
+            )
+            await state.record(outcome)
+            LiveMCPToolSearchIndex.refreshIfPresent(in: toolset)
+            if let failure = outcome.failure,
+               failure != LiveMCPComposition.authorizationRequiredNotice(serverName: serverName)
+            {
+                throw internalError("failed to reconnect MCP server after setup")
+            }
+            await emitToolsChanged(sessionID: sessionID, serverName: serverName)
+            return envelope(.object(["ok": .bool(true)]))
+        } catch {
+            let restored = await rollbackSetup(
+                serverName: serverName,
+                pending: pending,
+                previousPreferences: previousPreferences,
+                wasDisabled: wasDisabled,
+                previousDeclaration: previousDeclaration,
+                previousOutcome: previousOutcome,
+                previousWasConnected: previousWasConnected
+            )
+            guard restored else {
+                throw internalError("MCP setup failed and its previous state could not be restored")
+            }
+            throw error
+        }
+    }
+
+    private func setupSourceScope(_ declaration: MCPServerDeclaration) -> String {
+        if let scope = declaration.scope { return scope }
+        guard let userDocument = LiveMCPComposition.loadForEdit(at: userConfigPath) else {
+            return "project"
+        }
+        let userDeclarations = MCPConfigLoader.load(from: userDocument, scope: "user")
+        let userDeclaration = userDeclarations.setupServers.first {
+            $0.name == declaration.name
+        }
+        return userDeclaration?.config == declaration.config ? "user" : "project"
+    }
+
+    private func rollbackSetup(
+        serverName: String,
+        pending: McpServerPreferences,
+        previousPreferences: McpServerPreferences?,
+        wasDisabled: Bool,
+        previousDeclaration: MCPServerDeclaration?,
+        previousOutcome: MCPServerConnection?,
+        previousWasConnected: Bool
+    ) async -> Bool {
+        do {
+            let restored = try MCPSetupPreferencesStore.restoreServer(
+                named: serverName,
+                previous: previousPreferences,
+                ifCurrentIs: pending,
+                home: openGrokHome
+            )
+            guard restored else { return false }
+
+            if wasDisabled {
+                guard var root = LiveMCPComposition.loadForEdit(at: userConfigPath) else {
+                    return false
+                }
+                try applyMCPServerEnabled(serverName, enabled: false, in: &root)
+                try writeConfigFile(root, to: userConfigPath)
+            }
+        } catch {
+            return false
+        }
+
+        let connections = state.connections
+        let toolset = state.toolset
+        await connections.markServerShuttingDown(serverName)
+        MCPToolBridge.unregister(server: serverName, from: toolset)
+        if let attempted = await connections.release(named: serverName) {
+            try? await attempted.shutdown()
+            await attempted.close()
+        }
+
+        if previousWasConnected, let previousDeclaration {
+            await connections.markServerAvailable(serverName)
+            let disabledTools: Set<String>
+            if let root = LiveMCPComposition.loadForEdit(at: userConfigPath) {
+                disabledTools = allDisabledMCPTools(in: root)[serverName] ?? []
+            } else {
+                disabledTools = []
+            }
+            let makeHTTPTransport = self.makeHTTPTransport
+            let restored = await LiveMCPComposition.connect(
+                declaration: previousDeclaration,
+                toolset: toolset,
+                connections: connections,
+                environment: environment,
+                makeHTTPTransport: { makeHTTPTransport() },
+                disabledToolNames: disabledTools,
+                managedMCPPolicy: managedMCPPolicy
+            )
+            await state.record(restored)
+            LiveMCPToolSearchIndex.refreshIfPresent(in: toolset)
+            return restored.failure == nil
+        }
+
+        if let previousOutcome {
+            await state.record(previousOutcome)
+        } else {
+            await state.removeOutcome(name: serverName)
+        }
+        LiveMCPToolSearchIndex.refreshIfPresent(in: toolset)
+        return true
     }
 
     // MARK: x.ai/mcp/upsert

@@ -162,16 +162,36 @@ struct LiveMemoryConfiguration: Sendable, Equatable {
         if let table = document[path: ["memory", "dream"]] {
             var dream = MemoryDreamConfig()
             if let enabled = table["enabled"]?.boolValue { dream.enabled = enabled }
-            if let minHours = table["min_hours"]?.int64Value { dream.minHours = UInt64(minHours) }
+            var invalidDreamInterval = false
+            if let minHours = table["min_hours"]?.int64Value {
+                if let valid = UInt64(exactly: minHours) {
+                    dream.minHours = valid
+                } else {
+                    invalidDreamInterval = true
+                }
+            }
             if let minSessions = table["min_sessions"]?.int64Value {
-                dream.minSessions = UInt64(minSessions)
+                if let valid = UInt64(exactly: minSessions) {
+                    dream.minSessions = valid
+                } else {
+                    invalidDreamInterval = true
+                }
             }
             if let staleLockSecs = table["stale_lock_secs"]?.int64Value {
-                dream.staleLockSecs = UInt64(staleLockSecs)
+                if let valid = UInt64(exactly: staleLockSecs) {
+                    dream.staleLockSecs = valid
+                } else {
+                    invalidDreamInterval = true
+                }
             }
             if let checkInterval = table["check_interval_secs"]?.int64Value {
-                dream.checkIntervalSecs = UInt64(checkInterval)
+                if let valid = UInt64(exactly: checkInterval) {
+                    dream.checkIntervalSecs = valid
+                } else {
+                    invalidDreamInterval = true
+                }
             }
+            if invalidDreamInterval { dream.enabled = false }
             config.dream = dream
         }
 
@@ -406,6 +426,37 @@ struct LiveMemoryFlushCoordinator: Sendable {
 
 // MARK: - Backend
 
+enum LiveMemoryWorkspaceIdentity {
+    static func resolve(workingDirectory: URL, environment: [String: String]) -> String? {
+        let fallback = MemoryStorage.discoverWorkspaceIdentity(cwd: workingDirectory)
+        let canonical = workingDirectory.resolvingSymlinksInPath().standardizedFileURL
+        var gitEnvironment = environment
+        gitEnvironment["GIT_TERMINAL_PROMPT"] = "0"
+        if gitEnvironment["PATH"] == nil {
+            gitEnvironment["PATH"] = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"
+        }
+
+        #if os(Windows)
+        let executable = "git"
+        #else
+        let executable = "/usr/bin/git"
+        #endif
+        let outcome = runBoundedAntigravityProcess(
+            executable: executable,
+            arguments: ["-C", canonical.path, "config", "--get", "remote.origin.url"],
+            currentDirectory: nil,
+            environment: gitEnvironment,
+            timeout: 1
+        )
+        guard case let .exited(status, output, _) = outcome,
+              status == 0,
+              output.utf8.count <= 16_384,
+              let normalized = MemoryStorage.normalizeRemoteURL(output)
+        else { return fallback }
+        return normalized
+    }
+}
+
 /// Owns the memory index for one session.
 ///
 /// An actor because `MemoryIndex` is a mutable `final class` with no internal
@@ -415,9 +466,7 @@ actor LiveMemoryBackend {
     let configuration: LiveMemoryConfiguration
     private let storage: MemoryStorage
     private var index: MemoryIndex?
-    /// Set once the first search has forced a reindex, so a session with many
-    /// searches walks the memory tree once rather than per call.
-    private var didReindex = false
+    private var indexedFileStamps: [String: LiveMemoryFileStamp] = [:]
     private var completedSessionPaths: [String: String] = [:]
     private var flushInFlight = false
     private var previousFlushContent: String?
@@ -431,7 +480,14 @@ actor LiveMemoryBackend {
     ) {
         guard configuration.enabled else { return nil }
         self.configuration = configuration
-        self.storage = MemoryStorage(cwd: workingDirectory, environment: environment)
+        self.storage = MemoryStorage(
+            cwd: workingDirectory,
+            environment: environment,
+            workspaceIdentity: LiveMemoryWorkspaceIdentity.resolve(
+                workingDirectory: workingDirectory,
+                environment: environment
+            )
+        )
     }
 
     /// Open the index lazily and reindex the memory tree once per session.
@@ -442,24 +498,53 @@ actor LiveMemoryBackend {
     private func openIndex() -> MemoryIndex? {
         if let index { return index }
         guard !storage.isEphemeral else { return nil }
-        try? storage.ensureInitialized()
-        let indexURL = storage.workspaceDir.appendingPathComponent("index.json")
-        guard let opened = try? MemoryIndex.openOrCreate(
-            indexURL: indexURL,
-            storage: storage,
-            config: configuration.index,
-            embeddingDimensions: configuration.embeddingDimensions
-        ) else { return nil }
-        index = opened
-        return opened
+        #if canImport(SQLite3)
+        do {
+            try migrateLegacyWorkspaceIfNeeded()
+            try storage.ensureInitialized()
+            let indexURL = storage.workspaceDir.appendingPathComponent("index.sqlite")
+            let opened = try MemoryIndex.openOrCreate(
+                indexURL: indexURL,
+                storage: storage,
+                config: configuration.index,
+                embeddingDimensions: configuration.embeddingDimensions
+            )
+            index = opened
+            return opened
+        } catch {
+            return nil
+        }
+        #else
+        return nil
+        #endif
     }
 
-    private func reindexIfNeeded(_ index: MemoryIndex) {
-        guard !didReindex else { return }
-        didReindex = true
-        guard let files = try? storage.listMemoryFiles() else { return }
-        for file in files {
-            _ = try? index.reindexFile(path: file, source: storage.classifySource(file))
+    private func synchronizeMemoryFiles(_ index: MemoryIndex) -> Bool {
+        do {
+            try index.reload()
+            let files = try storage.listMemoryFiles()
+            let currentPaths = Set(files.map(\.path))
+            for indexedPath in try index.allIndexedPaths() where !currentPaths.contains(indexedPath) {
+                let removed = try index.deletePath(URL(fileURLWithPath: indexedPath))
+                guard removed > 0 else { return false }
+                indexedFileStamps.removeValue(forKey: indexedPath)
+            }
+
+            for file in files {
+                let stamp = try LiveMemoryFileStamp(file)
+                guard indexedFileStamps[file.path] != stamp else { continue }
+                let result = try index.reindexFile(path: file, source: storage.classifySource(file))
+                if result.added == 0, result.updated == 0, result.removed == 0,
+                   !FileManager.default.fileExists(atPath: file.path) {
+                    let removed = try index.deletePath(file)
+                    if removed > 0 { indexedFileStamps.removeValue(forKey: file.path) }
+                    continue
+                }
+                indexedFileStamps[file.path] = stamp
+            }
+            return true
+        } catch {
+            return false
         }
     }
 
@@ -470,9 +555,10 @@ actor LiveMemoryBackend {
         minScore: Float? = nil
     ) -> [MemorySearchResult] {
         guard let index = openIndex() else { return [] }
-        reindexIfNeeded(index)
+        guard synchronizeMemoryFiles(index) else { return [] }
         var config = configuration.search
         if let maxResults { config.maxResults = max(0, maxResults) }
+        config.maxResults = min(max(0, config.maxResults), Int.max / 3)
         if let minScore { config.minScore = minScore }
         return (try? index.hybridSearch(query, config: config)) ?? []
     }
@@ -480,8 +566,12 @@ actor LiveMemoryBackend {
     /// Read a memory file back. `from` is 1-based, matching Rust's
     /// `memory_get`, which also treats 0 as 1.
     func read(path: String, from: Int = 1, lines: Int? = nil) throws -> String {
+        guard from >= 0, lines.map({ $0 >= 0 }) ?? true else {
+            throw MemoryError.unsafePath("negative memory line offset")
+        }
         let url = URL(fileURLWithPath: path)
-        return try storage.readFile(path: url, from: max(0, from - 1), lines: lines)
+        let zeroBased = from > 0 ? from - 1 : 0
+        return try storage.readFile(path: url, from: zeroBased, lines: lines)
     }
 
     /// Append a note to long-term memory. Backs `/remember`.
@@ -516,7 +606,7 @@ actor LiveMemoryBackend {
         // Drop the index so the next search re-reads the file that just grew.
         // Cheaper and less error-prone than incrementally patching chunks.
         index = nil
-        didReindex = false
+        indexedFileStamps.removeAll(keepingCapacity: true)
     }
 
     /// Append an explicit, user-supplied note to today's session log.
@@ -548,7 +638,7 @@ actor LiveMemoryBackend {
             append: true
         )
         index = nil
-        didReindex = false
+        indexedFileStamps.removeAll(keepingCapacity: true)
     }
 
     func beginGeneratedFlush() -> Bool {
@@ -686,14 +776,140 @@ actor LiveMemoryBackend {
                 cleanedStems: []
             )
         }
-        try? storage.ensureInitialized()
-        return await runDreamConsolidation(
+        do {
+            try storage.ensureInitialized()
+        } catch {
+            return DreamResult(
+                status: .failed("failed to initialize memory: \(error.localizedDescription)"),
+                sessionsEligible: sessions.count,
+                cleanedStems: []
+            )
+        }
+        let result = await runDreamConsolidation(
             storage: storage,
             lock: lock,
             config: dreamConfig,
             sessions: sessions,
             sample: sample
         )
+        if case .completed = result.status {
+            guard let index = openIndex() else {
+                return DreamResult(
+                    status: .failed("dream completed but the memory index is unavailable"),
+                    sessionsEligible: result.sessionsEligible,
+                    cleanedStems: result.cleanedStems
+                )
+            }
+            do {
+                let rewritten = try index.reindexFile(
+                    path: storage.workspaceMemoryFile,
+                    source: storage.classifySource(storage.workspaceMemoryFile)
+                )
+                if rewritten.added == 0, rewritten.updated == 0,
+                   !(try index.allIndexedPaths().contains(storage.workspaceMemoryFile.path)) {
+                    throw LiveMemoryLifecycleError.summaryWasNotIndexed(storage.workspaceMemoryFile.path)
+                }
+                indexedFileStamps[storage.workspaceMemoryFile.path] = try LiveMemoryFileStamp(
+                    storage.workspaceMemoryFile
+                )
+                for stem in result.cleanedStems {
+                    let path = storage.sessionsDir.appendingPathComponent("\(stem).md")
+                    guard !FileManager.default.fileExists(atPath: path.path) else { continue }
+                    let removed = try index.deletePath(path)
+                    if removed > 0 { indexedFileStamps.removeValue(forKey: path.path) }
+                }
+            } catch {
+                return DreamResult(
+                    status: .failed("dream completed but memory indexing failed: \(error.localizedDescription)"),
+                    sessionsEligible: result.sessionsEligible,
+                    cleanedStems: result.cleanedStems
+                )
+            }
+        }
+        return result
+    }
+
+    private func migrateLegacyWorkspaceIfNeeded() throws {
+        let normalized = storage.workspacePath.standardizedFileURL
+        let name = slugify(normalized.lastPathComponent, maxLength: 40)
+        let slug = name.isEmpty ? "workspace" : name
+        let hash = String(FileChecksum.sha256Hex(normalized.path).prefix(8))
+        let legacy = storage.globalDir.appendingPathComponent("\(slug)-\(hash)", isDirectory: true)
+        let manager = FileManager.default
+        guard legacy.standardizedFileURL != storage.workspaceDir.standardizedFileURL,
+              manager.fileExists(atPath: legacy.path),
+              !manager.fileExists(atPath: storage.workspaceDir.path)
+        else { return }
+
+        let legacyValues = try legacy.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard legacyValues.isDirectory == true, legacyValues.isSymbolicLink != true else {
+            throw MemoryError.unsafePath(legacy.path)
+        }
+        var migrations: [(source: URL, relativePath: String)] = []
+        for name in ["MEMORY.md", "index.json"] {
+            let file = legacy.appendingPathComponent(name)
+            if manager.fileExists(atPath: file.path) {
+                try validateLegacyMemoryFile(file)
+                migrations.append((file, name))
+            }
+        }
+        let previousSessions = legacy.appendingPathComponent("sessions", isDirectory: true)
+        if manager.fileExists(atPath: previousSessions.path) {
+            let values = try previousSessions.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard values.isDirectory == true, values.isSymbolicLink != true else {
+                throw MemoryError.unsafePath(previousSessions.path)
+            }
+            let files = try manager.contentsOfDirectory(
+                at: previousSessions,
+                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+                options: [.skipsHiddenFiles]
+            )
+            for file in files where file.pathExtension == "md" {
+                try validateLegacyMemoryFile(file)
+                migrations.append((file, "sessions/\(file.lastPathComponent)"))
+            }
+        }
+        guard !migrations.isEmpty else { return }
+
+        try LiveSessionBusPresenceStore.ensureSecureDirectory(storage.globalDir)
+        try LiveSessionBusPresenceStore.ensureSecureDirectory(storage.workspaceDir)
+        for migration in migrations {
+            let destination = storage.workspaceDir.appendingPathComponent(migration.relativePath)
+            try LiveSessionBusPresenceStore.ensureSecureDirectory(destination.deletingLastPathComponent())
+            let contents = try PathSecurity.readNoFollow(
+                migration.source,
+                maximumBytes: 64 * 1_024 * 1_024
+            )
+            try SecureFile.write(at: destination, contents: contents)
+        }
+    }
+
+    private func validateLegacyMemoryFile(_ file: URL) throws {
+        let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              (values.fileSize ?? Int.max) <= 64 * 1_024 * 1_024
+        else {
+            throw MemoryError.unsafePath(file.path)
+        }
+    }
+}
+
+private struct LiveMemoryFileStamp: Equatable {
+    let size: UInt64
+    let modificationDate: Date
+    let fileNumber: UInt64
+
+    init(_ path: URL) throws {
+        let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
+        guard let size = attributes[.size] as? NSNumber,
+              let modified = attributes[.modificationDate] as? Date
+        else {
+            throw MemoryError.unsafePath(path.path)
+        }
+        self.size = size.uint64Value
+        self.modificationDate = modified
+        self.fileNumber = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
     }
 }
 
@@ -959,10 +1175,41 @@ enum LiveMemoryTools {
             guard case .string(let path)? = fields["path"], !path.isEmpty else {
                 return "memory_get requires a 'path'."
             }
-            let from = fields["from"].flatMap(intValue) ?? 1
-            let lines = fields["lines"].flatMap(intValue)
+            let from: Int
+            if let value = fields["from"] {
+                guard let parsed = intValue(value), parsed >= 0 else {
+                    return "memory_get requires a non-negative 'from' within the supported range."
+                }
+                from = parsed
+            } else {
+                from = 1
+            }
+            let lines: Int?
+            if let value = fields["lines"] {
+                guard let parsed = intValue(value), parsed >= 0 else {
+                    return "memory_get requires a non-negative 'lines' within the supported range."
+                }
+                lines = parsed
+            } else {
+                lines = nil
+            }
             do {
-                return try await backend.read(path: path, from: from, lines: lines)
+                let content = try await backend.read(path: path, from: from, lines: lines)
+                var rows = content.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+                if rows.last?.isEmpty == true { rows.removeLast() }
+                let firstLine = max(1, from)
+                let numbered = rows.enumerated().map { offset, row in
+                    let (number, overflow) = firstLine.addingReportingOverflow(offset)
+                    return "\(overflow ? Int.max : number)→\(row)"
+                }.joined(separator: "\n")
+                let fromLabel = fields["from"] == nil ? "start" : String(from)
+                let limitLabel = lines.map(String.init) ?? "all"
+                return """
+                    **File:** \(path)
+                    **Lines:** \(rows.count) (from: \(fromLabel), limit: \(limitLabel))
+
+                    \(numbered)
+                    """
             } catch {
                 return "memory_get failed: \(error)"
             }
@@ -972,7 +1219,16 @@ enum LiveMemoryTools {
     }
 
     private static func intValue(_ value: JSONValue) -> Int? {
-        if case .number(let number) = value { return Int(number.doubleValue) }
+        if case .number(let number) = value {
+            switch number {
+            case .int64(let integer):
+                return Int(exactly: integer)
+            case .uint64(let integer):
+                return Int(exactly: integer)
+            case .double(let number):
+                return Int(exactly: number)
+            }
+        }
         if case .string(let text) = value { return Int(text) }
         return nil
     }

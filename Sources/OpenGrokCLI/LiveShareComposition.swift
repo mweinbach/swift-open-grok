@@ -146,7 +146,11 @@ public enum LiveShareComposition {
         }
 
         let home = OpenGrokHomeResolver.resolve(environment: environment)
-        let manager = AuthManager(grokHome: home, environment: environment)
+        let manager = AuthManager(
+            grokHome: home,
+            config: liveManagedAuthenticationConfiguration(environment: environment),
+            environment: environment
+        )
         let auth = await manager.currentOrExpired()
         // share.rs:44-45 `.unwrap_or(false)` — absent settings mean closed.
         // Read through the allowlist so non-reviewed remote fields cannot

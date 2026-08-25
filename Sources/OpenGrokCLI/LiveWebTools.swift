@@ -24,6 +24,7 @@
 import Foundation
 import OpenGrokAuth
 import OpenGrokConfig
+import OpenGrokConfigTypes
 import OpenGrokHTTP
 import OpenGrokSamplingTypes
 import OpenGrokShared
@@ -51,14 +52,19 @@ enum LiveWebSearchSource: String, Sendable, Equatable {
 /// The resolved web-tool decision for one session.
 struct LiveWebToolAvailability: Sendable {
     var searchConfig: WebSearchConfig
+    /// Owner-configured search domain policy is authoritative over model input.
+    var searchFilter: WebSearchFilter = WebSearchFilter()
+    /// X search always uses the independently authenticated xAI candidate.
+    var xSearchConfig: WebSearchConfig = .disabled
+    /// Frozen egress policy; executor construction must not replace its params.
+    var fetchConfig: WebFetchConfig = .disabled
+    /// Standalone Codex search is eligible only for the native source.
+    var searchSource: LiveWebSearchSource = .native
     /// Advertise `web_search`.
     var webSearchEnabled: Bool
-    /// Advertise `web_fetch`. Independent of search credentials — fetching a
-    /// URL needs no API key, only the SSRF guard `WebFetchClient` already has.
+    /// Advertise `web_fetch` only after its feature and frozen policy resolve.
     var webFetchEnabled: Bool
-    /// Advertise `x_search`. Upstream registers it but puts it in no preset, and
-    /// `WebSearchClient.xSearch` hard-requires the xAI Responses backend, so it
-    /// only ever appears on an xAI-backed search config.
+    /// Advertise `x_search` independently of the generic search provider.
     var xSearchEnabled: Bool
 
     static let unavailable = LiveWebToolAvailability(
@@ -75,6 +81,8 @@ struct LiveWebToolAvailability: Sendable {
 struct LiveWebToolContext: Sendable {
     var availability: LiveWebToolAvailability
     var transport: any HTTPTransport
+    /// Absent means the model cannot see or invoke provider-authenticated search.
+    var standaloneWebSearchBackend: (any LiveStandaloneWebSearchBackend)? = nil
 }
 
 // MARK: - Resolution
@@ -82,9 +90,7 @@ struct LiveWebToolContext: Sendable {
 enum LiveWebToolComposition {
     /// Resolve the session's web-tool configuration.
     ///
-    /// `disableWebSearch` is the `--disable-web-search` master switch. It kills
-    /// `web_search` and `x_search`; `web_fetch` survives it, matching upstream,
-    /// where the flag governs the search config and not the fetch tool.
+    /// `disableWebSearch` is upstream's hard kill switch for every web surface.
     static func resolveAvailability(
         workingDirectory: URL,
         openGrokHome: URL,
@@ -92,18 +98,25 @@ enum LiveWebToolComposition {
         samplingProvider: ModelProvider,
         samplingAPIKey: String,
         samplingBaseURL: String,
-        disableWebSearch: Bool
+        disableWebSearch: Bool,
+        samplingContextWindow: UInt64? = nil,
+        effectiveConfig: TOMLValue? = nil,
+        requirements: [TOMLValue] = [],
+        remoteSettings: RemoteSettings? = nil
     ) -> LiveWebToolAvailability {
-        let webFetchEnabled = boolFromEnv(environment["GROK_WEB_FETCH"]) ?? true
-
         guard !disableWebSearch else {
-            return LiveWebToolAvailability(
-                searchConfig: .disabled,
-                webSearchEnabled: false,
-                webFetchEnabled: webFetchEnabled,
-                xSearchEnabled: false
-            )
+            return .unavailable
         }
+
+        let fetchConfig = resolveFetchConfig(
+            workingDirectory: workingDirectory,
+            openGrokHome: openGrokHome,
+            environment: environment,
+            contextWindowTokens: samplingContextWindow,
+            effectiveConfig: effectiveConfig,
+            requirements: requirements,
+            remoteSettings: remoteSettings
+        )
 
         let xaiConfig = resolveXaiSearchConfig(
             workingDirectory: workingDirectory,
@@ -111,7 +124,8 @@ enum LiveWebToolComposition {
             environment: environment,
             samplingProvider: samplingProvider,
             samplingAPIKey: samplingAPIKey,
-            samplingBaseURL: samplingBaseURL
+            samplingBaseURL: samplingBaseURL,
+            effectiveConfig: effectiveConfig
         )
         let perplexityConfig = resolvePerplexitySearchConfig(
             openGrokHome: openGrokHome,
@@ -124,7 +138,8 @@ enum LiveWebToolComposition {
             openGrokHome: openGrokHome,
             environment: environment,
             xaiAvailable: xaiConfig.isEnabled,
-            perplexityAvailable: perplexityConfig != nil
+            perplexityAvailable: perplexityConfig != nil,
+            effectiveConfig: effectiveConfig
         )
 
         let searchConfig: WebSearchConfig
@@ -141,12 +156,224 @@ enum LiveWebToolComposition {
 
         return LiveWebToolAvailability(
             searchConfig: searchConfig,
+            searchFilter: WebSearchFilter(
+                allowedDomains: configStringArray(
+                    path: ["toolset", "web_search", "allowed_domains"],
+                    workingDirectory: workingDirectory,
+                    openGrokHome: openGrokHome,
+                    environment: environment,
+                    effectiveConfig: effectiveConfig
+                ),
+                excludedDomains: configStringArray(
+                    path: ["toolset", "web_search", "excluded_domains"],
+                    workingDirectory: workingDirectory,
+                    openGrokHome: openGrokHome,
+                    environment: environment,
+                    effectiveConfig: effectiveConfig
+                )
+            ),
+            xSearchConfig: xaiConfig,
+            fetchConfig: fetchConfig,
+            searchSource: source,
             webSearchEnabled: searchConfig.isEnabled,
-            webFetchEnabled: webFetchEnabled,
-            // `x_search` needs the xAI Responses backend specifically; a
-            // Perplexity-backed session must not advertise it.
-            xSearchEnabled: searchConfig.isEnabled && !searchConfig.isPerplexity
+            webFetchEnabled: fetchConfig.isEnabled,
+            xSearchEnabled: xaiConfig.isEnabled && (
+                configBool(
+                    path: ["toolset", "x_search", "enabled"],
+                    workingDirectory: workingDirectory,
+                    openGrokHome: openGrokHome,
+                    environment: environment,
+                    effectiveConfig: effectiveConfig
+                ) ?? true
+            )
         )
+    }
+
+    /// Rust `agent_ops.rs:2405-2439`: feature defaults off; empty allowlists
+    /// disable the tool rather than silently restoring the built-in defaults.
+    static func resolveFetchConfig(
+        workingDirectory: URL,
+        openGrokHome: URL,
+        environment: [String: String],
+        contextWindowTokens: UInt64? = nil,
+        effectiveConfig: TOMLValue? = nil,
+        requirements: [TOMLValue] = [],
+        remoteSettings: RemoteSettings? = nil
+    ) -> WebFetchConfig {
+        let reviewedRemote = remoteSettings.map(AllowlistedRemoteSettings.init(projecting:))
+        let requirement = requirements.first {
+            $0[path: ["features", "web_fetch"]]?.boolValue != nil
+        }?[path: ["features", "web_fetch"]]?.boolValue
+        if requirement == nil, reviewedRemote?.webFetchEnabled == false {
+            return .disabled
+        }
+        let enabled = requirement
+            ?? boolFromEnv(environment["GROK_WEB_FETCH"])
+            ?? configBool(
+                path: ["features", "web_fetch"],
+                workingDirectory: workingDirectory,
+                openGrokHome: openGrokHome,
+                environment: environment,
+                effectiveConfig: effectiveConfig
+            )
+            ?? reviewedRemote?.webFetchEnabled
+            ?? false
+        guard enabled else { return .disabled }
+
+        let root = ["toolset", "web_fetch"]
+        let configuredDomains = configStringArray(
+            path: root + ["allowed_domains"],
+            workingDirectory: workingDirectory,
+            openGrokHome: openGrokHome,
+            environment: environment,
+            effectiveConfig: effectiveConfig
+        )
+        let domains: [String]?
+        if let remoteDomains = reviewedRemote?.webFetchAllowedDomains {
+            guard let restrictedDomains = intersectAllowedDomains(
+                configured: configuredDomains,
+                remote: remoteDomains
+            ), !restrictedDomains.isEmpty else {
+                return .disabled
+            }
+            domains = restrictedDomains
+        } else {
+            domains = configuredDomains
+        }
+        guard domains?.isEmpty != true else { return .disabled }
+
+        func integer(_ key: String) -> Int? {
+            configInteger(
+                path: root + [key],
+                workingDirectory: workingDirectory,
+                openGrokHome: openGrokHome,
+                environment: environment,
+                effectiveConfig: effectiveConfig
+            ).flatMap(Int.init(exactly:))
+        }
+
+        func unsigned(_ key: String) -> UInt64? {
+            configInteger(
+                path: root + [key],
+                workingDirectory: workingDirectory,
+                openGrokHome: openGrokHome,
+                environment: environment,
+                effectiveConfig: effectiveConfig
+            ).flatMap(UInt64.init(exactly:))
+        }
+
+        let localProxy = configString(
+            path: root + ["proxy_endpoint"],
+            workingDirectory: workingDirectory,
+            openGrokHome: openGrokHome,
+            environment: environment,
+            effectiveConfig: effectiveConfig
+        ) ?? environment["GROK_WEB_FETCH_PROXY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        let remoteProxy = reviewedRemote?.webFetchProxy?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let remoteProxy {
+            guard !remoteProxy.isEmpty,
+                  let components = URLComponents(string: remoteProxy),
+                  ["https", "http"].contains(components.scheme?.lowercased() ?? ""),
+                  components.host?.isEmpty == false,
+                  components.query == nil,
+                  components.fragment == nil,
+                  components.path.isEmpty || components.path == "/"
+            else { return .disabled }
+        }
+        let proxy = remoteProxy ?? localProxy
+        let allowLocal = configBool(
+            path: root + ["allow_local"],
+            workingDirectory: workingDirectory,
+            openGrokHome: openGrokHome,
+            environment: environment,
+            effectiveConfig: effectiveConfig
+        ) ?? boolFromEnv(environment["GROK_WEB_FETCH_ALLOW_LOCAL"])
+
+        return .enabled(params: WebFetchParams(
+            cacheTTLSeconds: unsigned("cache_ttl_secs"),
+            maxCacheEntries: integer("max_cache_entries"),
+            timeoutSeconds: unsigned("timeout_secs"),
+            maxContentLength: integer("max_content_length"),
+            maxMarkdownLength: integer("max_markdown_length"),
+            contextWindowTokens: contextWindowTokens ?? unsigned("context_window_tokens"),
+            allowedDomains: domains,
+            proxyEndpoint: proxy,
+            allowLocal: allowLocal
+        ))
+    }
+
+    private static func intersectAllowedDomains(
+        configured: [String]?,
+        remote: [String]
+    ) -> [String]? {
+        guard !remote.isEmpty else { return nil }
+
+        func normalized(_ raw: String) -> (host: String, path: String, rendered: String)? {
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !value.isEmpty,
+                  !value.contains("\\"), !value.contains("@"),
+                  !value.contains("?"), !value.contains("#"),
+                  !value.contains("%"), !value.contains(":"),
+                  value.unicodeScalars.allSatisfy({ $0.isASCII })
+            else { return nil }
+            let parts = value.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+            var host = String(parts[0])
+            if host.hasPrefix("www.") { host.removeFirst(4) }
+            let labels = host.split(separator: ".", omittingEmptySubsequences: false)
+            guard labels.count > 1,
+                  labels.allSatisfy({ label in
+                      !label.isEmpty && !label.hasPrefix("-") && !label.hasSuffix("-")
+                          && label.unicodeScalars.allSatisfy {
+                              ($0.value >= 97 && $0.value <= 122)
+                                  || ($0.value >= 48 && $0.value <= 57)
+                                  || $0.value == 45
+                          }
+                  })
+            else { return nil }
+            let path = parts.count == 2
+                ? "/" + parts[1].trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                : ""
+            guard !path.split(separator: "/").contains("..") else { return nil }
+            let canonicalPath = path == "/" ? "" : path
+            return (host, canonicalPath, host + canonicalPath)
+        }
+
+        let remoteEntries = remote.compactMap(normalized)
+        guard remoteEntries.count == remote.count else { return nil }
+        guard let configured else {
+            return Array(Set(remoteEntries.map { $0.rendered })).sorted()
+        }
+        let configuredEntries = configured.compactMap(normalized)
+        guard configuredEntries.count == configured.count else { return nil }
+
+        var intersections = Set<String>()
+        for local in configuredEntries {
+            for authoritative in remoteEntries {
+                let host: String
+                if local.host == authoritative.host || local.host.hasSuffix(".\(authoritative.host)") {
+                    host = local.host
+                } else if authoritative.host.hasSuffix(".\(local.host)") {
+                    host = authoritative.host
+                } else {
+                    continue
+                }
+
+                let path: String
+                if local.path.isEmpty || authoritative.path == local.path
+                    || authoritative.path.hasPrefix(local.path + "/") {
+                    path = authoritative.path
+                } else if authoritative.path.isEmpty
+                    || local.path.hasPrefix(authoritative.path + "/") {
+                    path = local.path
+                } else {
+                    continue
+                }
+                intersections.insert(host + path)
+            }
+        }
+        return intersections.sorted()
     }
 
     /// `effective_source_for` (`config.rs:516-540`).
@@ -163,13 +390,15 @@ enum LiveWebToolComposition {
         openGrokHome: URL,
         environment: [String: String],
         xaiAvailable: Bool,
-        perplexityAvailable: Bool
+        perplexityAvailable: Bool,
+        effectiveConfig: TOMLValue? = nil
     ) -> LiveWebSearchSource {
         if let explicit = explicitSource(
             provider: provider,
             workingDirectory: workingDirectory,
             openGrokHome: openGrokHome,
-            environment: environment
+            environment: environment,
+            effectiveConfig: effectiveConfig
         ) {
             return explicit
         }
@@ -179,7 +408,8 @@ enum LiveWebToolComposition {
                 path: ["toolset", "perplexity_web_search", "enabled"],
                 workingDirectory: workingDirectory,
                 openGrokHome: openGrokHome,
-                environment: environment
+                environment: environment,
+                effectiveConfig: effectiveConfig
             ) ?? false
             return legacyToggle && perplexityAvailable ? .perplexity : .xai
         case .codex:
@@ -189,7 +419,8 @@ enum LiveWebToolComposition {
                     path: ["toolset", "web_search", "model"],
                     workingDirectory: workingDirectory,
                     openGrokHome: openGrokHome,
-                    environment: environment
+                    environment: environment,
+                    effectiveConfig: effectiveConfig
                 )
             return xaiAvailable
                 && configuredModel != nil
@@ -216,7 +447,8 @@ enum LiveWebToolComposition {
         provider: ModelProvider,
         workingDirectory: URL,
         openGrokHome: URL,
-        environment: [String: String]
+        environment: [String: String],
+        effectiveConfig: TOMLValue?
     ) -> LiveWebSearchSource? {
         let key: String
         switch provider {
@@ -238,7 +470,8 @@ enum LiveWebToolComposition {
             path: ["toolset", "web_search_source", key],
             workingDirectory: workingDirectory,
             openGrokHome: openGrokHome,
-            environment: environment
+            environment: environment,
+            effectiveConfig: effectiveConfig
         ) else { return nil }
         return LiveWebSearchSource.fromCanonical(raw)
     }
@@ -261,7 +494,8 @@ enum LiveWebToolComposition {
         environment: [String: String],
         samplingProvider: ModelProvider,
         samplingAPIKey: String,
-        samplingBaseURL: String
+        samplingBaseURL: String,
+        effectiveConfig: TOMLValue? = nil
     ) -> WebSearchConfig {
         guard let apiKey = LiveImageToolComposition.xaiMediaAPIKey(
             samplingProvider: samplingProvider,
@@ -269,14 +503,27 @@ enum LiveWebToolComposition {
             environment: environment
         ) else { return .disabled }
 
-        let baseURL = LiveImageToolComposition.xaiMediaBaseURL(
-            samplingProvider: samplingProvider,
-            samplingBaseURL: samplingBaseURL,
-            configuredXaiBaseURL: OpenGrokLiveApplicationLauncher.configuredXaiAPIBaseURL(
+        let configuredBaseURL: String?
+        if let effectiveConfig {
+            configuredBaseURL = configString(
+                path: ["endpoints", "xai_api_base_url"],
+                workingDirectory: workingDirectory,
+                openGrokHome: openGrokHome,
+                environment: environment,
+                effectiveConfig: effectiveConfig
+            )
+        } else {
+            configuredBaseURL = OpenGrokLiveApplicationLauncher.configuredXaiAPIBaseURL(
                 workingDirectory: workingDirectory,
                 openGrokHome: openGrokHome,
                 environment: environment
-            ),
+            )
+        }
+
+        let baseURL = LiveImageToolComposition.xaiMediaBaseURL(
+            samplingProvider: samplingProvider,
+            samplingBaseURL: samplingBaseURL,
+            configuredXaiBaseURL: configuredBaseURL,
             environment: environment
         )
 
@@ -286,7 +533,8 @@ enum LiveWebToolComposition {
                 path: ["toolset", "web_search", "model"],
                 workingDirectory: workingDirectory,
                 openGrokHome: openGrokHome,
-                environment: environment
+                environment: environment,
+                effectiveConfig: effectiveConfig
             )
             ?? defaultWebSearchModel
 
@@ -324,27 +572,36 @@ enum LiveWebToolComposition {
     private static func configTables(
         workingDirectory: URL,
         openGrokHome: URL,
-        environment: [String: String]
+        environment: [String: String],
+        effectiveConfig: TOMLValue?
     ) -> [TOMLValue] {
-        var tables = [loadMergedProjectConfig(cwd: workingDirectory, environment: environment)]
-        if let user = try? loadConfigFile(
-            at: openGrokHome.appendingPathComponent("config.toml")
-        ) {
-            tables.append(user)
+        if let effectiveConfig {
+            return [effectiveConfig]
         }
-        return tables
+        // Direct fixtures predate the authoritative document; a user-owned
+        // config is safe to retain, but an untrusted project must never become
+        // an alternate egress-policy authority through this compatibility path.
+        guard let user = try? loadConfigFile(
+            at: openGrokHome.appendingPathComponent("config.toml"),
+            environment: environment
+        ) else {
+            return []
+        }
+        return [user]
     }
 
     private static func configString(
         path: [String],
         workingDirectory: URL,
         openGrokHome: URL,
-        environment: [String: String]
+        environment: [String: String],
+        effectiveConfig: TOMLValue?
     ) -> String? {
         for table in configTables(
             workingDirectory: workingDirectory,
             openGrokHome: openGrokHome,
-            environment: environment
+            environment: environment,
+            effectiveConfig: effectiveConfig
         ) {
             guard case .string(let raw)? = table[path: path] else { continue }
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -357,14 +614,64 @@ enum LiveWebToolComposition {
         path: [String],
         workingDirectory: URL,
         openGrokHome: URL,
-        environment: [String: String]
+        environment: [String: String],
+        effectiveConfig: TOMLValue?
     ) -> Bool? {
         for table in configTables(
             workingDirectory: workingDirectory,
             openGrokHome: openGrokHome,
-            environment: environment
+            environment: environment,
+            effectiveConfig: effectiveConfig
         ) {
             if case .boolean(let value)? = table[path: path] { return value }
+        }
+        return nil
+    }
+
+    private static func configInteger(
+        path: [String],
+        workingDirectory: URL,
+        openGrokHome: URL,
+        environment: [String: String],
+        effectiveConfig: TOMLValue?
+    ) -> Int64? {
+        for table in configTables(
+            workingDirectory: workingDirectory,
+            openGrokHome: openGrokHome,
+            environment: environment,
+            effectiveConfig: effectiveConfig
+        ) {
+            if case .integer(let value)? = table[path: path], value >= 0 {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private static func configStringArray(
+        path: [String],
+        workingDirectory: URL,
+        openGrokHome: URL,
+        environment: [String: String],
+        effectiveConfig: TOMLValue?
+    ) -> [String]? {
+        for table in configTables(
+            workingDirectory: workingDirectory,
+            openGrokHome: openGrokHome,
+            environment: environment,
+            effectiveConfig: effectiveConfig
+        ) {
+            guard let configured = table[path: path] else { continue }
+            guard case .array(let entries) = configured else { return [] }
+            var domains: [String] = []
+            domains.reserveCapacity(entries.count)
+            for entry in entries {
+                guard case .string(let value) = entry else { return [] }
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return [] }
+                domains.append(trimmed)
+            }
+            return domains
         }
         return nil
     }
@@ -384,7 +691,18 @@ struct LiveWebToolHandler: ToolHandler {
     /// nil when the session resolved no search backend — `web_fetch` alone is
     /// still a complete, useful tool, so this is not a construction failure.
     let searchClient: WebSearchClient?
+    let xSearchClient: WebSearchClient?
     let fetchClient: WebFetchClient
+
+    init(
+        searchClient: WebSearchClient?,
+        xSearchClient: WebSearchClient? = nil,
+        fetchClient: WebFetchClient
+    ) {
+        self.searchClient = searchClient
+        self.xSearchClient = xSearchClient ?? searchClient
+        self.fetchClient = fetchClient
+    }
 
     func invoke(
         clientName: String,
@@ -442,7 +760,7 @@ struct LiveWebToolHandler: ToolHandler {
         toolId: ToolId,
         args: JSONValue
     ) async -> Result<TypedToolOutput, ToolError> {
-        guard let searchClient else {
+        guard let xSearchClient else {
             return .failure(.custom(
                 code: "x_search_unavailable",
                 detail: "x_search has no configured backend for this session"
@@ -454,7 +772,7 @@ struct LiveWebToolHandler: ToolHandler {
             return .failure(.invalidArguments("x_search requires a non-empty query"))
         }
         do {
-            let result = try await searchClient.xSearch(query: query)
+            let result = try await xSearchClient.xSearch(query: query)
             return .success(searchOutput(toolId: toolId, result: result))
         } catch let error as WebMediaToolError {
             return .failure(.custom(code: "x_search_failed", detail: error.description))

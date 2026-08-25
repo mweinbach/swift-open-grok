@@ -225,7 +225,7 @@ enum LiveSessionSearchIndex {
                 retainedIDs.insert(candidate.sessionID)
                 let timestamp = milliseconds(candidate.updatedAt)
                 if let old = existing[candidate.sessionID],
-                   old.updatedAt == timestamp,
+                   unixSeconds(old.updatedAt) == unixSeconds(timestamp),
                    candidate.workingDirectory.isEmpty || old.workingDirectory == candidate.workingDirectory {
                     continue
                 }
@@ -275,6 +275,11 @@ enum LiveSessionSearchIndex {
 
     private static func milliseconds(_ date: Date) -> Int64 {
         Int64(date.timeIntervalSince1970 * 1_000)
+    }
+
+    private static func unixSeconds(_ milliseconds: Int64) -> Int64 {
+        let seconds = milliseconds / 1_000
+        return milliseconds < 0 && milliseconds % 1_000 != 0 ? seconds - 1 : seconds
     }
 
     private static func isSafeRegularFile(_ file: URL, root: URL) -> Bool {

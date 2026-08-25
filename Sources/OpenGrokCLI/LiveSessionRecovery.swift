@@ -45,6 +45,7 @@
 import Foundation
 import OpenGrokCompaction
 import OpenGrokSamplingTypes
+import OpenGrokSessionPersistence
 import OpenGrokShared
 
 // MARK: - Records
@@ -498,6 +499,8 @@ enum LiveRewindError: Error, CustomStringConvertible, Equatable {
     case noPoints
     case unknownPoint(Int)
     case notYetRun(Int)
+    case invalidSnapshot(path: String, message: String)
+    case historyReplayFailed(message: String)
     case writeFailed(path: String, message: String)
 
     var description: String {
@@ -508,6 +511,10 @@ enum LiveRewindError: Error, CustomStringConvertible, Equatable {
             return "no rewind point for prompt \(index)"
         case .notYetRun(let index):
             return "prompt \(index) has not run yet; there is nothing to rewind to"
+        case .invalidSnapshot(let path, let message):
+            return "unsafe rewind snapshot \(path): \(message)"
+        case .historyReplayFailed(let message):
+            return "cannot safely reconstruct the conversation: \(message)"
         case .writeFailed(let path, let message):
             return "failed to restore \(path): \(message)"
         }
@@ -695,6 +702,11 @@ actor LiveRewindCoordinator {
     private func capture(path rawPath: String) {
         guard open != nil else { return }
         guard let relative = relativePath(for: rawPath) else { return }
+        do {
+            try LiveRewindWorkspaceAccess(root: workingDirectory).validate(relative)
+        } catch {
+            return
+        }
         guard !capturedPaths.contains(relative) else { return }
         capturedPaths.insert(relative)
 
@@ -751,15 +763,24 @@ actor LiveRewindCoordinator {
         at url: URL,
         relative: String
     ) -> Result<LiveRewindSnapshot, LiveRewindSkipReason> {
-        let size = (try? fileManager.attributesOfItem(atPath: url.path)[.size] as? Int) ?? nil
-        if let size, size > limits.maxFileBytes {
-            return .failure(.tooLarge)
-        }
-        guard let data = try? Data(contentsOf: url) else {
+        _ = url
+        let current: LiveRewindWorkspaceAccess.FileContent
+        do {
+            current = try LiveRewindWorkspaceAccess(root: workingDirectory).read(
+                relative,
+                maximumBytes: limits.maxFileBytes
+            )
+        } catch {
             return .failure(.unreadable)
         }
-        guard data.count <= limits.maxFileBytes else {
+        let data: Data
+        switch current {
+        case .missing:
+            return .failure(.unreadable)
+        case .oversized:
             return .failure(.tooLarge)
+        case .data(let contents):
+            data = contents
         }
         guard let content = String(data: data, encoding: .utf8) else {
             return .failure(.binary)
@@ -843,6 +864,33 @@ actor LiveRewindCoordinator {
             throw LiveRewindError.notYetRun(targetPromptIndex)
         }
 
+        let workspace = try LiveRewindWorkspaceAccess(root: workingDirectory)
+        for point in points {
+            for snapshot in point.before + point.after {
+                try workspace.validate(snapshot.path)
+            }
+            for skipped in point.skipped {
+                try workspace.validate(skipped.path)
+            }
+        }
+
+        let reconstructed: [ConversationItem]
+        if mode == .filesOnly {
+            reconstructed = currentItems
+        } else {
+            do {
+                reconstructed = try LiveCanonicalRewind.reconstructedConversation(
+                    currentItems,
+                    toPromptIndex: targetPromptIndex,
+                    openGrokHome: openGrokHome,
+                    sessionID: sessionID,
+                    workingDirectory: workingDirectory
+                )
+            } catch {
+                throw LiveRewindError.historyReplayFailed(message: "\(error)")
+            }
+        }
+
         // Restoring to prompt N means undoing prompts N, N+1, … so every point
         // from N onward contributes. Earlier points win on conflict: they hold
         // the state furthest back, which is what "before prompt N" means.
@@ -879,11 +927,20 @@ actor LiveRewindCoordinator {
                     clean.append(path)
                     continue
                 }
-                let url = workingDirectory.appendingPathComponent(path)
-                let exists = fileManager.fileExists(atPath: url.path)
-                let current: String? = exists
-                    ? (try? Data(contentsOf: url)).flatMap { String(data: $0, encoding: .utf8) }
-                    : nil
+                let observed = try workspace.read(path, maximumBytes: limits.maxFileBytes)
+                let exists: Bool
+                let current: String?
+                switch observed {
+                case .missing:
+                    exists = false
+                    current = nil
+                case .oversized:
+                    exists = true
+                    current = nil
+                case .data(let data):
+                    exists = true
+                    current = String(data: data, encoding: .utf8)
+                }
                 switch (expected.content, current, exists) {
                 case (let want?, let have?, _) where want == have:
                     clean.append(path)
@@ -900,14 +957,9 @@ actor LiveRewindCoordinator {
         }
 
         let promptText = target.promptText
-        let sessionDir = openGrokHome.appendingPathComponent("sessions").appendingPathComponent(sessionID)
         let removedItemCount = mode == .filesOnly
             ? 0
-            : currentItems.count - liveTruncateConversation(
-                currentItems,
-                toPromptIndex: targetPromptIndex,
-                sessionDir: sessionDir
-            ).count
+            : max(0, currentItems.count - reconstructed.count)
 
         guard force else {
             return LiveRewindOutcome(
@@ -932,16 +984,11 @@ actor LiveRewindCoordinator {
             // the recovery path less useful, not more.
             for path in clean {
                 guard let snapshot = plan[path] else { continue }
-                let url = workingDirectory.appendingPathComponent(path)
                 do {
                     if let content = snapshot.content {
-                        try fileManager.createDirectory(
-                            at: url.deletingLastPathComponent(),
-                            withIntermediateDirectories: true
-                        )
-                        try Data(content.utf8).write(to: url, options: .atomic)
-                    } else if fileManager.fileExists(atPath: url.path) {
-                        try fileManager.removeItem(at: url)
+                        try workspace.write(Data(content.utf8), to: path)
+                    } else {
+                        try workspace.remove(path)
                     }
                     reverted.append(path)
                 } catch {

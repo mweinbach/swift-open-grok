@@ -1,13 +1,15 @@
 // ClaudeSessionScanner.swift
 //
 // Read-only scanner for Claude Code sessions stored as JSONL in
-// `~/.claude/projects/<hash>/`.
+// `~/.claude/projects/<sanitized-workspace-path>/`.
 //
-// Rust reference (`~/Projects/grok-build` commit 650c1db7):
-//   * `foreign_sessions/claude.rs:30-60` — scan entry point and config dir
-//     resolution.
-//   * `foreign_sessions/claude.rs` read_candidate / qualify_candidate / title
-//     extraction from JSONL head and tail.
+// Rust reference (`~/Projects/grok-build` commit 00e176c8):
+//   * `xai-grok-foreign-sessions/src/claude/projects.rs:6-50` — bounded
+//     current-checkout/repository/worktree project derivation.
+//   * `xai-grok-foreign-sessions/src/capability/unix.rs:7-43` — no-follow,
+//     descriptor-relative directory and transcript access.
+//   * `xai-grok-foreign-sessions/src/claude.rs:274-373` — bounded candidate
+//     qualification and head/tail transcript reads.
 //
 // This scanner never writes to the Claude store. It reads just enough of each
 // file (head and tail) to extract a title and metadata, matching the bounded
@@ -22,6 +24,12 @@ public enum ClaudeSessionScanner {
     static let readChunk = 64 * 1024
     static let maxHead = 4 * 1024 * 1024
     static let maxContentReads = 128
+    static let maxProjectDirs = 16
+    static let maxSanitizedPathBytes = 200
+    static let maxJSONLineBytes = 256 * 1024
+    static let maxJSONLines = 4_096
+    private static let maxGitMetadataBytes = 16 * 1024
+    private static let maxGitWorktreeEntries = 256
 
     // MARK: - Public entry point
 
@@ -36,11 +44,14 @@ public enum ClaudeSessionScanner {
         configDir: URL? = nil,
         environment: [String: String] = [:]
     ) -> [ForeignSessionSummary] {
-        guard let configDir = resolveConfigDir(configDir, environment: environment) else {
+        guard let configDir = resolveConfigDir(configDir, environment: environment),
+              let approvedRoot = ForeignSessionApprovedRoot(configDir)
+        else {
             return []
         }
-        let projectDirs = scopedProjectDirs(configDir: configDir, cwd: requestedCwd)
+        let projectDirs = scopedProjectDirs(configDir: approvedRoot.url, cwd: requestedCwd)
         let candidates = collectCandidates(
+            root: approvedRoot,
             projectDirs: projectDirs,
             now: now,
             maxAge: ForeignSessionLimits.maxSessionAge,
@@ -80,63 +91,220 @@ public enum ClaudeSessionScanner {
 
     // MARK: - Project directory scoping
 
-    /// Claude Code stores sessions under `projects/<hash>/` where the hash is
-    /// derived from the project path. We scan all project directories because
-    /// the hash function is not public and may change.
+    /// Never enumerate `projects`: only Git-related paths can authorize a
+    /// project directory, and every subsequent component is opened no-follow.
     static func scopedProjectDirs(configDir: URL, cwd: String) -> [URL] {
         let projectsDir = configDir.appendingPathComponent("projects", isDirectory: true)
-        guard FileManager.default.fileExists(atPath: projectsDir.path) else { return [] }
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: projectsDir,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else { return [] }
-        return entries.filter { url in
-            var isDir: ObjCBool = false
-            return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
-                && isDir.boolValue
+        var seenPaths = Set<String>()
+        var seenDirectories = Set<String>()
+        var directories: [URL] = []
+
+        for workspace in scopedWorkspacePaths(cwd: cwd) {
+            guard seenPaths.insert(workspace.path).inserted,
+                  directories.count < maxProjectDirs,
+                  let sanitized = sanitizedProjectPath(workspace.path),
+                  seenDirectories.insert(sanitized).inserted
+            else { continue }
+            directories.append(
+                projectsDir.appendingPathComponent(sanitized, isDirectory: true)
+            )
         }
+        return directories
+    }
+
+    static func sanitizedProjectPath(_ path: String) -> String? {
+        var sanitized = String()
+        sanitized.reserveCapacity(maxSanitizedPathBytes)
+        for scalar in path.unicodeScalars {
+            let value = scalar.value
+            if (48...57).contains(value)
+                || (65...90).contains(value)
+                || (97...122).contains(value)
+            {
+                sanitized.unicodeScalars.append(scalar)
+            } else {
+                sanitized.append("-")
+            }
+            if sanitized.utf8.count > maxSanitizedPathBytes { return nil }
+        }
+        return sanitized.isEmpty ? nil : sanitized
+    }
+
+    private struct GitTopology {
+        let checkout: URL
+        let gitDirectory: ForeignSessionApprovedRoot
+        let commonDirectory: ForeignSessionApprovedRoot
+    }
+
+    private static func scopedWorkspacePaths(cwd: String) -> [URL] {
+        let requested = URL(fileURLWithPath: cwd, isDirectory: true).standardizedFileURL
+        let canonical = requested.resolvingSymlinksInPath().standardizedFileURL
+        var paths: [URL] = []
+        var seen = Set<String>()
+
+        func include(_ path: URL) {
+            guard paths.count < maxProjectDirs, seen.insert(path.path).inserted else { return }
+            paths.append(path)
+        }
+
+        include(requested)
+        include(canonical)
+
+        guard let topology = discoverGitTopology(startingAt: canonical) else {
+            return paths
+        }
+        include(topology.checkout)
+
+        if topology.gitDirectory.url.path != topology.commonDirectory.url.path {
+            let mainCheckout = topology.commonDirectory.url.deletingLastPathComponent()
+                .standardizedFileURL
+            if gitDirectory(for: mainCheckout)?.url.path == topology.commonDirectory.url.path {
+                include(mainCheckout)
+            }
+        }
+
+        let worktrees = topology.commonDirectory.url
+            .appendingPathComponent("worktrees", isDirectory: true)
+        guard let approvedWorktrees = topology.commonDirectory.subroot(worktrees) else {
+            return Array(paths.prefix(maxProjectDirs))
+        }
+
+        var registrations: [String] = []
+        approvedWorktrees.visitEntries(maximum: maxGitWorktreeEntries) {
+            registrations.append($0)
+        }
+
+        for registration in registrations.sorted().prefix(maxProjectDirs) {
+            guard paths.count < maxProjectDirs else { break }
+            let directory = approvedWorktrees.url.appendingPathComponent(
+                registration,
+                isDirectory: true
+            )
+            guard let registeredRoot = approvedWorktrees.subroot(directory),
+                  let gitdir = readGitMetadata(named: "gitdir", under: registeredRoot),
+                  let gitFile = resolveGitPath(gitdir, relativeTo: registeredRoot.url)
+            else { continue }
+
+            let checkout = gitFile.deletingLastPathComponent()
+                .resolvingSymlinksInPath().standardizedFileURL
+            guard gitDirectory(for: checkout)?.url.path == registeredRoot.url.path else {
+                continue
+            }
+            include(checkout)
+        }
+        return paths
+    }
+
+    private static func discoverGitTopology(startingAt directory: URL) -> GitTopology? {
+        var checkout = directory
+        while true {
+            if let gitDirectory = gitDirectory(for: checkout) {
+                let commonDirectory: ForeignSessionApprovedRoot
+                if let commonPath = readGitMetadata(named: "commondir", under: gitDirectory),
+                   let resolved = resolveGitPath(commonPath, relativeTo: gitDirectory.url),
+                   let approved = ForeignSessionApprovedRoot(resolved)
+                {
+                    commonDirectory = approved
+                } else {
+                    commonDirectory = gitDirectory
+                }
+                return GitTopology(
+                    checkout: checkout.resolvingSymlinksInPath().standardizedFileURL,
+                    gitDirectory: gitDirectory,
+                    commonDirectory: commonDirectory
+                )
+            }
+
+            let parent = checkout.deletingLastPathComponent()
+            guard parent.path != checkout.path else { return nil }
+            checkout = parent
+        }
+    }
+
+    private static func gitDirectory(for checkout: URL) -> ForeignSessionApprovedRoot? {
+        guard let approvedCheckout = ForeignSessionApprovedRoot(checkout) else { return nil }
+        let metadata = approvedCheckout.url.appendingPathComponent(".git")
+        if let directory = approvedCheckout.subroot(metadata) { return directory }
+
+        guard let file = approvedCheckout.openRegularFile(metadata),
+              let contents = boundedGitMetadata(file),
+              contents.hasPrefix("gitdir:"),
+              let resolved = resolveGitPath(
+                String(contents.dropFirst("gitdir:".count)),
+                relativeTo: approvedCheckout.url
+              )
+        else { return nil }
+        return ForeignSessionApprovedRoot(resolved)
+    }
+
+    private static func readGitMetadata(
+        named name: String,
+        under root: ForeignSessionApprovedRoot
+    ) -> String? {
+        let candidate = root.url.appendingPathComponent(name)
+        guard let file = root.openRegularFile(candidate) else { return nil }
+        return boundedGitMetadata(file)
+    }
+
+    private static func boundedGitMetadata(_ file: ForeignSessionApprovedFile) -> String? {
+        guard file.size > 0,
+              file.size <= UInt64(maxGitMetadataBytes),
+              let contents = file.read(maximum: Int(file.size)),
+              let text = String(data: contents, encoding: .utf8)
+        else { return nil }
+        let firstLine = text.split(whereSeparator: \.isNewline).first
+        return firstLine.map {
+            String($0).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+
+    private static func resolveGitPath(_ value: String, relativeTo base: URL) -> URL? {
+        let path = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty, !path.contains("\0") else { return nil }
+        return URL(fileURLWithPath: path, relativeTo: base)
+            .absoluteURL.resolvingSymlinksInPath().standardizedFileURL
     }
 
     // MARK: - Candidate collection
 
     struct Candidate {
-        let path: URL
+        let file: ForeignSessionApprovedFile
         let sessionID: String
-        let modified: Date
-        let size: UInt64
+
+        var path: URL { file.path }
+        var modified: Date { file.modified }
+        var size: UInt64 { file.size }
     }
 
     static func collectCandidates(
+        root: ForeignSessionApprovedRoot,
         projectDirs: [URL],
         now: Date,
         maxAge: TimeInterval,
         limit: Int
     ) -> [Candidate] {
         var candidates: [Candidate] = []
-        for projectDir in projectDirs {
-            guard let entries = try? FileManager.default.contentsOfDirectory(
-                at: projectDir,
-                includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey],
-                options: [.skipsHiddenFiles]
-            ) else { continue }
-            for entry in entries {
-                guard entry.pathExtension == "jsonl" else { continue }
+        for projectDir in projectDirs.prefix(maxProjectDirs) {
+            guard let projectRoot = root.subroot(projectDir) else { continue }
+            var projectCandidates: [Candidate] = []
+            let complete = projectRoot.visitEntries { name in
+                let entry = projectRoot.url.appendingPathComponent(name)
+                guard entry.pathExtension == "jsonl" else { return }
                 let stem = entry.deletingPathExtension().lastPathComponent
-                guard isValidUUID(stem) else { continue }
-                guard let attrs = try? entry.resourceValues(
-                    forKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
-                ) else { continue }
-                guard attrs.isRegularFile == true else { continue }
-                guard let modified = attrs.contentModificationDate else { continue }
-                let size = UInt64(attrs.fileSize ?? 0)
-                guard size > 0 else { continue }
-                guard isForeignSessionWithin(modified, now: now, window: maxAge) else { continue }
+                guard isValidUUID(stem) else { return }
+                guard let file = projectRoot.openRegularFile(entry),
+                      file.size > 0,
+                      isForeignSessionWithin(file.modified, now: now, window: maxAge)
+                else { return }
                 insertSorted(
-                    &candidates,
-                    Candidate(path: entry, sessionID: stem, modified: modified, size: size),
+                    &projectCandidates,
+                    Candidate(file: file, sessionID: stem),
                     limit: limit
                 )
+            }
+            guard complete else { continue }
+            for candidate in projectCandidates {
+                insertSorted(&candidates, candidate, limit: limit)
             }
         }
         return candidates
@@ -156,7 +324,7 @@ public enum ClaudeSessionScanner {
             return nil
         }
 
-        guard let storedCwd, foreignSessionPathsEqual(storedCwd, requestedCwd) else { return nil }
+        guard let storedCwd, canonicalPathsEqual(storedCwd, requestedCwd) else { return nil }
 
         let tail = readTail(candidate)
 
@@ -194,9 +362,10 @@ public enum ClaudeSessionScanner {
         _ candidate: Candidate
     ) -> (head: String, cwd: String?)? {
         let maxSize = min(candidate.size, UInt64(maxHead))
+        guard maxSize > 0 else { return nil }
         var limit = min(readChunk, Int(maxSize))
         while true {
-            guard let head = readPrefix(candidate.path, limit: limit) else { return nil }
+            guard let head = readPrefix(candidate.file, limit: limit) else { return nil }
             let cwd = firstJSONString(in: head, key: "cwd")
             if cwd != nil || limit >= Int(maxSize) {
                 return (head, cwd)
@@ -205,29 +374,24 @@ public enum ClaudeSessionScanner {
         }
     }
 
-    static func readPrefix(_ url: URL, limit: Int) -> String? {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        let data = handle.readData(ofLength: limit)
+    static func readPrefix(_ file: ForeignSessionApprovedFile, limit: Int) -> String? {
+        guard limit <= maxHead, let data = file.read(maximum: limit) else { return nil }
         return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
     }
 
     static func readTail(_ candidate: Candidate) -> String {
         let len = min(candidate.size, UInt64(readChunk))
-        guard let handle = try? FileHandle(forReadingFrom: candidate.path) else { return "" }
-        defer { try? handle.close() }
         let offset = candidate.size - len
-        if offset > 0 {
-            handle.seek(toFileOffset: offset)
+        guard let data = candidate.file.read(offset: offset, maximum: Int(len)) else {
+            return ""
         }
-        let data = handle.readData(ofLength: Int(len))
         return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
     }
 
     // MARK: - JSONL field extraction
 
     static func firstJSONString(in text: String, key: String) -> String? {
-        for line in text.split(whereSeparator: \.isNewline) {
+        for line in boundedLines(in: text) {
             if let value = jsonStringField(String(line), key: key) {
                 return value
             }
@@ -236,7 +400,7 @@ public enum ClaudeSessionScanner {
     }
 
     static func lastJSONString(in text: String, key: String) -> String? {
-        for line in text.split(whereSeparator: \.isNewline).reversed() {
+        for line in boundedLines(in: text, fromEnd: true) {
             if let value = jsonStringField(String(line), key: key) {
                 return value
             }
@@ -245,7 +409,8 @@ public enum ClaudeSessionScanner {
     }
 
     static func jsonStringField(_ line: String, key: String) -> String? {
-        guard let data = line.data(using: .utf8),
+        guard line.utf8.count <= maxJSONLineBytes,
+              let data = line.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let value = obj[key] as? String
         else { return nil }
@@ -258,10 +423,11 @@ public enum ClaudeSessionScanner {
     /// `first_prompt` logic including command-name and bash-input tag handling.
     static func firstPrompt(in head: String) -> String? {
         var commandFallback: String?
-        for line in head.split(whereSeparator: \.isNewline) {
+        for line in boundedLines(in: head) {
             let lineStr = String(line)
             if lineStr.contains("\"tool_result\"") { continue }
-            guard let data = lineStr.data(using: .utf8),
+            guard lineStr.utf8.count <= maxJSONLineBytes,
+                  let data = lineStr.data(using: .utf8),
                   let entry = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { continue }
             guard (entry["type"] as? String) == "user" else { continue }
@@ -311,6 +477,42 @@ public enum ClaudeSessionScanner {
         let afterLT = trimmed.dropFirst()
         guard let next = afterLT.first else { return false }
         return next.isLowercase && next.isASCII
+    }
+
+    private static func boundedLines(in text: String, fromEnd: Bool = false) -> [Substring] {
+        var lines: [Substring] = []
+        lines.reserveCapacity(min(maxJSONLines, 64))
+        var remainder = text[...]
+
+        while !remainder.isEmpty, lines.count < maxJSONLines {
+            if fromEnd {
+                if let separator = remainder.lastIndex(where: \.isNewline) {
+                    let start = remainder.index(after: separator)
+                    let line = remainder[start...]
+                    if !line.isEmpty { lines.append(line) }
+                    remainder = remainder[..<separator]
+                } else {
+                    lines.append(remainder)
+                    break
+                }
+            } else if let separator = remainder.firstIndex(where: \.isNewline) {
+                let line = remainder[..<separator]
+                if !line.isEmpty { lines.append(line) }
+                remainder = remainder[remainder.index(after: separator)...]
+            } else {
+                lines.append(remainder)
+                break
+            }
+        }
+        return lines
+    }
+
+    private static func canonicalPathsEqual(_ left: String, _ right: String) -> Bool {
+        let canonicalLeft = URL(fileURLWithPath: left).standardizedFileURL
+            .resolvingSymlinksInPath().standardizedFileURL.path
+        let canonicalRight = URL(fileURLWithPath: right).standardizedFileURL
+            .resolvingSymlinksInPath().standardizedFileURL.path
+        return foreignSessionPathsEqual(canonicalLeft, canonicalRight)
     }
 
     // MARK: - Helpers

@@ -129,10 +129,25 @@ public enum CLIRunner {
         application: OpenGrokApplication = .unavailable,
         releaseValidationDependencies: LiveReleaseValidationDependencies = .live
     ) async -> Int32 {
-        let command = CLICommandParser.parse(args, environment: environment)
+        let parsedCommand = CLICommandParser.parse(args, environment: environment)
+        let startup: (command: CLICommand, environment: [String: String])
+        do {
+            startup = try LiveDashboardStartupComposition.normalize(
+                command: parsedCommand,
+                environment: environment
+            )
+        } catch let error as CLIApplicationError {
+            streams.err("open-grok: \(error.description).\n")
+            return ExitCode.failure.rawValue
+        } catch {
+            streams.err("open-grok: \(error).\n")
+            return ExitCode.failure.rawValue
+        }
+        let command = startup.command
+        let launchEnvironment = startup.environment
         if let refusal = LiveVersionPolicyGate.refusal(
             for: command,
-            environment: environment
+            environment: launchEnvironment
         ) {
             streams.err(refusal + "\n")
             return ExitCode.failure.rawValue
@@ -186,7 +201,17 @@ public enum CLIRunner {
             return ExitCode.usage.rawValue
         default:
             do {
-                try await application.run(command: command, environment: environment, streams: streams)
+                if streams.rawError != nil {
+                    LiveCrashBootstrap.shared.start(
+                        environment: launchEnvironment,
+                        streams: streams
+                    )
+                }
+                try await application.run(
+                    command: command,
+                    environment: launchEnvironment,
+                    streams: streams
+                )
                 return ExitCode.success.rawValue
             } catch is CancellationError {
                 streams.err("open-grok: operation cancelled.\n")

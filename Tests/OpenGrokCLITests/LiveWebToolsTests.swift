@@ -45,14 +45,12 @@ private func availability(
 
 // MARK: - The kill switch
 
-@Test func disableWebSearchSuppressesSearchButNotFetch() {
+@Test func disableWebSearchSuppressesEveryWebCapability() {
     let resolved = availability(apiKey: "xai-key", disableWebSearch: true)
     #expect(!resolved.webSearchEnabled)
     #expect(!resolved.xSearchEnabled)
     #expect(resolved.searchConfig.isEnabled == false)
-    // `--disable-web-search` governs the search config. Fetching a URL the user
-    // supplied is a different capability and survives the flag.
-    #expect(resolved.webFetchEnabled)
+    #expect(!resolved.webFetchEnabled)
 }
 
 // MARK: - Credentials gate advertisement
@@ -68,8 +66,7 @@ private func availability(
     let resolved = availability(provider: .xai, apiKey: "")
     #expect(!resolved.webSearchEnabled)
     #expect(!resolved.xSearchEnabled)
-    // Fetch needs no API key, so it is still on offer.
-    #expect(resolved.webFetchEnabled)
+    #expect(!resolved.webFetchEnabled)
 }
 
 @Test func aNonXaiSessionMayNotBorrowItsOwnBearerForXaiSearch() {

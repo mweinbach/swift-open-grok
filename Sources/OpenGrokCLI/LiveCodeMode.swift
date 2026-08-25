@@ -606,7 +606,7 @@ private struct LiveDynamicCodeModeDelegate: CodeModeSessionDelegate {
     ) async -> Result<JSONValue, CodeModeError> {
         let snapshot = LiveCodeModeToolSurface(
             mode: mode,
-            baseTools: toolExecutor.currentToolSpecs(),
+            baseTools: await toolExecutor.currentActiveToolSpecs(),
             provider: provider
         ).snapshot
         guard snapshot.definition(for: invocation.toolName) != nil else {
@@ -702,7 +702,7 @@ actor LiveCodeModeCoordinator {
     func beginTurn(emit: @escaping LiveCodeModeEmitter.Sink) async {
         activeSnapshot = LiveCodeModeToolSurface(
             mode: surface.mode,
-            baseTools: toolExecutor.currentToolSpecs(),
+            baseTools: await toolExecutor.currentActiveToolSpecs(),
             provider: activeProvider
         ).snapshot
         await emitter.attach(emit)

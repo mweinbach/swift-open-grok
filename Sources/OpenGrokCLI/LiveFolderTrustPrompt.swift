@@ -42,7 +42,7 @@ enum LiveFolderTrustPrompt {
             featureEnabled: featureEnabled,
             inputs: FolderTrustDecideInputs(
                 storeTrusted: PersistentFolderTrustStore(environment: environment).isTrusted(workspace),
-                repoConfigsPresent: repoConfigsPresent(at: cwd),
+                repoConfigsPresent: repoConfigsPresent(at: cwd, environment: environment),
                 isInteractive: hasInteractiveSurface && interactiveInput != nil && terminal.isTTY(),
                 keyRecordable: keyRecordable
             )

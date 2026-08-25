@@ -16,17 +16,14 @@
 // `y` copies a bg task's stdout (`panes.rs:422-430`) and IS wired. This
 // header used to claim the port had no clipboard channel and the tests
 // pinned `copyAction == nil` forever; both were wrong. The channel is
-// `LivePagerClipboard.copy` (`LiveScrollbackFocus.swift:386-394`), the same
-// OSC 52 write that already carries `/copy`, `/export`, and the scrollback
-// selection copy. `copyAction` is set ONLY when the snapshot holds output,
+// `LivePagerClipboard.copy`, shared with `/copy`, `/export`, and scrollback
+// selection. Its native clipboard, policy-gated OSC 52, and owner-private
+// recovery-file legs prevent an unverified terminal escape from being the
+// only route. `copyAction` is set ONLY when the snapshot holds output,
 // mirroring upstream's `!task.stdout.is_empty()` gate — a `y` that copies
 // an empty string is still a copy that lands nowhere.
 //
-// What the OSC 52 leg does not carry, recorded: no `pbcopy` fallback, no
-// tmux-buffer leg, no `~/.opengrok/last-copy.txt` backup, and no
-// CopyDelivery trust classification — the success note is upstream's
-// "Unverified" tier, the real cost of a terminal that may have OSC 52
-// switched off. A truncated snapshot copies what the snapshot holds.
+// A truncated snapshot copies what the snapshot holds.
 //
 // Enter opens the selected entry (`panes.rs:339-383`): a bg task or monitor
 // opens the block viewer over its stdout — unconditionally, upstream has no

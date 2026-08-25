@@ -599,18 +599,16 @@ struct ACPMCPExtensionTests {
         #expect(result["_meta"]?["x.ai/mcp/sdk"] == nil)
     }
 
-    @Test("setup is refused with the terminal error; toggle/toggle_tool are live; unknown prefix names (incl. inbound sdk_call) get upstream's bare method_not_found")
+    @Test("setup validates required session identity; toggle/toggle_tool are live; unknown prefix names get method_not_found")
     func prefixRefusals() async throws {
         let harness = try await MCPFamilyHarness.start(configTOML: "")
         defer { Task { await harness.shutdown() } }
 
-        // Setup is not ported (no setup-schema surface): refused with the
-        // data-carrying terminal error so "not ported" is distinguishable.
         let (setupResult, setupError) = await harness.call("x.ai/mcp/setup", id: "ref-setup")
         #expect(setupResult == nil)
-        #expect(setupError?.code == .methodNotFound)
+        #expect(setupError?.code == .invalidParams)
         #expect(
-            setupError?.data == .string("unknown ACP extension method: x.ai/mcp/setup")
+            setupError?.data == .string("invalid params: missing field `sessionId`")
         )
 
         // Upstream's OWN refusal for unknown names under the prefix — bare

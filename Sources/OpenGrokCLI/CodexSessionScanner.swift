@@ -1,19 +1,11 @@
 // CodexSessionScanner.swift
 //
-// Read-only scanner for Codex sessions stored as JSONL rollout files under
-// `~/.codex/sessions/`.
+// Read-only scanner for Codex sessions stored in state databases or JSONL
+// rollout files under `~/.codex/`.
 //
-// Rust reference (`~/Projects/grok-build` commit 650c1db7):
-//   * `foreign_sessions/codex/mod.rs:18-50` — home resolution and scan entry
-//     point.
-//   * `foreign_sessions/codex/files.rs` — rollout-file based scanner.
-//
-// The Rust reference also supports a SQLite state database
-// (`codex/db.rs`). This Swift port scans only the rollout JSONL files,
-// matching the files.rs path. The database path is deliberately deferred:
-// it requires SQLite bindings that this target does not carry, and the
-// file-based scanner covers the common case. The omission is recorded in
-// the handoff.
+// Rust reference (`~/Projects/grok-build` commit 00e176c8fb4035701c24199bf9225973c1b13c20):
+//   * `xai-grok-foreign-sessions/src/codex/mod.rs:42-51` — database-first scan.
+//   * `xai-grok-foreign-sessions/src/codex/files.rs:244-349` — rollout metadata.
 //
 // This scanner never writes to the Codex store. Read-only, bounded I/O.
 
@@ -26,6 +18,7 @@ public enum CodexSessionScanner {
     static let maxMetadataReads = 128
     static let maxHeadRecords = 10
     static let maxHeadBytes = 64 * 1024
+    static let maxDateDirectories = 32
 
     // MARK: - Public entry point
 
@@ -40,16 +33,28 @@ public enum CodexSessionScanner {
         codexHome: URL? = nil,
         environment: [String: String] = [:]
     ) -> [ForeignSessionSummary] {
-        guard let home = resolveCodexHome(codexHome, environment: environment) else {
+        guard let home = resolveCodexHome(codexHome, environment: environment),
+              let root = CodexApprovedRoot(home)
+        else {
             return []
         }
-        let sessionsDir = home.appendingPathComponent("sessions", isDirectory: true)
-        guard FileManager.default.fileExists(atPath: sessionsDir.path) else { return [] }
+        if var sessions = CodexSessionDatabaseScanner.scan(
+            root: root,
+            requestedCwd: requestedCwd,
+            now: now
+        ) {
+            finishForeignToolScan(&sessions)
+            return sessions
+        }
+
+        let sessionsDir = root.url.appendingPathComponent("sessions", isDirectory: true)
+        guard root.containsSafeDirectory(sessionsDir) else { return [] }
         let candidates = collectRolloutCandidates(
             sessionsDir: sessionsDir,
             now: now,
             maxAge: ForeignSessionLimits.maxSessionAge,
-            limit: maxMetadataReads
+            limit: maxMetadataReads,
+            root: root
         )
         var accepted = Set<String>()
         var sessions: [ForeignSessionSummary] = []
@@ -90,6 +95,7 @@ public enum CodexSessionScanner {
         let id: String
         let modified: Date
         let size: UInt64
+        let root: CodexApprovedRoot
     }
 
     /// Codex stores rollouts in date-partitioned directories:
@@ -101,31 +107,35 @@ public enum CodexSessionScanner {
         sessionsDir: URL,
         now: Date,
         maxAge: TimeInterval,
-        limit: Int
+        limit: Int,
+        root: CodexApprovedRoot
     ) -> [RolloutCandidate] {
         var candidates: [RolloutCandidate] = []
         let dateDirs = recentDateDirectories(sessionsDir: sessionsDir, now: now, days: 31)
         for dateDir in dateDirs {
+            guard root.containsSafeDirectory(dateDir) else { continue }
             guard let entries = try? FileManager.default.contentsOfDirectory(
                 at: dateDir,
-                includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey],
+                includingPropertiesForKeys: nil,
                 options: [.skipsHiddenFiles]
             ) else { continue }
             for entry in entries {
                 guard entry.pathExtension == "jsonl" else { continue }
                 let name = entry.deletingPathExtension().lastPathComponent
                 guard let id = rolloutID(from: name) else { continue }
-                guard let attrs = try? entry.resourceValues(
-                    forKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
-                ) else { continue }
-                guard attrs.isRegularFile == true else { continue }
-                guard let modified = attrs.contentModificationDate else { continue }
-                let size = UInt64(attrs.fileSize ?? 0)
-                guard size > 0 else { continue }
-                guard isForeignSessionWithin(modified, now: now, window: maxAge) else { continue }
+                guard let opened = root.openRegularFile(entry), opened.size > 0 else { continue }
+                guard isForeignSessionWithin(opened.modified, now: now, window: maxAge) else {
+                    continue
+                }
                 insertRolloutSorted(
                     &candidates,
-                    RolloutCandidate(path: entry, id: id, modified: modified, size: size),
+                    RolloutCandidate(
+                        path: opened.path,
+                        id: id,
+                        modified: opened.modified,
+                        size: opened.size,
+                        root: root
+                    ),
                     limit: limit
                 )
             }
@@ -140,26 +150,32 @@ public enum CodexSessionScanner {
         now: Date,
         days: Int
     ) -> [URL] {
-        let calendar = Calendar(identifier: .gregorian)
-        var dirs: [URL] = []
-        for dayOffset in 0..<days {
-            guard let date = calendar.date(byAdding: .day, value: -dayOffset, to: now) else {
-                continue
-            }
-            let components = calendar.dateComponents([.year, .month, .day], from: date)
-            guard let year = components.year,
-                  let month = components.month,
-                  let day = components.day
-            else { continue }
-            let dir = sessionsDir
-                .appendingPathComponent(String(year), isDirectory: true)
-                .appendingPathComponent(String(format: "%02d", month), isDirectory: true)
-                .appendingPathComponent(String(format: "%02d", day), isDirectory: true)
-            if FileManager.default.fileExists(atPath: dir.path) {
-                dirs.append(dir)
+        let localCalendar = Calendar(identifier: .gregorian)
+        var utcCalendar = localCalendar
+        utcCalendar.timeZone = TimeZone(secondsFromGMT: 0) ?? localCalendar.timeZone
+        var dirs: [String: URL] = [:]
+
+        for calendar in [localCalendar, utcCalendar] {
+            for dayOffset in 0..<days {
+                guard let date = calendar.date(byAdding: .day, value: -dayOffset, to: now) else {
+                    continue
+                }
+                let components = calendar.dateComponents([.year, .month, .day], from: date)
+                guard let year = components.year,
+                      let month = components.month,
+                      let day = components.day
+                else { continue }
+                let key = String(format: "%04d/%02d/%02d", year, month, day)
+                let dir = sessionsDir
+                    .appendingPathComponent(String(format: "%04d", year), isDirectory: true)
+                    .appendingPathComponent(String(format: "%02d", month), isDirectory: true)
+                    .appendingPathComponent(String(format: "%02d", day), isDirectory: true)
+                if FileManager.default.fileExists(atPath: dir.path) {
+                    dirs[key] = dir
+                }
             }
         }
-        return dirs
+        return dirs.keys.sorted(by: >).prefix(maxDateDirectories).compactMap { dirs[$0] }
     }
 
     // MARK: - Rollout ID extraction
@@ -179,6 +195,13 @@ public enum CodexSessionScanner {
         guard UUID(uuidString: id) != nil else { return nil }
         let timestamp = String(value[..<value.index(before: idStart)])
         guard timestamp.count == 19 else { return nil }
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd'T'HH-mm-ss"
+        formatter.isLenient = false
+        guard formatter.date(from: timestamp) != nil else { return nil }
         return id
     }
 
@@ -191,21 +214,21 @@ public enum CodexSessionScanner {
         let head = readHead(candidate)
         guard !head.isEmpty else { return nil }
         let meta = parseHeadMetadata(head)
-        guard let storedCwd = meta.cwd, foreignSessionPathsEqual(storedCwd, requestedCwd) else { return nil }
-        let source = meta.source ?? .codexCli
-        let titleText: String?
-        if let firstMsg = meta.firstUserMessage {
-            titleText = normalizeForeignTitle(firstMsg)
-        } else {
-            titleText = nil
-        }
-        guard let title = titleText else { return nil }
+        guard let metadataID = meta.id,
+              let parsedMetadataID = UUID(uuidString: metadataID),
+              parsedMetadataID == UUID(uuidString: candidate.id),
+              let storedCwd = meta.cwd,
+              foreignSessionPathsEqual(storedCwd, requestedCwd),
+              let source = meta.source,
+              let firstMessage = meta.firstUserMessage,
+              let title = normalizeForeignTitle(firstMessage)
+        else { return nil }
         return ForeignSessionSummary(
             tool: .codex,
             source: source,
             nativeID: candidate.id,
             title: title,
-            cwd: requestedCwd,
+            cwd: storedCwd,
             updatedAt: candidate.modified,
             branch: meta.branch.flatMap { normalizeForeignTitle($0) }
         )
@@ -214,9 +237,11 @@ public enum CodexSessionScanner {
     /// Read the first few JSONL records from a rollout, bounded to
     /// `maxHeadBytes`.
     static func readHead(_ candidate: RolloutCandidate) -> String {
-        let limit = min(Int(candidate.size), maxHeadBytes)
-        guard let handle = try? FileHandle(forReadingFrom: candidate.path) else { return "" }
-        defer { try? handle.close() }
+        guard let opened = candidate.root.openRegularFile(candidate.path),
+              opened.size > 0
+        else { return "" }
+        let limit = Int(min(opened.size, UInt64(maxHeadBytes)))
+        let handle = FileHandle(fileDescriptor: opened.descriptor, closeOnDealloc: false)
         let data = handle.readData(ofLength: limit)
         return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
     }
@@ -235,6 +260,8 @@ public enum CodexSessionScanner {
     static func parseHeadMetadata(_ head: String) -> HeadMetadata {
         var meta = HeadMetadata()
         var recordCount = 0
+        var sawSessionMetadata = false
+        var acceptsLegacyRecords = false
         for line in head.split(whereSeparator: \.isNewline) {
             guard recordCount < maxHeadRecords else { break }
             recordCount += 1
@@ -242,32 +269,72 @@ public enum CodexSessionScanner {
             guard let data = lineStr.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { continue }
-            if meta.cwd == nil, let cwd = obj["cwd"] as? String {
-                meta.cwd = cwd
-            }
-            if meta.id == nil, let id = obj["session_id"] as? String {
+            if obj["type"] as? String == "session_meta", !sawSessionMetadata {
+                sawSessionMetadata = true
+                acceptsLegacyRecords = false
+                meta = HeadMetadata()
+                guard let payload = obj["payload"] as? [String: Any] else { continue }
+                meta.id = payload["id"] as? String
+                meta.cwd = payload["cwd"] as? String
+                meta.source = codexSourceFromValue(payload["source"])
+                let git = payload["git"] as? [String: Any]
+                meta.branch = git?["branch"] as? String ?? payload["git_branch"] as? String
+            } else if !sawSessionMetadata,
+                      !acceptsLegacyRecords,
+                      let id = obj["session_id"] as? String,
+                      let cwd = obj["cwd"] as? String
+            {
+                acceptsLegacyRecords = true
                 meta.id = id
+                meta.cwd = cwd
+                meta.source = codexSourceFromValue(obj["source"])
+                meta.branch = obj["git_branch"] as? String
             }
-            if meta.source == nil {
-                if let sourceStr = obj["source"] as? String {
-                    meta.source = codexSourceFromString(sourceStr)
-                } else if let sourceObj = obj["source"] as? [String: Any] {
-                    meta.source = codexSourceFromObject(sourceObj)
-                }
-            }
-            if meta.branch == nil, let branch = obj["git_branch"] as? String {
-                meta.branch = branch
-            }
-            if meta.firstUserMessage == nil {
-                if let role = obj["role"] as? String, role == "user",
-                   let content = obj["content"] as? String {
-                    meta.firstUserMessage = content
-                } else if let msg = obj["message"] as? String {
-                    meta.firstUserMessage = msg
-                }
+
+            guard meta.firstUserMessage == nil else { continue }
+            if let payload = obj["payload"] as? [String: Any],
+               let message = userMessage(from: payload)
+            {
+                meta.firstUserMessage = normalizeForeignTitle(message)
+            } else if acceptsLegacyRecords,
+                      obj["role"] as? String == "user",
+                      let content = obj["content"] as? String
+            {
+                meta.firstUserMessage = normalizeForeignTitle(content)
             }
         }
         return meta
+    }
+
+    private static func userMessage(from payload: [String: Any]) -> String? {
+        if payload["type"] as? String == "user_message" {
+            return payload["message"] as? String
+        }
+        guard payload["type"] as? String == "message",
+              payload["role"] as? String == "user",
+              let content = payload["content"] as? [[String: Any]]
+        else { return nil }
+
+        guard let text = content.first(where: { item in
+            guard let type = item["type"] as? String else { return false }
+            return (type == "input_text" || type == "text") && item["text"] is String
+        })?["text"] as? String else { return nil }
+
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.hasPrefix("<environment_context>"),
+              !trimmed.hasPrefix("<user_instructions>")
+        else { return nil }
+        return text
+    }
+
+    static func codexSourceFromValue(_ value: Any?) -> ForeignSessionSource? {
+        if let string = value as? String {
+            return codexSourceFromString(string)
+        }
+        if let object = value as? [String: Any] {
+            return codexSourceFromObject(object)
+        }
+        return nil
     }
 
     /// Map a Codex source string to a `ForeignSessionSource`, matching Rust's

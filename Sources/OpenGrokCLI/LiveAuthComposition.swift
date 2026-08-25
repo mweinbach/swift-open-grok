@@ -20,6 +20,7 @@
 
 import Foundation
 import OpenGrokAuth
+import OpenGrokConfig
 import OpenGrokHTTP
 import OpenGrokPaths
 
@@ -41,12 +42,21 @@ public struct LiveAuthServices: Sendable {
         _ openBrowser: (@Sendable (URL) -> Void)?
     ) async throws -> CodexCredentials
 
+    public typealias XAILoginFlow = @Sendable (
+        _ manager: AuthManager,
+        _ environment: [String: String],
+        _ transport: any HTTPTransport,
+        _ openBrowser: (@Sendable (URL) -> Void)?
+    ) async throws -> GrokAuth
+
     /// Transport used for OAuth exchange, refresh, and best-effort revoke.
     public var makeTransport: @Sendable () -> any HTTPTransport
     /// Browser + local-callback OAuth flow.
     public var codexBrowserLogin: CodexLoginFlow
     /// Device-code fallback flow.
     public var codexDeviceLogin: CodexLoginFlow
+    /// xAI browser OAuth, also used only when its device endpoint returns 404.
+    public var xaiBrowserLogin: XAILoginFlow
     /// Best-effort browser opener. `nil` disables opening.
     public var openBrowser: (@Sendable (URL) -> Void)?
     /// Reads one secret line from the controlling terminal.
@@ -63,11 +73,21 @@ public struct LiveAuthServices: Sendable {
         openBrowser: (@Sendable (URL) -> Void)?,
         readSecretLine: @escaping @Sendable () -> String?,
         isInteractive: @escaping @Sendable () -> Bool,
+        xaiBrowserLogin: @escaping XAILoginFlow = {
+            manager, environment, transport, openBrowser in
+            try await loginXAIBrowser(
+                manager: manager,
+                environment: environment,
+                transport: transport,
+                openBrowser: openBrowser
+            )
+        },
         managedPolicySetupServices: LiveManagedSetupServices = .production
     ) {
         self.makeTransport = makeTransport
         self.codexBrowserLogin = codexBrowserLogin
         self.codexDeviceLogin = codexDeviceLogin
+        self.xaiBrowserLogin = xaiBrowserLogin
         self.openBrowser = openBrowser
         self.readSecretLine = readSecretLine
         self.isInteractive = isInteractive
@@ -222,6 +242,137 @@ public enum LiveAuthComposition {
     /// Utility routes this composition owns.
     public static let routeNames: Set<String> = ["login", "logout"]
 
+    /// Reconstruct the authentication policy from trusted disk tiers rather
+    /// than environment defaults. Managed restrictions are monotonic: a user
+    /// document, project overlay, or `GROK_DISABLE_API_KEY_AUTH=false` cannot
+    /// switch off an administrator's key denial or widen a pinned team list.
+    ///
+    /// The user layer is intentionally optional here. A malformed personal
+    /// config must not erase already-readable managed or requirements policy.
+    public static func effectiveGrokComConfig(
+        environment: [String: String],
+        document: TOMLValue? = nil
+    ) throws -> GrokComConfig {
+        let systemManaged = try loadSystemManagedConfig(environment: environment)
+        let managed = try loadManagedConfig(environment: environment)
+
+        let home = OpenGrokHomeResolver.resolve(environment: environment)
+        _ = try loadTomlFile(
+            at: home.appendingPathComponent(REQUIREMENTS_FILENAME),
+            environment: environment
+        )
+        if let systemDirectory = systemConfigDir() {
+            _ = try loadTomlFile(
+                at: systemDirectory.appendingPathComponent(REQUIREMENTS_FILENAME),
+                environment: environment
+            )
+        }
+
+        let requirements = requirementsLayers(environment: environment).map(\.value)
+        let trustedDocuments = [systemManaged, managed] + requirements
+        var effective = systemManaged
+        deepMergeTOML(&effective, overrides: managed)
+        if let document {
+            deepMergeTOML(&effective, overrides: document)
+        } else if let user = try? loadFromDisk(environment: environment) {
+            deepMergeTOML(&effective, overrides: user)
+        }
+        for requirement in requirements {
+            deepMergeTOML(&effective, overrides: requirement)
+        }
+
+        var config = GrokComConfig.default(environment: environment)
+        let effectivePolicy = try authPolicy(in: effective)
+        let trustedPolicies = try trustedDocuments.map { try authPolicy(in: $0) }
+        let apiKeysLocked = config.disableAPIKeyAuth == true
+            || effectivePolicy.disableAPIKeyAuth == true
+            || trustedPolicies.contains(where: { $0.disableAPIKeyAuth == true })
+        if apiKeysLocked {
+            config.disableAPIKeyAuth = true
+        } else if let configured = effectivePolicy.disableAPIKeyAuth {
+            config.disableAPIKeyAuth = configured
+        }
+
+        var teamPolicies = trustedPolicies.compactMap(\.forceLoginTeamUUID)
+        if let effectiveTeam = effectivePolicy.forceLoginTeamUUID {
+            teamPolicies.append(effectiveTeam)
+        }
+        if let first = teamPolicies.first {
+            var allowed = first.allowedIDs
+            for policy in teamPolicies.dropFirst() {
+                allowed = allowed.filter { policy.allowedIDs.contains($0) }
+            }
+            config.forceLoginTeamUUID = allowed.count == 1
+                ? .single(allowed[0])
+                : .anyOf(allowed)
+        }
+
+        if let issuer = effective[path: ["grok_com_config", "oidc", "issuer"]]?.stringValue,
+           let clientID = effective[path: ["grok_com_config", "oidc", "client_id"]]?.stringValue
+        {
+            let scopes = effective[path: ["grok_com_config", "oidc", "scopes"]]?
+                .arrayValue?.compactMap(\.stringValue) ?? defaultOIDCScopes
+            config.oidc = OidcAuthConfig(
+                issuer: issuer,
+                clientID: clientID,
+                scopes: scopes,
+                audience: effective[path: ["grok_com_config", "oidc", "audience"]]?.stringValue
+            )
+            config.oauth2 = nil
+        }
+
+        return config
+    }
+
+    private struct LoginPolicy {
+        var disableAPIKeyAuth: Bool?
+        var forceLoginTeamUUID: ForceLoginTeam?
+    }
+
+    private static func authPolicy(in document: TOMLValue) throws -> LoginPolicy {
+        var policy = LoginPolicy()
+        for section in ["auth", "grok_com_config"] {
+            if let rawDisable = document[path: [section, "disable_api_key_auth"]] {
+                guard let disabled = rawDisable.boolValue else {
+                    throw CLIApplicationError.failed(
+                        "administrator login policy disable_api_key_auth must be a boolean"
+                    )
+                }
+                policy.disableAPIKeyAuth = policy.disableAPIKeyAuth == true || disabled
+            }
+
+            guard let rawTeam = document[path: [section, "force_login_team_uuid"]] else {
+                continue
+            }
+            let teamPolicy: ForceLoginTeam
+            if let team = rawTeam.stringValue {
+                teamPolicy = .single(team)
+            } else if let entries = rawTeam.arrayValue {
+                let teams = entries.compactMap(\.stringValue)
+                guard teams.count == entries.count else {
+                    throw CLIApplicationError.failed(
+                        "administrator login policy force_login_team_uuid must contain only team identifiers"
+                    )
+                }
+                teamPolicy = .anyOf(teams)
+            } else {
+                throw CLIApplicationError.failed(
+                    "administrator login policy force_login_team_uuid must be a team identifier or list"
+                )
+            }
+
+            if let previous = policy.forceLoginTeamUUID {
+                let allowed = previous.allowedIDs.filter { teamPolicy.allowedIDs.contains($0) }
+                policy.forceLoginTeamUUID = allowed.count == 1
+                    ? .single(allowed[0])
+                    : .anyOf(allowed)
+            } else {
+                policy.forceLoginTeamUUID = teamPolicy
+            }
+        }
+        return policy
+    }
+
     /// Whether the launcher should delegate `command` here.
     public static func handles(_ command: CLICommand) -> Bool {
         guard case .utility(let options) = command else { return false }
@@ -334,7 +485,70 @@ public enum LiveAuthComposition {
         streams: CLIStreams,
         services: LiveAuthServices
     ) async throws {
-        let config = GrokComConfig.default(environment: environment)
+        let config: GrokComConfig
+        do {
+            config = try effectiveGrokComConfig(environment: environment)
+        } catch {
+            throw CLIApplicationError.failed(describe(error))
+        }
+
+        let home = OpenGrokHomeResolver.resolve(environment: environment)
+        let manager = AuthManager(grokHome: home, config: config, environment: environment)
+        let forceBrowser = options.options["--oauth"] != nil
+            || options.options["--oidc"] != nil
+        let useDevice = !forceBrowser && shouldUseXAIDeviceFlow(
+            options: options,
+            environment: environment
+        )
+
+        if forceBrowser || useDevice {
+            do {
+                let auth: GrokAuth
+                if useDevice, config.oidc == nil {
+                    do {
+                        auth = try await loginXAIDevice(
+                            manager: manager,
+                            config: config,
+                            environment: environment,
+                            streams: streams,
+                            services: services
+                        )
+                    } catch DeviceCodeError.notEnabled {
+                        streams.err(
+                            "Device-code login isn't available for this deployment; using browser sign-in.\n"
+                        )
+                        auth = try await loginXAIOAuthBrowser(
+                            manager: manager,
+                            environment: environment,
+                            streams: streams,
+                            services: services
+                        )
+                    }
+                } else {
+                    if useDevice {
+                        streams.err(
+                            "Device-code login isn't available for your SSO provider; using browser sign-in.\n"
+                        )
+                    }
+                    auth = try await loginXAIOAuthBrowser(
+                        manager: manager,
+                        environment: environment,
+                        streams: streams,
+                        services: services
+                    )
+                }
+                if !options.json {
+                    let account = auth.email.map { " as \($0)" } ?? ""
+                    streams.out("Signed in to xAI\(account).\n")
+                }
+                return
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw CLIApplicationError.failed(describe(error))
+            }
+        }
+
         if config.apiKeyAuthDisabled(environment: environment) {
             throw CLIApplicationError.failed(AuthError.apiKeyAuthDisabled.description)
         }
@@ -350,8 +564,6 @@ public enum LiveAuthComposition {
             )
         }
 
-        let home = OpenGrokHomeResolver.resolve(environment: environment)
-        let manager = AuthManager(grokHome: home, config: config, environment: environment)
         do {
             try await loginXAIWithAPIKey(manager: manager, apiKey: apiKey)
         } catch {
@@ -360,6 +572,102 @@ public enum LiveAuthComposition {
         if !options.json {
             streams.out("Signed in to xAI with an API key.\n")
         }
+    }
+
+    private static func shouldUseXAIDeviceFlow(
+        options: CLIUtilityOptions,
+        environment: [String: String]
+    ) -> Bool {
+        if options.options["--oauth"] != nil || options.options["--oidc"] != nil {
+            return false
+        }
+        if options.options["--device-auth"] != nil
+            || options.options["--device-code"] != nil
+        {
+            return true
+        }
+        if let enabled = OpenGrokConfig.envBool(
+            "GROK_LOGIN_DEVICE_FLOW",
+            environment: environment
+        ) {
+            return enabled
+        }
+        guard let layers = try? ConfigLayers.load(environment: environment) else {
+            return false
+        }
+        return layers.effectiveConfigBase()[path: ["auth", "login_device_flow"]]?
+            .boolValue ?? false
+    }
+
+    private static func loginXAIOAuthBrowser(
+        manager: AuthManager,
+        environment: [String: String],
+        streams: CLIStreams,
+        services: LiveAuthServices
+    ) async throws -> GrokAuth {
+        let announce: @Sendable (URL) -> Void = { url in
+            streams.err(
+                "\nTo sign in, open this URL in your browser:\n\n  \(url.absoluteString)\n\n"
+            )
+            services.openBrowser?(url)
+        }
+        return try await services.xaiBrowserLogin(
+            manager,
+            environment,
+            services.makeTransport(),
+            announce
+        )
+    }
+
+    private static func loginXAIDevice(
+        manager: AuthManager,
+        config: GrokComConfig,
+        environment: [String: String],
+        streams: CLIStreams,
+        services: LiveAuthServices
+    ) async throws -> GrokAuth {
+        guard let oauth = config.oauth2 else {
+            throw CLIApplicationError.failed(
+                "Sign-in is not available for this deployment. Set XAI_API_KEY instead."
+            )
+        }
+        let transport = services.makeTransport()
+        let device = try await requestDeviceCode(
+            issuer: oauth.issuer,
+            clientID: oauth.clientID,
+            scopes: oauth.scopes,
+            surface: services.isInteractive() ? .cli : .headless,
+            transport: transport
+        )
+        let displayURI = device.verificationURIComplete ?? device.verificationURI
+        streams.err("\nTo sign in, open this URL in your browser:\n\n  \(displayURI)\n\n")
+        if let url = URL(string: displayURI) {
+            services.openBrowser?(url)
+        }
+        let codePrompt = device.verificationURIComplete == nil
+            ? "Then enter this code:"
+            : "Confirm this code in your browser:"
+        streams.err("\(codePrompt)\n\n  \(device.userCode)\n\nWaiting for authorization...\n")
+
+        // Poll without a manager so team policy can inspect the authenticated
+        // JWT principal before any token reaches auth.json or a live snapshot.
+        let auth = try await completeDeviceCodeLogin(
+            issuer: oauth.issuer,
+            clientID: oauth.clientID,
+            device: device,
+            transport: transport,
+            manager: nil
+        )
+        try enforceLoginPrincipal(
+            policy: config.forceLoginTeamUUID,
+            actual: peekAccessTokenPrincipalID(auth.key)
+        )
+        try await loginXAIWithSession(
+            manager: manager,
+            auth: auth,
+            policy: config.forceLoginTeamUUID
+        )
+        return auth
     }
 
     /// Positional argument, then environment, then an interactive prompt.
@@ -605,13 +913,16 @@ public enum LiveAuthComposition {
         let home = OpenGrokHomeResolver.resolve(environment: environment)
         let codexFile = OpenGrokAuthPaths.codexAuthFileURL(environment: environment)
 
-        let manager: AuthManager? = accountTarget == .codex
-            ? nil
-            : AuthManager(
+        let manager: AuthManager?
+        if accountTarget == .codex {
+            manager = nil
+        } else {
+            manager = AuthManager(
                 grokHome: home,
-                config: GrokComConfig.default(environment: environment),
+                config: try effectiveGrokComConfig(environment: environment),
                 environment: environment
             )
+        }
         let codexAuthFile: URL? = accountTarget == .xai ? nil : codexFile
         let codexTransport: (any HTTPTransport)? = codexAuthFile == nil
             ? nil
@@ -749,22 +1060,36 @@ public enum LiveAuthComposition {
         if deploymentKeyFromEnvironment(environment) != nil {
             return LiveAuthProviderStatus(authenticated: true, source: "GROK_DEPLOYMENT_KEY")
         }
-        if xaiAPIKeyFromEnvironment(environment) != nil {
+        guard let config = try? effectiveGrokComConfig(environment: environment) else {
+            return .unauthenticated
+        }
+        let apiKeysDisabled = config.apiKeyAuthDisabled(environment: environment)
+        if !apiKeysDisabled, xaiAPIKeyFromEnvironment(environment) != nil {
             return LiveAuthProviderStatus(authenticated: true, source: "environment")
         }
         let path = OpenGrokAuthPaths.authFileURL(environment: environment)
         guard let store = try? readAuthJSONOrEmpty(at: path) else {
             return .unauthenticated
         }
-        let scope = GrokComConfig.default(environment: environment).authScope
-        if let session = lookupAuth(store, scope: scope) {
+        if let session = lookupAuth(store, scope: config.authScope) {
+            if session.authMode == .apiKey && apiKeysDisabled {
+                return .unauthenticated
+            }
+            do {
+                try enforceLoginPrincipal(
+                    policy: config.forceLoginTeamUUID,
+                    actual: peekAccessTokenPrincipalID(session.key)
+                )
+            } catch {
+                return .unauthenticated
+            }
             return LiveAuthProviderStatus(
                 authenticated: true,
                 source: session.authMode == .apiKey ? "api_key" : "session",
                 account: session.email ?? (session.userID.isEmpty ? nil : session.userID)
             )
         }
-        if store[apiKeyScope] != nil {
+        if !apiKeysDisabled, store[apiKeyScope] != nil {
             return LiveAuthProviderStatus(authenticated: true, source: "api_key")
         }
         return .unauthenticated

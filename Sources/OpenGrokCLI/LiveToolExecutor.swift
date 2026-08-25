@@ -519,6 +519,23 @@ struct LiveToolExecutor: Sendable {
             inheritedPermissionHandle: inheritedPermissionHandle,
             sandboxAutoAllowBash: sandboxPredicate
         )
+        let pinnedGitIgnore = security.requirements.first {
+            $0[path: ["tools", "respect_gitignore"]]?.boolValue != nil
+        }?[path: ["tools", "respect_gitignore"]]?.boolValue
+        let environmentGitIgnore: Bool?
+        switch environment["GROK_RESPECT_GITIGNORE"] {
+        case "1", "true":
+            environmentGitIgnore = true
+        case "0", "false":
+            environmentGitIgnore = false
+        default:
+            environmentGitIgnore = nil
+        }
+        let respectGitIgnore = pinnedGitIgnore
+            ?? environmentGitIgnore
+            ?? security.document[path: ["tools", "respect_gitignore"]]?.boolValue
+            ?? false
+        fileToolResources.extras.insert(GitIgnoreAccessPolicy(enabled: respectGitIgnore))
         // The dedicated plan-approval view, root sessions only: a child's
         // plan sheet would be indistinguishable from the parent's (the same
         // reason the plan-mode tools themselves are stripped below), and the
@@ -643,12 +660,27 @@ struct LiveToolExecutor: Sendable {
                 let searchClient = availability.searchConfig.isEnabled
                     ? try? WebSearchClient(
                         configuration: availability.searchConfig,
+                        transport: webToolContext.transport,
+                        filter: availability.searchFilter
+                    )
+                    : nil
+                let xSearchClient = availability.xSearchConfig.isEnabled
+                    ? try? WebSearchClient(
+                        configuration: availability.xSearchConfig,
                         transport: webToolContext.transport
                     )
                     : nil
+                let fetchParameters: WebFetchParams
+                if case .enabled(let configured) = availability.fetchConfig {
+                    fetchParameters = configured
+                } else {
+                    fetchParameters = WebFetchParams()
+                }
                 let handler = LiveWebToolHandler(
                     searchClient: searchClient,
+                    xSearchClient: xSearchClient,
                     fetchClient: WebFetchClient(
+                        params: fetchParameters,
                         transport: webToolContext.transport,
                         environment: environment
                     )
@@ -659,7 +691,7 @@ struct LiveToolExecutor: Sendable {
                      BuiltinToolCatalog.webSearchQualifiedId),
                     (availability.webFetchEnabled,
                      BuiltinToolCatalog.webFetchQualifiedId),
-                    (availability.xSearchEnabled && searchClient != nil,
+                    (availability.xSearchEnabled && xSearchClient != nil,
                      BuiltinToolCatalog.xSearchQualifiedId),
                 ]
                 for (enabled, qualifiedId) in advertised where enabled {
@@ -669,6 +701,16 @@ struct LiveToolExecutor: Sendable {
                         kind: kinds[qualifiedId]
                     ))
                 }
+            }
+            if let standalone = webToolContext.standaloneWebSearchBackend {
+                builder.setHandler(
+                    qualifiedId: BuiltinToolCatalog.webRunQualifiedId,
+                    handler: LiveStandaloneWebSearchHandler(backend: standalone)
+                )
+                toolConfig.tools.append(ToolConfig.fromId(
+                    BuiltinToolCatalog.webRunQualifiedId,
+                    kind: .webSearch
+                ))
             }
         }
         // MCP meta-tools (`search_tool` / `use_tool`). Always retained in the
@@ -1037,11 +1079,15 @@ struct LiveToolExecutor: Sendable {
             .union(schedulerToolNames)
             .union(monitorToolNames)
             .union([Self.runTerminalTool.name])
+        var sessionOwnedToolNames = Set(sessionTools.map(\.name))
+        if sessionServices?.handles(LiveGoalTools.toolName) == true {
+            sessionOwnedToolNames.insert(LiveGoalTools.toolName)
+        }
         assert(
-            Set(sessionTools.map(\.name)).isDisjoint(with: dispatchedToolNames),
+            sessionOwnedToolNames.isDisjoint(with: dispatchedToolNames),
             """
             session-service tool name collides with a dispatched tool: \
-            \(Set(sessionTools.map(\.name)).intersection(dispatchedToolNames)). \
+            \(sessionOwnedToolNames.intersection(dispatchedToolNames)). \
             The session branch runs first and skips the capability filter and \
             hooks that registry tools get, and the permission gate that shell \
             and background-task tools get.
@@ -1099,6 +1145,18 @@ struct LiveToolExecutor: Sendable {
                 parameters: definition.argumentsSchema
                     ?? .object(["type": .string("object")])
             ))
+        }
+        return current
+    }
+
+    /// Goal state may change after launch, so the actual sampling surface
+    /// refreshes it without changing the synchronous MCP inspection seam.
+    func currentActiveToolSpecs() async -> [ToolSpec] {
+        var current = currentToolSpecs().filter { $0.name != LiveGoalTools.toolName }
+        if let sessionServices {
+            current.append(contentsOf: await sessionServices.goalToolSpecs().filter {
+                sessionToolPolicy?.allows(liveToolName: $0.name) ?? true
+            })
         }
         return current
     }
@@ -1482,15 +1540,40 @@ struct LiveToolExecutor: Sendable {
             }
             switch bridgeResult {
             case .success(let result):
+                var images: [OpenGrokShellToolImage] = []
+                for block in result.output.modelOutput {
+                    guard case let .image(mimeType, data, _, _, path, _) = block else {
+                        continue
+                    }
+                    guard mimeType.hasPrefix("image/"),
+                          data.utf8.count <= 64 * 1024 * 1024,
+                          let decoded = Data(base64Encoded: data),
+                          !decoded.isEmpty
+                    else {
+                        return .failure(.failed("tool returned invalid or oversized image data"))
+                    }
+                    images.append(OpenGrokShellToolImage(
+                        mimeType: mimeType,
+                        base64Data: data,
+                        path: path
+                    ))
+                }
+                let outputText: String
+                if result.promptText.isEmpty, let image = images.first {
+                    outputText = "Read image file: \(image.path ?? "image")"
+                } else {
+                    outputText = result.promptText
+                }
                 let promptText = await appendLspDiagnostics(
                     toolName: call.name,
                     args: args,
                     workingDirectory: workingDirectory,
-                    promptText: result.promptText
+                    promptText: outputText
                 )
                 return .success(OpenGrokShellToolCallResult(
                     value: result.output.value,
-                    promptText: promptText
+                    promptText: promptText,
+                    images: images
                 ))
             case .failure(let error):
                 return .failure(.failed(error.description))

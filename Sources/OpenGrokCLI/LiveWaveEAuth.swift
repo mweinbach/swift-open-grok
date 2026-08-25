@@ -32,6 +32,8 @@ extension LiveInteractiveControllerRenderer {
         syncWaveEAuthPresentation()
         authPresentationTask?.cancel()
         authPresentationTask = Task { [weak self] in
+            await self?.resumePendingDashboardStartupAfterAuthentication()
+            guard !Task.isCancelled else { return }
             try? await Task.sleep(nanoseconds: 900_000_000)
             guard !Task.isCancelled else { return }
             await self?.clearWaveEAuthPresentation()

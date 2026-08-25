@@ -238,7 +238,7 @@ public func loadWorkspaceRemoteSettings(
     let home = OpenGrokHomeResolver.resolve(environment: environment)
     let authManager = AuthManager(
         grokHome: home,
-        config: GrokComConfig.default(environment: environment),
+        config: liveManagedAuthenticationConfiguration(environment: environment),
         environment: environment
     )
     guard let auth = try? await authManager.auth() else { return nil }
@@ -404,6 +404,9 @@ public enum LiveWorkspaceComposition {
             isInteractive: false,
             cli: permissionOptions
         )
+        if let failure = security.configurationLoadFailure {
+            throw WorkspaceRouteError(failure)
+        }
         let requested = LiveSandboxComposition.resolveProfileName(
             document: security.document,
             requirements: security.requirements,

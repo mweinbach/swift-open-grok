@@ -44,6 +44,7 @@ import OpenGrokFileTools
 import OpenGrokHooks
 import OpenGrokHooksPluginTypes
 import OpenGrokInterjection
+import OpenGrokModels
 import OpenGrokSampler
 import OpenGrokSamplingTypes
 import OpenGrokShared
@@ -208,10 +209,6 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         /// The trusted project overlay is recomputed per spawn in
         /// `effectiveSpawnPersonas()`, never cached here.
         var basePersonas: [String: SubagentPersona] = [:]
-        /// Matches the root turn loop's ceiling (`LiveComposition.swift`
-        /// `runTurn`): a child that has not converged in this many tool
-        /// rounds is looping.
-        var maxToolRounds: Int = 16
         /// Injectable Antigravity CLI seam. Defaults to production so
         /// `makeSubagentHost` needs no LiveComposition edit; tests swap a
         /// fake that returns canned stdout/exit codes.
@@ -237,6 +234,35 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         var childSamplerFactory: (
             @Sendable (String, CodexPermissions?) async throws -> ChildSamplerRoute
         )? = nil
+        /// A child definition's own limit wins; absent both limits is unlimited.
+        var parentMaxTurns: Int? = nil
+        /// Resolve the effective child's metadata, never the parent's catalog entry.
+        var childModelContextDefault: (@Sendable (String) -> ModelSubagentContextMode?)? = nil
+    }
+
+    enum ForkDirective: Sendable, Equatable {
+        case none
+        case verbatim
+        case digest
+
+        static func resolve(
+            requested: SubagentContextMode?,
+            childModelDefault: ModelSubagentContextMode?,
+            childModel: String,
+            parentModel: String
+        ) -> Self {
+            let shouldFork: Bool
+            switch requested {
+            case .fresh:
+                shouldFork = false
+            case .fork:
+                shouldFork = true
+            case nil:
+                shouldFork = childModelDefault == .fork
+            }
+            guard shouldFork else { return .none }
+            return childModel == parentModel ? .verbatim : .digest
+        }
     }
 
     /// The one coordinator per root session (scope item 1). Exposed
@@ -599,6 +625,11 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                         "type": .string("string"),
                         "description": .string("Optional model slug for this agent. If provided, it must resolve to one of the available model slugs, and its provider must have usable credentials. If omitted, the subagent uses the same model as the parent agent."),
                     ]),
+                    "context": .object([
+                        "type": .string("string"),
+                        "enum": .array([.string("fork"), .string("fresh")]),
+                        "description": .string("Initial context for the subagent: \"fork\" inherits this conversation's investigation; \"fresh\" starts with only the child's instructions and task prompt. If omitted, the default depends on the child's model. Ignored when resume_from is set."),
+                    ]),
                     "reasoning_effort": .object([
                         "type": .string("string"),
                         "description": .string("Optional reasoning effort for this agent. May also be supplied with resume_from to select the resumed continuation's effort."),
@@ -927,7 +958,8 @@ actor LiveSubagentHost: LiveSubagentQuerying {
 
         let childModel = runtime.model ?? context.parentModel
         let antigravityModel = LiveAntigravityComposition.stripModelPrefix(childModel)
-        if workflow?.forkContext == true, resumeID == nil {
+        var forkDirective: ForkDirective = .none
+        if resumeID == nil, workflow?.forkContext == true {
             guard antigravityModel == nil else {
                 return .failure(.invalidCall(
                     "fork_context is unavailable for external workflow child runners"
@@ -939,6 +971,35 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                 return .failure(.invalidCall(
                     "workflow parent conversation cannot be safely forked: \(error)"
                 ))
+            }
+        } else if resumeID == nil, workflow == nil, antigravityModel == nil {
+            forkDirective = ForkDirective.resolve(
+                requested: input.context,
+                childModelDefault: context.childModelContextDefault?(childModel),
+                childModel: childModel,
+                parentModel: context.parentModel
+            )
+            if forkDirective != .none,
+               let parentItems = await parentConversationItemsForFork() {
+                switch forkDirective {
+                case .none:
+                    break
+                case .verbatim:
+                    let cleanItems = Self.cleanForkPrefix(parentItems)
+                    if cleanItems.contains(where: Self.isInheritableParentItem) {
+                        forkItems = cleanItems
+                    } else {
+                        forkDirective = .none
+                    }
+                case .digest:
+                    if let digest = Self.sanitizedForkDigest(parentItems) {
+                        forkItems = [.user(digest)]
+                    } else {
+                        forkDirective = .none
+                    }
+                }
+            } else {
+                forkDirective = .none
             }
         }
         var antigravityRoster: [String] = []
@@ -1085,6 +1146,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         let childRuntime = runtime
         let inheritedItems = resumeItems
         let inheritedForkItems = forkItems
+        let childForkDirective = forkDirective
         let childAntigravityRoster = antigravityRoster
         let inheritedAntigravityConversationID = resumeSource?.antigravityConversationID
         let childOutputTokenBudget = workflow?.maxOutputTokens
@@ -1167,6 +1229,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                             cwd: childCWD,
                             resumeItems: inheritedItems,
                             forkItems: inheritedForkItems,
+                            forkDirective: childForkDirective,
                             maxOutputTokens: childOutputTokenBudget
                         )
                     }
@@ -1301,6 +1364,148 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         let stats = bookkeeping[childID]
         message += "\n\nThe subagent's session was preserved (\(stats?.terminalToolCalls ?? 0) tool calls, \(stats?.terminalTurns ?? 0) turns). To retry or continue it, call this tool again with resume_from: \"\(childID)\"."
         return .failure(.invalidCall(message))
+    }
+
+    /// Prefer the live parent spine because a spawn occurs before its current
+    /// turn necessarily reaches durable storage. Both sources must still own
+    /// this exact session, workspace, and provider/model identity.
+    private func parentConversationItemsForFork() async -> [ConversationItem]? {
+        if let parentUsageHistory {
+            let record = await parentUsageHistory.snapshot()
+            guard ownsParentConversation(record) else { return nil }
+            if !record.items.isEmpty { return record.items }
+        }
+
+        do {
+            guard let record = try await context.conversationStore.loadIfPresent(
+                sessionID: context.sessionID
+            ), ownsParentConversation(record), !record.items.isEmpty else {
+                return nil
+            }
+            return record.items
+        } catch {
+            return nil
+        }
+    }
+
+    private func ownsParentConversation(_ record: LiveConversationRecord) -> Bool {
+        guard record.sessionID == context.sessionID,
+              URL(fileURLWithPath: record.workingDirectory, isDirectory: true)
+                .standardizedFileURL.path == context.workingDirectory.standardizedFileURL.path
+        else {
+            return false
+        }
+        if let recordedModel = record.currentModelID,
+           recordedModel != context.parentModel {
+            return false
+        }
+        if let recordedProvider = record.currentProvider,
+           let expectedProvider = context.parentProvider
+                ?? resolveSubagentModelProvider(context.parentModel),
+           recordedProvider != expectedProvider {
+            return false
+        }
+        return true
+    }
+
+    static func isInheritableParentItem(_ item: ConversationItem) -> Bool {
+        if case .system = item { return false }
+        return true
+    }
+
+    /// Preserve the parent's exact cached prefix, excluding only a dangling
+    /// model turn. Encoded native-tool identities pair by provider call ID.
+    static func cleanForkPrefix(_ items: [ConversationItem]) -> [ConversationItem] {
+        var unansweredCalls: Set<String> = []
+        var lastCleanIndex = 0
+
+        for (index, item) in items.enumerated() {
+            let acceptableBoundary: Bool
+            switch item {
+            case .assistant(let assistant):
+                for call in assistant.toolCalls {
+                    unansweredCalls.insert(call.callId)
+                }
+                acceptableBoundary = true
+            case .toolResult(let result):
+                let callID = ToolCall.decodeCustomToolCallId(result.toolCallId)?.callId
+                    ?? result.toolCallId
+                unansweredCalls.remove(callID)
+                acceptableBoundary = true
+            case .customToolOutput(let output):
+                unansweredCalls.remove(output.callId)
+                acceptableBoundary = true
+            case .user:
+                acceptableBoundary = true
+            case .system, .backendToolCall, .reasoning:
+                acceptableBoundary = false
+            }
+            if acceptableBoundary, unansweredCalls.isEmpty {
+                lastCleanIndex = index + 1
+            }
+        }
+
+        return Array(items.prefix(lastCleanIndex))
+    }
+
+    /// Cross-model children receive newly constructed plaintext only. Raw
+    /// provider items, encrypted reasoning, tool arguments/results, image URLs,
+    /// synthetic instructions, and parent system prompts never cross the seam.
+    static func sanitizedForkDigest(_ items: [ConversationItem]) -> String? {
+        var sections: [String] = []
+        var remainingCharacters = 64_000
+
+        for item in items.reversed() {
+            var rendered: [String] = []
+            switch item {
+            case .user(let user):
+                guard user.syntheticReason == nil else { continue }
+                let text = user.content.compactMap { part -> String? in
+                    guard case .text(let value) = part else { return nil }
+                    return value
+                }.joined(separator: "\n")
+                if !text.isEmpty {
+                    rendered.append("[User]: \(String(text.prefix(4_000)))")
+                }
+            case .assistant(let assistant):
+                if !assistant.content.isEmpty {
+                    rendered.append("[Assistant]: \(String(assistant.content.prefix(4_000)))")
+                }
+                for call in assistant.toolCalls {
+                    rendered.append("[Tool Call]: \(call.name)")
+                }
+            case .reasoning(let reasoning):
+                let summary = reasoning.summary.map(\.text).joined(separator: "\n")
+                if !summary.isEmpty {
+                    rendered.append("[Thinking]: \(String(summary.prefix(1_200)))")
+                }
+            case .backendToolCall(let backend):
+                if case .codexRawInput(let raw) = backend.kind {
+                    if let fallback = raw.crossProviderFallback, !fallback.isEmpty {
+                        rendered.append("[Prior Context]: \(String(fallback.prefix(4_000)))")
+                    }
+                } else {
+                    let summary = backend.textSummary()
+                    if !summary.isEmpty {
+                        rendered.append("[Prior Context]: \(String(summary.prefix(4_000)))")
+                    }
+                }
+            case .system, .toolResult, .customToolOutput:
+                continue
+            }
+
+            let section = rendered.joined(separator: "\n")
+            guard !section.isEmpty else { continue }
+            guard section.count + 1 <= remainingCharacters else { break }
+            sections.append(section)
+            remainingCharacters -= section.count + 1
+        }
+
+        guard !sections.isEmpty else { return nil }
+        return "<forked_context>\n"
+            + "The following sanitized history summarizes the parent investigation.\n\n"
+            + sections.reversed().joined(separator: "\n")
+            + "\n</forked_context>"
     }
 
     /// A built-in workflow may inherit actual parent conversation context,
@@ -1450,6 +1655,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         cwd: URL,
         resumeItems: [ConversationItem]?,
         forkItems: [ConversationItem]? = nil,
+        forkDirective: ForkDirective = .none,
         maxOutputTokens: UInt32? = nil
     ) async -> OpenGrokChildResult {
         let startedAt = Date()
@@ -1509,6 +1715,12 @@ actor LiveSubagentHost: LiveSubagentQuerying {
             liveChildLoopIDs.remove(childID)
             pendingChildFollowups.removeValue(forKey: childID)
         }
+        // Standalone search captures its owner's conversation actor and
+        // session ID. Sharing the parent's authenticated backend would send
+        // parent history under a child tool call, even on the same provider.
+        // A child gets no standalone surface until it has its own bound route.
+        var childWebToolContext = context.webToolContext
+        childWebToolContext?.standaloneWebSearchBackend = nil
         let executor: LiveToolExecutor
         do {
             executor = try await LiveToolExecutor(
@@ -1520,7 +1732,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                 fileAccessPolicy: context.fileAccessPolicy,
                 environment: context.environment,
                 imageToolContext: context.imageToolContext,
-                webToolContext: context.webToolContext,
+                webToolContext: childWebToolContext,
                 sandboxDecision: context.sandboxDecision,
                 securityContext: context.securityContext,
                 // Children get no rewind/memory surface in this slice; the
@@ -1560,25 +1772,29 @@ actor LiveSubagentHost: LiveSubagentQuerying {
 
         var items = resumeItems ?? []
         if resumeItems == nil {
-            if let systemPrompt = renderSubagentSystemPrompt(
-                definition: definition,
-                runtime: runtime,
-                workingDirectory: cwd
-            ) {
-                items.append(.system(systemPrompt))
-            }
-            // "Subagents receive a compacted version of project instructions"
-            // (the tool description's own promise): the AGENTS.md chain rides
-            // as the first user message, as
-            // `renderSubagentInitialUserMessage` renders it.
-            if let agentsBody = renderSubagentInitialUserMessage(
-                definition: definition,
-                workingDirectory: cwd
-            ) {
-                items.append(.user(agentsBody))
-            }
-            if let forkItems {
-                items.append(contentsOf: forkItems)
+            if forkDirective == .verbatim, let forkItems {
+                items = forkItems
+            } else {
+                if let systemPrompt = renderSubagentSystemPrompt(
+                    definition: definition,
+                    runtime: runtime,
+                    workingDirectory: cwd
+                ) {
+                    items.append(.system(systemPrompt))
+                }
+                // "Subagents receive a compacted version of project instructions"
+                // (the tool description's own promise): the AGENTS.md chain rides
+                // as the first user message, as
+                // `renderSubagentInitialUserMessage` renders it.
+                if let agentsBody = renderSubagentInitialUserMessage(
+                    definition: definition,
+                    workingDirectory: cwd
+                ) {
+                    items.append(.user(agentsBody))
+                }
+                if let forkItems {
+                    items.append(contentsOf: forkItems)
+                }
             }
         }
         items.append(.user(prompt))
@@ -1614,6 +1830,7 @@ actor LiveSubagentHost: LiveSubagentQuerying {
         var finalOutput = ""
         var terminalError: String? = nil
         var cancelled = false
+        let maximumToolRounds = definition.maxTurns ?? context.parentMaxTurns
 
         while true {
             do {
@@ -1714,10 +1931,6 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                 break
             }
             let round = (bookkeeping[childID]?.turns ?? 0) + 1
-            guard round <= context.maxToolRounds else {
-                terminalError = "agent \(childID) exceeded \(context.maxToolRounds) tool rounds"
-                break
-            }
             bookkeeping[childID]?.turns = UInt32(round)
             do {
                 let toolItems = try await executeChildCalls(
@@ -1728,6 +1941,11 @@ actor LiveSubagentHost: LiveSubagentQuerying {
                 )
                 items.append(contentsOf: toolItems)
                 bookkeeping[childID]?.liveItems = items
+                if let maximumToolRounds,
+                   UInt64(round) >= UInt64(maximumToolRounds) {
+                    terminalError = "agent \(childID) exceeded \(maximumToolRounds) tool rounds"
+                    break
+                }
             } catch is CancellationError {
                 cancelled = true
                 terminalError = "Subagent was cancelled"

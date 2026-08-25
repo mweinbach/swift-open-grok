@@ -7,6 +7,7 @@ import OpenGrokCodeMode
 import OpenGrokCompaction
 import OpenGrokConfig
 import OpenGrokConfigTypes
+import OpenGrokCrashHandler
 import OpenGrokDiagnostics
 import OpenGrokFileTools
 import OpenGrokFastWorktree
@@ -68,11 +69,14 @@ public struct OpenGrokLiveSamplingTuning: Sendable, Equatable {
     public var streamToolCalls: Bool?
     /// Backend-hosted search is available only when the resolved model declares it.
     public var supportsBackendSearch: Bool
+    public var supportsStandaloneWebSearch: Bool
     public var codexMultiAgentV2: Bool
     public var temperature: Float?
     public var topP: Float?
     public var maxCompletionTokens: UInt32?
     public var contextWindow: UInt64?
+    public var maxRetries: UInt32?
+    public var inferenceIdleTimeoutSecs: UInt64?
 
     public init(
         reasoningEffort: ReasoningEffort? = nil,
@@ -80,22 +84,28 @@ public struct OpenGrokLiveSamplingTuning: Sendable, Equatable {
         serviceTier: String? = nil,
         streamToolCalls: Bool? = nil,
         supportsBackendSearch: Bool = false,
+        supportsStandaloneWebSearch: Bool = false,
         codexMultiAgentV2: Bool = false,
         temperature: Float? = nil,
         topP: Float? = nil,
         maxCompletionTokens: UInt32? = nil,
-        contextWindow: UInt64? = nil
+        contextWindow: UInt64? = nil,
+        maxRetries: UInt32? = nil,
+        inferenceIdleTimeoutSecs: UInt64? = nil
     ) {
         self.reasoningEffort = reasoningEffort
         self.reasoningSummary = reasoningSummary
         self.serviceTier = serviceTier
         self.streamToolCalls = streamToolCalls
         self.supportsBackendSearch = supportsBackendSearch
+        self.supportsStandaloneWebSearch = supportsStandaloneWebSearch
         self.codexMultiAgentV2 = codexMultiAgentV2
         self.temperature = temperature
         self.topP = topP
         self.maxCompletionTokens = maxCompletionTokens
         self.contextWindow = contextWindow
+        self.maxRetries = maxRetries
+        self.inferenceIdleTimeoutSecs = inferenceIdleTimeoutSecs
     }
 
     /// Project a resolved catalog entry, with an optional validated per-switch
@@ -128,11 +138,14 @@ public struct OpenGrokLiveSamplingTuning: Sendable, Equatable {
             },
             streamToolCalls: info.streamToolCalls,
             supportsBackendSearch: info.supportsBackendSearch,
+            supportsStandaloneWebSearch: info.supportsStandaloneWebSearch ?? false,
             codexMultiAgentV2: info.codexMultiAgentV2,
             temperature: info.temperature,
             topP: info.topP,
             maxCompletionTokens: info.maxCompletionTokens,
-            contextWindow: info.contextWindow
+            contextWindow: info.contextWindow,
+            maxRetries: info.maxRetries,
+            inferenceIdleTimeoutSecs: info.inferenceIdleTimeoutSecs
         )
     }
 }
@@ -147,6 +160,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
     /// account pinning (`ChatGPT-Account-ID`, `X-OpenAI-Fedramp`) arrives here.
     public let extraHeaders: [String: String]
     public let queryParams: [String: String]
+    public let envHTTPHeaders: [String: String]
     /// Launch-scoped configuration authority; never substitute process cwd/env.
     public let environment: [String: String]
     /// Model-tuning facts from the catalog entry (effort, summary, sampling
@@ -173,6 +187,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         apiBackend: ApiBackend = .chatCompletions,
         extraHeaders: [String: String] = [:],
         queryParams: [String: String] = [:],
+        envHTTPHeaders: [String: String] = [:],
         environment: [String: String] = [:],
         tuning: OpenGrokLiveSamplingTuning = OpenGrokLiveSamplingTuning(),
         doomLoopRecovery: DoomLoopRecoveryPolicy? = nil,
@@ -188,6 +203,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         self.apiBackend = apiBackend
         self.extraHeaders = extraHeaders
         self.queryParams = queryParams
+        self.envHTTPHeaders = envHTTPHeaders
         self.environment = environment
         self.tuning = tuning
         self.doomLoopRecovery = doomLoopRecovery
@@ -201,6 +217,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
         lhs.model == rhs.model && lhs.baseURL == rhs.baseURL && lhs.apiKey == rhs.apiKey &&
         lhs.provider == rhs.provider && lhs.apiBackend == rhs.apiBackend &&
         lhs.extraHeaders == rhs.extraHeaders && lhs.queryParams == rhs.queryParams &&
+        lhs.envHTTPHeaders == rhs.envHTTPHeaders &&
         lhs.environment == rhs.environment &&
         lhs.tuning == rhs.tuning && lhs.doomLoopRecovery == rhs.doomLoopRecovery &&
         lhs.codexPermissions == rhs.codexPermissions
@@ -215,6 +232,7 @@ public struct OpenGrokLiveSamplingConfiguration: Sendable, Equatable {
             apiBackend: apiBackend,
             extraHeaders: extraHeaders,
             queryParams: queryParams,
+            envHTTPHeaders: envHTTPHeaders,
             environment: environment,
             tuning: tuning,
             doomLoopRecovery: doomLoopRecovery,
@@ -597,17 +615,21 @@ public struct OpenGrokLiveSampler: Sendable {
                 .sorted { $0.key < $1.key }
                 .map { (name: $0.key, value: $0.value) },
             queryParams: configuration.queryParams,
+            envHTTPHeaders: configuration.envHTTPHeaders,
             contextWindow: configuration.tuning.contextWindow ?? 0,
+            maxRetries: configuration.tuning.maxRetries,
             streamToolCalls: shouldInjectStreamToolCalls(
                 configuration.tuning.streamToolCalls
                     ?? resolveStreamToolCallsPreference(environment: configuration.environment),
                 provider: configuration.provider,
                 backend: configuration.apiBackend
             ),
+            idleTimeoutSecs: configuration.tuning.inferenceIdleTimeoutSecs,
             reasoningEffort: configuredReasoningEffort,
             serviceTier: configuration.tuning.serviceTier,
             reasoningSummary: configuration.tuning.reasoningSummary,
             supportsBackendSearch: configuration.tuning.supportsBackendSearch,
+            supportsStandaloneWebSearch: configuration.tuning.supportsStandaloneWebSearch,
             codexMultiAgentV2: configuration.tuning.codexMultiAgentV2,
             codexPermissions: configuration.codexPermissions,
             doomLoopRecovery: configuration.doomLoopRecovery,
@@ -1224,6 +1246,7 @@ extension OpenGrokLiveInteractiveInput {
         guard inputTTY.isATTY() else { return nil }
 
         let lease = try await inputTTY.enterRawMode()
+        enableTerminalEscapeRestore()
         // DA2 owns stdin after raw mode and before EventStream
         // (da2.rs:16-19, app/mod.rs:1356-1361). Poll-bounded; no sleep.
         await LiveTerminalStartupProbes.probeDa2AndPushKittyKeyboard { data in
@@ -1233,6 +1256,7 @@ extension OpenGrokLiveInteractiveInput {
         do {
             input = try PlatformTerminalInput()
         } catch {
+            disableTerminalEscapeRestore()
             await lease.release()
             throw error
         }
@@ -1691,7 +1715,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             if options.common.leader {
                 let cwd = workflowSourceCWD
                 let openGrokHome = Self.resolveOpenGrokHome(environment: context.environment)
-                let relay = GrokComConfig.default(environment: context.environment)
+                let relay = try LiveAuthComposition.effectiveGrokComConfig(
+                    environment: context.environment
+                )
                 let lease: LiveLeaderClientLease
                 do {
                     lease = try await dependencies.makeLeaderClient(
@@ -1772,6 +1798,13 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     usage: "/feedback <text>"
                 )]
                 : []
+            let goalCommands = toolExecutor.sessionServices?.goal == nil
+                ? []
+                : [OpenGrokPagerCommandRegistration(
+                    name: "goal",
+                    summary: "Set or manage this session's goal",
+                    usage: "/goal [objective | status | pause | resume | clear]"
+                )]
             // A `--workflow` launch is a background run, exactly as upstream:
             // it is registered and started here and the session continues
             // unblocked. A non-interactive launch has no session to continue
@@ -1873,6 +1906,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             // list the model is offered (`toolExecutor.tools`), so the row
             // exists exactly when the injection it produces can be acted on.
             let imagineCommands = LiveImagineCommand.registrations(
+                advertisedToolNames: Set(toolExecutor.tools.map(\.name))
+            )
+            let imagineVideoCommands = LiveImagineVideoCommand.registrations(
                 advertisedToolNames: Set(toolExecutor.tools.map(\.name))
             )
             // `/loop` — registered only when this session's advertised
@@ -2017,9 +2053,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                                     ?? CLI_CHAT_PROXY_BASE_URL_DEFAULT
                             ),
                             liveBoundary: sharedExportBoundary,
-                            tokenHeader: GrokComConfig
-                                .default(environment: context.environment)
-                                .tokenHeader
+                            tokenHeader: try LiveAuthComposition.effectiveGrokComConfig(
+                                environment: context.environment,
+                                document: foundation.securityContext.document
+                            ).tokenHeader
                         ),
                         // The paint ceiling: `GROK_MIN_DRAW_MS` wins, then the
                         // `[ui.display_refresh]` auto-cadence policy fed by a
@@ -2055,7 +2092,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         // order for this subset: feedback, announcements,
                         // loop, imagine (`slash/commands/mod.rs:121-135`).
                         localCommands: feedbackCommands + announcementsCommands
-                            + loopCommands + imagineCommands,
+                            + loopCommands + imagineCommands + imagineVideoCommands
+                            + goalCommands,
                         localCommandHandler: { invocation in
                             switch invocation.name {
                             case "announcements":
@@ -2086,6 +2124,25 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                                     rawArgumentTail: OpenGrokPagerInteractiveController
                                         .rawArgumentTail(of: invocation)
                                 )
+                            case "imagine-video":
+                                return LiveImagineVideoCommand.outcome(
+                                    rawArgumentTail: OpenGrokPagerInteractiveController
+                                        .rawArgumentTail(of: invocation)
+                                )
+                            case "goal":
+                                guard let coordinator = toolExecutor.sessionServices?.goal else {
+                                    return .notice("Goal tracking is not available in this session.")
+                                }
+                                switch await LiveGoalCommands.run(
+                                    argument: OpenGrokPagerInteractiveController
+                                        .rawArgumentTail(of: invocation),
+                                    coordinator: coordinator
+                                ) {
+                                case .message(let message):
+                                    return .notice(message)
+                                case .submitPrompt(let prompt):
+                                    return .submit(prompt)
+                                }
                             case "loop":
                                 // `/loop` — empty args echo the usage
                                 // message; otherwise the schedule instruction
@@ -3548,6 +3605,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             environment: context.environment,
             workingDirectory: cwd,
             openGrokHome: openGrokHome,
+            trustedConfiguration: securityContext.document,
             sessionID: sessionID,
             doomLoopRecovery: doomLoopRecovery
         )
@@ -3629,7 +3687,9 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 environment: context.environment,
                 samplingProvider: samplingConfiguration.provider,
                 samplingAPIKey: samplingConfiguration.apiKey,
-                samplingBaseURL: samplingConfiguration.baseURL
+                samplingBaseURL: samplingConfiguration.baseURL,
+                requirements: securityContext.requirements,
+                remoteSettings: dependencies.remoteSettingsSnapshot
             ),
             transport: dependencies.makeImageTransport()
         )
@@ -3638,25 +3698,43 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 workingDirectory: cwd,
                 openGrokHome: openGrokHome,
                 environment: context.environment,
-                samplingProvider: samplingConfiguration.provider,
-                samplingAPIKey: samplingConfiguration.apiKey,
-                samplingBaseURL: samplingConfiguration.baseURL
-            ),
-            transport: dependencies.makeImageTransport()
-        )
-        let webToolContext = LiveWebToolContext(
-            availability: LiveWebToolComposition.resolveAvailability(
-                workingDirectory: cwd,
-                openGrokHome: openGrokHome,
-                environment: context.environment,
+                effectiveConfig: securityContext.document,
                 samplingProvider: samplingConfiguration.provider,
                 samplingAPIKey: samplingConfiguration.apiKey,
                 samplingBaseURL: samplingConfiguration.baseURL,
-                disableWebSearch: options.agentOptions.disableWebSearch
+                requirements: securityContext.requirements,
+                remoteSettings: dependencies.remoteSettingsSnapshot
             ),
+            transport: dependencies.makeImageTransport()
+        )
+        let webAvailability = LiveWebToolComposition.resolveAvailability(
+            workingDirectory: cwd,
+            openGrokHome: openGrokHome,
+            environment: context.environment,
+            samplingProvider: samplingConfiguration.provider,
+            samplingAPIKey: samplingConfiguration.apiKey,
+            samplingBaseURL: samplingConfiguration.baseURL,
+            disableWebSearch: options.agentOptions.disableWebSearch,
+            samplingContextWindow: samplingConfiguration.tuning.contextWindow,
+            effectiveConfig: securityContext.document,
+            requirements: securityContext.requirements,
+            remoteSettings: dependencies.remoteSettingsSnapshot
+        )
+        let standaloneWebSearch = try LiveStandaloneWebSearchComposition.makeBackend(
+            configuration: samplingConfiguration,
+            credential: credential,
+            conversationHistory: launchHistory,
+            sessionID: sessionID,
+            availability: webAvailability,
+            disableWebSearch: options.agentOptions.disableWebSearch,
+            supportsStandaloneWebSearch: samplingConfiguration.tuning.supportsStandaloneWebSearch
+        )
+        let webToolContext = LiveWebToolContext(
+            availability: webAvailability,
             // Web requests reuse the image transport: same HTTP stack, same
             // test seam. Nothing about it is image-specific.
-            transport: dependencies.makeImageTransport()
+            transport: dependencies.makeImageTransport(),
+            standaloneWebSearchBackend: standaloneWebSearch
         )
         let subagentHost = Self.makeSubagentHost(
             options: options,
@@ -3969,6 +4047,18 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     apiBackend: childConfiguration.apiBackend,
                     supportsBackendSearch: childConfiguration.tuning.supportsBackendSearch
                 )
+            },
+            parentMaxTurns: options.agentOptions.maxTurns.map(Int.init),
+            childModelContextDefault: { model in
+                let input = liveCatalogResolutionInput(
+                    workingDirectory: cwd,
+                    environment: environment,
+                    trustedDocument: securityContext.document
+                )
+                return findModelByID(
+                    resolveModelCatalog(input: input),
+                    modelID: model
+                )?.info.subagentContextDefault
             }
         ))
     }
@@ -4092,10 +4182,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             return composition
         }()
         let configuredProviderDefinitions = parseConfiguredModelCatalog(
-            from: ((try? loadAuthorityComposition(
-                cwd: foundation.cwd,
-                environment: context.environment
-            ).effective()) ?? .table(TOMLTable())),
+            from: foundation.securityContext.document,
             environment: context.environment
         ).authProviders
         // `/model` rebuilds the provider stack through this coordinator; the
@@ -4157,13 +4244,25 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         ) ?? foundation.securityContext.document[
             path: ["features", "remote_compaction_v2"]
         ]?.boolValue ?? true
+        let twoPassCompaction = EffectiveFeatures.resolve(FeatureResolutionInputs(
+            effectiveConfig: foundation.securityContext.document,
+            remote: dependencies.remoteSettingsSnapshot.map(
+                AllowlistedRemoteSettings.init(projecting:)
+            ) ?? AllowlistedRemoteSettings(),
+            environment: context.environment
+        )).twoPassCompaction.value
+        let trustedCompactionThreshold = foundation.securityContext.document[
+            path: ["session", "auto_compact_threshold_percent"]
+        ]?.int64Value.flatMap(UInt8.init(exactly:))
         let compaction = LiveCompactionCoordinator(
             history: conversationHistory,
             modelSwitch: modelSwitch,
             sessionID: foundation.sessionID,
             openGrokHome: foundation.openGrokHome,
             toolExecutor: foundation.toolExecutor,
-            codexRemoteV2Enabled: remoteCompactionV2Enabled
+            codexRemoteV2Enabled: remoteCompactionV2Enabled,
+            twoPassCompactionEnabled: twoPassCompaction,
+            trustedAutoCompactThresholdPercent: trustedCompactionThreshold
         )
         let interjections = LiveSessionInterjections()
         // Follow-up delivery needs the interjection actor, which is born
@@ -4811,6 +4910,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         environment: [String: String],
         workingDirectory: URL,
         openGrokHome: URL,
+        trustedConfiguration: TOMLValue,
         sessionID: String,
         doomLoopRecovery: DoomLoopRecoveryPolicy?
     ) async throws -> (OpenGrokLiveSamplingConfiguration, LiveResolvedCredential) {
@@ -4836,11 +4936,13 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let restoredProvider = restoresStoredRoute ? conversationRecord.currentProvider : nil
         let configuredCatalog = liveConfiguredModelCatalog(
             workingDirectory: workingDirectory,
-            environment: environment
+            environment: environment,
+            trustedDocument: trustedConfiguration
         )
         let catalogInput = liveCatalogResolutionInput(
             workingDirectory: workingDirectory,
-            environment: environment
+            environment: environment,
+            trustedDocument: trustedConfiguration
         )
         let configuredCatalogMap = resolveModelCatalog(input: catalogInput)
         let routeProvider = requestedProvider ?? restoredProvider
@@ -4995,6 +5097,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         let resolver = LiveCredentialResolver(
             environment: environment,
             openGrokHome: openGrokHome,
+            grokComConfig: try LiveAuthComposition.effectiveGrokComConfig(
+                environment: environment,
+                document: trustedConfiguration
+            ),
             codexRefreshService: .live(
                 endpoints: CodexEndpoints.fromEnvironment(environment),
                 transport: URLSessionHTTPTransport()
@@ -5002,6 +5108,15 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         )
         let credential: LiveResolvedCredential
         if let namedAuthResolver {
+            let firstPartyXAI = provider == .xai
+                && trustedBuiltInSessionEndpoint(provider: .xai, baseURL: baseURL)
+            guard !firstPartyXAI
+                || !resolver.grokComConfig.apiKeyAuthDisabled(environment: environment)
+            else {
+                throw CLIApplicationError.failed(
+                    "administrator policy does not allow xAI API-key authentication"
+                )
+            }
             guard let token = namedAuthResolver.currentToken(), !token.isEmpty else {
                 throw CLIApplicationError.failed("named auth provider did not return a usable credential")
             }
@@ -5052,7 +5167,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 ?? selectedProfile?.reasoningEfforts
                 ?? []
         )
-        let tuning: OpenGrokLiveSamplingTuning
+        var tuning: OpenGrokLiveSamplingTuning
         if let tuningEntry {
             tuning = OpenGrokLiveSamplingTuning(entry: tuningEntry, effortOverride: effortOverride)
         } else if let profile = selectedProfile {
@@ -5075,6 +5190,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         } else {
             tuning = OpenGrokLiveSamplingTuning()
         }
+        tuning.supportsStandaloneWebSearch = tuningEntry?.info.supportsStandaloneWebSearch
+            ?? (credential.source == .codexOAuth && apiBackend == .responses)
         let sampling = OpenGrokLiveSamplingConfiguration(
             model: model,
             baseURL: baseURL,
@@ -5083,6 +5200,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             apiBackend: apiBackend,
             extraHeaders: headers,
             queryParams: configuredEntry?.queryParams ?? [:],
+            envHTTPHeaders: configuredEntry?.envHTTPHeaders ?? [:],
             environment: environment,
             tuning: tuning,
             doomLoopRecovery: doomLoopRecovery,
@@ -5289,18 +5407,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         openGrokHome: URL,
         environment: [String: String]
     ) -> String? {
-        let project = loadMergedProjectConfig(
-            cwd: workingDirectory,
-            environment: environment
+        let security = LiveSecurityContext.resolve(
+            workspaceRoot: workingDirectory,
+            environment: environment,
+            isInteractive: false
         )
-        if let value = endpointsXaiAPIBaseURL(in: project) { return value }
-        let userConfig = try? loadConfigFile(
-            at: openGrokHome.appendingPathComponent("config.toml")
-        )
-        if let userConfig, let value = endpointsXaiAPIBaseURL(in: userConfig) {
-            return value
-        }
-        return nil
+        return endpointsXaiAPIBaseURL(in: security.document)
     }
 
     private static func endpointsXaiAPIBaseURL(in table: TOMLValue) -> String? {

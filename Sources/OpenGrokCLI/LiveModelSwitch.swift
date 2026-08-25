@@ -28,18 +28,33 @@ import OpenGrokModels
 import OpenGrokProviderSession
 import OpenGrokSamplingTypes
 
+func liveManagedAuthenticationConfiguration(
+    environment: [String: String]
+) -> GrokComConfig {
+    do {
+        return try LiveAuthComposition.effectiveGrokComConfig(environment: environment)
+    } catch {
+        var denied = GrokComConfig.default(environment: environment)
+        denied.disableAPIKeyAuth = true
+        denied.forceLoginTeamUUID = .anyOf([])
+        return denied
+    }
+}
+
 func liveConfiguredModelCatalog(
     workingDirectory: URL,
-    environment: [String: String]
+    environment: [String: String],
+    trustedDocument: TOMLValue? = nil
 ) -> ConfiguredModelCatalog {
-    let authority = try? loadAuthorityComposition(
-        cwd: workingDirectory,
-        environment: environment
-    )
+    let document = trustedDocument ?? LiveSecurityContext.resolve(
+        workspaceRoot: workingDirectory,
+        environment: environment,
+        isInteractive: false
+    ).document
     let trusted = (try? ConfigLayers.load(environment: environment))
         .map { parseProviderDefinitions(from: $0.effectiveConfigBase()) }
     return parseConfiguredModelCatalog(
-        from: authority?.effective() ?? .table(TOMLTable()),
+        from: document,
         trustedProviderDefinitions: trusted,
         environment: environment
     )
@@ -130,6 +145,9 @@ struct LiveModelCatalogResolver: Sendable {
             LiveCredentialResolver(
                 environment: environment,
                 openGrokHome: openGrokHome,
+                grokComConfig: liveManagedAuthenticationConfiguration(
+                    environment: environment
+                ),
                 codexRefreshService: .live(
                     endpoints: CodexEndpoints.fromEnvironment(environment),
                     transport: URLSessionHTTPTransport()
@@ -324,6 +342,13 @@ struct LiveModelCatalogResolver: Sendable {
             credentialHeaders: credential.extraHeaders,
             configuredHeaders: entry.info.extraHeaders
         )
+        var tuning = OpenGrokLiveSamplingTuning(
+            entry: entry,
+            effortOverride: effort,
+            serviceTier: serviceTier
+        )
+        tuning.supportsStandaloneWebSearch = entry.info.supportsStandaloneWebSearch
+            ?? (credential.source == .codexOAuth && backend == .responses)
         return LiveModelResolution(
             sampling: OpenGrokLiveSamplingConfiguration(
                 model: profile.model,
@@ -333,12 +358,9 @@ struct LiveModelCatalogResolver: Sendable {
                 apiBackend: backend,
                 extraHeaders: headers,
                 queryParams: entry.queryParams,
+                envHTTPHeaders: entry.envHTTPHeaders,
                 environment: environment,
-                tuning: OpenGrokLiveSamplingTuning(
-                    entry: entry,
-                    effortOverride: effort,
-                    serviceTier: serviceTier
-                ),
+                tuning: tuning,
                 doomLoopRecovery: doomLoopRecovery,
                 bearerResolver: namedAuthResolver.map(NamedAuthBearerResolver.init),
                 credentialProvider: credential.binding.authCredentialProvider
@@ -582,6 +604,7 @@ actor LiveModelSwitchCoordinator {
             queryParams: previous.queryParams.filter {
                 !credentialQueryParameters.contains($0.key.lowercased())
             },
+            envHTTPHeaders: [:],
             environment: previous.environment,
             tuning: previous.tuning,
             doomLoopRecovery: previous.doomLoopRecovery,
@@ -967,6 +990,7 @@ actor LiveModelSwitchCoordinator {
             apiBackend: active.apiBackend,
             extraHeaders: active.extraHeaders,
             queryParams: active.queryParams,
+            envHTTPHeaders: active.envHTTPHeaders,
             environment: active.environment,
             tuning: tuning,
             doomLoopRecovery: active.doomLoopRecovery,
@@ -1093,6 +1117,9 @@ final class LiveModelCatalogStore: @unchecked Sendable {
             resolver: LiveCredentialResolver(
                 environment: environment,
                 openGrokHome: openGrokHome,
+                grokComConfig: liveManagedAuthenticationConfiguration(
+                    environment: environment
+                ),
                 codexAuthFile: openGrokHome.appendingPathComponent(
                     OpenGrokAuthPaths.codexAuthFileName
                 ),
@@ -1205,6 +1232,9 @@ final class LiveModelCatalogStore: @unchecked Sendable {
             resolver: LiveCredentialResolver(
                 environment: environment,
                 openGrokHome: openGrokHome,
+                grokComConfig: liveManagedAuthenticationConfiguration(
+                    environment: environment
+                ),
                 codexAuthFile: openGrokHome.appendingPathComponent(
                     OpenGrokAuthPaths.codexAuthFileName
                 ),
@@ -1397,6 +1427,9 @@ final class LiveModelCatalogStore: @unchecked Sendable {
         let resolver = LiveCredentialResolver(
             environment: environment,
             openGrokHome: openGrokHome,
+            grokComConfig: liveManagedAuthenticationConfiguration(
+                environment: environment
+            ),
             codexAuthFile: codexAuthFile
         )
         let broker = LiveModelCatalogCredentialBroker(
@@ -1413,7 +1446,9 @@ final class LiveModelCatalogStore: @unchecked Sendable {
         }
         let xaiSession: Bool
         if let authStore = try? readAuthJSONOrEmpty(at: authFile) {
-            let scope = GrokComConfig.default(environment: environment).authScope
+            let scope = liveManagedAuthenticationConfiguration(
+                environment: environment
+            ).authScope
             xaiSession = lookupAuth(authStore, scope: scope)?.isSessionAuth == true
         } else {
             xaiSession = false
@@ -1672,19 +1707,22 @@ private func liveCatalogCredentialFingerprint(
 
 func liveCatalogResolutionInput(
     workingDirectory: URL,
-    environment: [String: String]
+    environment: [String: String],
+    trustedDocument: TOMLValue? = nil
 ) -> CatalogResolutionInput {
-    let document = (try? loadAuthorityComposition(
-        cwd: workingDirectory,
-        environment: environment
-    ).effective()) ?? .table(TOMLTable())
+    let document = trustedDocument ?? LiveSecurityContext.resolve(
+        workspaceRoot: workingDirectory,
+        environment: environment,
+        isInteractive: false
+    ).document
     let openCodeGoEnabled = document[path: ["models", "opencode_go_enabled_models"]]?.arrayValue?
         .compactMap(\.stringValue) ?? []
     let openRouterEnabled = document[path: ["models", "openrouter_enabled_models"]]?.arrayValue?
         .compactMap(\.stringValue) ?? []
     let configured = liveConfiguredModelCatalog(
         workingDirectory: workingDirectory,
-        environment: environment
+        environment: environment,
+        trustedDocument: document
     )
     var modelOverrides = configured.modelOverrides
     let openGrokHome = LiveModelCatalogStore.resolveOpenGrokHome(environment: environment)

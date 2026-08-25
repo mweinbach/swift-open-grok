@@ -103,6 +103,30 @@ extension LiveInteractiveControllerRenderer {
         )
     }
 
+    /// Consume before dispatch so a reentrant render or repeated auth completion
+    /// cannot open the startup dashboard twice (`event_loop.rs:2144-2163`).
+    func consumePendingDashboardStartup() async throws {
+        guard pendingDashboardStartup, privacyBanner?.authDone == true else { return }
+        pendingDashboardStartup = false
+        try await render(.global(.openDashboard))
+    }
+
+    /// Authentication completion is authoritative even for Codex-only sessions,
+    /// whose credentials are intentionally absent from xAI's `AuthManager`.
+    func resumePendingDashboardStartupAfterAuthentication() async {
+        guard pendingDashboardStartup else { return }
+        await refreshPrivacyBannerState()
+        guard !Task.isCancelled else { return }
+        privacyBanner?.authDone = true
+
+        do {
+            try await consumePendingDashboardStartup()
+        } catch {
+            note("Unable to open the Agent Dashboard: \(error)")
+            try? renderState()
+        }
+    }
+
     func registerSessionTab(_ id: String) {
         guard !id.isEmpty, !sessionTabs.contains(where: { $0.sessionID == id }) else {
             touchSessionTab(id)
@@ -1091,7 +1115,7 @@ extension LiveInteractiveControllerRenderer {
                 // The OSC 52 seam `/copy` and `/export` already ride
                 // (`deliver`): one write into the sink in hand, which is
                 // what also works over SSH and inside tmux.
-                try LivePagerClipboard.copy(snapshot.output) { data in
+                try LivePagerClipboard.copy(snapshot.output, environment: environment) { data in
                     try sink.write(String(decoding: data, as: UTF8.self))
                 }
                 try sink.flush()
@@ -1329,7 +1353,7 @@ extension LiveInteractiveControllerRenderer {
         // failure maps to the auth-required arm and its exact copy.
         let manager = AuthManager(
             grokHome: openGrokHome,
-            config: GrokComConfig.default(environment: environment),
+            config: liveManagedAuthenticationConfiguration(environment: environment),
             environment: environment
         )
         let auth: GrokAuth
@@ -1730,6 +1754,10 @@ extension LiveInteractiveControllerRenderer {
         // file reads only (auth store + config.toml); nothing consumes it in
         // a frame yet — see `privacyBanner`.
         await refreshPrivacyBannerState()
+        if environment[LiveDashboardStartupComposition.startupEnvironmentVariable] == "1" {
+            pendingDashboardStartup = true
+            try await consumePendingDashboardStartup()
+        }
         await refreshContextUsage()
         if let permissionMode {
             permissionModeFlags = await permissionMode.composerFlags()

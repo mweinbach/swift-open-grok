@@ -159,7 +159,20 @@ enum LiveStartupAuthenticationReadiness {
             }
         }
 
-        let resolver = LiveCredentialResolver(environment: environment, openGrokHome: home)
+        let authConfiguration: GrokComConfig
+        do {
+            authConfiguration = try LiveAuthComposition.effectiveGrokComConfig(
+                environment: environment,
+                document: document
+            )
+        } catch {
+            return false
+        }
+        let resolver = LiveCredentialResolver(
+            environment: environment,
+            openGrokHome: home,
+            grokComConfig: authConfiguration
+        )
         if provider != .xai {
             if namedAuthReady || explicitAPIKey != nil {
                 return true
@@ -178,7 +191,7 @@ enum LiveStartupAuthenticationReadiness {
             return false
         }
 
-        let config = GrokComConfig.default(environment: environment)
+        let config = authConfiguration
         let apiKeyAllowed = !config.apiKeyAuthDisabled(environment: environment)
         let manager = AuthManager(grokHome: home, config: config, environment: environment)
         let account = await manager.currentOrExpired()

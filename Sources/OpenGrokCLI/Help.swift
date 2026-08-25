@@ -81,7 +81,7 @@ public enum OpenGrokHelp {
       login, logout                         Manage credentials.
       inspect, doctor [fix]                 Diagnose config and terminal.
       setup, update, export, trace, share, wrap
-      dashboard                             Reserved; currently unavailable.
+      dashboard                             Open the interactive session dashboard.
       release-validate --binary PATH --expected-version VERSION
                      [--expected-commit COMMIT] --isolated-root ROOT
       completions SHELL                     bash, zsh, fish, powershell, elvish.
@@ -305,9 +305,8 @@ public enum OpenGrokHelp {
             return """
             open-grok dashboard
 
-            The standalone dashboard utility route is reserved but unavailable in
-            this port. It remains fail-closed until a CLI dashboard host is wired.
-            Use `/dashboard` from a running pager session.
+            Start the interactive session with its dashboard open. Dashboard
+            availability respects the configured dashboard policy.
 
             """
         case "version":

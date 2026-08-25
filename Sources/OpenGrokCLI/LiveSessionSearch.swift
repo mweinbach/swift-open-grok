@@ -23,20 +23,21 @@ struct LiveSessionDocument: Sendable, Equatable {
     var workingDirectory: String
     var title: String?
     var updatedAt: Date
-    /// User prompts, then assistant text. Built the same way Rust builds its
-    /// `content` column, and capped the same way.
+    /// User prompts, assistant text, and tool metadata, in upstream index order.
     var content: String
 
-    /// Rust caps assistant text and tool metadata at 100_000 characters each
-    /// while indexing. The same cap applies here, for the same reason: one
-    /// pathological session must not dominate the corpus or the memory used to
-    /// search it.
-    static let contentLimit = 100_000
+    /// Upstream's misleadingly named character limits actually count UTF-8
+    /// bytes; the combined limit retains the newest complete Unicode scalars.
+    static let contentLimit = 200_000
+    private static let fieldLimit = 100_000
+    private static let toolCallLimit = 200
 
     static func build(from record: LiveConversationRecord) -> LiveSessionDocument {
         var prompts: [String] = []
         var assistantText: [String] = []
         var toolMetadata: [String] = []
+        var assistantBytes = 0
+        var toolBytes = 0
         var toolCallCount = 0
         var title: String?
         for item in record.items {
@@ -53,38 +54,39 @@ struct LiveSessionDocument: Sendable, Equatable {
                 }
                 prompts.append(text)
             case .assistant(let assistant):
-                let text = assistant.content
-                if !text.isEmpty { assistantText.append(text) }
-                for call in assistant.toolCalls where toolCallCount < 200 {
+                appendField(
+                    assistant.content,
+                    to: &assistantText,
+                    emittedBytes: &assistantBytes
+                )
+                for call in assistant.toolCalls where toolCallCount < toolCallLimit {
                     toolCallCount += 1
-                    toolMetadata.append(call.name)
+                    appendField(call.name, to: &toolMetadata, emittedBytes: &toolBytes)
                     guard let data = call.arguments.data(using: .utf8),
                           let object = try? JSONSerialization.jsonObject(with: data)
                             as? [String: Any]
                     else { continue }
                     for key in ["path", "file_path", "file", "target_file"] {
                         if let path = object[key] as? String, !path.isEmpty {
-                            toolMetadata.append(path)
+                            appendField(path, to: &toolMetadata, emittedBytes: &toolBytes)
                         }
                     }
                     if let locations = object["locations"] as? [[String: Any]] {
-                        toolMetadata.append(contentsOf: locations.compactMap {
-                            $0["path"] as? String
-                        })
+                        for location in locations {
+                            guard let path = location["path"] as? String else { continue }
+                            appendField(path, to: &toolMetadata, emittedBytes: &toolBytes)
+                        }
                     }
                 }
             default:
                 continue
             }
         }
-        var content = prompts.joined(separator: "\n\n")
-        let assistant = assistantText.joined(separator: "\n")
-        if !assistant.isEmpty {
-            content += "\n\n" + String(assistant.prefix(contentLimit))
-        }
-        if !toolMetadata.isEmpty {
-            content += "\n\n" + String(toolMetadata.joined(separator: "\n").prefix(contentLimit))
-        }
+        let content = [
+            prompts.joined(separator: "\n\n"),
+            assistantText.joined(separator: "\n"),
+            toolMetadata.joined(separator: "\n"),
+        ].joined(separator: "\n\n")
         return LiveSessionDocument(
             sessionID: record.sessionID,
             workingDirectory: record.workingDirectory,
@@ -92,8 +94,40 @@ struct LiveSessionDocument: Sendable, Equatable {
             // title wins over the derived first prompt.
             title: record.title ?? title,
             updatedAt: record.updatedAt,
-            content: String(content.prefix(contentLimit))
+            content: utf8Suffix(content, limit: contentLimit)
         )
+    }
+
+    private static func appendField(
+        _ value: String,
+        to fields: inout [String],
+        emittedBytes: inout Int
+    ) {
+        guard !value.isEmpty, emittedBytes < fieldLimit else { return }
+        let retained = utf8Prefix(value, limit: fieldLimit - emittedBytes)
+        guard !retained.isEmpty else { return }
+        fields.append(retained)
+        emittedBytes += retained.utf8.count
+    }
+
+    private static func utf8Prefix(_ value: String, limit: Int) -> String {
+        let bytes = value.utf8
+        guard bytes.count > limit else { return value }
+        var end = bytes.index(bytes.startIndex, offsetBy: limit)
+        while end > bytes.startIndex, bytes[end] & 0b1100_0000 == 0b1000_0000 {
+            bytes.formIndex(before: &end)
+        }
+        return String(decoding: bytes[..<end], as: UTF8.self)
+    }
+
+    private static func utf8Suffix(_ value: String, limit: Int) -> String {
+        let bytes = value.utf8
+        guard bytes.count > limit else { return value }
+        var start = bytes.index(bytes.endIndex, offsetBy: -limit)
+        while start < bytes.endIndex, bytes[start] & 0b1100_0000 == 0b1000_0000 {
+            bytes.formIndex(after: &start)
+        }
+        return String(decoding: bytes[start...], as: UTF8.self)
     }
 }
 

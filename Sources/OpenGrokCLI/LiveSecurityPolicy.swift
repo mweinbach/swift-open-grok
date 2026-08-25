@@ -99,8 +99,9 @@ actor LiveSessionWritePolicy {
         case .edit:
             return allowsEdits
         case .bash(let command):
-            let trimmed = command.trimmingCharacters(in: .whitespaces)
-            return bashPrefixGrants.contains { !$0.isEmpty && trimmed.hasPrefix($0) }
+            return bashPrefixGrants.contains {
+                matchesSessionBashGrant(command, grant: $0)
+            }
         case .read, .grep, .webSearch:
             return true
         case .webFetch(let url):
@@ -116,7 +117,8 @@ actor LiveSessionWritePolicy {
             allowsEdits = true
         case .bash(let command):
             // Grant the whole command as its own prefix: a session grant for
-            // `npm test` must not also cover `npm publish`.
+            // `npm test` must not also cover `npm publish`. Matching stays on
+            // the permission engine's fail-closed single-command argv seam.
             let trimmed = command.trimmingCharacters(in: .whitespaces)
             if !trimmed.isEmpty { bashPrefixGrants.append(trimmed) }
         case .webFetch(let url):
@@ -219,6 +221,8 @@ struct LiveSecurityContext: Sendable {
     /// Admin-owned MCP admission rules. This is deliberately resolved from
     /// the protected system file, never from the merged project/user document.
     var managedMCPPolicy: ManagedMCPPolicy
+    /// A malformed lower-tier file must never erase administrator authority.
+    var configurationLoadFailure: String? = nil
 
     /// Resolve for `workspaceRoot`.
     ///
@@ -239,11 +243,23 @@ struct LiveSecurityContext: Sendable {
         let managedSettingsPath = managedSettingsPath ?? claudeManagedSettingsPath()
         let managedMCPPolicy = ManagedMCPPolicy.load(from: managedSettingsPath)
         // One disk load, reused for the trust flag, the merge and the sandbox.
-        let layers = try? ConfigLayers.load(environment: environment)
+        let layers: ConfigLayers
+        do {
+            layers = try ConfigLayers.load(environment: environment)
+        } catch {
+            return configurationFailureContext(
+                error: error,
+                workspaceRoot: workspaceRoot,
+                environment: environment,
+                cli: cli,
+                managedSettingsPath: managedSettingsPath,
+                managedMCPPolicy: managedMCPPolicy
+            )
+        }
         // The base chain without the project tier, used to read the folder
         // trust feature flag itself — a repo must not be able to switch off
         // the gate that is deciding whether to read it.
-        let base = layers?.effectiveConfigBase() ?? .table(TOMLTable())
+        let base = layers.effectiveConfigBase()
 
         let featureEnabled = folderTrustEnabled(document: base, environment: environment)
         let effectiveWorkspaceRoot = workspaceRoot.standardizedFileURL.resolvingSymlinksInPath()
@@ -270,7 +286,10 @@ struct LiveSecurityContext: Sendable {
             featureEnabled: featureEnabled,
             inputs: FolderTrustDecideInputs(
                 storeTrusted: store.isTrusted(workspaceTrustIdentity),
-                repoConfigsPresent: repoConfigsPresent(at: effectiveWorkspaceRoot),
+                repoConfigsPresent: repoConfigsPresent(
+                    at: effectiveWorkspaceRoot,
+                    environment: environment
+                ),
                 isInteractive: isInteractive,
                 keyRecordable: keyRecordable
             )
@@ -295,14 +314,12 @@ struct LiveSecurityContext: Sendable {
                 environment: environment
             )
             : .table(TOMLTable())
-        let document = layers.map {
-            AuthorityComposition.from(layers: $0, project: project).effective()
-        } ?? base
+        let document = AuthorityComposition.from(layers: layers, project: project).effective()
 
         let requirements = [
-            layers?.mdmRequirements,
-            layers?.systemRequirements,
-            layers?.userRequirements,
+            layers.mdmRequirements,
+            layers.systemRequirements,
+            layers.userRequirements,
         ].compactMap { $0 }
 
         let home = URL(
@@ -316,24 +333,18 @@ struct LiveSecurityContext: Sendable {
         // *user's* requirements.toml cannot smuggle a catch-all allow past the
         // YOLO pin.
         var permissionLayers: [(document: TOMLValue, source: PermissionRuleSource)] = []
-        if let systemRequirements = layers?.systemRequirements {
+        if let systemRequirements = layers.systemRequirements {
             permissionLayers.append((systemRequirements, .systemRequirements))
         }
-        if let mdmRequirements = layers?.mdmRequirements {
+        if let mdmRequirements = layers.mdmRequirements {
             permissionLayers.append((mdmRequirements, .systemRequirements))
         }
-        if let userRequirements = layers?.userRequirements {
+        if let userRequirements = layers.userRequirements {
             permissionLayers.append((userRequirements, .requirements))
         }
-        if let systemManaged = layers?.systemManaged {
-            permissionLayers.append((systemManaged, .managedConfig))
-        }
-        if let managed = layers?.managed {
-            permissionLayers.append((managed, .managedConfig))
-        }
-        if let user = layers?.user {
-            permissionLayers.append((user, .config))
-        }
+        permissionLayers.append((layers.systemManaged, .managedConfig))
+        permissionLayers.append((layers.managed, .managedConfig))
+        permissionLayers.append((layers.user, .config))
         // Absent entirely when the folder is untrusted.
         if projectTrusted {
             permissionLayers.append((project, .config))
@@ -361,6 +372,81 @@ struct LiveSecurityContext: Sendable {
         )
     }
 
+    private static func configurationFailureContext(
+        error: any Error,
+        workspaceRoot: URL,
+        environment: [String: String],
+        cli: CLIPermissionOptions,
+        managedSettingsPath: URL?,
+        managedMCPPolicy: ManagedMCPPolicy
+    ) -> LiveSecurityContext {
+        let systemRequirements = loadSystemRequirements(environment: environment)
+        let mdmRequirements = mdmRequirementsValue(environment: environment)
+        let userRequirements = loadRequirements(environment: environment)
+        let requirements = [
+            mdmRequirements,
+            systemRequirements,
+            userRequirements,
+        ].compactMap { $0 }
+        let systemManaged = try? loadSystemManagedConfig(environment: environment)
+        let managed = try? loadManagedConfig(environment: environment)
+
+        var permissionLayers: [(document: TOMLValue, source: PermissionRuleSource)] = []
+        if let systemRequirements {
+            permissionLayers.append((systemRequirements, .systemRequirements))
+        }
+        if let mdmRequirements {
+            permissionLayers.append((mdmRequirements, .systemRequirements))
+        }
+        if let userRequirements {
+            permissionLayers.append((userRequirements, .requirements))
+        }
+        if let systemManaged {
+            permissionLayers.append((systemManaged, .managedConfig))
+        }
+        if let managed {
+            permissionLayers.append((managed, .managedConfig))
+        }
+
+        var document = systemManaged ?? .table(TOMLTable())
+        if let managed { deepMergeTOML(&document, overrides: managed) }
+        for requirementsLayer in requirements.reversed() {
+            deepMergeTOML(&document, overrides: requirementsLayer)
+        }
+
+        let home = URL(fileURLWithPath: environment["HOME"] ?? NSHomeDirectory())
+        var permissions = resolvePermissions(PermissionResolutionInputs(
+            permissionLayers: permissionLayers,
+            requirementsLayers: requirements,
+            managedSettings: loadManagedSettingsPermissions(at: managedSettingsPath),
+            cwd: workspaceRoot,
+            home: home,
+            projectTrusted: false,
+            cliDenyRules: cli.denyRules
+        ))
+        let failure = "Failed to load security configuration: \(error)"
+        permissions.config.rules.append(PermissionRule(
+            action: .deny,
+            tool: .any,
+            source: .synthetic
+        ))
+        permissions.config.promptPolicy = .deny
+        permissions.defaultMode = .dontAsk
+        permissions.alwaysApprove = false
+        permissions.yoloPinReason = permissions.yoloPinReason ?? failure
+        permissions.skipped.append(SkippedPermission(rule: "configuration", reason: failure))
+        permissions.sources.append("configuration-error")
+
+        return LiveSecurityContext(
+            document: document,
+            projectTrusted: false,
+            permissions: permissions,
+            requirements: requirements,
+            managedMCPPolicy: managedMCPPolicy,
+            configurationLoadFailure: failure
+        )
+    }
+
     /// Runtime reconnects and hub launches cannot inherit a caller-supplied
     /// environment override: policy authority belongs solely to the canonical
     /// admin-owned managed-settings.json path.
@@ -380,6 +466,9 @@ struct LiveSecurityContext: Sendable {
         environment: [String: String],
         runtime: (any LiveSandboxRuntime)? = nil
     ) throws -> LiveSandboxDecision {
+        if let configurationLoadFailure {
+            throw SandboxError.configConflict(configurationLoadFailure)
+        }
         if let runtime {
             return try LiveSandboxComposition.bootstrap(
                 workspaceRoot: workspaceRoot,

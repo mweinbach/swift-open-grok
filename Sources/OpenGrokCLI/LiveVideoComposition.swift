@@ -14,6 +14,7 @@
 
 import Foundation
 import OpenGrokConfig
+import OpenGrokConfigTypes
 import OpenGrokHTTP
 import OpenGrokSamplingTypes
 import OpenGrokShared
@@ -53,19 +54,47 @@ enum LiveVideoToolComposition {
         workingDirectory: URL,
         openGrokHome: URL,
         environment: [String: String],
+        effectiveConfig: TOMLValue? = nil,
         samplingProvider: ModelProvider,
         samplingAPIKey: String,
         samplingBaseURL: String,
-        tierRestricted: Bool = false
+        tierRestricted: Bool = false,
+        requirements: [TOMLValue] = [],
+        remoteSettings: RemoteSettings? = nil
     ) -> LiveVideoToolAvailability {
-        let videoGenEnabled = resolveBoolFlag(
+        let remote = remoteSettings.map(AllowlistedRemoteSettings.init(projecting:))
+        let requirement = requirements.first {
+            $0[path: ["features", "video_gen"]]?.boolValue != nil
+        }?[path: ["features", "video_gen"]]?.boolValue
+        let remotelyDenied = remote?.videoGenEnabled == false
+            || remote?.imagineToolDisabled("image_to_video") == true
+            || remote?.imagineToolDisabled("reference_to_video") == true
+            || remote?.imagineToolDisabled("video_gen") == true
+        if requirement == nil, remotelyDenied {
+            return .unavailable
+        }
+        let videoGenEnabled = requirement ?? resolveBoolFlag(
             envKey: "GROK_VIDEO_GEN",
             configKey: "video_gen",
             workingDirectory: workingDirectory,
             openGrokHome: openGrokHome,
-            environment: environment
+            environment: environment,
+            effectiveConfig: effectiveConfig,
+            remoteValue: remote?.videoGenEnabled
         )
         guard videoGenEnabled else { return .unavailable }
+
+        // Upstream permits protected video only when its client actually
+        // presigns a team-owned S3 upload and sends that URL to xAI. This
+        // client has no such transport, so even a plausible S3 config cannot
+        // make retained video safe: protection must remove both tools.
+        guard !disablesZDRIncompatibleVideo(
+            effectiveConfig: effectiveConfig,
+            openGrokHome: openGrokHome,
+            environment: environment
+        ) else {
+            return .unavailable
+        }
 
         guard let apiKey = LiveImageToolComposition.xaiMediaAPIKey(
             samplingProvider: samplingProvider,
@@ -174,14 +203,61 @@ enum LiveVideoToolComposition {
 
     // MARK: Flag plumbing
 
+    private static func disablesZDRIncompatibleVideo(
+        effectiveConfig: TOMLValue?,
+        openGrokHome: URL,
+        environment: [String: String]
+    ) -> Bool {
+        // ToolsConfig::resolve accepts exactly these spellings. An invalid
+        // override cannot silently replace the effective protection bit.
+        switch environment["GROK_DISABLE_ZDR_INCOMPATIBLE_TOOLS"] {
+        case "0", "false":
+            return false
+        case "1", "true":
+            return true
+        default:
+            break
+        }
+
+        let document: TOMLValue
+        if let effectiveConfig {
+            // This is the session's trust-gated authority document: project,
+            // user, managed, and requirements layers are already resolved.
+            document = effectiveConfig
+        } else {
+            // Compatibility callers have no folder-trust verdict. Reading a
+            // project file here would let an untrusted repository disable a
+            // managed policy, so only owner/admin disk layers are eligible.
+            var configurationEnvironment = environment
+            configurationEnvironment["OPENGROK_HOME"] = openGrokHome.path
+            guard let layers = try? ConfigLayers.load(environment: configurationEnvironment) else {
+                return true
+            }
+            document = layers.effectiveConfigBase()
+        }
+
+        guard case .boolean(let disabled)? = document[
+            path: ["tools", "disable_zdr_incompatible_tools"]
+        ] else {
+            return false
+        }
+        return disabled
+    }
+
     private static func resolveBoolFlag(
         envKey: String,
         configKey: String,
         workingDirectory: URL,
         openGrokHome: URL,
-        environment: [String: String]
+        environment: [String: String],
+        effectiveConfig: TOMLValue?,
+        remoteValue: Bool?
     ) -> Bool {
         if let fromEnv = boolFromEnv(environment[envKey]) { return fromEnv }
+        if let effectiveConfig,
+           case .boolean(let configured)? = effectiveConfig[path: ["features", configKey]] {
+            return configured
+        }
         if let raw = configBool(
             path: ["features", configKey],
             workingDirectory: workingDirectory,
@@ -190,7 +266,7 @@ enum LiveVideoToolComposition {
         ) {
             return raw
         }
-        return true
+        return remoteValue ?? true
     }
 
     private static func boolFromEnv(_ raw: String?) -> Bool? {

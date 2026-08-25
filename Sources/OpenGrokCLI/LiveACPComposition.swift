@@ -380,7 +380,15 @@ public enum LiveACPComposition {
             extensionHandler: launchComponents.extensionHandler,
             extensionNotifications: launchComponents.extensionNotifications,
             onSessionOpened: launchComponents.onSessionOpened,
-            onSessionClosed: launchComponents.onSessionClosed
+            onSessionClosed: launchComponents.onSessionClosed,
+            configuration: ACPAgentConfiguration(
+                agentCapabilities: ACPAgentConfiguration.defaultAgentCapabilities(
+                    supportsEmbeddedContext: true
+                ),
+                initializationMetadata: OpenGrokInitializeMetadata(
+                    currentWorkingDirectory: cwd.path
+                )
+            )
         )
         // The outbound half of the notification gateway: the components'
         // emitters (recap, swarm acks, the mailbox observer) now target THIS

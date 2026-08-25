@@ -24,6 +24,7 @@
 import Foundation
 import OpenGrokAuth
 import OpenGrokConfig
+import OpenGrokConfigTypes
 import OpenGrokHTTP
 import OpenGrokPaths
 import OpenGrokSamplingTypes
@@ -99,8 +100,11 @@ enum LiveImageToolComposition {
         environment: [String: String],
         samplingProvider: ModelProvider,
         samplingAPIKey: String,
-        samplingBaseURL: String
+        samplingBaseURL: String,
+        requirements: [TOMLValue] = [],
+        remoteSettings: RemoteSettings? = nil
     ) -> LiveImageToolAvailability {
+        let remote = remoteSettings.map(AllowlistedRemoteSettings.init(projecting:))
         let imageGenEnabled = resolveBoolFlag(
             envKey: "GROK_IMAGE_GEN",
             configKey: "image_gen",
@@ -108,8 +112,16 @@ enum LiveImageToolComposition {
             openGrokHome: openGrokHome,
             environment: environment
         )
+            && remote?.imageGenEnabled != false
+            && remote?.imagineToolDisabled(IMAGE_GEN_TOOL_NAME) != true
+            && !requirementDisables(IMAGE_GEN_TOOL_NAME, requirements: requirements)
         // `image_edit` has no `[features]` key upstream — env or default only.
-        let imageEditEnabled = boolFromEnv(environment["GROK_IMAGE_EDIT"]) ?? true
+        let imageEditEnabled = (boolFromEnv(environment["GROK_IMAGE_EDIT"]) ?? true)
+            && remote?.imageGenEnabled != false
+            && remote?.imagineToolDisabled(IMAGE_EDIT_TOOL_NAME) != true
+            && !requirementDisables(IMAGE_EDIT_TOOL_NAME, requirements: requirements)
+
+        guard imageGenEnabled || imageEditEnabled else { return .unavailable }
 
         let provider = resolveProvider(
             workingDirectory: workingDirectory,
@@ -310,9 +322,9 @@ enum LiveImageToolComposition {
         workingDirectory: URL,
         openGrokHome: URL,
         environment: [String: String]
-    ) -> ImageGenerationProvider {
+    ) -> OpenGrokWebMediaTools.ImageGenerationProvider {
         if let raw = environment["GROK_IMAGE_GENERATION_PROVIDER"],
-           let parsed = ImageGenerationProvider.fromCanonical(raw) {
+           let parsed = OpenGrokWebMediaTools.ImageGenerationProvider.fromCanonical(raw) {
             return parsed
         }
         if let raw = configString(
@@ -320,7 +332,7 @@ enum LiveImageToolComposition {
             workingDirectory: workingDirectory,
             openGrokHome: openGrokHome,
             environment: environment
-        ), let parsed = ImageGenerationProvider.fromCanonical(raw) {
+        ), let parsed = OpenGrokWebMediaTools.ImageGenerationProvider.fromCanonical(raw) {
             return parsed
         }
         return .default
@@ -345,6 +357,19 @@ enum LiveImageToolComposition {
             return raw
         }
         return true
+    }
+
+    private static func requirementDisables(
+        _ name: String,
+        requirements: [TOMLValue]
+    ) -> Bool {
+        requirements.contains { requirement in
+            [["features", name], ["tools", name], [name], ["\(name)_enabled"]]
+                .contains { path in
+                    if case .boolean(false)? = requirement[path: path] { return true }
+                    return false
+                }
+        }
     }
 
     private static func resolveStringFlag(
@@ -511,12 +536,11 @@ struct LiveImageToolHandler: ToolHandler {
             return .success(textOutput(toolId: toolId, text: TIER_RESTRICTED_UPSELL))
         }
 
-        // Upstream threads an `ImageGenerationTurnId` resource here, falling
-        // back to the call id. Neither is reachable at the `ToolHandler` seam —
-        // `ToolCallContext` carries no call id — so this is per-session rather
-        // than per-turn. It only feeds `x-codex-image-turn-id`, an
-        // OpenAI-route header.
-        let turnID = resources.sessionId
+        let attachmentRegistry = resources.extras.get(LiveImageTurnReferences.self)
+        let currentTurn = attachmentRegistry?.sessionID == resources.sessionId
+            ? attachmentRegistry
+            : nil
+        let turnID = currentTurn?.turnID ?? ctx.callId.rawValue
         let prompt = stringField(args, "prompt") ?? ""
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return .failure(.invalidArguments("\(clientName) requires a non-empty prompt"))
@@ -530,7 +554,8 @@ struct LiveImageToolHandler: ToolHandler {
                 bytes = try await client.generate(
                     prompt: prompt,
                     aspectRatio: aspectRatio,
-                    turnID: turnID
+                    turnID: turnID,
+                    sessionID: resources.sessionId
                 )
             case IMAGE_EDIT_TOOL_NAME:
                 let references = stringArrayField(args, "image")
@@ -539,17 +564,27 @@ struct LiveImageToolHandler: ToolHandler {
                         "image_edit requires at least one reference image"
                     ))
                 }
+                let resolved = try references.map {
+                    try LiveImageReferenceResolver.resolve(
+                        $0,
+                        resources: resources,
+                        attachments: currentTurn
+                    )
+                }
                 bytes = try await client.edit(
                     prompt: prompt,
-                    dataURLs: references,
+                    dataURLs: resolved,
                     aspectRatio: aspectRatio,
-                    turnID: turnID
+                    turnID: turnID,
+                    sessionID: resources.sessionId
                 )
             default:
                 return .failure(.notImplemented(
                     "image tool handler does not implement \(clientName)"
                 ))
             }
+        } catch let error as ToolError {
+            return .failure(error)
         } catch let error as ImageGenError {
             return .failure(.custom(code: "image_gen_failed", detail: error.description))
         } catch {

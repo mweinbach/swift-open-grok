@@ -18,6 +18,7 @@ import OpenGrokCompaction
 import OpenGrokConfig
 import OpenGrokProviderSession
 import OpenGrokSamplingTypes
+import OpenGrokSessionPersistence
 import OpenGrokShared
 import OpenGrokTokenEstimation
 
@@ -27,9 +28,9 @@ struct LiveSessionServices: Sendable {
     var memory: LiveMemoryBackend?
     var goal: LiveGoalCoordinator?
     let owningSessionID: String?
-    /// Cached because `LiveToolExecutor.tools` is a `let` computed once at
-    /// construction: the advertised list cannot change mid-session, so it is
-    /// resolved once with the goal state as it stood at launch.
+    /// Launch snapshot for callers that cannot await. Goal activation can
+    /// happen after construction, so turn-time callers must use
+    /// `activeToolSpecs()` rather than treating this snapshot as authoritative.
     var toolSpecs: [ToolSpec]
 
     init(
@@ -59,6 +60,19 @@ struct LiveSessionServices: Sendable {
         Set(toolSpecs.map(\.name))
     }
 
+    /// Expose the goal tool only while its actor currently owns an active goal.
+    func goalToolSpecs() async -> [ToolSpec] {
+        guard let goal else { return [] }
+        return LiveGoalTools.toolSpecs(goalIsActive: await goal.isActive)
+    }
+
+    /// Reconcile the launch snapshot with the current actor-owned goal state.
+    func activeToolSpecs() async -> [ToolSpec] {
+        var specs = toolSpecs.filter { $0.name != LiveGoalTools.toolName }
+        specs.append(contentsOf: await goalToolSpecs())
+        return specs
+    }
+
     /// Whether this aggregate owns `name`.
     ///
     /// **Invariant: these names must not collide with any `BuiltinToolCatalog`
@@ -79,6 +93,7 @@ struct LiveSessionServices: Sendable {
     /// is structural rather than by convention.
     func handles(_ name: String) -> Bool {
         toolNames.contains(name)
+            || (name == LiveGoalTools.toolName && goal != nil)
     }
 
     /// Dispatch one session-service tool call.
@@ -253,10 +268,29 @@ extension OpenGrokLiveApplicationLauncher {
         // that usually misses, and it has to exist for `/goal` to have anything
         // to talk to. `update_goal` is still only *advertised* while a goal is
         // active, so a session without a goal sees no extra tool.
-        let goalDirectory = openGrokHome
-            .appendingPathComponent("sessions", isDirectory: true)
-            .appendingPathComponent(sessionID, isDirectory: true)
-        let goal = LiveGoalCoordinator(sessionDirectory: goalDirectory)
+        let goal: LiveGoalCoordinator
+        do {
+            let goalDirectory = try SessionDocumentStore(grokHome: openGrokHome)
+                .sessionDirectory(
+                    sessionID: sessionID,
+                    cwd: workingDirectory.standardizedFileURL.path
+                )
+            goal = LiveGoalCoordinator(
+                sessionDirectory: goalDirectory,
+                stateRoot: openGrokHome
+            )
+        } catch {
+            // Keep the command reachable so its caller sees the real failure;
+            // this coordinator rejects every mutation and never writes to its
+            // placeholder directory.
+            goal = LiveGoalCoordinator(
+                sessionDirectory: openGrokHome,
+                stateRoot: openGrokHome,
+                initializationError: .invalidSessionDirectory(
+                    String(describing: error)
+                )
+            )
+        }
 
         return LiveSessionServices(
             rewind: rewind,

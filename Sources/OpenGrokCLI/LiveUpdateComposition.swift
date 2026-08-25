@@ -120,7 +120,12 @@ public enum LiveLaunchAutoUpdate {
         }
 
         let current = OpenGrokCLIVersion.installed(environment: environment)
-        let policy = LiveUpdateComposition.resolveVersionPolicy(environment: environment)
+        let policy: VersionPolicy
+        do {
+            policy = try LiveUpdateComposition.resolveVersionPolicy(environment: environment)
+        } catch {
+            return
+        }
         let channel = UpdateChannel.stable
 
         let release: ReleaseCandidate
@@ -250,7 +255,7 @@ public enum LiveUpdateComposition {
         }
 
         let current = OpenGrokCLIVersion.installed(environment: environment)
-        let policy = resolveVersionPolicy(environment: environment)
+        let policy = try resolveVersionPolicy(environment: environment)
 
         if check {
             let status = await checkStatus(
@@ -569,15 +574,29 @@ public enum LiveVersionPolicyGate {
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> String? {
         guard !isExempt(command) else { return nil }
-        let policy = LiveUpdateComposition.resolveVersionPolicy(environment: environment)
-        return message(for: evaluate(
-            current: OpenGrokCLIVersion.installed(environment: environment),
-            policy: policy
-        ))
+        do {
+            let policy = try LiveUpdateComposition.resolveVersionPolicy(environment: environment)
+            return message(for: evaluate(
+                current: OpenGrokCLIVersion.installed(environment: environment),
+                policy: policy
+            ))
+        } catch {
+            return String(describing: error)
+        }
     }
 }
 
 // MARK: - Policy resolution
+
+private struct VerifiedVersionPolicyRequirements {
+    let user: TOMLValue?
+    let system: TOMLValue?
+    let mdm: TOMLValue?
+}
+
+private enum VersionPolicyConfigurationFailure: Error {
+    case invalidRequirements(source: String)
+}
 
 extension LiveUpdateComposition {
     /// Fold the four version bounds across the config layers.
@@ -587,8 +606,15 @@ extension LiveUpdateComposition {
     /// administrator set — never loosen it (`resolve/version.rs:136-160`).
     public static func resolveVersionPolicy(
         environment: [String: String]
-    ) -> VersionPolicy {
-        let layers = (try? ConfigLayers.load(environment: environment)) ?? ConfigLayers()
+    ) throws -> VersionPolicy {
+        let layers: ConfigLayers
+        do {
+            layers = try verifiedVersionPolicyLayers(environment: environment)
+        } catch {
+            throw CLIApplicationError.failed(
+                versionPolicyConfigurationFailureMessage(for: error)
+            )
+        }
         var candidates: [TOMLValue] = [layers.systemManaged, layers.managed, layers.user]
         if let req = layers.userRequirements { candidates.append(req) }
         if let req = layers.systemRequirements { candidates.append(req) }
@@ -607,12 +633,124 @@ extension LiveUpdateComposition {
             var managedOnly = VersionPolicy()
             fold(&managedOnly, layer: layers.systemManaged)
             fold(&managedOnly, layer: layers.managed)
+            if let req = layers.userRequirements { fold(&managedOnly, layer: req) }
             if let req = layers.systemRequirements { fold(&managedOnly, layer: req) }
             if let req = layers.mdmRequirements { fold(&managedOnly, layer: req) }
             policy.requiredMinimum = managedOnly.requiredMinimum
             policy.requiredMaximum = managedOnly.requiredMaximum
         }
         return policy
+    }
+
+    private static func verifiedVersionPolicyLayers(
+        environment: [String: String]
+    ) throws -> ConfigLayers {
+        let requirements = try verifiedVersionPolicyRequirements(environment: environment)
+
+        do {
+            return try ConfigLayers.load(environment: environment)
+        } catch {
+            // Owner-editable config can fail independently of administrator
+            // policy. Unlike upstream `resolve/version.rs:194-201`, never
+            // replace administrator layers with an empty config: reload every
+            // trusted source independently and reject broken trusted sources.
+            return try ConfigLayers(
+                systemManaged: loadSystemManagedConfig(environment: environment),
+                managed: loadManagedConfig(environment: environment),
+                user: .table(TOMLTable()),
+                userRequirements: requirements.user,
+                systemRequirements: requirements.system,
+                mdmRequirements: requirements.mdm
+            )
+        }
+    }
+
+    private static func verifiedVersionPolicyRequirements(
+        environment: [String: String]
+    ) throws -> VerifiedVersionPolicyRequirements {
+        let user: TOMLValue?
+        if let home = userGrokHome(environment: environment) {
+            user = try verifiedVersionPolicyRequirementsLayer(
+                at: home.appendingPathComponent(REQUIREMENTS_FILENAME),
+                environment: environment
+            )
+        } else {
+            user = nil
+        }
+
+        let system: TOMLValue?
+        if let directory = systemConfigDir() {
+            system = try verifiedVersionPolicyRequirementsLayer(
+                at: directory.appendingPathComponent(REQUIREMENTS_FILENAME),
+                environment: environment
+            )
+        } else {
+            system = nil
+        }
+
+        let mdm: TOMLValue?
+        if let raw = managedPreferencesRequirements() {
+            guard let normalized = normalizeRequirementsValue(
+                raw,
+                source: MDM_REQUIREMENTS_SOURCE,
+                environment: environment
+            ) else {
+                throw VersionPolicyConfigurationFailure.invalidRequirements(
+                    source: MDM_REQUIREMENTS_SOURCE
+                )
+            }
+            mdm = normalized
+        } else {
+            mdm = nil
+        }
+
+        return VerifiedVersionPolicyRequirements(user: user, system: system, mdm: mdm)
+    }
+
+    private static func verifiedVersionPolicyRequirementsLayer(
+        at path: URL,
+        environment: [String: String]
+    ) throws -> TOMLValue? {
+        let value = try loadTomlFile(at: path, environment: environment)
+        guard case let .table(table) = value, !table.isEmpty else {
+            return nil
+        }
+
+        // This can block a valid binary when a policy artifact is damaged;
+        // skipping the artifact would instead erase unknown mandatory bounds.
+        guard let normalized = normalizeRequirementsValue(
+            value,
+            source: path.path,
+            environment: environment
+        ) else {
+            throw VersionPolicyConfigurationFailure.invalidRequirements(
+                source: path.lastPathComponent
+            )
+        }
+        return normalized
+    }
+
+    private static func versionPolicyConfigurationFailureMessage(
+        for error: any Error
+    ) -> String {
+        let source: String
+        if let configError = error as? OpenGrokConfigIOError {
+            switch configError {
+            case let .tomlParse(path, _), let .io(path, _):
+                source = path.lastPathComponent
+            }
+        } else if let configurationError = error as? VersionPolicyConfigurationFailure {
+            switch configurationError {
+            case let .invalidRequirements(name):
+                source = name
+            }
+        } else {
+            source = "a mandatory managed configuration layer"
+        }
+
+        return "Managed version policy could not be verified: \(source) is malformed, "
+            + "unreadable, or invalid. Session startup is blocked until your managed "
+            + "configuration is repaired; run `open-grok setup` or contact your administrator."
     }
 
     private static func fold(_ policy: inout VersionPolicy, layer: TOMLValue) {
