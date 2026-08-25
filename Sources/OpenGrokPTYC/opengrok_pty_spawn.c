@@ -1,14 +1,33 @@
 // Portable PTY open + fork/exec with session / controlling-terminal / CWD setup.
 
-/* POSIX-only; see the guard rationale in opengrok_pty_spawn.h. On Windows this
-   file compiles to a single placeholder symbol so the target still produces an
-   object file. */
 #if defined(_WIN32)
 
-/* A translation unit with no external symbols is not portable C; give the
-   Windows build one so the archive is well-formed. */
-int opengrok_pty_unavailable_on_windows(void);
-int opengrok_pty_unavailable_on_windows(void) { return 0; }
+#include "opengrok_pty_spawn.h"
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+typedef HRESULT (WINAPI *opengrok_release_pseudoconsole_fn)(void *);
+
+int opengrok_release_pseudoconsole(void *console) {
+    if (console == NULL) {
+        return -1;
+    }
+
+    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    if (kernel == NULL) {
+        return 0;
+    }
+
+    FARPROC symbol = GetProcAddress(kernel, "ReleasePseudoConsole");
+    if (symbol == NULL) {
+        return 0;
+    }
+
+    opengrok_release_pseudoconsole_fn release =
+        (opengrok_release_pseudoconsole_fn)symbol;
+    return SUCCEEDED(release(console)) ? 1 : -1;
+}
 
 #else
 

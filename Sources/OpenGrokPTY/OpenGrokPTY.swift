@@ -1072,6 +1072,7 @@ import WinSDK
 
 private final class WindowsPTYOutputReader: @unchecked Sendable {
     private let lock = NSLock()
+    private let completion = DispatchSemaphore(value: 0)
     private var handle: HANDLE?
     private var continuation: AsyncThrowingStream<Data, Error>.Continuation?
     private var buffered: [Data] = []
@@ -1126,6 +1127,11 @@ private final class WindowsPTYOutputReader: @unchecked Sendable {
         }
     }
 
+    func waitForCompletion(milliseconds: Int) -> Bool {
+        if lock.withLock({ finished }) { return true }
+        return completion.wait(timeout: .now() + .milliseconds(milliseconds)) == .success
+    }
+
     private func readLoop() {
         defer {
             let pipe = lock.withLock { () -> HANDLE? in
@@ -1174,19 +1180,21 @@ private final class WindowsPTYOutputReader: @unchecked Sendable {
     }
 
     private func complete(_ error: (any Error)?) {
-        let consumer = lock.withLock { () -> AsyncThrowingStream<Data, Error>.Continuation? in
+        let result = lock.withLock { () -> (AsyncThrowingStream<Data, Error>.Continuation?)? in
             guard !finished else { return nil }
             finished = true
             failure = error
             let consumer = continuation
             continuation = nil
-            return consumer
+            return .some(consumer)
         }
+        guard let consumer = result else { return }
         if let error {
             consumer?.finish(throwing: error)
         } else {
             consumer?.finish()
         }
+        completion.signal()
     }
 }
 #endif
@@ -1202,6 +1210,7 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
     private var processHandle: HANDLE?
     private var jobHandle: HANDLE?
     private var pseudoConsole: HPCON?
+    private var pseudoConsoleReleased = false
     private var inputWrite: HANDLE?
     private var outputReader: WindowsPTYOutputReader?
     #endif
@@ -1216,6 +1225,7 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
         process: HANDLE,
         job: HANDLE?,
         pseudoConsole: HPCON?,
+        pseudoConsoleReleased: Bool,
         inputWrite: HANDLE?,
         outputRead: HANDLE?
     ) {
@@ -1224,6 +1234,7 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
             self.processHandle = process
             self.jobHandle = job
             self.pseudoConsole = pseudoConsole
+            self.pseudoConsoleReleased = pseudoConsoleReleased
             self.inputWrite = inputWrite
             self.outputReader = reader
         }
@@ -1380,17 +1391,23 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
             return
         }
         let status: ProcessExit = .code(Int32(bitPattern: code))
-        let handles = lock.withLock { () -> (console: HPCON?, input: HANDLE?) in
+        let handles = lock.withLock { () -> (
+            console: HPCON?,
+            input: HANDLE?,
+            reader: WindowsPTYOutputReader?,
+            released: Bool
+        ) in
             exitStatus = status
             let console = pseudoConsole
             pseudoConsole = nil
             let input = inputWrite
             inputWrite = nil
-            return (console, input)
+            return (console, input, outputReader, pseudoConsoleReleased)
         }
         if let input = handles.input { CloseHandle(input) }
-        // conhost retains the output writer after the child exits. Closing its
-        // console while the reader still drains is what lets output() finish.
+        // A released console exits after its last client and flushes its final
+        // frame. Older hosts require a bounded drain before forced teardown.
+        _ = handles.reader?.waitForCompletion(milliseconds: handles.released ? 2_000 : 100)
         if let console = handles.console { ClosePseudoConsole(console) }
         continuation.resume(returning: status)
     }
@@ -1612,6 +1629,10 @@ enum WindowsConPTY {
         guard previousSuspendCount != DWORD.max else {
             throw PTYError.spawnFailed("ResumeThread failed: \(GetLastError())")
         }
+        let releaseStatus = opengrok_release_pseudoconsole(console)
+        guard releaseStatus >= 0 else {
+            throw PTYError.spawnFailed("ReleasePseudoConsole failed")
+        }
 
         let process = WindowsPTYProcess(
             identifier: "pid:\(processInformation.dwProcessId)",
@@ -1621,6 +1642,7 @@ enum WindowsConPTY {
             process: processInformation.hProcess,
             job: job,
             pseudoConsole: console,
+            pseudoConsoleReleased: releaseStatus > 0,
             inputWrite: inputWrite,
             outputRead: outputRead
         )
