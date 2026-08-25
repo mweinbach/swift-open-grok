@@ -35,6 +35,7 @@ enum LiveUpdateLeaderRelaunch {
     static let maximumLeaders = 32
     static let maximumDurationSeconds: Double = 10
     static let perLeaderTimeoutSeconds: Double = 2
+    private static let maximumResponseFrames = 8
 
     /// `xai-grok-pager-bin/src/main.rs:2342-2393`: every discoverable older
     /// leader gets one bounded, non-fatal request after an explicit install.
@@ -258,12 +259,6 @@ enum LiveUpdateLeaderRelaunch {
         timeoutSeconds: Double,
         streams: CLIStreams
     ) async {
-        let client = ACPLeaderClient(
-            channel: channel,
-            clientType: "grok-pager-update",
-            mode: .stdio,
-            capabilities: ACPLeaderClientCapabilities()
-        )
         let watchdog = Task.detached {
             do {
                 try await Task.sleep(
@@ -272,39 +267,102 @@ enum LiveUpdateLeaderRelaunch {
             } catch {
                 return
             }
-            await client.close()
+            await channel.close()
         }
 
         do {
-            let registration = try await client.start()
-            if registration.ready,
-               registration.protocolVersion == ACPLeaderProtocolLimits.protocolVersion,
-               registration.capabilities?.controlV1 == true,
-               registration.capabilities?.relaunchV1 == true,
-               let reported = registration.binaryVersion,
-               let current = strictVersion(reported),
-               current < installed
-            {
-                let result = try await client.control([
-                    "type": "relaunch_for_update",
-                    "to_version": installedVersion,
-                ])
-                if case .relaunching(let from, let to, let grace) = result,
-                   from == reported,
-                   to == installedVersion,
-                   grace == 10_000
-                {
-                    streams.err(
-                        "  ↻ Relaunching shared session (leader \(from) → \(to))…\n"
-                    )
-                }
+            if let (from, to) = try await relaunchAcknowledgement(
+                channel: channel,
+                installedVersion: installedVersion,
+                installed: installed
+            ) {
+                streams.err(
+                    "  ↻ Relaunching shared session (leader \(from) → \(to))…\n"
+                )
             }
         } catch {
             // The leader can legitimately exit between discovery and its ACK.
         }
 
         watchdog.cancel()
-        await client.close()
+        await channel.close()
+    }
+
+    private static func relaunchAcknowledgement(
+        channel: any WebSocketByteChannel,
+        installedVersion: String,
+        installed: SemVerVersion
+    ) async throws -> (from: String, to: String)? {
+        let reader = ACPLeaderChannelReader(
+            channel: channel,
+            maximumMessageSize: ACPLeaderProtocolLimits.maximumMessageSize
+        )
+
+        // Synchronous Windows named-pipe handles cannot service a parked read
+        // and a later write concurrently. This one-shot exchange must finish
+        // each write before starting the read for its corresponding response.
+        try await channel.write(try ACPLeaderCodec.encode(
+            ACPLeaderClientMessage.register(
+                clientType: "grok-pager-update",
+                mode: .stdio,
+                capabilities: ACPLeaderClientCapabilities()
+            )
+        ))
+
+        guard let registration = try await reader.next(ACPLeaderServerMessage.self),
+              case .registered(_, let ready, let protocolVersion, let binaryVersion, let capabilities)
+                = registration
+        else { return nil }
+
+        if !ready {
+            guard let readiness = try await reader.next(ACPLeaderServerMessage.self),
+                  case .leaderReady = readiness
+            else { return nil }
+        }
+
+        guard protocolVersion == ACPLeaderProtocolLimits.protocolVersion,
+              capabilities?.controlV1 == true,
+              capabilities?.relaunchV1 == true,
+              let reported = binaryVersion,
+              let current = strictVersion(reported),
+              current < installed
+        else { return nil }
+
+        let requestID = UUID().uuidString
+        try await channel.write(try ACPLeaderCodec.encode(
+            ACPLeaderClientMessage.control(
+                requestID: requestID,
+                command: [
+                    "type": "relaunch_for_update",
+                    "to_version": installedVersion,
+                ]
+            )
+        ))
+
+        for _ in 0..<maximumResponseFrames {
+            guard let response = try await reader.next(ACPLeaderServerMessage.self) else {
+                return nil
+            }
+
+            switch response {
+            case .controlResult(let responseID, let payload):
+                guard responseID == requestID,
+                      case .relaunching(let from, let to, let grace) = payload,
+                      from == reported,
+                      to == installedVersion,
+                      grace == 10_000
+                else { return nil }
+                return (from, to)
+
+            case .acp, .pong, .leaderReady:
+                continue
+
+            case .controlError, .error, .shuttingDown, .shutdown, .registered:
+                return nil
+            }
+        }
+
+        return nil
     }
 }
 

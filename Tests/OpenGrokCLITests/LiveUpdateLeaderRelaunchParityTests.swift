@@ -218,6 +218,127 @@ private actor UpdateScriptedLeader {
     }
 }
 
+private actor UpdateHalfDuplexLeaderChannel: WebSocketByteChannel {
+    private enum Phase: Equatable {
+        case registration
+        case registered
+        case control
+        case acknowledged
+        case finished
+        case closed
+    }
+
+    private enum Violation: Error {
+        case invalidFrame
+        case unexpectedMessage
+        case simultaneousReadAndWrite
+    }
+
+    private let correlatedAcknowledgement: Bool
+    private var phase = Phase.registration
+    private var decoder = ACPLeaderFrameDecoder()
+    private var blockedRead: CheckedContinuation<[UInt8]?, Error>?
+    private var requestID: String?
+    private var registrationTypes: [String] = []
+    private var commands: [[String: String]] = []
+    private var speculativeReads = 0
+
+    init(correlatedAcknowledgement: Bool) {
+        self.correlatedAcknowledgement = correlatedAcknowledgement
+    }
+
+    func read() async throws -> [UInt8]? {
+        switch phase {
+        case .registered:
+            phase = .control
+            return try ACPLeaderCodec.encode(
+                ACPLeaderServerMessage.registered(
+                    clientID: 1,
+                    ready: true,
+                    protocolVersion: ACPLeaderProtocolLimits.protocolVersion,
+                    binaryVersion: "1.0.0",
+                    capabilities: .supported
+                )
+            )
+
+        case .control:
+            speculativeReads += 1
+            return try await withCheckedThrowingContinuation { continuation in
+                blockedRead = continuation
+            }
+
+        case .acknowledged:
+            guard let requestID else { throw Violation.unexpectedMessage }
+            phase = .finished
+            let responseID = correlatedAcknowledgement ? requestID : UUID().uuidString
+            return try ACPLeaderCodec.encode(
+                ACPLeaderServerMessage.controlResult(
+                    requestID: responseID,
+                    payload: .relaunching(
+                        fromVersion: "1.0.0",
+                        toVersion: "2.0.0",
+                        graceMilliseconds: 10_000
+                    )
+                )
+            )
+
+        case .closed:
+            return nil
+
+        case .registration, .finished:
+            throw Violation.unexpectedMessage
+        }
+    }
+
+    func write(_ bytes: [UInt8]) async throws {
+        decoder.append(bytes)
+        guard let body = try decoder.nextFrame(), decoder.bufferedByteCount == 0 else {
+            throw Violation.invalidFrame
+        }
+
+        let message = try ACPLeaderCodec.decode(ACPLeaderClientMessage.self, from: body)
+        switch message {
+        case .register(let clientType, let mode, _):
+            guard phase == .registration, mode == .stdio else {
+                throw Violation.unexpectedMessage
+            }
+            registrationTypes.append(clientType)
+            phase = .registered
+
+        case .control(let id, let command):
+            guard phase == .control else { throw Violation.unexpectedMessage }
+            // A speculative reader gets a deterministic opportunity to park
+            // before this synchronous-handle analogue accepts the write.
+            try await Task.sleep(nanoseconds: 20_000_000)
+            guard phase == .control, speculativeReads == 0 else {
+                throw Violation.simultaneousReadAndWrite
+            }
+            requestID = id
+            commands.append(command)
+            phase = .acknowledged
+
+        case .acp, .ping, .disconnect:
+            throw Violation.unexpectedMessage
+        }
+    }
+
+    func close() async {
+        guard phase != .closed else { return }
+        phase = .closed
+        let continuation = blockedRead
+        blockedRead = nil
+        continuation?.resume(returning: nil)
+    }
+
+    func observed() -> (
+        registrations: [String],
+        commands: [[String: String]],
+        speculativeReads: Int
+    ) {
+        (registrationTypes, commands, speculativeReads)
+    }
+}
+
 private actor UpdateNotificationEvents {
     private var events: [String] = []
 
@@ -307,6 +428,48 @@ struct LiveUpdateLeaderRelaunchParityTests {
 
             await host.stop()
             served.cancel()
+        }
+    }
+
+    @Test(
+        "one-shot control remains half-duplex and requires its exact acknowledgement ID",
+        arguments: [true, false]
+    )
+    func halfDuplexControlRequiresCorrelatedAcknowledgement(_ correlated: Bool) async throws {
+        try await withUpdateLeaderFixture { fixture in
+            let endpoint = try await fixture.endpoint()
+            let channel = UpdateHalfDuplexLeaderChannel(
+                correlatedAcknowledgement: correlated
+            )
+            let (streams, out, err) = CLIStreams.buffered()
+
+            await LiveUpdateLeaderRelaunch.notify(
+                installedVersion: "2.0.0",
+                environment: fixture.environment,
+                streams: streams,
+                dependencies: LiveUpdateLeaderRelaunchDependencies(
+                    dial: { path, timeout in
+                        guard path == endpoint, timeout > 0 else {
+                            throw CLIApplicationError.failed("unexpected half-duplex dial")
+                        }
+                        return channel
+                    }
+                )
+            )
+
+            let observed = await channel.observed()
+            #expect(observed.registrations == ["grok-pager-update"])
+            #expect(observed.commands == [[
+                "type": "relaunch_for_update",
+                "to_version": "2.0.0",
+            ]])
+            #expect(observed.speculativeReads == 0)
+            #expect(out.contents.isEmpty)
+            #expect(err.contents == (
+                correlated
+                    ? "  ↻ Relaunching shared session (leader 1.0.0 → 2.0.0)…\n"
+                    : ""
+            ))
         }
     }
 
