@@ -47,7 +47,7 @@ struct LiveShareLauncherReachabilityTests {
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: home) }
 
-        let command = try CLICommandParser.parseOrThrow(["trace", "session-1"])
+        let command = try CLICommandParser.parseOrThrow(["dashboard"])
         let (streams, out, err) = CLIStreams.buffered()
 
         do {
@@ -57,7 +57,7 @@ struct LiveShareLauncherReachabilityTests {
             )
             Issue.record("expected the unhooked command to be refused")
         } catch let error as CLIApplicationError {
-            #expect(error == .unsupported(route: "trace"))
+            #expect(error == .unsupported(route: "dashboard"))
         } catch {
             Issue.record("unexpected error for the negative control: \(error)")
         }
