@@ -249,6 +249,14 @@ public actor ACPLeaderIPCHost {
     private var ready = true
     private var stopped = false
     private var activated = false
+    private var relaunchAdmissionClosed = false
+    private var inFlightACPRequests = 0
+    private var relaunchDrainTask: Task<Void, Never>?
+    private var relaunchShutdownHandler: (@Sendable () async -> Void)?
+
+    private static let relaunchIdleGraceNanoseconds: UInt64 = 5_000_000_000
+    private static let relaunchFlushGraceNanoseconds: UInt64 = 5_000_000_000
+    private static let relaunchPollNanoseconds: UInt64 = 100_000_000
 
     private struct ClientHandle: Sendable {
         var clientType: String
@@ -273,6 +281,16 @@ public actor ACPLeaderIPCHost {
     }
 
     public func connectedClientCount() -> Int { clients.count }
+
+    public func isStopped() -> Bool { stopped }
+
+    /// The process owner closes its real listener and relay after client
+    /// shutdown has been broadcast; an in-memory host needs no such adapter.
+    public func setRelaunchShutdownHandler(
+        _ handler: @escaping @Sendable () async -> Void
+    ) {
+        relaunchShutdownHandler = handler
+    }
 
     /// Whether any registered client is `headless`.
     ///
@@ -327,6 +345,10 @@ public actor ACPLeaderIPCHost {
 
     public func serve(channel: any WebSocketByteChannel) async {
         await activate()
+        guard !stopped, !relaunchAdmissionClosed else {
+            await channel.close()
+            return
+        }
         let reader = ACPLeaderChannelReader(
             channel: channel,
             maximumMessageSize: configuration.maximumMessageSize
@@ -346,6 +368,11 @@ public actor ACPLeaderIPCHost {
             return
         } catch {
             log("leader: client registration failed: \(error)")
+            await channel.close()
+            return
+        }
+
+        guard !stopped, !relaunchAdmissionClosed else {
             await channel.close()
             return
         }
@@ -391,15 +418,87 @@ public actor ACPLeaderIPCHost {
     }
 
     public func stop() async {
+        await stop(reason: .manual)
+    }
+
+    private func stop(reason: ACPLeaderShutdownReason) async {
         guard !stopped else { return }
         stopped = true
+        relaunchAdmissionClosed = true
+        if reason != .autoUpdate {
+            relaunchDrainTask?.cancel()
+            relaunchDrainTask = nil
+        }
         await runtime.setRosterNotificationSink(nil)
         // `server.rs:1228-1235` — a live workspace exposure drains with the
         // leader, before clients are told to leave.
-        await controlPlane.finalize()
+        if reason == .autoUpdate {
+            await finalizeRelaunchExposure()
+        } else {
+            await controlPlane.finalize()
+        }
         for client in clients.values {
-            await client.writer.send(.shuttingDown(reason: .manual, delayMilliseconds: 0))
+            await client.writer.send(.shuttingDown(reason: reason, delayMilliseconds: 0))
             await client.writer.send(.shutdown)
+        }
+        if reason == .autoUpdate {
+            await relaunchShutdownHandler?()
+        }
+    }
+
+    private func closeRelaunchAdmission() {
+        relaunchAdmissionClosed = true
+    }
+
+    private func armUpdateRelaunch() {
+        guard !stopped, relaunchDrainTask == nil else { return }
+        relaunchDrainTask = Task.detached { [weak self] in
+            guard let self else { return }
+            await self.drainForUpdateRelaunch()
+        }
+    }
+
+    private func drainForUpdateRelaunch() async {
+        let started = DispatchTime.now().uptimeNanoseconds
+        let deadline = started.addingReportingOverflow(Self.relaunchIdleGraceNanoseconds)
+        let latest = deadline.overflow ? UInt64.max : deadline.partialValue
+
+        while inFlightACPRequests > 0 || controlPlane.hasActiveWorkspaceActivity() {
+            if DispatchTime.now().uptimeNanoseconds >= latest {
+                log("leader: update relaunch grace elapsed while activity remained in flight")
+                break
+            }
+            do {
+                try await Task.sleep(nanoseconds: Self.relaunchPollNanoseconds)
+            } catch {
+                return
+            }
+        }
+        guard !Task.isCancelled, !stopped else { return }
+        await stop(reason: .autoUpdate)
+    }
+
+    /// Disconnecting a real hub exposure is meaningful teardown; this
+    /// runtime has no durable-session flush API, so none is fabricated.
+    private func finalizeRelaunchExposure() async {
+        let outcome = AsyncOutcomeGate<Bool>()
+        let drain = Task.detached { [controlPlane] in
+            await controlPlane.finalize()
+            outcome.finish(.success(true))
+        }
+        let deadline = Task.detached {
+            do {
+                try await Task.sleep(nanoseconds: Self.relaunchFlushGraceNanoseconds)
+            } catch {
+                return
+            }
+            outcome.finish(.success(false))
+        }
+        let completed = (try? await outcome.value()) == true
+        deadline.cancel()
+        if !completed {
+            drain.cancel()
+            log("leader: update relaunch exposure drain exceeded its bounded grace")
         }
     }
 
@@ -499,10 +598,16 @@ public actor ACPLeaderIPCHost {
                 // answering inline would stall this client's ACP traffic and
                 // pings behind it. Detached rather than `Task {}` for the same
                 // executor-inheritance reason as `withTimeout` above.
-                Task.detached { [controlPlane, writer] in
+                Task.detached { [weak self, controlPlane, writer] in
                     switch await controlPlane.run(command) {
                     case .success(let payload):
+                        if case .relaunching = payload {
+                            await self?.closeRelaunchAdmission()
+                        }
                         await writer.send(.controlResult(requestID: requestID, payload: payload))
+                        if case .relaunching = payload {
+                            await self?.armUpdateRelaunch()
+                        }
                     case .failure(let code, let message):
                         await writer.send(
                             .controlError(requestID: requestID, code: code, message: message)
@@ -521,6 +626,20 @@ public actor ACPLeaderIPCHost {
             let message = try? ACPMessage(data: data)
         else {
             log("leader: client \(clientID) sent a frame that is not ACP JSON-RPC; dropping")
+            return
+        }
+
+        if relaunchAdmissionClosed,
+           case .request(let requestID, _, _) = message
+        {
+            await deliver(
+                .response(
+                    id: requestID,
+                    result: nil,
+                    error: ACPRuntimeError.requestCancelled.acpError
+                ),
+                to: clientID
+            )
             return
         }
 
@@ -612,6 +731,8 @@ public actor ACPLeaderIPCHost {
             outbound = injected
         }
 
+        inFlightACPRequests += 1
+        defer { inFlightACPRequests -= 1 }
         let replies = await ACPLeaderRequestAuthority.$clientID.withValue(String(clientID)) {
             await runtime.handle(outbound)
         }

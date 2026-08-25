@@ -1184,7 +1184,7 @@ struct ACPLeaderControlPlaneTests {
     /// The commands this build does not implement get a typed refusal with
     /// the request id echoed — while the read-only probes still answer, so
     /// the refusals are scoped, not a blanket "no control plane".
-    @Test("cpu profiling and relaunch are typed refusals, never a hang", .timeLimit(.minutes(1)))
+    @Test("unsupported CPU profiling is a typed refusal while its status remains available", .timeLimit(.minutes(1)))
     func unsupportedCommandsRefused() async throws {
         let host = makeHost()
         let (client, served) = attach(to: host)
@@ -1200,15 +1200,6 @@ struct ACPLeaderControlPlaneTests {
         #expect(profileCode == ACPLeaderControlErrorCode.unsupportedCommand)
         // `cpu_profile.rs:707-709`.
         #expect(profileMessage.contains("not supported in this build"))
-
-        try await sendControl(client, id: "2", command: ["type": "relaunch_for_update", "to_version": "9.9.9"])
-        let relaunchRefusal = try await nextError(client)
-        guard case .controlError("2", let relaunchCode, let relaunchMessage) = relaunchRefusal else {
-            Issue.record("expected a control error, got \(relaunchRefusal)")
-            return
-        }
-        #expect(relaunchCode == ACPLeaderControlErrorCode.unsupportedCommand)
-        #expect(relaunchMessage.contains("restart the leader manually"))
 
         try await sendControl(client, id: "3", command: ["type": "cpu_profile_status"])
         let status = try await nextResult(client)

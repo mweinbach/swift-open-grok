@@ -245,15 +245,15 @@ struct ACPLeaderMessageTests {
     /// The advertisement is pinned field-by-field: `control_v1` and
     /// `workspace_exposure` are claimed because `ACPLeaderControlPlane`
     /// implements them (upstream advertises both unconditionally for the same
-    /// reason — `server.rs:153-160`); the profiler and relaunch stay
-    /// unclaimed because this build has neither.
+    /// reason — `server.rs:153-160`); bounded relaunch is implemented by the
+    /// live IPC host, while the absent profiler stays unclaimed.
     @Test("advertised capabilities claim exactly the implemented control plane")
     func advertisedCapabilities() {
         let supported = ACPLeaderCapabilities.supported
         #expect(supported.controlV1)
         #expect(supported.workspaceExposure)
         #expect(!supported.runtimeCPUProfile)
-        #expect(!supported.relaunchV1)
+        #expect(supported.relaunchV1)
         #expect(supported.profileFormats.isEmpty)
     }
 }
@@ -366,6 +366,8 @@ struct ACPLeaderControlPayloadTests {
             ),
             .cpuProfileStatus(ACPLeaderCpuProfileStatus(active: true, stopping: true, startedAt: "t", svgPath: "/p", frequencyHz: 250)),
             .workspaceStatus(ACPLeaderWorkspaceStatus(state: "paused", hubURL: "wss://h", cwd: "/c", uptimeMs: 1, activeToolCalls: 3, sessions: ["a"], pid: 9)),
+            .relaunching(fromVersion: "1.2.3", toVersion: "2.0.0", graceMilliseconds: 10_000),
+            .relaunchDeclined(reason: "a relaunch is already in progress"),
         ]
         for payload in payloads {
             let frame = try ACPLeaderCodec.encode(payload)
@@ -383,7 +385,7 @@ struct ACPLeaderControlPayloadTests {
         #expect(throws: ACPLeaderProtocolError.self) {
             try ACPLeaderCodec.decode(
                 ACPLeaderControlPayload.self,
-                from: Array(#"{"type":"relaunching","from_version":"1","to_version":"2","grace_ms":0}"#.utf8)
+                from: Array(#"{"type":"future_unimplemented_payload","value":"unsupported"}"#.utf8)
             )
         }
     }

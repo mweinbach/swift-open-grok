@@ -374,6 +374,11 @@ public enum LiveLeaderComposition {
         // rather than the mutable slot the relay decision was built up in.
         let relayRunner = relayClient
 
+        await ipcHandle.setRelaunchShutdownHandler {
+            await listener.stop()
+            await relayHandle.stop()
+        }
+
         return CLIApplicationSession(
             waitForExit: {
                 await withTaskGroup(of: Void.self) { group in
@@ -443,6 +448,7 @@ public enum LiveLeaderComposition {
     /// round-trip is not worth the extra state.
     static func waitForHeadlessClient(on host: ACPLeaderIPCHost) async {
         while !Task.isCancelled {
+            if await host.isStopped() { return }
             if await host.hasHeadlessClient() { return }
             do {
                 try await Task.sleep(nanoseconds: 1_000_000_000)

@@ -194,9 +194,8 @@ public struct ACPLeaderClientCapabilities: Sendable, Hashable, Codable {
 /// (`client.rs:187-240`), so claiming it without implementing the commands
 /// would turn a clean `UnsupportedControl` into a hang. `control_v1` and
 /// `workspace_exposure` are claimed: `get_leader_info` and the workspace
-/// control commands are implemented (`ACPLeaderControlPlane`). CPU profiling
-/// and relaunch-for-update are not, stay unclaimed, and are refused with
-/// typed errors rather than answered.
+/// control commands and bounded update relaunches are implemented by the live
+/// IPC host. CPU profiling is absent and therefore remains unadvertised.
 public struct ACPLeaderCapabilities: Sendable, Hashable, Codable {
     public var controlV1: Bool
     public var runtimeCPUProfile: Bool
@@ -240,15 +239,14 @@ public struct ACPLeaderCapabilities: Sendable, Hashable, Codable {
     /// What this port actually supports. Upstream advertises `control_v1` and
     /// `workspace_exposure` unconditionally because the feature is in the
     /// binary (`server.rs:153-160`); both are set here for the same reason now
-    /// that `ACPLeaderControlPlane` exists. `runtime_cpu_profile` stays false
-    /// — the port has no profiler where upstream compiles one in on unix
-    /// (`cpu_profile.rs:650-655`) — and `relaunch_v1` stays false, which
-    /// upstream clients degrade on gracefully by advising a manual restart
-    /// (`protocol.rs:185-190`). `profile_formats` is empty on both sides
-    /// (`cpu_profile.rs:658-664`).
+    /// that `ACPLeaderControlPlane` exists. `relaunch_v1` is backed by the
+    /// host's bounded, acknowledgement-first shutdown. `runtime_cpu_profile`
+    /// stays false because this port has no profiler; `profile_formats` is
+    /// empty on both sides (`cpu_profile.rs:658-664`).
     public static let supported = ACPLeaderCapabilities(
         controlV1: true,
-        workspaceExposure: true
+        workspaceExposure: true,
+        relaunchV1: true
     )
 }
 
@@ -518,11 +516,17 @@ public enum ACPLeaderControlPayload: Sendable, Hashable {
     case leaderInfo(ACPLeaderInfo)
     case cpuProfileStatus(ACPLeaderCpuProfileStatus)
     case workspaceStatus(ACPLeaderWorkspaceStatus)
+    case relaunching(fromVersion: String, toVersion: String, graceMilliseconds: UInt64)
+    case relaunchDeclined(reason: String)
 }
 
 extension ACPLeaderControlPayload: Codable {
     private enum TypeKeys: String, CodingKey {
         case type
+        case fromVersion = "from_version"
+        case toVersion = "to_version"
+        case graceMilliseconds = "grace_ms"
+        case reason
     }
 
     public init(from decoder: Decoder) throws {
@@ -534,6 +538,14 @@ extension ACPLeaderControlPayload: Codable {
             self = .cpuProfileStatus(try ACPLeaderCpuProfileStatus(from: decoder))
         case "workspace_status":
             self = .workspaceStatus(try ACPLeaderWorkspaceStatus(from: decoder))
+        case "relaunching":
+            self = .relaunching(
+                fromVersion: try container.decode(String.self, forKey: .fromVersion),
+                toVersion: try container.decode(String.self, forKey: .toVersion),
+                graceMilliseconds: try container.decode(UInt64.self, forKey: .graceMilliseconds)
+            )
+        case "relaunch_declined":
+            self = .relaunchDeclined(reason: try container.decode(String.self, forKey: .reason))
         case let other:
             throw ACPLeaderProtocolError.unknownMessageType("control payload `\(other)`")
         }
@@ -550,6 +562,16 @@ extension ACPLeaderControlPayload: Codable {
             try status.encode(to: encoder)
         case .workspaceStatus(let status):
             try status.encode(to: encoder)
+        case .relaunching(let fromVersion, let toVersion, let graceMilliseconds):
+            var container = encoder.container(keyedBy: TypeKeys.self)
+            try container.encode("relaunching", forKey: .type)
+            try container.encode(fromVersion, forKey: .fromVersion)
+            try container.encode(toVersion, forKey: .toVersion)
+            try container.encode(graceMilliseconds, forKey: .graceMilliseconds)
+        case .relaunchDeclined(let reason):
+            var container = encoder.container(keyedBy: TypeKeys.self)
+            try container.encode("relaunch_declined", forKey: .type)
+            try container.encode(reason, forKey: .reason)
         }
     }
 }

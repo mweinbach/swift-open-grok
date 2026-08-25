@@ -21,6 +21,7 @@
 // the same shape upstream produces when its own hub connect fails.
 
 import Foundation
+import OpenGrokVersion
 
 // MARK: - Errors
 
@@ -37,8 +38,7 @@ import Foundation
 public enum ACPLeaderControlErrorCode {
     /// The frame could not be parsed as a control command.
     public static let invalidCommand = 100
-    /// A real command this build does not implement (CPU profiling,
-    /// relaunch-for-update).
+    /// A real command this build does not implement, such as CPU profiling.
     public static let unsupportedCommand = 101
     /// The workspace backend refused or failed; upstream's
     /// `ControlErrorCode::InternalError` side (`server.rs:1000-1006`).
@@ -254,6 +254,8 @@ public enum ACPLeaderControlOutcome: Sendable, Hashable {
 public final class ACPLeaderControlPlane: @unchecked Sendable {
     /// `server.rs:998`.
     public static let productionComputerHubURL = "wss://computer-hub.grok.com/v1/tools"
+    /// Five seconds for in-flight turns, followed by five for real teardown.
+    public static let relaunchGraceMilliseconds: UInt64 = 10_000
 
     private let metadata: ACPLeaderControlMetadata
     private let defaultHubURL: String?
@@ -275,6 +277,8 @@ public final class ACPLeaderControlPlane: @unchecked Sendable {
     private var exposure: Exposure?
     private let mutationLock = NSLock()
     private var mutationTail: Task<Void, Never>?
+    private let relaunchLock = NSLock()
+    private var relaunching = false
 
     public init(
         metadata: ACPLeaderControlMetadata = ACPLeaderControlMetadata(),
@@ -319,14 +323,7 @@ public final class ACPLeaderControlPlane: @unchecked Sendable {
                 message: "runtime CPU profiling is not supported in this build"
             )
         case .relaunchForUpdate(let version):
-            // Advertised as `relaunch_v1: false`, so an upstream client never
-            // sends this (`protocol.rs:185-190`); a hand-rolled one gets a
-            // refusal that spells out the manual path.
-            return .failure(
-                code: ACPLeaderControlErrorCode.unsupportedCommand,
-                message: "relaunch-for-update to \(version) is not implemented in this build; "
-                    + "restart the leader manually to pick up the new version"
-            )
+            return .success(decideRelaunch(toVersion: version))
         case .workspaceStatus:
             // Read-only and never serialized behind the mutations
             // (`server.rs:1220-1226`).
@@ -350,6 +347,42 @@ public final class ACPLeaderControlPlane: @unchecked Sendable {
                 await old.connection.disconnect()
             }
         }
+    }
+
+    /// Workspace tool calls are the live activity signal this composition owns;
+    /// connected session identifiers alone do not imply an in-flight turn.
+    func hasActiveWorkspaceActivity() -> Bool {
+        (currentExposure()?.connection.snapshot().activeToolCalls ?? 0) > 0
+    }
+
+    /// `server.rs:1394-1432`: the decision is synchronous and idempotent so
+    /// its acknowledgement can reach the writer before shutdown is armed.
+    private func decideRelaunch(toVersion target: String) -> ACPLeaderControlPayload {
+        let current = metadata.binaryVersion
+        let exactCurrent = current == current.trimmingCharacters(in: .whitespacesAndNewlines)
+        let exactTarget = target == target.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard exactCurrent,
+              exactTarget,
+              let currentVersion = try? SemVerVersion.parse(current),
+              let targetVersion = try? SemVerVersion.parse(target),
+              currentVersion < targetVersion
+        else {
+            return .relaunchDeclined(
+                reason: "leader version \(current) is not older than \(target)"
+            )
+        }
+
+        relaunchLock.lock()
+        defer { relaunchLock.unlock() }
+        guard !relaunching else {
+            return .relaunchDeclined(reason: "a relaunch is already in progress")
+        }
+        relaunching = true
+        return .relaunching(
+            fromVersion: current,
+            toVersion: target,
+            graceMilliseconds: Self.relaunchGraceMilliseconds
+        )
     }
 
     // MARK: Payloads
