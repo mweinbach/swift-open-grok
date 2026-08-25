@@ -732,6 +732,9 @@ public final class SamplingClient: @unchecked Sendable {
         if request.serviceTier == nil {
             request.serviceTier = defaults.serviceTier
         }
+        if defaults.provider == .codex {
+            request.prepareImagesForCodex()
+        }
     }
 
     private func extractModelMetadata(from headers: [String: String]) -> ResponseModelMetadata? {
