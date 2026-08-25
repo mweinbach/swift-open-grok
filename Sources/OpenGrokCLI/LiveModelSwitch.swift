@@ -97,6 +97,8 @@ struct LiveModelCatalogResolver: Sendable {
     let environment: [String: String]
     let openGrokHome: URL
     let sessionID: String
+    let clientIdentifier: String?
+    let samplingLog: LiveSamplingLog?
     /// Project root for the `[endpoints]` config lookup. A mid-session switch
     /// has to read the same config chain the cold start did, or the two
     /// disagree about the endpoint for the same model.
@@ -126,6 +128,8 @@ struct LiveModelCatalogResolver: Sendable {
         openGrokHome: URL,
         sessionID: String,
         workingDirectory: URL,
+        clientIdentifier: String? = nil,
+        samplingLog: LiveSamplingLog? = nil,
         doomLoopRecovery: DoomLoopRecoveryPolicy? = nil,
         catalogSource: @escaping @Sendable () -> OrderedModelMap = {
             resolveModelCatalog(input: .default)
@@ -158,6 +162,8 @@ struct LiveModelCatalogResolver: Sendable {
         self.environment = environment
         self.openGrokHome = openGrokHome
         self.sessionID = sessionID
+        self.clientIdentifier = clientIdentifier
+        self.samplingLog = samplingLog
         self.workingDirectory = workingDirectory
         self.doomLoopRecovery = doomLoopRecovery
         self.catalogSource = catalogSource
@@ -360,6 +366,8 @@ struct LiveModelCatalogResolver: Sendable {
                 queryParams: entry.queryParams,
                 envHTTPHeaders: entry.envHTTPHeaders,
                 environment: environment,
+                clientIdentifier: clientIdentifier,
+                samplingLog: samplingLog,
                 tuning: tuning,
                 doomLoopRecovery: doomLoopRecovery,
                 bearerResolver: namedAuthResolver.map(NamedAuthBearerResolver.init),
@@ -606,6 +614,8 @@ actor LiveModelSwitchCoordinator {
             },
             envHTTPHeaders: [:],
             environment: previous.environment,
+            clientIdentifier: previous.clientIdentifier,
+            samplingLog: previous.samplingLog,
             tuning: previous.tuning,
             doomLoopRecovery: previous.doomLoopRecovery,
             codexPermissions: previous.codexPermissions,
@@ -992,6 +1002,8 @@ actor LiveModelSwitchCoordinator {
             queryParams: active.queryParams,
             envHTTPHeaders: active.envHTTPHeaders,
             environment: active.environment,
+            clientIdentifier: active.clientIdentifier,
+            samplingLog: active.samplingLog,
             tuning: tuning,
             doomLoopRecovery: active.doomLoopRecovery,
             bearerResolver: active.bearerResolver,

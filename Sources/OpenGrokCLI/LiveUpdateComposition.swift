@@ -121,11 +121,17 @@ public enum LiveLaunchAutoUpdate {
 
         let current = OpenGrokCLIVersion.installed(environment: environment)
         let policy: VersionPolicy
+        let installer: UpdateInstaller
         do {
             policy = try LiveUpdateComposition.resolveVersionPolicy(environment: environment)
+            installer = try LiveInstallerLaunchConfiguration.effectiveInstaller(environment: environment)
         } catch {
             return
         }
+        // The only production installation service verifies Open Grok GitHub
+        // release assets. npm, internal, and unknown backends must never be
+        // silently redirected into that different installer/provider lane.
+        guard installer == .openGrok else { return }
         let channel = UpdateChannel.stable
 
         let release: ReleaseCandidate
@@ -139,7 +145,7 @@ public enum LiveLaunchAutoUpdate {
             current: current,
             target: release.version,
             channel: channel,
-            installer: .openGrok,
+            installer: installer,
             policy: policy
         )
         guard decision.shouldUpdate else {
@@ -256,11 +262,13 @@ public enum LiveUpdateComposition {
 
         let current = OpenGrokCLIVersion.installed(environment: environment)
         let policy = try resolveVersionPolicy(environment: environment)
+        let installer = try LiveInstallerLaunchConfiguration.effectiveInstaller(environment: environment)
 
         if check {
             let status = await checkStatus(
                 current: current,
                 policy: policy,
+                installer: installer,
                 environment: environment,
                 services: services
             )
@@ -276,6 +284,7 @@ public enum LiveUpdateComposition {
             pinnedVersion: pinnedVersion,
             forceReinstall: forceReinstall,
             policy: policy,
+            installer: installer,
             environment: environment,
             streams: streams,
             services: services
@@ -287,6 +296,7 @@ public enum LiveUpdateComposition {
     static func checkStatus(
         current: String,
         policy: VersionPolicy,
+        installer: UpdateInstaller,
         environment: [String: String],
         services: LiveUpdateServices
     ) async -> UpdateStatus {
@@ -296,7 +306,7 @@ public enum LiveUpdateComposition {
                 current: current,
                 target: release.version,
                 channel: .stable,
-                installer: .openGrok,
+                installer: installer,
                 policy: policy
             )
             return UpdateStatus(decision: decision, autoUpdate: nil)
@@ -305,7 +315,7 @@ public enum LiveUpdateComposition {
                 currentVersion: current,
                 latestVersion: nil,
                 updateAvailable: false,
-                installer: UpdateInstaller.openGrok.rawValue,
+                installer: installer.rawValue,
                 channel: UpdateChannel.stable.rawValue,
                 autoUpdate: nil,
                 error: describe(error)
@@ -354,6 +364,7 @@ public enum LiveUpdateComposition {
         pinnedVersion: String?,
         forceReinstall: Bool,
         policy: VersionPolicy,
+        installer: UpdateInstaller,
         environment: [String: String],
         streams: CLIStreams,
         services: LiveUpdateServices
@@ -392,7 +403,7 @@ public enum LiveUpdateComposition {
                 current: current,
                 target: release.version,
                 channel: .stable,
-                installer: .openGrok,
+                installer: installer,
                 policy: policy
             )
             guard decision.shouldUpdate || forceReinstall else {
@@ -413,6 +424,12 @@ public enum LiveUpdateComposition {
             throw CLIApplicationError.failed(
                 "release \(release.tagName) publishes \(release.version), not \(target); "
                     + "only the latest release is installable"
+            )
+        }
+        guard installer == .openGrok else {
+            throw CLIApplicationError.failed(
+                "installer '\(installer.rawValue)' has no verified Open Grok release backend; "
+                    + "update through its own approved installer"
             )
         }
         let asset: ReleaseAsset

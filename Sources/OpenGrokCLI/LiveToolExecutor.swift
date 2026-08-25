@@ -400,6 +400,33 @@ struct LiveToolExecutor: Sendable {
     /// call and the visible pane can never point at different lists.
     let todoStore: LiveTodoStore
     let telemetryStatus: LiveTelemetryStatus
+
+    private static func resolvedHunkTrackingMode(
+        commandLine: String?,
+        environment: [String: String],
+        trustedConfiguration: TOMLValue
+    ) -> TrackingMode? {
+        let configured: String?
+        if case .string(let value)? = trustedConfiguration[path: ["ui", "hunk_tracker_mode"]] {
+            configured = value
+        } else {
+            configured = nil
+        }
+
+        let selected = [commandLine, environment["GROK_HUNK_TRACKER"], configured]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+
+        switch selected?.lowercased() {
+        case "all_dirty":
+            return .allDirty
+        case "off", "disabled":
+            return nil
+        default:
+            return .agentOnly
+        }
+    }
+
     init(
         processBackend: any ShellProcessBackend,
         sessionID: String,
@@ -493,7 +520,8 @@ struct LiveToolExecutor: Sendable {
         // The monitor runtime, same defaulting rule: only the interactive
         // TUI foundation has an event-delivery seam, so only it passes one.
         monitorHost: LiveMonitorHost? = nil,
-        startupTrustCheckpoint: (@Sendable (LiveFolderTrustStartupCheckpoint) async -> Void)? = nil
+        startupTrustCheckpoint: (@Sendable (LiveFolderTrustStartupCheckpoint) async -> Void)? = nil,
+        hunkTrackerMode: String? = nil
     ) async throws {
         self.subagentHost = subagentHost
         self.sessionEnvironment = environment
@@ -570,16 +598,26 @@ struct LiveToolExecutor: Sendable {
         let sandboxPredicate: @Sendable () -> Bool = sandboxAutoAllowBash ?? {
             sandboxIsEnforced && shouldAutoAllowBash()
         }
-        // One live hunk tracker per session. Attribution is recorded inside
-        // `SessionFS.writeText` / `ApplyPatchTool` *only after* a successful
-        // write (gate order step 7), so a denied or failed edit records
-        // nothing — wiring the actor here is what makes that reachability
-        // real rather than a tested library no live session constructs.
-        let hunkTracker = HunkTrackerActor(
-            sessionId: sessionID,
-            workingDir: standardizedWorkingDirectory.path,
-            defaultAgentId: "main"
+        // Folder trust has already removed unauthorized project configuration
+        // from this document. Never reload a repository-owned config directly
+        // here: it could otherwise suppress or broaden attribution before the
+        // workspace owner has decided whether to trust the checkout.
+        let trackingMode = Self.resolvedHunkTrackingMode(
+            commandLine: hunkTrackerMode,
+            environment: environment,
+            trustedConfiguration: security.document
         )
+        // Attribution remains downstream of a successful, authorized write.
+        // An explicit off/disabled mode removes the actor instead of leaving a
+        // live observer behind a setting that claims tracking is disabled.
+        let hunkTracker = trackingMode.map {
+            HunkTrackerActor(
+                sessionId: sessionID,
+                workingDir: standardizedWorkingDirectory.path,
+                mode: $0,
+                defaultAgentId: "main"
+            )
+        }
         // One live plan tracker per session, rooted at the workspace. The
         // plan gate (PermissionPipeline step 1) and plan-file auto-approval
         // (step 3) consult this; without a live tracker the gate could never

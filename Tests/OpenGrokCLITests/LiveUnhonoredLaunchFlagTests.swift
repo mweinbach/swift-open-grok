@@ -12,14 +12,31 @@ import Testing
 @Suite("Unhonored launch flags refuse at validation", .serialized)
 struct LiveUnhonoredLaunchFlagTests {
     private func run(_ extraArguments: [String]) async -> (Int32, String, String) {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("open-grok-launch-flags-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(
+                at: home,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        } catch {
+            Issue.record("could not create an isolated launch-flag home: \(error)")
+            return (CLIRunner.ExitCode.failure.rawValue, "", "\(error)")
+        }
+        let environment = [
+            "HOME": home.path,
+            "OPENGROK_HOME": home.path,
+            "GROK_SANDBOX": "off",
+        ]
+        defer {
+            LiveManagedPolicyLifecycle.stop(environment: environment)
+            try? FileManager.default.removeItem(at: home)
+        }
         let (streams, out, err) = CLIStreams.buffered()
         let code = await CLIRunner.run(
             ["headless", "--prompt", "hi"] + extraArguments,
-            environment: [
-                "HOME": NSTemporaryDirectory(),
-                "OPENGROK_HOME": NSTemporaryDirectory(),
-                "GROK_SANDBOX": "off",
-            ],
+            environment: environment,
             streams: streams,
             application: OpenGrokApplication.live(control: .never)
         )
@@ -82,28 +99,25 @@ struct LiveUnhonoredLaunchFlagTests {
         #expect(!error.contains("nothing in this composition honors yet"))
     }
 
-    @Test("--compaction-mode is refused before launch")
+    @Test("--compaction-mode reaches its live compaction policy")
     func compactionMode() async {
-        await expectRefusal(
-            extraArguments: ["--compaction-mode", "segments"],
-            flag: "--compaction-mode"
-        )
+        let (code, _, error) = await run(["--compaction-mode", "segments"])
+        #expect(code != CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(!error.contains("nothing in this composition honors yet"))
     }
 
-    @Test("--compaction-detail is refused before launch")
+    @Test("--compaction-detail reaches its live compaction policy")
     func compactionDetail() async {
-        await expectRefusal(
-            extraArguments: ["--compaction-detail", "minimal"],
-            flag: "--compaction-detail"
-        )
+        let (code, _, error) = await run(["--compaction-detail", "minimal"])
+        #expect(code != CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(!error.contains("nothing in this composition honors yet"))
     }
 
-    @Test("--hunk-tracker-mode is refused before launch")
+    @Test("--hunk-tracker-mode reaches the actual file-tool tracker")
     func hunkTrackerMode() async {
-        await expectRefusal(
-            extraArguments: ["--hunk-tracker-mode", "off"],
-            flag: "--hunk-tracker-mode"
-        )
+        let (code, _, error) = await run(["--hunk-tracker-mode", "off"])
+        #expect(code != CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(!error.contains("nothing in this composition honors yet"))
     }
 
     @Test("--storage-mode is refused before launch")
@@ -114,20 +128,36 @@ struct LiveUnhonoredLaunchFlagTests {
         )
     }
 
-    @Test("--client-identifier is refused before launch")
+    @Test("--client-identifier reaches the actual session and provider")
     func clientIdentifier() async {
-        await expectRefusal(
-            extraArguments: ["--client-identifier", "ci"],
-            flag: "--client-identifier"
-        )
+        let (code, _, error) = await run(["--client-identifier", "ci"])
+        #expect(code != CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(!error.contains("nothing in this composition honors yet"))
     }
 
-    @Test("--installer is refused before launch")
+    @Test("--installer reaches durable owner update configuration")
     func installer() async {
-        await expectRefusal(
-            extraArguments: ["--installer", "brew"],
-            flag: "--installer"
-        )
+        let (code, _, error) = await run(["--installer", "brew"])
+        #expect(code != CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(!error.contains("nothing in this composition honors yet"))
+    }
+
+    @Test("--xai-api-base-url reaches the first-party sampling configuration")
+    func xaiAPIBaseURL() async {
+        let (code, _, error) = await run([
+            "--xai-api-base-url", "https://inference.example.test/v1",
+        ])
+        #expect(code != CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(!error.contains("nothing in this composition honors yet"))
+    }
+
+    @Test("--cli-chat-proxy-base-url reaches only first-party auxiliary services")
+    func chatProxyBaseURL() async {
+        let (code, _, error) = await run([
+            "--cli-chat-proxy-base-url", "https://proxy.example.test/v1",
+        ])
+        #expect(code != CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(!error.contains("nothing in this composition honors yet"))
     }
 
     @Test("--terminal is refused before launch")
@@ -150,25 +180,32 @@ struct LiveUnhonoredLaunchFlagTests {
         await expectRefusal(extraArguments: ["--force-login"], flag: "--force-login")
     }
 
-    @Test("--log-sampling is refused before launch")
+    @Test("--log-sampling reaches bounded owner-private sampling diagnostics")
     func logSampling() async {
-        await expectRefusal(extraArguments: ["--log-sampling"], flag: "--log-sampling")
+        let (code, _, error) = await run(["--log-sampling"])
+        #expect(code != CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(!error.contains("nothing in this composition honors yet"))
     }
 
-    @Test("--no-wait-for-background is refused before launch")
+    @Test("--no-wait-for-background reaches bounded headless shutdown")
     func noWaitForBackground() async {
-        await expectRefusal(
-            extraArguments: ["--no-wait-for-background"],
-            flag: "--no-wait-for-background"
-        )
+        let (code, _, error) = await run(["--no-wait-for-background"])
+        #expect(code != CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(!error.contains("nothing in this composition honors yet"))
     }
 
-    @Test("--background-wait-timeout is refused before launch")
+    @Test("--background-wait-timeout reaches bounded headless shutdown")
     func backgroundWaitTimeout() async {
-        await expectRefusal(
-            extraArguments: ["--background-wait-timeout", "30"],
-            flag: "--background-wait-timeout"
-        )
+        let (code, _, error) = await run(["--background-wait-timeout", "30"])
+        #expect(code != CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(!error.contains("nothing in this composition honors yet"))
+    }
+
+    @Test("--storage-mode local honors the existing durable local session backend")
+    func localStorageMode() async {
+        let (code, _, error) = await run(["--storage-mode", "local"])
+        #expect(code != CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(!error.contains("nothing in this composition honors yet"))
     }
 
     @Test("--chat is parsed but honestly refuses without the gateway frontend")

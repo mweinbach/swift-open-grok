@@ -26,6 +26,8 @@ import Foundation
 import OpenGrokAuth
 import OpenGrokChatState
 import OpenGrokCompaction
+import OpenGrokConfig
+import OpenGrokFileUtils
 import OpenGrokHTTP
 import OpenGrokModels
 import OpenGrokSampler
@@ -33,6 +35,273 @@ import OpenGrokSamplingTypes
 import OpenGrokSessionPersistence
 import OpenGrokShellSessionSupport
 import OpenGrokTokenEstimation
+
+/// Session-frozen compaction artifact policy. Rust writes CLI values into the
+/// process environment before applying env > config > remote precedence; the
+/// injected launch environment here must remain isolated between sessions.
+struct LiveCompactionLaunchPolicy: Sendable, Equatable {
+    let mode: CompactionMode
+
+    init(mode: CompactionMode = .summary) {
+        self.mode = mode
+    }
+
+    static func resolve(
+        options: CLIExecutionOptions,
+        environment: [String: String],
+        trustedConfiguration: TOMLValue,
+        remoteSettings: AllowlistedRemoteSettings? = nil
+    ) -> Self {
+        let mode = firstRecognizedMode(in: [
+            options.advanced.compactionMode,
+            environment["GROK_COMPACTION_MODE"],
+            trustedConfiguration[path: ["features", "compaction_mode"]]?.stringValue,
+            remoteSettings?.compactionMode,
+        ])
+        let detail = firstRecognizedDetail(in: [
+            options.advanced.compactionDetail,
+            environment["GROK_COMPACTION_DETAIL"],
+            trustedConfiguration[path: ["features", "compaction_detail"]]?.stringValue,
+            remoteSettings?.compactionDetail,
+        ])
+        return Self(mode: mode.withSegmentDetail(detail))
+    }
+
+    private static func firstRecognizedMode(in candidates: [String?]) -> CompactionMode {
+        for case let candidate? in candidates {
+            if let mode = CompactionMode.parse(
+                candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            ) {
+                return mode
+            }
+        }
+        return .summary
+    }
+
+    private static func firstRecognizedDetail(in candidates: [String?]) -> CompactionDetail {
+        for case let candidate? in candidates {
+            if let detail = CompactionDetail.parse(
+                candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            ) {
+                return detail
+            }
+        }
+        return .verbose
+    }
+}
+
+/// Canonical, owner-private segment storage. Numbering is derived from disk so
+/// a resumed session never overwrites artifacts produced by its previous host.
+struct LiveCompactionArtifactStore: Sendable {
+    let openGrokHome: URL
+    let sessionID: String
+    let workingDirectory: String
+
+    private static let keywordStopwords: Set<String> = [
+        "section", "summary", "current", "work", "errors", "analysis",
+        "primary", "request", "intent", "technical", "concepts", "pending",
+        "problem", "solving", "include", "outline", "describe", "specific",
+        "messages", "feedback", "snippet", "snippets", "session", "explicit",
+        "thorough", "language", "important", "convention",
+    ]
+
+    var sessionDirectory: URL {
+        get throws {
+            try SessionDocumentStore(grokHome: openGrokHome).sessionDirectory(
+                sessionID: sessionID,
+                cwd: workingDirectory
+            )
+        }
+    }
+
+    func transcriptHint(for mode: CompactionMode) throws -> String? {
+        let location: URL
+        switch mode {
+        case .summary:
+            return nil
+        case .transcript:
+            location = try sessionDirectory.appendingPathComponent(
+                SessionDocumentStore.updatesFileName
+            )
+        case .segments:
+            location = try sessionDirectory.appendingPathComponent(
+                CompactionTranscript.COMPACTION_DIR,
+                isDirectory: true
+            )
+        }
+        return mode.transcriptHint(location: location.path)
+    }
+
+    @discardableResult
+    func persistSegment(
+        items: [ConversationItem],
+        summary: String,
+        detail: CompactionDetail,
+        timestamp: String
+    ) throws -> URL {
+        let sessionDirectory = try sessionDirectory
+        try RelocationFS.requireDirectory(sessionDirectory)
+        try RelocationFS.requireRegularFile(
+            sessionDirectory.appendingPathComponent(SessionDocumentStore.summaryFileName)
+        )
+
+        let directory = sessionDirectory.appendingPathComponent(
+            CompactionTranscript.COMPACTION_DIR,
+            isDirectory: true
+        )
+        if FileManager.default.fileExists(atPath: directory.path) {
+            try RelocationFS.requireDirectory(directory)
+        } else {
+            try RelocationFS.createDirectoryDurable(directory, stateRoot: openGrokHome)
+            try RelocationFS.requireDirectory(directory)
+        }
+
+        let lock = try AdvisoryFileLock.acquire(
+            at: directory.appendingPathComponent(".segments.lock")
+        )
+        defer { lock.release() }
+
+        let index = try nextSegmentIndex(in: directory)
+        let safeItems = Self.prepareSegmentItems(items)
+        let markdown = renderSegmentMD(
+            items: safeItems,
+            summary: formatCompactSummary(summary),
+            index: index,
+            detail: detail,
+            timestamp: timestamp
+        )
+        let segmentURL = directory.appendingPathComponent(
+            CompactionTranscript.segmentFilename(index)
+        )
+        try RelocationFS.writeAtomicDurable(
+            path: segmentURL,
+            data: Data(markdown.utf8),
+            stateRoot: openGrokHome
+        )
+
+        let indexURL = directory.appendingPathComponent(CompactionTranscript.INDEX_FILE)
+        var indexData: Data
+        if FileManager.default.fileExists(atPath: indexURL.path) {
+            try RelocationFS.requireRegularFile(indexURL)
+            indexData = try Data(contentsOf: indexURL)
+        } else {
+            indexData = Data(CompactionTranscript.INDEX_HEADER.utf8)
+        }
+        if indexData.last != 0x0A {
+            indexData.append(0x0A)
+        }
+        indexData.append(contentsOf: CompactionTranscript.renderIndexRow(
+            index: index,
+            turnCount: safeItems.count,
+            approxBytes: markdown.utf8.count,
+            keywords: Self.keywords(in: summary)
+        ).utf8)
+        try RelocationFS.writeAtomicDurable(
+            path: indexURL,
+            data: indexData,
+            stateRoot: openGrokHome
+        )
+        return segmentURL
+    }
+
+    static func prepareSegmentItems(_ items: [ConversationItem]) -> [ConversationItem] {
+        items.compactMap { item in
+            switch item {
+            case .reasoning:
+                return nil
+            case .user(var user):
+                user.content = user.content.map { part in
+                    if case .image = part {
+                        return .text(text: "[image]")
+                    }
+                    return part
+                }
+                return .user(user)
+            case .toolResult(var result):
+                if !result.images.isEmpty {
+                    let markers = result.images.map { _ in "[image]" }.joined(separator: "\n")
+                    result.content += result.content.isEmpty ? markers : "\n\(markers)"
+                    result.images = []
+                }
+                result.orderedContent = result.orderedContent.map { part in
+                    if case .image = part {
+                        return .text(text: "[image]")
+                    }
+                    return part
+                }
+                return .toolResult(result)
+            case .customToolOutput(var output):
+                output.content = output.content.map { part in
+                    if case .image = part {
+                        return .text(text: "[image]")
+                    }
+                    return part
+                }
+                return .customToolOutput(output)
+            case .system, .assistant, .backendToolCall:
+                return item
+            }
+        }
+    }
+
+    static func keywords(in summary: String) -> [String] {
+        guard let sectionExpression = try? NSRegularExpression(
+            pattern: "(?m)^#{0,6}\\s*8\\.\\s+Current Work"
+        ), let headerExpression = try? NSRegularExpression(
+            pattern: "(?m)^#{0,6}\\s*\\d+\\.\\s+[A-Z]"
+        ), let keywordExpression = try? NSRegularExpression(
+            pattern: "[A-Z][A-Za-z0-9_]{3,}|[a-z][a-z0-9_]{5,}"
+        ) else {
+            return []
+        }
+
+        let fullRange = NSRange(summary.startIndex..<summary.endIndex, in: summary)
+        var searchRange = fullRange
+        if let section = sectionExpression.firstMatch(in: summary, range: fullRange) {
+            let sectionEnd = NSMaxRange(section.range)
+            let trailingRange = NSRange(
+                location: sectionEnd,
+                length: fullRange.length - sectionEnd
+            )
+            let end = headerExpression.firstMatch(in: summary, range: trailingRange)?
+                .range.location ?? fullRange.length
+            searchRange = NSRange(location: section.range.location, length: end - section.range.location)
+        }
+
+        var keywords: [String] = []
+        var seen: Set<String> = []
+        for match in keywordExpression.matches(in: summary, range: searchRange) {
+            guard let range = Range(match.range, in: summary) else { continue }
+            let keyword = String(summary[range])
+            guard !keywordStopwords.contains(keyword.lowercased()),
+                  seen.insert(keyword).inserted
+            else { continue }
+            keywords.append(keyword)
+            if keywords.count == 8 { break }
+        }
+        return keywords
+    }
+
+    private func nextSegmentIndex(in directory: URL) throws -> UInt64 {
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]
+        )
+        var next: UInt64 = 0
+        for entry in entries {
+            guard let index = CompactionTranscript.parseSegmentIndex(entry.lastPathComponent) else {
+                continue
+            }
+            try RelocationFS.requireRegularFile(entry)
+            guard index < UInt64.max else {
+                throw CLIApplicationError.failed("compaction segment index exhausted")
+            }
+            next = max(next, index + 1)
+        }
+        return next
+    }
+}
 
 /// Adapts the live sampler to the compaction module's sampler protocol.
 ///
@@ -160,6 +429,8 @@ func liveCredentialGuardedCompactionConfiguration(
         extraHeaders: configuration.extraHeaders,
         queryParams: configuration.queryParams,
         environment: configuration.environment,
+        clientIdentifier: configuration.clientIdentifier,
+        samplingLog: configuration.samplingLog,
         tuning: configuration.tuning,
         doomLoopRecovery: configuration.doomLoopRecovery,
         codexPermissions: configuration.codexPermissions,
@@ -274,6 +545,7 @@ actor LiveCompactionCoordinator {
     private let modelSwitch: LiveModelSwitchCoordinator
     private var sessionID: String
     private let openGrokHome: URL
+    private let launchPolicy: LiveCompactionLaunchPolicy
     private let toolExecutor: LiveToolExecutor?
     /// Injection seam: production builds an HTTP transport from the live
     /// credential; tests supply a scripted one.
@@ -311,6 +583,7 @@ actor LiveCompactionCoordinator {
         modelSwitch: LiveModelSwitchCoordinator,
         sessionID: String,
         openGrokHome: URL,
+        launchPolicy: LiveCompactionLaunchPolicy = LiveCompactionLaunchPolicy(),
         toolExecutor: LiveToolExecutor? = nil,
         codexRemoteV2Enabled: Bool = true,
         twoPassCompactionEnabled: Bool = false,
@@ -369,6 +642,7 @@ actor LiveCompactionCoordinator {
         self.modelSwitch = modelSwitch
         self.sessionID = sessionID
         self.openGrokHome = openGrokHome
+        self.launchPolicy = launchPolicy
         self.toolExecutor = toolExecutor
         self.codexRemoteV2Enabled = codexRemoteV2Enabled
         self.twoPassCompactionEnabled = twoPassCompactionEnabled
@@ -543,7 +817,7 @@ actor LiveCompactionCoordinator {
                 ))
                 let sanitized = sanitizeCompactedHistory(replacement).items
                 let tokensAfter = sanitized.map(estimateItemTokens).reduce(0, &+)
-                let report = CompactionReport(
+                var report = CompactionReport(
                     kind: .local,
                     itemsBefore: items.count,
                     itemsAfter: sanitized.count,
@@ -563,18 +837,23 @@ actor LiveCompactionCoordinator {
                     autoCompactSuppressed = true
                     return .unableToCompact(reason: "history changed during compaction")
                 }
+                let persistedReplacement: [ConversationItem]
                 do {
-                    try await recordCompactionCheckpoint(
+                    persistedReplacement = try await recordCompactionCheckpoint(
                         preCompactionItems: items,
-                        replacement: sanitized
+                        replacement: sanitized,
+                        kind: report.kind,
+                        summary: summaryText
                     )
                 } catch {
                     autoCompactSuppressed = true
                     return .unableToCompact(reason: "could not persist compaction checkpoint: \(error)")
                 }
+                report.itemsAfter = persistedReplacement.count
+                report.tokensAfter = persistedReplacement.map(estimateItemTokens).reduce(0, &+)
                 compactionCount &+= 1
                 lastReport = report
-                return .compacted(items: sanitized, report: report)
+                return .compacted(items: persistedReplacement, report: report)
             }
         }
 
@@ -586,7 +865,7 @@ actor LiveCompactionCoordinator {
             autoCompactSuppressed = true
             return .unableToCompact(reason: reason)
         case .compacted(let compactedItems, let compactedReport):
-            let replacement = await addingLiveStateReminder(to: compactedItems, source: items)
+            var replacement = await addingLiveStateReminder(to: compactedItems, source: items)
             var report = compactedReport
             report.itemsAfter = replacement.count
             report.tokensAfter = replacement.map(estimateItemTokens).reduce(0, &+)
@@ -603,14 +882,17 @@ actor LiveCompactionCoordinator {
                 return .unableToCompact(reason: "history changed during compaction")
             }
             do {
-                try await recordCompactionCheckpoint(
+                replacement = try await recordCompactionCheckpoint(
                     preCompactionItems: items,
-                    replacement: replacement
+                    replacement: replacement,
+                    kind: report.kind
                 )
             } catch {
                 autoCompactSuppressed = true
                 return .unableToCompact(reason: "could not persist compaction checkpoint: \(error)")
             }
+            report.itemsAfter = replacement.count
+            report.tokensAfter = replacement.map(estimateItemTokens).reduce(0, &+)
             compactionCount &+= 1
             lastReport = report
             return .compacted(items: replacement, report: report)
@@ -662,7 +944,7 @@ actor LiveCompactionCoordinator {
                 ))
                 let sanitized = sanitizeCompactedHistory(replacement).items
                 let tokensAfter = sanitized.map(estimateItemTokens).reduce(0, &+)
-                let report = CompactionReport(
+                var report = CompactionReport(
                     kind: .local,
                     itemsBefore: items.count,
                     itemsAfter: sanitized.count,
@@ -682,18 +964,23 @@ actor LiveCompactionCoordinator {
                 ) == .applied else {
                     return .unableToCompact(reason: "the conversation changed during compaction")
                 }
+                let persistedReplacement: [ConversationItem]
                 do {
-                    try await recordCompactionCheckpoint(
+                    persistedReplacement = try await recordCompactionCheckpoint(
                         preCompactionItems: items,
-                        replacement: sanitized
+                        replacement: sanitized,
+                        kind: report.kind,
+                        summary: summaryText
                     )
-                    try await history.commit(sessionID: sessionID, items: sanitized)
+                    try await history.commit(sessionID: sessionID, items: persistedReplacement)
                 } catch {
                     return .unableToCompact(reason: String(describing: error))
                 }
+                report.itemsAfter = persistedReplacement.count
+                report.tokensAfter = persistedReplacement.map(estimateItemTokens).reduce(0, &+)
                 compactionCount &+= 1
                 lastReport = report
-                return .compacted(items: sanitized, report: report)
+                return .compacted(items: persistedReplacement, report: report)
             }
         }
 
@@ -709,7 +996,7 @@ actor LiveCompactionCoordinator {
         case .unableToCompact(let reason):
             return .unableToCompact(reason: reason)
         case .compacted(let compactedItems, let compactedReport):
-            let replacement = await addingLiveStateReminder(to: compactedItems, source: items)
+            var replacement = await addingLiveStateReminder(to: compactedItems, source: items)
             var report = compactedReport
             report.itemsAfter = replacement.count
             report.tokensAfter = replacement.map(estimateItemTokens).reduce(0, &+)
@@ -722,14 +1009,17 @@ actor LiveCompactionCoordinator {
                 return .unableToCompact(reason: "the conversation changed during compaction")
             }
             do {
-                try await recordCompactionCheckpoint(
+                replacement = try await recordCompactionCheckpoint(
                     preCompactionItems: items,
-                    replacement: replacement
+                    replacement: replacement,
+                    kind: report.kind
                 )
                 try await history.commit(sessionID: sessionID, items: replacement)
             } catch {
                 return .unableToCompact(reason: String(describing: error))
             }
+            report.itemsAfter = replacement.count
+            report.tokensAfter = replacement.map(estimateItemTokens).reduce(0, &+)
             compactionCount &+= 1
             lastReport = report
             return .compacted(items: replacement, report: report)
@@ -773,8 +1063,10 @@ actor LiveCompactionCoordinator {
 
     private func recordCompactionCheckpoint(
         preCompactionItems: [ConversationItem],
-        replacement: [ConversationItem]
-    ) async throws {
+        replacement: [ConversationItem],
+        kind: CompactionKind,
+        summary: String? = nil
+    ) async throws -> [ConversationItem] {
         let originalUserInfo: String? = {
             if preCompactionItems.count > 1, case .user = preCompactionItems[1] {
                 return preCompactionItems[1].textContent()
@@ -800,12 +1092,51 @@ actor LiveCompactionCoordinator {
             cwd = await history.snapshot().workingDirectory
         }
 
-        let checkpointID = UUID().uuidString.lowercased()
         let createdAt = ISO8601DateFormatter().string(from: Date())
+        let artifactStore = LiveCompactionArtifactStore(
+            openGrokHome: openGrokHome,
+            sessionID: sessionID,
+            workingDirectory: cwd
+        )
+        var persistedReplacement = replacement
+        if kind == .local,
+           let hint = try artifactStore.transcriptHint(for: launchPolicy.mode),
+           let summaryIndex = Self.compactionSummaryIndex(in: persistedReplacement),
+           case .user(var user) = persistedReplacement[summaryIndex],
+           let textIndex = user.content.lastIndex(where: { part in
+               if case .text = part { return true }
+               return false
+           }),
+           case .text(let text) = user.content[textIndex],
+           !text.contains(hint)
+        {
+            user.content[textIndex] = .text(text: text + hint)
+            persistedReplacement[summaryIndex] = .user(user)
+        }
+
+        if case .segments(let detail) = launchPolicy.mode, kind != .truncation {
+            let segmentSummary: String
+            if let summary {
+                segmentSummary = summary
+            } else if kind == .local {
+                segmentSummary = Self.compactionSummary(in: replacement)
+                    ?? "[Locally compacted context]"
+            } else {
+                segmentSummary = "[OpenAI server-side compacted context]"
+            }
+            try artifactStore.persistSegment(
+                items: preCompactionItems,
+                summary: segmentSummary,
+                detail: detail,
+                timestamp: createdAt
+            )
+        }
+
+        let checkpointID = UUID().uuidString.lowercased()
         let checkpoint = CompactionCheckpointFile(
             checkpointID: checkpointID,
             promptIndexAtCompaction: promptIndexAtCompaction,
-            compactedHistory: replacement,
+            compactedHistory: persistedReplacement,
             createdAt: createdAt,
             originalUserInfo: originalUserInfo
         )
@@ -828,6 +1159,25 @@ actor LiveCompactionCoordinator {
             ])
         )
         try documentStore.appendUpdate(update, sessionID: sessionID, cwd: cwd)
+        return persistedReplacement
+    }
+
+    private static func compactionSummaryIndex(in items: [ConversationItem]) -> Int? {
+        let prefix = formatCompactSummaryContent("")
+        return items.lastIndex { item in
+            guard case .user(let user) = item,
+                  user.syntheticReason == .compactionMeta
+            else { return false }
+            return item.textContent().hasPrefix(prefix)
+        }
+    }
+
+    private static func compactionSummary(in items: [ConversationItem]) -> String? {
+        guard let index = compactionSummaryIndex(in: items) else { return nil }
+        let text = items[index].textContent()
+        let prefix = formatCompactSummaryContent("")
+        return String(text.dropFirst(prefix.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func makeEngine(

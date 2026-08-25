@@ -20,11 +20,17 @@ struct LiveSamplingRuntime: Sendable {
     private let config: SamplerConfig
     private let transport: any HTTPTransport
     private let validatedClient: SamplingClient
+    private let samplingLog: LiveSamplingLog?
 
-    init(config: SamplerConfig, transport: any HTTPTransport) throws {
+    init(
+        config: SamplerConfig,
+        transport: any HTTPTransport,
+        samplingLog: LiveSamplingLog? = nil
+    ) throws {
         self.validatedClient = try SamplingClient(config: config, transport: transport)
         self.config = config
         self.transport = transport
+        self.samplingLog = samplingLog
     }
 
     func sample(
@@ -35,6 +41,13 @@ struct LiveSamplingRuntime: Sendable {
         onEvent: @escaping @Sendable (OpenGrokLiveSamplingEvent) async -> Void
     ) async throws -> LiveSamplingRuntimeResult {
         try Task.checkCancellation()
+
+        let requestID = RequestId.random()
+        let requestLog = try samplingLog?.begin(
+            config: config,
+            request: request,
+            requestID: requestID
+        )
 
         var effectiveConfig = config
         effectiveConfig.codexPermissions = validatedClient.provider == .codex
@@ -56,7 +69,6 @@ struct LiveSamplingRuntime: Sendable {
             retryPolicy: retryPolicy,
             transport: transport
         )
-        let requestID = RequestId.random()
         if let codexTurnState, validatedClient.provider == .codex {
             actor.handle.submit(
                 requestId: requestID,
@@ -73,6 +85,7 @@ struct LiveSamplingRuntime: Sendable {
 
             for await event in actor.events {
                 try Task.checkCancellation()
+                try requestLog?.observe(event)
                 switch event {
                 case .completed(_, let response, let metrics):
                     await forwarder.flush(onEvent: onEvent)
@@ -92,8 +105,10 @@ struct LiveSamplingRuntime: Sendable {
             }
 
             try Task.checkCancellation()
+            try requestLog?.failUnexpectedly()
             throw CLIApplicationError.failed("sampling stream ended without a response")
         } onCancel: {
+            requestLog?.cancel()
             actor.handle.cancel(requestId: requestID)
             actor.handle.shutdown()
         }

@@ -377,13 +377,20 @@ actor LiveLeaderPagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGro
 
     private func ensureInitialized() async throws {
         guard !initialized else { return }
+        let capabilities = await client.capabilities
         let request = InitializeRequest(
             protocolVersion: .v1,
             clientCapabilities: ClientCapabilities(
-                fs: FileSystemCapabilities(readTextFile: true, writeTextFile: true),
-                terminal: true
+                fs: FileSystemCapabilities(
+                    readTextFile: capabilities.fsRead,
+                    writeTextFile: capabilities.fsWrite
+                ),
+                terminal: capabilities.terminal
             ),
-            clientInfo: Implementation(name: "open-grok", version: "0.0.0")
+            clientInfo: Implementation(
+                name: OpenGrokACPExtension.executable,
+                version: capabilities.clientVersion ?? OpenGrokCLIVersion.compiled
+            )
         )
         let response = try await client.request(
             method: AgentMethodNames.initialize,
