@@ -29,6 +29,8 @@ public enum ACPLeaderClientError: Error, Sendable, Hashable, CustomStringConvert
     case notStarted
     case alreadyStarted
     case registrationClosed
+    case registrationTimeout(seconds: Double)
+    case readinessTimeout(seconds: Double)
     case unexpectedRegistrationReply(String)
     case leaderError(code: Int, message: String)
     case controlError(requestID: String, code: Int, message: String)
@@ -43,6 +45,10 @@ public enum ACPLeaderClientError: Error, Sendable, Hashable, CustomStringConvert
             return "leader client is already registered"
         case .registrationClosed:
             return "leader closed the connection during registration"
+        case .registrationTimeout(let seconds):
+            return "leader did not acknowledge registration within \(seconds) seconds"
+        case .readinessTimeout(let seconds):
+            return "leader did not become ready within \(seconds) seconds"
         case .unexpectedRegistrationReply(let reply):
             return "unexpected leader registration reply: \(reply)"
         case .leaderError(let code, let message):
@@ -71,12 +77,15 @@ public actor ACPLeaderClient {
     private let channel: any WebSocketByteChannel
     private let reader: ACPLeaderChannelReader
     private let writer: ACPLeaderClientWriter
+    private let registrationTimeoutSeconds: TimeInterval
+    private let readinessTimeoutSeconds: TimeInterval
     private var readerTask: Task<Void, Never>?
     private var nextRequestID: Int64 = 1
     private var pendingACP: [AcpRequestId: CheckedContinuation<JSONValue, Error>] = [:]
     private var pendingControl: [String: CheckedContinuation<ACPLeaderControlPayload, Error>] = [:]
     private var closed = false
     private var started = false
+    private var starting = false
     private var registrationValue: ACPLeaderClientRegistration?
     private let eventStream: AsyncThrowingStream<ACPMessage, Error>
     private var eventContinuation: AsyncThrowingStream<ACPMessage, Error>.Continuation?
@@ -88,12 +97,20 @@ public actor ACPLeaderClient {
         channel: any WebSocketByteChannel,
         clientType: String = "grok-tui",
         mode: ACPLeaderClientMode = .stdio,
-        capabilities: ACPLeaderClientCapabilities = ACPLeaderClientCapabilities()
+        capabilities: ACPLeaderClientCapabilities = ACPLeaderClientCapabilities(),
+        readinessTimeoutSeconds: TimeInterval = 120,
+        registrationTimeoutSeconds: TimeInterval = 10
     ) {
         self.channel = channel
         self.clientType = clientType
         self.mode = mode
         self.capabilities = capabilities
+        self.registrationTimeoutSeconds = registrationTimeoutSeconds.isFinite
+            ? min(max(0, registrationTimeoutSeconds), 10)
+            : 10
+        self.readinessTimeoutSeconds = readinessTimeoutSeconds.isFinite
+            ? min(max(0, readinessTimeoutSeconds), 120)
+            : 120
         self.reader = ACPLeaderChannelReader(
             channel: channel,
             maximumMessageSize: ACPLeaderProtocolLimits.maximumMessageSize
@@ -108,43 +125,117 @@ public actor ACPLeaderClient {
 
     public func start() async throws -> ACPLeaderClientRegistration {
         guard !closed else { throw ACPLeaderClientError.disconnected }
-        guard !started else { throw ACPLeaderClientError.alreadyStarted }
+        guard !started, !starting else { throw ACPLeaderClientError.alreadyStarted }
+        starting = true
+        defer { starting = false }
 
-        try await writer.send(
-            .register(
-                clientType: clientType,
-                mode: mode,
-                capabilities: capabilities
+        do {
+            try Task.checkCancellation()
+            try await writer.send(
+                .register(
+                    clientType: clientType,
+                    mode: mode,
+                    capabilities: capabilities
+                )
             )
-        )
-        guard let message = try await reader.next(ACPLeaderServerMessage.self) else {
-            await close()
-            throw ACPLeaderClientError.registrationClosed
-        }
-        guard case .registered(
-            let clientID,
-            let ready,
-            let protocolVersion,
-            let binaryVersion,
-            let leaderCapabilities
-        ) = message else {
-            await close()
-            throw ACPLeaderClientError.unexpectedRegistrationReply(String(describing: message))
-        }
+            // Rust leader/client.rs:28,357-369 separately bounds the initial
+            // registration reply before its longer leader-readiness deadline.
+            let message = try await startupMessage(
+                timeoutSeconds: registrationTimeoutSeconds,
+                timeoutError: .registrationTimeout(seconds: registrationTimeoutSeconds)
+            )
+            if case .error(let code, let message) = message {
+                throw ACPLeaderClientError.leaderError(code: code, message: message)
+            }
+            guard case .registered(
+                let clientID,
+                let ready,
+                let protocolVersion,
+                let binaryVersion,
+                let leaderCapabilities
+            ) = message else {
+                throw ACPLeaderClientError.unexpectedRegistrationReply(String(describing: message))
+            }
 
-        let value = ACPLeaderClientRegistration(
-            clientID: clientID,
-            ready: ready,
-            protocolVersion: protocolVersion,
-            binaryVersion: binaryVersion,
-            capabilities: leaderCapabilities
-        )
-        registrationValue = value
-        started = true
-        readerTask = Task { [weak self] in
-            await self?.readLoop()
+            // Rust leader/client.rs:394-428 consumes LeaderReady before its
+            // shared reader starts; otherwise the first ACP request races boot.
+            if !ready {
+                let readiness = try await startupMessage(
+                    timeoutSeconds: readinessTimeoutSeconds,
+                    timeoutError: .readinessTimeout(seconds: readinessTimeoutSeconds)
+                )
+                switch readiness {
+                case .leaderReady:
+                    break
+                case .shutdown, .shuttingDown:
+                    throw ACPLeaderClientError.registrationClosed
+                case .error(let code, let message):
+                    throw ACPLeaderClientError.leaderError(code: code, message: message)
+                default:
+                    throw ACPLeaderClientError.unexpectedRegistrationReply(
+                        String(describing: readiness)
+                    )
+                }
+            }
+
+            guard !closed else { throw ACPLeaderClientError.disconnected }
+            let value = ACPLeaderClientRegistration(
+                clientID: clientID,
+                ready: true,
+                protocolVersion: protocolVersion,
+                binaryVersion: binaryVersion,
+                capabilities: leaderCapabilities
+            )
+            registrationValue = value
+            started = true
+            readerTask = Task { [weak self] in
+                await self?.readLoop()
+            }
+            return value
+        } catch {
+            await close()
+            throw error
         }
-        return value
+    }
+
+    /// Byte-channel reads do not observe task cancellation. A detached race
+    /// can return on its deadline; `start()` then closes the channel to release
+    /// the losing read instead of hanging while a task group joins it.
+    private func startupMessage(
+        timeoutSeconds seconds: TimeInterval,
+        timeoutError: ACPLeaderClientError
+    ) async throws -> ACPLeaderServerMessage {
+        let reader = reader
+        let nanoseconds = UInt64(seconds * 1_000_000_000)
+        let gate = AsyncOutcomeGate<ACPLeaderServerMessage>()
+        let work = Task.detached {
+            do {
+                guard let message = try await reader.next(ACPLeaderServerMessage.self) else {
+                    throw ACPLeaderClientError.registrationClosed
+                }
+                gate.finish(.success(message))
+            } catch {
+                gate.finish(.failure(error))
+            }
+        }
+        let timer = Task.detached {
+            do {
+                try await Task.sleep(nanoseconds: nanoseconds)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            gate.finish(.failure(timeoutError))
+        }
+        defer {
+            work.cancel()
+            timer.cancel()
+        }
+        return try await withTaskCancellationHandler {
+            try await gate.value()
+        } onCancel: {
+            gate.finish(.failure(CancellationError()))
+        }
     }
 
     /// Incoming ACP requests and notifications. Responses are consumed by the
