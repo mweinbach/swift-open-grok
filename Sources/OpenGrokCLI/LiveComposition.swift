@@ -1639,7 +1639,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 return try await LiveWorkflowComposition.session(for: command, context: context)
             }
             if LiveSessionsComposition.handles(command) {
-                return try await LiveSessionsComposition.session(for: command, context: context)
+                return try await LiveSessionsComposition.session(
+                    for: command,
+                    context: context,
+                    transport: dependencies.makeImageTransport()
+                )
             }
             if LiveExportComposition.handles(command) {
                 return try await LiveExportComposition.session(for: command, context: context)

@@ -21,17 +21,22 @@
 //
 // Deliberately NOT ported: Rust's remote session registry (`search` merges a
 // local FTS index with a remote registry, `sessions_cmd.rs:71-166`) and the
-// worktree-label grouping that depends on it. This route is local-store only.
+// worktree-label grouping that depends on it. Listing/search stay local; the
+// asynchronous executable delete path removes an eligible first-party remote
+// copy before touching local history (`sessions_cmd.rs:174-193`).
 //
 // Like `LiveAuthComposition` and `LiveMCPComposition`, this file is
 // self-contained: the launcher hook that routes `sessions` here belongs in
 // `LiveComposition.swift`, which the integration slice owns.
 
 import Foundation
+import OpenGrokAuth
 import OpenGrokConfig
 import OpenGrokConfigTypes
+import OpenGrokHTTP
 import OpenGrokSamplingTypes
 import OpenGrokSessionPersistence
+import OpenGrokShellSessionSupport
 
 // MARK: - Catalog
 
@@ -379,7 +384,8 @@ public enum LiveSessionsComposition {
     /// process-cwd trap is that library helpers must not invent their own.
     public static func session(
         for command: CLICommand,
-        context: CLIApplicationContext
+        context: CLIApplicationContext,
+        transport: (any HTTPTransport)? = nil
     ) async throws -> CLIApplicationSession {
         guard case .sessions(let options) = command else {
             throw CLIApplicationError.unsupported(route: command.routeName)
@@ -391,14 +397,24 @@ public enum LiveSessionsComposition {
             cwd: cwd,
             openGrokHome: home
         )
-        try run(
-            options: options,
-            environment: context.environment,
-            streams: context.streams,
-            cwd: cwd,
-            foreignScanner: LiveForeignSessionScanner(environment: context.environment),
-            foreignSources: foreignSources
-        )
+        if options.action == .delete {
+            try await runRemoteFirstDelete(
+                options: options,
+                environment: context.environment,
+                streams: context.streams,
+                catalog: LiveSessionCatalog(openGrokHome: home),
+                transport: transport ?? URLSessionHTTPTransport()
+            )
+        } else {
+            try run(
+                options: options,
+                environment: context.environment,
+                streams: context.streams,
+                cwd: cwd,
+                foreignScanner: LiveForeignSessionScanner(environment: context.environment),
+                foreignSources: foreignSources
+            )
+        }
         return CLIApplicationSession(waitForExit: {}, shutdown: {})
     }
 
@@ -816,13 +832,110 @@ public enum LiveSessionsComposition {
     ) throws {
         let id = try requireIdentifier(options, action: "delete")
         let removed = try catalog.delete(sessionID: id)
+        try writeDeleteResult(options: options, sessionID: id, removed: removed, streams: streams)
+    }
+
+    /// The sessions subcommand cannot know which process originally enabled
+    /// writeback. Rust therefore tries the first-party delete for every valid,
+    /// non-ZDR account, irrespective of the current storage-mode override.
+    /// Remote failure must leave every local document available for a retry.
+    private static func runRemoteFirstDelete(
+        options: CLISessionOptions,
+        environment: [String: String],
+        streams: CLIStreams,
+        catalog: LiveSessionCatalog,
+        transport: any HTTPTransport
+    ) async throws {
+        let sessionID = try requireIdentifier(options, action: "delete")
+        try LiveConversationStore.validateSessionID(sessionID)
+        let home = OpenGrokHomeResolver.resolve(environment: environment)
+        let configuration = liveManagedAuthenticationConfiguration(environment: environment)
+        let authManager = AuthManager(
+            grokHome: home,
+            config: configuration,
+            environment: environment
+        )
+
+        var remoteRemoved = false
+        if let account = await authManager.current(), remoteDeleteAccountIsEligible(account) {
+            let client: LiveSessionWritebackClient
+            do {
+                client = try LiveSessionWritebackClient(
+                    home: home,
+                    environment: environment,
+                    authManager: authManager,
+                    exportBoundary: ExportBoundary(),
+                    transport: transport
+                )
+                remoteRemoved = try await client.deleteSessionData(sessionID: sessionID)
+                let current = AuthManager(
+                    grokHome: home,
+                    config: configuration,
+                    environment: environment
+                )
+                guard let owner = await current.current(),
+                      remoteDeleteAccountIsEligible(owner),
+                      owner.userID == account.userID,
+                      owner.principalID == account.principalID,
+                      owner.teamID == account.teamID,
+                      owner.organizationID == account.organizationID
+                else {
+                    throw LiveSessionWritebackClientError.accountChanged
+                }
+            } catch {
+                throw CLIApplicationError.failed("failed to delete remote session data: \(error)")
+            }
+        }
+
+        let localRemoved = try catalog.delete(sessionID: sessionID)
+        try writeDeleteResult(
+            options: options,
+            sessionID: sessionID,
+            removed: remoteRemoved || localRemoved,
+            streams: streams
+        )
+    }
+
+    private static func remoteDeleteAccountIsEligible(_ account: GrokAuth) -> Bool {
+        guard account.isXAIAuth,
+              account.isSessionAuth,
+              !account.isZDRTeam,
+              !account.userID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !account.key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return false
+        }
+        switch account.authMode {
+        case .oidc:
+            return account.refreshToken?.trimmingCharacters(in: .whitespacesAndNewlines)
+                .isEmpty == false
+        case .external:
+            return true
+        case .apiKey, .webLogin:
+            return false
+        }
+    }
+
+    private static func writeDeleteResult(
+        options: CLISessionOptions,
+        sessionID: String,
+        removed: Bool,
+        streams: CLIStreams
+    ) throws {
         if options.json {
-            streams.out(try encodeJSON(["id": id, "deleted": removed] as [String: Any]) + "\n")
+            streams.out(try encodeJSON([
+                "id": sessionID,
+                "deleted": removed,
+            ] as [String: Any]) + "\n")
             return
         }
         // Rust: sessions_cmd.rs:190 and :192 verbatim, trailing period on the
         // miss only.
-        streams.out(removed ? "Deleted session \(id)\n" : "No session found with id \(id).\n")
+        streams.out(
+            removed
+                ? "Deleted session \(sessionID)\n"
+                : "No session found with id \(sessionID).\n"
+        )
     }
 
     // MARK: helpers
