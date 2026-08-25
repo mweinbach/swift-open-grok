@@ -232,28 +232,6 @@ int og_windows_websocket_connect(
         goto cleanup;
     }
 
-    DWORD keepalive_ms = OG_WINDOWS_WEBSOCKET_KEEPALIVE_MS;
-    if (!WinHttpSetOption(
-        request,
-        WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL,
-        &keepalive_ms,
-        sizeof(keepalive_ms)
-    )) {
-        og_windows_websocket_set_error(GetLastError(), "could not enable the 15-second WebSocket keepalive");
-        goto cleanup;
-    }
-
-    DWORD close_timeout_ms = OG_WINDOWS_WEBSOCKET_CLOSE_TIMEOUT_MS;
-    if (!WinHttpSetOption(
-        request,
-        WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT,
-        &close_timeout_ms,
-        sizeof(close_timeout_ms)
-    )) {
-        og_windows_websocket_set_error(GetLastError(), "could not bound the WebSocket close handshake");
-        goto cleanup;
-    }
-
     if (wide_headers[0] != L'\0' && !WinHttpAddRequestHeaders(
         request,
         wide_headers,
@@ -325,6 +303,67 @@ int og_windows_websocket_connect(
             ? ERROR_TIMEOUT
             : GetLastError();
         og_windows_websocket_set_error(code, "WebSocket upgrade could not be completed");
+        goto cleanup;
+    }
+    if (InterlockedCompareExchange(&deadline.expired, 0, 0)) {
+        og_windows_websocket_set_error(ERROR_TIMEOUT, "WebSocket connection deadline expired");
+        goto cleanup;
+    }
+
+    /* These options accept only the handle returned by CompleteUpgrade, not
+       its session or request. A server can therefore observe the 101 before
+       local policy is armed; never publish the socket if either option fails. */
+    DWORD keepalive_ms = OG_WINDOWS_WEBSOCKET_KEEPALIVE_MS;
+    if (!WinHttpSetOption(
+        upgraded,
+        WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL,
+        &keepalive_ms,
+        sizeof(keepalive_ms)
+    )) {
+        og_windows_websocket_set_error(GetLastError(), "could not enable the 15-second WebSocket keepalive");
+        goto cleanup;
+    }
+    DWORD observed_keepalive = 0;
+    DWORD observed_keepalive_size = sizeof(observed_keepalive);
+    if (!WinHttpQueryOption(
+        upgraded,
+        WINHTTP_OPTION_WEB_SOCKET_KEEPALIVE_INTERVAL,
+        &observed_keepalive,
+        &observed_keepalive_size
+    ) || observed_keepalive_size != sizeof(observed_keepalive)
+      || observed_keepalive != keepalive_ms) {
+        DWORD error = GetLastError();
+        og_windows_websocket_set_error(
+            error == ERROR_SUCCESS ? ERROR_INVALID_DATA : error,
+            "could not verify the 15-second WebSocket keepalive"
+        );
+        goto cleanup;
+    }
+
+    DWORD close_timeout_ms = OG_WINDOWS_WEBSOCKET_CLOSE_TIMEOUT_MS;
+    if (!WinHttpSetOption(
+        upgraded,
+        WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT,
+        &close_timeout_ms,
+        sizeof(close_timeout_ms)
+    )) {
+        og_windows_websocket_set_error(GetLastError(), "could not bound the WebSocket close handshake");
+        goto cleanup;
+    }
+    DWORD observed_close_timeout = 0;
+    DWORD observed_close_timeout_size = sizeof(observed_close_timeout);
+    if (!WinHttpQueryOption(
+        upgraded,
+        WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT,
+        &observed_close_timeout,
+        &observed_close_timeout_size
+    ) || observed_close_timeout_size != sizeof(observed_close_timeout)
+      || observed_close_timeout != close_timeout_ms) {
+        DWORD error = GetLastError();
+        og_windows_websocket_set_error(
+            error == ERROR_SUCCESS ? ERROR_INVALID_DATA : error,
+            "could not verify the bounded WebSocket close handshake"
+        );
         goto cleanup;
     }
     if (InterlockedCompareExchange(&deadline.expired, 0, 0)) {
