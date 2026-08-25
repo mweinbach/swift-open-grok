@@ -655,13 +655,15 @@ public enum ContentBlock: Codable, Sendable, Equatable, Hashable {
     case toolUse(id: String, name: String, input: JSONValue)
     case toolResult(toolUseId: String, content: ToolResultContent, cacheControl: CacheControl?)
     case thinking(thinking: String, signature: String)
+    /// Opaque provider-redacted reasoning, retained only to keep its stream decodable.
+    case redactedThinking(data: String)
 
     public enum CodingKeys: String, CodingKey {
         case type, text, cacheControl, source
         case id, name, input
         case toolUseId = "tool_use_id"
         case content
-        case thinking, signature
+        case thinking, signature, data
     }
 
     public init(from decoder: Decoder) throws {
@@ -692,6 +694,8 @@ public enum ContentBlock: Codable, Sendable, Equatable, Hashable {
                 thinking: try c.decode(String.self, forKey: .thinking),
                 signature: try c.decode(String.self, forKey: .signature)
             )
+        case "redacted_thinking":
+            self = .redactedThinking(data: try c.decode(String.self, forKey: .data))
         default:
             throw DecodingError.dataCorruptedError(forKey: .type, in: c, debugDescription: "unknown ContentBlock: \(type)")
         }
@@ -721,6 +725,9 @@ public enum ContentBlock: Codable, Sendable, Equatable, Hashable {
             try c.encode("thinking", forKey: .type)
             try c.encode(thinking, forKey: .thinking)
             try c.encode(signature, forKey: .signature)
+        case .redactedThinking(let data):
+            try c.encode("redacted_thinking", forKey: .type)
+            try c.encode(data, forKey: .data)
         }
     }
 }

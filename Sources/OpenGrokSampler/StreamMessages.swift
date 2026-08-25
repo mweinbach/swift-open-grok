@@ -185,6 +185,9 @@ public func streamMessages(
                             name: name,
                             argumentsDelta: initialArguments
                         ))
+                    case .redactedThinking:
+                        // The encrypted payload is parse-only and must never enter model-visible history.
+                        break
                     case .image, .toolResult:
                         break
                     }
