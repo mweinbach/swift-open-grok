@@ -543,10 +543,10 @@ struct LiveTraceUploadParityTests {
     }
 
     @Test(
-        "direct cloud buckets take precedence and never silently downgrade to proxy upload",
+        "unavailable direct cloud credentials never silently downgrade to proxy upload",
         arguments: ["gs://private-google-bucket", "s3://private-amazon-bucket"]
     )
-    func unsupportedDirectBucketsFailClosed(_ bucket: String) async throws {
+    func unavailableDirectBucketsFailClosed(_ bucket: String) async throws {
         let fixture = try TraceUploadFixture()
         defer { fixture.clean() }
         try await fixture.seed("direct-bucket")
@@ -563,7 +563,11 @@ struct LiveTraceUploadParityTests {
 
         #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
         #expect(result.output.isEmpty)
-        #expect(result.errors.contains("direct cloud-storage upload method is not available"))
+        if bucket.hasPrefix("gs://") {
+            #expect(result.errors.contains("direct cloud-storage upload method is not available"))
+        } else {
+            #expect(result.errors.contains("AWS"))
+        }
         #expect(!result.errors.contains(bucket))
         #expect(transport.recordedRequests.isEmpty)
         #expect(!FileManager.default.fileExists(atPath: fixture.archiveDirectory.path))

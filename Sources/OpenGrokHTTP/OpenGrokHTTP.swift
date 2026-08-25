@@ -828,6 +828,16 @@ public final class HTTPTransportSessionDelegate: NSObject, URLSessionDelegate, @
         !extraRootCertificates.isEmpty && !additionalTrustRootsApplied
     }
 
+    var additionalTrustRootsFailure: HTTPError? {
+        guard additionalTrustRootsUnavailable else { return nil }
+        return .transport(
+            TransportFailure(
+                kind: .permanent,
+                detail: "configured additional TLS trust roots are unavailable on this platform"
+            )
+        )
+    }
+
     /// Whether this platform can honor `validateCertificates == false`.
     ///
     /// swift-corelibs-foundation ships neither `NSURLAuthenticationMethodServerTrust`
@@ -866,6 +876,17 @@ public final class HTTPTransportSessionDelegate: NSObject, URLSessionDelegate, @
         #else
         self.additionalTrustRootsApplied = extraRootCertificates.isEmpty
         #endif
+        super.init()
+    }
+
+    init(
+        validateCertificates: Bool,
+        extraRootCertificates: [Data],
+        additionalTrustRootsApplied: Bool
+    ) {
+        self.validateCertificates = validateCertificates
+        self.extraRootCertificates = extraRootCertificates
+        self.additionalTrustRootsApplied = additionalTrustRootsApplied
         super.init()
     }
 
@@ -942,6 +963,17 @@ public final class URLSessionHTTPTransport: NSObject, HTTPTransport, @unchecked 
         super.init()
     }
 
+    init(
+        configuration: HTTPTransportConfiguration,
+        session: URLSession,
+        sessionDelegate: HTTPTransportSessionDelegate
+    ) {
+        self.configuration = configuration
+        self.session = session
+        self.sessionDelegate = sessionDelegate
+        super.init()
+    }
+
     /// Exposed for configuration-forwarding tests.
     public var appliedConfigurationSnapshot: HTTPSessionConfigurationBuilder.Snapshot {
         HTTPSessionConfigurationBuilder.snapshot(configuration)
@@ -949,6 +981,9 @@ public final class URLSessionHTTPTransport: NSObject, HTTPTransport, @unchecked 
 
     public func send(_ request: HTTPRequest) async throws -> HTTPResponse {
         try Task.checkCancellation()
+        if let failure = sessionDelegate?.additionalTrustRootsFailure {
+            throw failure
+        }
         let urlRequest = try makeURLRequest(request)
         do {
             let (data, response) = try await session.data(for: urlRequest)
@@ -983,6 +1018,10 @@ public final class URLSessionHTTPTransport: NSObject, HTTPTransport, @unchecked 
         let mailbox = BoundedStreamMailbox(
             maxPendingBytes: configuration.maxStreamBufferBytes
         )
+        if let failure = sessionDelegate?.additionalTrustRootsFailure {
+            mailbox.finish(throwing: failure)
+            return mailbox.makeStream()
+        }
         #if !canImport(Darwin)
         return streamViaDataDelegate(request, mailbox: mailbox)
         #else
@@ -1757,12 +1796,36 @@ public final class URLSessionWebSocketClient: WebSocketClient, @unchecked Sendab
             configuration: configuration,
             headers: headers
         )
-        let task = prepared.session.webSocketTask(with: prepared.request)
+        do {
+            return try connect(
+                preparedSession: prepared.session,
+                request: prepared.request,
+                delegate: prepared.delegate,
+                snapshot: prepared.snapshot,
+                maximumMessageSize: maximumMessageSize
+            )
+        } catch {
+            prepared.session.invalidateAndCancel()
+            throw error
+        }
+    }
+
+    static func connect(
+        preparedSession: URLSession,
+        request: URLRequest,
+        delegate: HTTPTransportSessionDelegate,
+        snapshot: HTTPSessionConfigurationBuilder.Snapshot,
+        maximumMessageSize: Int = WebSocketLimits.defaultMaximumMessageSize
+    ) throws -> URLSessionWebSocketClient {
+        if let failure = delegate.additionalTrustRootsFailure {
+            throw failure
+        }
+        let task = preparedSession.webSocketTask(with: request)
         return URLSessionWebSocketClient(
             task: task,
-            session: prepared.session,
-            sessionDelegate: prepared.delegate,
-            appliedConfigurationSnapshot: prepared.snapshot,
+            session: preparedSession,
+            sessionDelegate: delegate,
+            appliedConfigurationSnapshot: snapshot,
             maximumMessageSize: maximumMessageSize
         )
     }

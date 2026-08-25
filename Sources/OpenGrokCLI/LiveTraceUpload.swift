@@ -22,7 +22,7 @@ public struct LiveTraceUploadServices: Sendable {
 
     public static var production: LiveTraceUploadServices {
         LiveTraceUploadServices(
-            makeTransport: { URLSessionHTTPTransport() },
+            makeTransport: { LiveCloudTraceUpload.makeProductionTransport() },
             sleep: { seconds in
                 try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
             }
@@ -42,6 +42,7 @@ private enum LiveTraceUploadFailure: Error, Sendable {
     case networkUnavailable
     case networkInterrupted
     case invalidTransport
+    case cloud(String)
 
     var message: String {
         switch self {
@@ -57,6 +58,8 @@ private enum LiveTraceUploadFailure: Error, Sendable {
             return "Storage proxy request was interrupted or timed out."
         case .invalidTransport:
             return "Storage proxy request could not be completed safely."
+        case .cloud(let message):
+            return message
         }
     }
 }
@@ -68,6 +71,17 @@ enum LiveTraceUpload {
     struct Authorization: Sendable {
         let endpoint: URL
         let credentials: GrokAuthCredentials
+        let cloud: LiveCloudTraceUpload.Authorization?
+
+        init(
+            endpoint: URL,
+            credentials: GrokAuthCredentials,
+            cloud: LiveCloudTraceUpload.Authorization? = nil
+        ) {
+            self.endpoint = endpoint
+            self.credentials = credentials
+            self.cloud = cloud
+        }
     }
 
     private static let requestTimeout: TimeInterval = 60
@@ -85,9 +99,8 @@ enum LiveTraceUpload {
             throw refusal("trace uploads have not been explicitly enabled")
         }
 
-        if let bucket = configuredDirectBucket(document: document, environment: environment),
-           bucket.hasPrefix("gs://") || bucket.hasPrefix("s3://")
-        {
+        let directBucket = configuredDirectBucket(document: document, environment: environment)
+        if directBucket?.hasPrefix("gs://") == true {
             throw refusal(
                 "the configured direct cloud-storage upload method is not available in this build"
             )
@@ -142,12 +155,28 @@ enum LiveTraceUpload {
             throw refusal("the session does not have an active first-party xAI provider")
         }
 
+        let credentials = GrokAuthCredentials(
+            userToken: sessionAuth?.key,
+            deploymentKey: deploymentKey
+        )
+        if let bucket = directBucket, bucket.hasPrefix("s3://") {
+            let cloud: LiveCloudTraceUpload.Authorization
+            do {
+                cloud = try LiveCloudTraceUpload.authorize(
+                    sessionID: sessionID,
+                    bucketURL: bucket,
+                    document: document,
+                    environment: environment
+                )
+            } catch let error as LiveCloudTraceUpload.Failure {
+                throw refusal(error.message)
+            }
+            return Authorization(endpoint: cloud.endpoint, credentials: credentials, cloud: cloud)
+        }
+
         return Authorization(
             endpoint: try storageEndpoint(document: document, environment: environment),
-            credentials: GrokAuthCredentials(
-                userToken: sessionAuth?.key,
-                deploymentKey: deploymentKey
-            )
+            credentials: credentials
         )
     }
 
@@ -178,28 +207,42 @@ enum LiveTraceUpload {
                 environment: environment,
                 uploadEnabled: uploadEnabled
             )
-            guard authorization.endpoint == initialAuthorization.endpoint else {
+            guard authorization.endpoint == initialAuthorization.endpoint,
+                  authorization.cloud == initialAuthorization.cloud
+            else {
                 throw refusal("the authorized trace storage endpoint changed before upload")
             }
 
-            var headers = [
-                "Accept": "application/json",
-                "Content-Type": "application/gzip",
-                "X-Storage-Path": objectPath,
-                "x-grok-client-version": OpenGrokVersion.compiledVersion,
-                "x-grok-client-identifier": DEFAULT_CLIENT_IDENTIFIER,
-            ]
-            authorization.credentials.apply(
-                to: &headers,
-                baseURL: authorization.endpoint.absoluteString
-            )
-            let request = HTTPRequest(
-                method: .post,
-                url: authorization.endpoint,
-                headers: headers,
-                body: archive,
-                timeout: requestTimeout
-            )
+            let request: HTTPRequest
+            if let cloud = authorization.cloud {
+                do {
+                    request = try LiveCloudTraceUpload.request(
+                        authorization: cloud,
+                        archive: archive
+                    )
+                } catch let error as LiveCloudTraceUpload.Failure {
+                    throw LiveTraceUploadFailure.cloud(error.message)
+                }
+            } else {
+                var headers = [
+                    "Accept": "application/json",
+                    "Content-Type": "application/gzip",
+                    "X-Storage-Path": objectPath,
+                    "x-grok-client-version": OpenGrokVersion.compiledVersion,
+                    "x-grok-client-identifier": DEFAULT_CLIENT_IDENTIFIER,
+                ]
+                authorization.credentials.apply(
+                    to: &headers,
+                    baseURL: authorization.endpoint.absoluteString
+                )
+                request = HTTPRequest(
+                    method: .post,
+                    url: authorization.endpoint,
+                    headers: headers,
+                    body: archive,
+                    timeout: requestTimeout
+                )
+            }
 
             let response: HTTPResponse
             do {
@@ -242,6 +285,11 @@ enum LiveTraceUpload {
             let status = response.metadata.statusCode
             guard (200..<300).contains(status) else {
                 guard retryableStatusCodes.contains(status), attempt + 1 < maximumAttempts else {
+                    if authorization.cloud != nil {
+                        throw LiveTraceUploadFailure.cloud(
+                            "S3 storage rejected the upload (HTTP \(status))."
+                        )
+                    }
                     throw LiveTraceUploadFailure.rejected(status: status)
                 }
                 try await pause(
@@ -251,6 +299,20 @@ enum LiveTraceUpload {
                     retryNotice: retryNotice
                 )
                 continue
+            }
+
+            if let cloud = authorization.cloud {
+                guard response.body.isEmpty,
+                      response.metadata.url == nil || response.metadata.url == authorization.endpoint
+                else {
+                    throw LiveTraceUploadFailure.cloud(
+                        "S3 storage returned an unsafe or unexpected upload response."
+                    )
+                }
+                return LiveCloudTraceUpload.resultURL(
+                    authorization: cloud,
+                    sessionID: sessionID
+                )
             }
 
             let decoded: LiveTraceUploadResponse
