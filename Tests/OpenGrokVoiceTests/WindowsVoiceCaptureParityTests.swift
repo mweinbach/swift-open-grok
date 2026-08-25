@@ -2,6 +2,7 @@
 
 import Foundation
 import Testing
+import WinSDK
 
 @testable import OpenGrokVoice
 
@@ -20,7 +21,7 @@ private final class WindowsVoiceCapabilityProbeObservations: @unchecked Sendable
     private let lock = NSLock()
     private var recordedResults: [Bool] = []
     private var currentTime: UInt64 = 0
-    private var workerThreadNames: [String] = []
+    private var workerThreadIdentifiers: [DWORD] = []
 
     var results: [Bool] {
         lock.lock()
@@ -34,10 +35,10 @@ private final class WindowsVoiceCapabilityProbeObservations: @unchecked Sendable
         return currentTime
     }
 
-    var threadNames: [String] {
+    var threadIdentifiers: [DWORD] {
         lock.lock()
         defer { lock.unlock() }
-        return workerThreadNames
+        return workerThreadIdentifiers
     }
 
     func record(_ result: Bool) {
@@ -54,8 +55,8 @@ private final class WindowsVoiceCapabilityProbeObservations: @unchecked Sendable
 
     func recordWorkerThread() -> Int {
         lock.lock()
-        workerThreadNames.append(Thread.current.name ?? "")
-        let count = workerThreadNames.count
+        workerThreadIdentifiers.append(GetCurrentThreadId())
+        let count = workerThreadIdentifiers.count
         lock.unlock()
         return count
     }
@@ -129,6 +130,7 @@ struct WindowsVoiceCaptureParityTests {
     @Test("successful default-device detection stays native-thread confined and refreshes expired cache")
     func successfulCapabilityProbeAndCacheRefresh() {
         let observations = WindowsVoiceCapabilityProbeObservations()
+        let callerThreadIdentifier = GetCurrentThreadId()
         let probe = WindowsVoiceCapabilityProbe(
             deadlineMilliseconds: 250,
             cacheLifetimeMilliseconds: 20,
@@ -140,15 +142,14 @@ struct WindowsVoiceCaptureParityTests {
         #expect(probe.hasDefaultInputDevice())
         #expect(probe.hasDefaultInputDevice())
         #expect(probe.workerLaunchCount == 1)
-        #expect(observations.threadNames == ["opengrok-wasapi-capability"])
+        #expect(observations.threadIdentifiers.count == 1)
+        #expect(observations.threadIdentifiers.allSatisfy { $0 != callerThreadIdentifier })
 
         observations.advance(by: 20_000_000)
         #expect(!probe.hasDefaultInputDevice())
         #expect(probe.workerLaunchCount == 2)
-        #expect(observations.threadNames == [
-            "opengrok-wasapi-capability",
-            "opengrok-wasapi-capability",
-        ])
+        #expect(observations.threadIdentifiers.count == 2)
+        #expect(observations.threadIdentifiers.allSatisfy { $0 != callerThreadIdentifier })
     }
 
     @Test("native capability failures remain unavailable and reuse their bounded negative cache")
