@@ -180,7 +180,7 @@ private struct FolderTrustPromptFixture {
             atomically: true,
             encoding: .utf8
         )
-        environment = [
+        var launchEnvironment = [
             "HOME": home.path,
             "OPENGROK_HOME": ownerState.path,
             "GROK_SANDBOX": "off",
@@ -188,6 +188,16 @@ private struct FolderTrustPromptFixture {
             "GROK_FOLDER_TRUST": "1",
             "PATH": ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin",
         ]
+        #if os(Windows)
+        let systemRoot = ProcessInfo.processInfo.environment["SystemRoot"] ?? "C:\\Windows"
+        let powerShellDirectory = URL(fileURLWithPath: systemRoot, isDirectory: true)
+            .appendingPathComponent("System32", isDirectory: true)
+            .appendingPathComponent("WindowsPowerShell", isDirectory: true)
+            .appendingPathComponent("v1.0", isDirectory: true)
+        launchEnvironment["SystemRoot"] = systemRoot
+        launchEnvironment["PATH"] = powerShellDirectory.path + ";" + (launchEnvironment["PATH"] ?? "")
+        #endif
+        environment = launchEnvironment
     }
 
     func dispose() {
@@ -280,11 +290,37 @@ private struct FolderTrustPromptFixture {
         try FileManager.default.createDirectory(at: hookDirectory, withIntermediateDirectories: true)
 
         #if os(Windows)
-        let executable = URL(fileURLWithPath: ProcessInfo.processInfo.environment["SystemRoot"] ?? "C:\\Windows")
-            .appendingPathComponent("System32/cmd.exe").path
-        let mcpArguments = ["/d", "/c", "echo started > \"\(mcpMarker.path)\""]
-        let lspArguments = ["/d", "/c", "echo started > \"\(lspMarker.path)\""]
-        let hookCommand = "\"\(executable)\" /d /c echo started > \"\(hookMarker.path)\""
+        let executable = URL(
+            fileURLWithPath: ProcessInfo.processInfo.environment["SystemRoot"] ?? "C:\\Windows",
+            isDirectory: true
+        )
+        .appendingPathComponent("System32", isDirectory: true)
+        .appendingPathComponent("WindowsPowerShell", isDirectory: true)
+        .appendingPathComponent("v1.0", isDirectory: true)
+        .appendingPathComponent("powershell.exe")
+        .path
+
+        func markerScript(named name: String, marker: URL) throws -> URL {
+            let script = project.appendingPathComponent(name)
+            let escapedMarker = marker.path.replacingOccurrences(of: "'", with: "''")
+            try "[System.IO.File]::WriteAllText('\(escapedMarker)', 'started')\r\n".write(
+                to: script,
+                atomically: true,
+                encoding: .utf8
+            )
+            return script
+        }
+
+        let mcpScript = try markerScript(named: "trust-prompt-mcp.ps1", marker: mcpMarker)
+        let lspScript = try markerScript(named: "trust-prompt-lsp.ps1", marker: lspMarker)
+        let hookScript = try markerScript(named: "trust-prompt-hook.ps1", marker: hookMarker)
+        let mcpArguments = [
+            "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", mcpScript.path,
+        ]
+        let lspArguments = [
+            "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", lspScript.path,
+        ]
+        let hookCommand = hookScript.path
         #else
         let executable = "/usr/bin/touch"
         let mcpArguments = [mcpMarker.path]
