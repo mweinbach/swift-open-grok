@@ -19,11 +19,10 @@
 //     layout copied loosely below.
 //   * `sessions_cmd.rs:190,192` — the exact `delete` result strings.
 //
-// Deliberately NOT ported: Rust's remote session registry (`search` merges a
-// local FTS index with a remote registry, `sessions_cmd.rs:71-166`) and the
-// worktree-label grouping that depends on it. Listing/search stay local; the
-// asynchronous executable delete path removes an eligible first-party remote
-// copy before touching local history (`sessions_cmd.rs:174-193`).
+// Listing and search merge the first-party session registry with local history
+// (`sessions_cmd.rs:48-166`), while deletion removes the separate first-party
+// writeback copy before touching local history (`sessions_cmd.rs:174-193`).
+// Worktree-label grouping remains unported.
 //
 // Like `LiveAuthComposition` and `LiveMCPComposition`, this file is
 // self-contained: the launcher hook that routes `sessions` here belongs in
@@ -31,12 +30,14 @@
 
 import Foundation
 import OpenGrokAuth
+import OpenGrokCLIChatProxyTypes
 import OpenGrokConfig
 import OpenGrokConfigTypes
 import OpenGrokHTTP
 import OpenGrokSamplingTypes
 import OpenGrokSessionPersistence
 import OpenGrokShellSessionSupport
+import OpenGrokWorkspace
 
 // MARK: - Catalog
 
@@ -397,14 +398,61 @@ public enum LiveSessionsComposition {
             cwd: cwd,
             openGrokHome: home
         )
+        let selectedTransport = transport ?? URLSessionHTTPTransport()
         if options.action == .delete {
             try await runRemoteFirstDelete(
                 options: options,
                 environment: context.environment,
                 streams: context.streams,
                 catalog: LiveSessionCatalog(openGrokHome: home),
-                transport: transport ?? URLSessionHTTPTransport()
+                transport: selectedTransport
             )
+        } else if options.action == .list || options.action == .search {
+            let registryQuery: String?
+            if options.action == .search {
+                guard let query = options.query?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !query.isEmpty
+                else {
+                    throw CLIApplicationError.failed(
+                        "sessions search requires a query: open-grok sessions search <query>"
+                    )
+                }
+                registryQuery = query
+            } else {
+                registryQuery = nil
+            }
+            let remote = await fetchRemoteRegistrySessions(
+                query: registryQuery,
+                limit: options.limit,
+                home: home,
+                cwd: cwd,
+                environment: context.environment,
+                streams: context.streams,
+                transport: selectedTransport
+            )
+            let catalog = LiveSessionCatalog(openGrokHome: home)
+            if options.action == .list {
+                try runList(
+                    catalog: catalog,
+                    json: options.json,
+                    limit: options.limit,
+                    streams: context.streams,
+                    cwd: cwd,
+                    foreignScanner: LiveForeignSessionScanner(environment: context.environment),
+                    foreignSources: foreignSources,
+                    remoteSessions: remote
+                )
+            } else {
+                try runSearch(
+                    options: options,
+                    catalog: catalog,
+                    streams: context.streams,
+                    environment: context.environment,
+                    workingDirectory: cwd,
+                    gate: .shared,
+                    remoteSessions: remote
+                )
+            }
         } else {
             try run(
                 options: options,
@@ -416,6 +464,50 @@ public enum LiveSessionsComposition {
             )
         }
         return CLIApplicationSession(waitForExit: {}, shutdown: {})
+    }
+
+    private static func fetchRemoteRegistrySessions(
+        query: String?,
+        limit: Int,
+        home: URL,
+        cwd: URL,
+        environment: [String: String],
+        streams: CLIStreams,
+        transport: any HTTPTransport
+    ) async -> [SessionReplicaResponse] {
+        guard limit > 0 else { return [] }
+        var registryEnvironment = environment
+        if let document = try? loadAuthorityComposition(
+            cwd: cwd,
+            environment: environment
+        ).effective() {
+            let endpointKeys = [
+                ("GROK_CLI_CHAT_PROXY_BASE_URL", "cli_chat_proxy_base_url"),
+                ("GROK_DEPLOYMENT_KEY", "deployment_key"),
+                ("GROK_ALPHA_TEST_KEY", "alpha_test_key"),
+            ]
+            for (environmentKey, configurationKey) in endpointKeys
+            where registryEnvironment[environmentKey] == nil {
+                if let configured = document[path: ["endpoints", configurationKey]]?.stringValue,
+                   !configured.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    registryEnvironment[environmentKey] = configured
+                }
+            }
+        }
+
+        do {
+            let client = try LiveSessionRegistryClient(
+                home: home,
+                environment: registryEnvironment,
+                transport: transport
+            )
+            return try await client.search(query: query, limit: limit)
+        } catch LiveSessionRegistryClientError.unavailable {
+            return []
+        } catch {
+            streams.err("warning: remote session search failed: \(error)\n")
+            return []
+        }
     }
 
     /// Production gate for `sessions list`: resolve session-compat cells from
@@ -632,7 +724,8 @@ public enum LiveSessionsComposition {
         streams: CLIStreams,
         cwd: URL,
         foreignScanner: (any ForeignSessionScanning)? = nil,
-        foreignSources: EnabledForeignSources = .none
+        foreignSources: EnabledForeignSources = .none,
+        remoteSessions: [SessionReplicaResponse] = []
     ) throws {
         var sessions = try catalog.list()
         // Zero scanner calls (and therefore zero vendor I/O) when every source
@@ -641,38 +734,58 @@ public enum LiveSessionsComposition {
             let foreign = scanner.scan(cwd: cwd.path, enabled: foreignSources)
             sessions.append(contentsOf: foreign.map(listing(fromForeign:)))
         }
-        sessions.sort { lhs, rhs in
-            if lhs.lastActivityAt == rhs.lastActivityAt {
-                return lhs.sessionID < rhs.sessionID
+        let entries: [LiveRemoteSessionMerge.Entry]
+        if remoteSessions.isEmpty {
+            sessions.sort { lhs, rhs in
+                if lhs.lastActivityAt == rhs.lastActivityAt {
+                    return lhs.sessionID < rhs.sessionID
+                }
+                return lhs.lastActivityAt > rhs.lastActivityAt
             }
-            return lhs.lastActivityAt > rhs.lastActivityAt
+            entries = sessions.prefix(max(0, limit)).map {
+                LiveRemoteSessionMerge.Entry(listing: $0, source: .local, firstPrompt: nil)
+            }
+        } else {
+            entries = LiveRemoteSessionMerge.merge(
+                local: sessions,
+                remote: remoteSessions,
+                repositoryRemotes: WorkspaceSessionGitMetadata.resolve(at: cwd).gitRemotes,
+                limit: limit
+            )
         }
-        sessions = Array(sessions.prefix(max(0, limit)))
         if json {
-            streams.out(try encodeJSON(sessions.map(payload(for:))) + "\n")
+            streams.out(try encodeJSON(entries.map { entry in
+                var body = payload(for: entry.listing)
+                if entry.source != .local { body["source"] = entry.source.rawValue }
+                return body
+            }) + "\n")
             return
         }
-        guard !sessions.isEmpty else {
+        guard !entries.isEmpty else {
             streams.out("No sessions found.\n")
             return
         }
+        let includesRemote = entries.contains { $0.source != .local }
         var lines = [
             row(
                 id: "SESSION ID",
                 created: "CREATED",
                 updated: "UPDATED",
-                model: "MODEL",
+                model: includesRemote ? "STATUS" : "MODEL",
                 title: "TITLE"
             )
         ]
-        for session in sessions {
+        for entry in entries {
+            let session = entry.listing
             let badge = session.foreignSource.map { "[\($0.badge)] " } ?? ""
             lines.append(
                 row(
                     id: session.sessionID,
                     created: day(session.createdAt),
                     updated: day(session.lastActivityAt),
-                    model: session.model ?? (session.foreignSource != nil ? "-" : "-"),
+                    model: includesRemote
+                        ? entry.source.rawValue
+                        : (session.model ?? "-"),
                     title: badge + (session.title ?? "(no title)")
                 )
             )
@@ -682,8 +795,8 @@ public enum LiveSessionsComposition {
 
     /// Rust's list row is `{:<36}  {:<10}  {:<10}  {:<10}  {}` over
     /// id/created/updated/status/summary (`sessions_cmd.rs:218-246`). The
-    /// status column is a remote-registry concept this port has no source for,
-    /// so it carries the model instead; the widths are otherwise the same.
+    /// Remote-backed listings expose the upstream source/status column; purely
+    /// local listings preserve this port's existing model column and widths.
     private static func row(
         id: String,
         created: String,
@@ -704,18 +817,17 @@ public enum LiveSessionsComposition {
 
     /// `open-grok sessions search <query> [-n LIMIT] [--json]`.
     ///
-    /// Rust runs a local FTS query and a remote-registry query concurrently and
-    /// merges them (`sessions_cmd.rs:71-166`). This port has no remote registry
-    /// — the file header already records that as deliberately not ported — so
-    /// the output carries local hits only and omits Rust's `(remote)` rows
-    /// rather than printing an empty section that implies a lookup happened.
+    /// Rust runs a local FTS query and a remote-registry query, prints local
+    /// hits first, and fills the remaining bounded slots with unique remote
+    /// rows (`sessions_cmd.rs:71-166`).
     private static func runSearch(
         options: CLISessionOptions,
         catalog: LiveSessionCatalog,
         streams: CLIStreams,
         environment: [String: String],
         workingDirectory: URL,
-        gate: SessionSearchGate
+        gate: SessionSearchGate,
+        remoteSessions: [SessionReplicaResponse] = []
     ) throws {
         guard let query = options.query?.trimmingCharacters(in: .whitespacesAndNewlines),
               !query.isEmpty
@@ -752,11 +864,25 @@ public enum LiveSessionsComposition {
         if let by = policy.disabledReason {
             streams.err("warning: local session search is off (\(by)); local sessions were not searched.\n")
         }
+
+        var seenSessionIDs = Set(hits.map(\.sessionID))
+        let remaining = max(0, options.limit - hits.count)
+        var remoteHits: [SessionReplicaResponse] = []
+        for remote in remoteSessions where remoteHits.count < remaining {
+            if seenSessionIDs.insert(remote.sessionId).inserted {
+                remoteHits.append(remote)
+            }
+        }
+
         if options.json {
-            streams.out(try encodeJSON(hits.map(payload(for:))) + "\n")
+            var payloads = hits.map(payload(for:))
+            for remote in remoteHits {
+                payloads.append(remoteSearchPayload(for: remote))
+            }
+            streams.out(try encodeJSON(payloads) + "\n")
             return
         }
-        guard !hits.isEmpty else {
+        guard !hits.isEmpty || !remoteHits.isEmpty else {
             streams.out("No sessions matched \(query).\n")
             return
         }
@@ -771,9 +897,26 @@ public enum LiveSessionsComposition {
             lines.append("  \(hit.title ?? "(untitled)")")
             lines.append("  \(hit.snippet)")
         }
+        for remote in remoteHits {
+            lines.append("\(remote.sessionId) (remote)  \(timestamp(remote.updatedAt))")
+            lines.append("  \(remote.summary.isEmpty ? "(untitled)" : remote.summary)")
+            lines.append("  \(String((remote.firstPrompt ?? "").prefix(80)))")
+        }
         lines.append("")
-        lines.append("Total: \(hits.count)")
+        lines.append("Total: \(hits.count + remoteHits.count)")
         streams.out(lines.joined(separator: "\n") + "\n")
+    }
+
+    private static func remoteSearchPayload(for session: SessionReplicaResponse) -> [String: Any] {
+        var payload: [String: Any] = [
+            "id": session.sessionId,
+            "cwd": session.cwd,
+            "last_activity_at": timestamp(session.updatedAt),
+            "source": "remote",
+            "snippet": String((session.firstPrompt ?? "").prefix(80)),
+        ]
+        if !session.summary.isEmpty { payload["title"] = session.summary }
+        return payload
     }
 
     private static func payload(for hit: LiveSessionSearchHit) -> [String: Any] {
