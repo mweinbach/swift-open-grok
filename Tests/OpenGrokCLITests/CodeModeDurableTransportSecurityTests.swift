@@ -1,4 +1,7 @@
 import Foundation
+#if os(Windows)
+import OpenGrokConfig
+#endif
 import OpenGrokPagerRender
 import OpenGrokSamplingTypes
 import OpenGrokSessionPersistence
@@ -19,8 +22,14 @@ private struct CodeModeTransportDiskFixture {
         )
         home = root.appendingPathComponent("home", isDirectory: true)
         workspace = root.appendingPathComponent("workspace", isDirectory: true)
+        #if os(Windows)
+        try OpenGrokConfig.createDirAllOwnerOnly(root, stateRoot: root)
+        try OpenGrokConfig.createDirAllOwnerOnly(home, stateRoot: home)
+        try OpenGrokConfig.createDirAllOwnerOnly(workspace, stateRoot: root)
+        #else
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        #endif
     }
 
     func cleanup() {
