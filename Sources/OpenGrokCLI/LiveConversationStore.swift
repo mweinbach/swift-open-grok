@@ -1876,6 +1876,14 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
         do {
             let result = try await sampleTurn(context: context, request: request, emit: emit)
             if result.stopReason == "max_turns_reached" {
+                toolExecutor.fireObserveHook(
+                    event: .stopCancelled,
+                    promptID: request.promptID,
+                    payload: [
+                        "reason": .string("max_turns"),
+                        "cancelledBy": .string("runtime"),
+                    ]
+                )
                 var fields: [String: JSONValue] = ["reason": .string("max_turns_reached")]
                 if let maxTurns { fields["limit"] = .number(.uint64(UInt64(maxTurns))) }
                 await conversationHistory.endEventTurn(
@@ -1896,6 +1904,14 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             return result
         } catch {
             if error is CancellationError {
+                toolExecutor.fireObserveHook(
+                    event: .stopCancelled,
+                    promptID: request.promptID,
+                    payload: [
+                        "reason": .string("user_interrupt"),
+                        "cancelledBy": .string("user"),
+                    ]
+                )
                 await conversationHistory.endEventTurn(
                     outcome: .cancelled,
                     cancellationCategory: .midTurnAbort
@@ -2410,8 +2426,8 @@ struct LiveShellSamplingDriver: OpenGrokShellSamplingDriver, Sendable {
             // StopFailure fires when the turn ends due to an API/turn error
             // rather than a genuine stop, matching upstream (turn.rs:1224-1234).
             // Payload carries the error class, details, and the rendered
-            // message (event.rs:376-387). A cancellation is not a failure and
-            // is rethrown without firing.
+            // message (event.rs:376-387). Cancellations bypass this failure
+            // branch and are announced by the outer turn lifecycle instead.
             toolExecutor.fireObserveHook(
                 event: .stopFailure,
                 promptID: request.promptID,

@@ -231,6 +231,7 @@ struct HookPluginDescriptorTests {
             (.sessionEnd, "session_end"),
             (.stop, "stop"),
             (.stopFailure, "stop_failure"),
+            (.stopCancelled, "stop_cancelled"),
             (.preToolUse, "pre_tool_use"),
             (.postToolUse, "post_tool_use"),
             (.postToolUseFailure, "post_tool_use_failure"),
@@ -249,6 +250,7 @@ struct HookPluginDescriptorTests {
         // Display labels (trust/precedence UX)
         #expect(HookEvent.preToolUse.description == "Pre-Tool Use")
         #expect(HookEvent.sessionStart.description == "Session Start")
+        #expect(HookEvent.stopCancelled.description == "Stop Cancelled")
     }
 
     @Test("scopes, statuses, handler types")

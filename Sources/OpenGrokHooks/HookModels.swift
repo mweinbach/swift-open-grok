@@ -22,6 +22,7 @@ public extension HookEvent {
         .sessionEnd,
         .stop,
         .stopFailure,
+        .stopCancelled,
         .notification,
         .userPromptSubmit,
         .permissionDenied,
@@ -40,6 +41,7 @@ public extension HookEvent {
         case "SessionEnd", "session_end", "sessionEnd": self = .sessionEnd
         case "Stop", "stop": self = .stop
         case "StopFailure", "stop_failure", "stopFailure": self = .stopFailure
+        case "StopCancelled", "stop_cancelled", "stopCancelled": self = .stopCancelled
         case "Notification", "notification": self = .notification
         case "UserPromptSubmit", "user_prompt_submit", "userPromptSubmit", "beforeSubmitPrompt": self = .userPromptSubmit
         case "PermissionDenied", "permission_denied", "permissionDenied": self = .permissionDenied
@@ -60,6 +62,7 @@ public extension HookEvent {
         case .sessionEnd: return "session_end"
         case .stop: return "stop"
         case .stopFailure: return "stop_failure"
+        case .stopCancelled: return "stop_cancelled"
         case .notification: return "notification"
         case .userPromptSubmit: return "user_prompt_submit"
         case .permissionDenied: return "permission_denied"
@@ -80,7 +83,7 @@ public extension HookEvent {
 
     var matcherPolicy: HookMatcherPolicy {
         switch self {
-        case .stop, .subagentStop, .userPromptSubmit: return .ignored
+        case .stop, .userPromptSubmit: return .ignored
         default: return .tested
         }
     }
@@ -178,11 +181,25 @@ public struct HookEventEnvelope: Sendable, Equatable, Codable {
     }
 
     public var matchValue: String? {
-        let keys = ["toolName", "notificationType", "subagentType", "source", "reason", "error"]
-        for key in keys where payload[key]?.stringValue?.isEmpty == false {
-            return payload[key]?.stringValue
+        let key: String
+        switch hookEventName {
+        case .preToolUse, .postToolUse, .postToolUseFailure, .permissionDenied:
+            key = "toolName"
+        case .notification:
+            key = "notificationType"
+        case .subagentStart, .subagentStop:
+            key = "subagentType"
+        case .sessionStart, .preCompact, .postCompact:
+            key = "source"
+        case .sessionEnd, .stopCancelled:
+            key = "reason"
+        case .stopFailure:
+            key = "error"
+        case .stop, .userPromptSubmit:
+            return nil
         }
-        return nil
+        guard let value = payload[key]?.stringValue, !value.isEmpty else { return nil }
+        return value
     }
 
     private enum CodingKeys: String, CodingKey {

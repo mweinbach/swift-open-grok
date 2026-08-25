@@ -40,7 +40,7 @@ actor LiveHookPresentationStore {
                 state: aggregateState(records),
                 hooks: rows(records, phase: .pre)
             )
-        case .stop, .stopFailure:
+        case .stop, .stopFailure, .stopCancelled:
             guard let id else { return }
             stopHooks[id, default: []].append(contentsOf: rows(records, phase: .stop))
         case .sessionEnd, .notification, .subagentStart, .subagentStop,

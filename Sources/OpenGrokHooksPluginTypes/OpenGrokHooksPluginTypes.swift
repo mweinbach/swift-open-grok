@@ -189,6 +189,7 @@ public enum HookEvent: Hashable, Sendable, Codable, Equatable {
     case sessionEnd
     case stop
     case stopFailure
+    case stopCancelled
     case preToolUse
     case postToolUse
     case postToolUseFailure
@@ -205,6 +206,7 @@ public enum HookEvent: Hashable, Sendable, Codable, Equatable {
         (.sessionEnd, "session_end"),
         (.stop, "stop"),
         (.stopFailure, "stop_failure"),
+        (.stopCancelled, "stop_cancelled"),
         (.preToolUse, "pre_tool_use"),
         (.postToolUse, "post_tool_use"),
         (.postToolUseFailure, "post_tool_use_failure"),
@@ -247,6 +249,7 @@ extension HookEvent: CustomStringConvertible {
         case .sessionEnd: return "Session End"
         case .stop: return "Stop"
         case .stopFailure: return "Stop Failure"
+        case .stopCancelled: return "Stop Cancelled"
         case .notification: return "Notification"
         case .userPromptSubmit: return "Prompt Submit"
         case .permissionDenied: return "Permission Denied"

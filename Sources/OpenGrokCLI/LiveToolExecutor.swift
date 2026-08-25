@@ -1161,7 +1161,7 @@ struct LiveToolExecutor: Sendable {
 
     /// Fire an observe-only hook event (SessionStart, UserPromptSubmit,
     /// PostToolUse, PostToolUseFailure, PermissionDenied, StopFailure,
-    /// Notification, PreCompact, PostCompact, SessionEnd).
+    /// StopCancelled, Notification, PreCompact, PostCompact, SessionEnd).
     ///
     /// Fire-and-forget: the spawned task awaits the dispatch and records its
     /// results in the gate's buffer, but the turn never waits on it. Observe

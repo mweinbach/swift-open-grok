@@ -93,7 +93,7 @@ private struct HookEventsFixture {
             env = {}
         name = env.get("hookEventName", "")
         fields = ["source", "prompt", "toolName", "toolUseId", "error",
-                  "notificationType", "reason", "toolInputTruncated",
+                  "notificationType", "reason", "cancelledBy", "toolInputTruncated",
                   "toolResultTruncated", "isBackgrounded"]
         parts = [name]
         for key in fields:
@@ -151,6 +151,7 @@ private struct HookEventsFixture {
             "PostToolUseFailure":  [{"hooks": [{"type": "command", "command": "\(escapedScriptPath)"}]}],
             "PermissionDenied":     [{"hooks": [{"type": "command", "command": "\(escapedScriptPath)"}]}],
             "StopFailure":          [{"hooks": [{"type": "command", "command": "\(escapedScriptPath)"}]}],
+            "StopCancelled":        [{"hooks": [{"type": "command", "command": "\(escapedScriptPath)"}]}],
             "Notification":        [{"hooks": [{"type": "command", "command": "\(escapedScriptPath)"}]}],
             "PreCompact":           [{"hooks": [{"type": "command", "command": "\(escapedScriptPath)"}]}],
             "PostCompact":          [{"hooks": [{"type": "command", "command": "\(escapedScriptPath)"}]}],
@@ -166,7 +167,7 @@ private struct HookEventsFixture {
             encoding: .utf8
         )
 
-        var env = [
+        let env = [
             "HOME": home.path,
             "OPENGROK_HOME": home.path,
             "GROK_SANDBOX": "off",
@@ -205,7 +206,7 @@ private struct HookEventsFixture {
         else { return [] }
         let fields = [
             "source", "prompt", "toolName", "toolUseId", "error",
-            "notificationType", "reason", "toolInputTruncated",
+            "notificationType", "reason", "cancelledBy", "toolInputTruncated",
             "toolResultTruncated", "isBackgrounded",
         ]
         return contents.split(whereSeparator: \.isNewline).map { rawLine in
@@ -250,6 +251,8 @@ private struct HookEventsFixture {
 private actor CannedSamplerStore {
     private var queue: [OpenGrokLiveSamplingResponse] = []
     private var throwNext = false
+    private var holdNext = false
+    private var isHolding = false
 
     func enqueue(_ responses: [OpenGrokLiveSamplingResponse]) {
         queue.append(contentsOf: responses)
@@ -262,7 +265,25 @@ private actor CannedSamplerStore {
         throwNext = true
     }
 
-    func next(turnID: String, tools: [ToolSpec]) throws -> OpenGrokLiveSamplingResponse {
+    func enqueueHeldTurn() {
+        holdNext = true
+    }
+
+    func waitUntilHolding(timeoutSeconds: TimeInterval = 15) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while !isHolding, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return isHolding
+    }
+
+    func next(turnID: String, tools: [ToolSpec]) async throws -> OpenGrokLiveSamplingResponse {
+        if holdNext {
+            holdNext = false
+            isHolding = true
+            defer { isHolding = false }
+            try await Task.sleep(nanoseconds: 30_000_000_000)
+        }
         if throwNext {
             throwNext = false
             throw SamplingError.api(
@@ -311,6 +332,116 @@ private func textResponse(_ text: String) -> OpenGrokLiveSamplingResponse {
 
 @Suite("Live hook events reachability", .serialized)
 struct LiveHookEventsReachabilityTests {
+    @Test("user-cancelled live turns run StopCancelled exactly once with authentic cancellation metadata")
+    func userCancellationFiresStopCancelled() async throws {
+        let fixture = try HookEventsFixture()
+        defer { fixture.dispose() }
+        let store = CannedSamplerStore()
+        await store.enqueueHeldTurn()
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in makeCannedSampler(store) }
+        )
+        let foundation = try await OpenGrokLiveApplicationLauncher.makeSessionFoundation(
+            options: fixture.launchOptions(["--model", "grok-4.5"]),
+            context: fixture.context(),
+            dependencies: dependencies
+        )
+        let stack = await OpenGrokLiveApplicationLauncher.makeAgentStack(
+            foundation: foundation,
+            context: fixture.context(),
+            dependencies: dependencies
+        )
+        let shell = stack.shell
+        let state = try await shell.start()
+        #expect(state.state == .running)
+        let sessionID = SessionID(foundation.sessionID)
+        let created = try await shell.createSession(OpenGrokShellSessionRequest(
+            sessionID: sessionID,
+            cwd: foundation.cwd,
+            providerConfiguration: foundation.providerConfiguration
+        ))
+        #expect(created.sessionID == sessionID)
+
+        let handle = try await shell.submitTurn(
+            sessionID: sessionID,
+            request: OpenGrokShellTurnRequest(
+                promptID: "cancelled-prompt",
+                text: "wait until cancelled",
+                turnID: "cancelled-turn"
+            )
+        )
+        #expect(await store.waitUntilHolding())
+        try await shell.cancelTurn(handle)
+        try await fixture.waitFor(event: "stop_cancelled")
+
+        let cancellations = fixture.recordedEvents().filter {
+            $0.hasPrefix("stop_cancelled|")
+        }
+        #expect(cancellations.count == 1)
+        #expect(cancellations[0].contains("reason=user_interrupt"))
+        #expect(cancellations[0].contains("cancelledBy=user"))
+        #expect(!fixture.recordedEvents().contains { $0.hasPrefix("stop_failure|") })
+        await foundation.toolExecutor.shutdown()
+    }
+
+    @Test("the live maximum-turn limit reports StopCancelled as a runtime cancellation")
+    func maxTurnsFiresStopCancelled() async throws {
+        let fixture = try HookEventsFixture()
+        defer { fixture.dispose() }
+        let store = CannedSamplerStore()
+        await store.enqueue([
+            toolCallResponse(
+                callId: "limited-tool",
+                name: "todo_write",
+                args: #"{"todos":[{"id":"1","content":"stop after this", "status":"pending"}]}"#
+            ),
+        ])
+        let dependencies = OpenGrokLiveCompositionDependencies(
+            makeSampler: { _ in makeCannedSampler(store) }
+        )
+        let foundation = try await OpenGrokLiveApplicationLauncher.makeSessionFoundation(
+            options: fixture.launchOptions(["--model", "grok-4.5", "--max-turns", "1"]),
+            context: fixture.context(),
+            dependencies: dependencies
+        )
+        let stack = await OpenGrokLiveApplicationLauncher.makeAgentStack(
+            foundation: foundation,
+            context: fixture.context(),
+            dependencies: dependencies
+        )
+        let shell = stack.shell
+        let state = try await shell.start()
+        #expect(state.state == .running)
+        let sessionID = SessionID(foundation.sessionID)
+        let created = try await shell.createSession(OpenGrokShellSessionRequest(
+            sessionID: sessionID,
+            cwd: foundation.cwd,
+            providerConfiguration: foundation.providerConfiguration
+        ))
+        #expect(created.sessionID == sessionID)
+        let handle = try await shell.submitTurn(
+            sessionID: sessionID,
+            request: OpenGrokShellTurnRequest(
+                promptID: "max-turns-prompt",
+                text: "make one tool call",
+                turnID: "max-turns-turn"
+            )
+        )
+        let result = try await shell.waitForTurn(
+            handle,
+            timeout: ShellDuration(timeInterval: 30)
+        )
+        #expect(result.stopReason == "max_turns_reached")
+        try await fixture.waitFor(event: "stop_cancelled")
+        let cancellations = fixture.recordedEvents().filter {
+            $0.hasPrefix("stop_cancelled|")
+        }
+        #expect(cancellations.count == 1)
+        #expect(cancellations[0].contains("reason=max_turns"))
+        #expect(cancellations[0].contains("cancelledBy=runtime"))
+        await foundation.toolExecutor.shutdown()
+    }
+
     /// Drive the live composition through the full lifecycle and assert each
     /// observe event fires exactly when upstream fires it, with the payload
     /// keys upstream sends. A broken UserPromptSubmit hook proves fail-open.

@@ -213,8 +213,17 @@ private func buildSpecs(
     let knownEvents = HookEvent.runtimeOrder.filter { event in hooks.keys.contains { HookEvent(hookKey: $0) == event } }
 
     for event in knownEvents {
-        guard let originalKey = hooks.keys.first(where: { HookEvent(hookKey: $0) == event }),
-              let groups = hooks[originalKey] else { continue }
+        let matchingKeys = hooks.keys
+            .filter { HookEvent(hookKey: $0) == event }
+            .sorted { lhs, rhs in
+                let lhsIsSubagentEnd = event == .subagentStop && isSubagentEndAlias(lhs)
+                let rhsIsSubagentEnd = event == .subagentStop && isSubagentEndAlias(rhs)
+                if lhsIsSubagentEnd != rhsIsSubagentEnd {
+                    return !lhsIsSubagentEnd
+                }
+                return lhs < rhs
+            }
+        let groups = matchingKeys.flatMap { hooks[$0] ?? [] }
         for (groupIndex, group) in groups.enumerated() {
             let configuredMatcher = group.matcher?.isEmpty == false ? group.matcher : nil
             var compiledMatcher: HookMatcher?
@@ -268,6 +277,15 @@ private func buildSpecs(
         }
     }
     return HookParseResult(specs: specs, errors: errors, skippedEvents: unknownEvents)
+}
+
+private func isSubagentEndAlias(_ key: String) -> Bool {
+    switch key {
+    case "SubagentEnd", "subagent_end", "subagentEnd":
+        return true
+    default:
+        return false
+    }
 }
 
 private extension RawHandler {
