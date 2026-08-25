@@ -66,6 +66,14 @@ public struct SystemVoiceAudioCapture: VoiceAudioCapture {
             )
         }
         return try await MicCaptureSubprocess.inputDeviceInfo()
+        #elseif os(Windows)
+        guard capabilities.microphoneCapture, capabilities.microphonePermission else {
+            throw VoiceError.unsupported(
+                capability: .microphoneCapture,
+                reason: "no accessible default Windows microphone input device"
+            )
+        }
+        return try await WindowsVoiceCaptureSession.inputDeviceInfo()
         #else
         throw VoiceError.unsupported(
             capability: .microphoneCapture,
@@ -93,6 +101,14 @@ public struct SystemVoiceAudioCapture: VoiceAudioCapture {
             )
         }
         return try await MicCaptureSubprocess.startCapture(sampleRate: sampleRate)
+        #elseif os(Windows)
+        guard capabilities.microphoneCapture, capabilities.microphonePermission else {
+            throw VoiceError.unsupported(
+                capability: .microphoneCapture,
+                reason: "no accessible default Windows microphone input device"
+            )
+        }
+        return try await WindowsVoiceCaptureSession.start(sampleRate: sampleRate)
         #else
         throw VoiceError.unsupported(
             capability: .microphoneCapture,

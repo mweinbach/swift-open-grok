@@ -300,7 +300,26 @@ private func targets() -> [Target] {
     // W5-S5: Hooks base; PluginMarketplace -> Hooks.
     t.append(.target(name: "OpenGrokHooks", dependencies: dep(w0s2, w0s3, w1s4, w1s5, w2s1, w2s2, w4s3, w4s1)))
     t.append(.target(name: "OpenGrokPluginMarketplace", dependencies: dep(w0s2, w0s3, w1s4, w1s5, w2s1, w2s2, w4s3, ["OpenGrokHooks"])))
-    t.append(contentsOf: libs(w5s6, dep(w0s2, w0s3, w0s4, w1s3, w1s5, w2s1, w2s2, w2s4, w3s3)))
+    t.append(.target(
+        name: "COpenGrokWASAPI",
+        path: "Sources/COpenGrokWASAPI",
+        publicHeadersPath: "include",
+        linkerSettings: [
+            .linkedLibrary("ole32", .when(platforms: [.windows])),
+            .linkedLibrary("uuid", .when(platforms: [.windows])),
+        ]
+    ))
+    t.append(contentsOf: libs(
+        w5s6.filter { $0 != "OpenGrokVoice" },
+        dep(w0s2, w0s3, w0s4, w1s3, w1s5, w2s1, w2s2, w2s4, w3s3)
+    ))
+    t.append(.target(
+        name: "OpenGrokVoice",
+        dependencies: dep(
+            w0s2, w0s3, w0s4, w1s3, w1s5, w2s1, w2s2, w2s4, w3s3,
+            ["COpenGrokWASAPI"]
+        )
+    ))
 
     // ---- Wave 6 ----
     // W6-S1: JavaScriptRuntime base; CodeMode -> JavaScriptRuntime.

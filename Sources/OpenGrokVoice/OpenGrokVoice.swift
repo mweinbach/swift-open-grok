@@ -57,6 +57,14 @@ public struct VoiceCapabilities: Codable, Equatable, Sendable {
             transcription: true,
             playback: false
         )
+        #elseif os(Windows)
+        let deviceAvailable = WindowsVoiceCaptureSupport.hasDefaultInputDevice()
+        return VoiceCapabilities(
+            microphoneCapture: deviceAvailable,
+            microphonePermission: deviceAvailable,
+            transcription: true,
+            playback: false
+        )
         #else
         return VoiceCapabilities(
             microphoneCapture: false,
