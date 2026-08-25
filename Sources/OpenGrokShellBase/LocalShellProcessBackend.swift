@@ -162,7 +162,14 @@ public actor LocalShellProcessBackend: ShellProcessBackend, ShellCapabilityProvi
         }
 
         await stopTask(taskID, cause: .cancellation, explicitlyKilled: true)
-        return .killed
+        switch await record.completion.wait(timeout: .seconds(5)) {
+        case .completed:
+            return .killed
+        case .cancelled, .timedOut:
+            // Match Rust's bounded reap: an uninterruptible child remains
+            // owned by its monitor instead of stalling the shell forever.
+            return .killed
+        }
     }
 
     public func killForegroundCommands() async {

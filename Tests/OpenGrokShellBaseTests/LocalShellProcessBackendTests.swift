@@ -116,6 +116,33 @@ struct LocalShellProcessBackendTests {
         #endif
     }
 
+    @Test("an explicit background kill publishes completion before it returns")
+    func explicitKillFinalizesBackgroundSnapshot() async throws {
+        #if os(Windows)
+        return
+        #else
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let backend = LocalShellProcessBackend()
+        let handle = try await backend.runBackground(
+            ShellCommandRequest(
+                command: "sleep 30",
+                workingDirectory: directory,
+                toolCallID: "call-explicit-background-kill",
+                ownerSessionID: "owner-background-kill",
+                shell: .sh
+            )
+        )
+
+        #expect(await backend.killTask(handle.taskID) == .killed)
+        let snapshot = await backend.getTask(handle.taskID)
+        #expect(snapshot?.completed == true)
+        #expect(snapshot?.explicitlyKilled == true)
+        #expect(snapshot?.blockWaited == false)
+        #expect(await backend.killTask(handle.taskID) == .alreadyExited)
+        #endif
+    }
+
     @Test("owner cleanup kills only matching background tasks")
     func ownerCleanup() async throws {
         #if os(Windows)

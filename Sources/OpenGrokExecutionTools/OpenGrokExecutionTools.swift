@@ -882,7 +882,9 @@ public actor ExecutionToolRuntime {
         guard let snapshot = snapshots[taskId] else { return .notFound }
         guard !snapshot.completed else { return .alreadyExited }
         guard let process = processes[taskId] else { return .alreadyExited }
+        guard let completion = running[taskId] else { return .alreadyExited }
         await process.cancel()
+        await completion.value
         return .killed
     }
 

@@ -453,6 +453,36 @@ func backgroundLifecycle() async throws {
     #expect(killOutcome == .alreadyExited)
 }
 
+@Test("background kill finalizes its authoritative snapshot before reporting success")
+func backgroundKillFinalizesSnapshotBeforeReportingSuccess() async throws {
+    let home = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: home) }
+    let process = CancellationIgnoringPTYProcess()
+    let runtime = ExecutionToolRuntime(
+        adapter: CancellationIgnoringPTYAdapter(process: process),
+        outputHome: home
+    )
+    let result = await runtime.execute(ExecutionRequest(
+        command: "sleep forever",
+        isBackground: true,
+        toolCallId: "background-kill-completion"
+    ))
+
+    guard case .success(.background(let handle)) = result else {
+        Issue.record("expected a background handle, got \(result)")
+        return
+    }
+
+    let outcome = await runtime.killTask(handle.taskId)
+    #expect(outcome == .killed)
+    #expect(process.wasCancelled)
+
+    let completed = await runtime.taskSnapshot(handle.taskId)
+    #expect(completed?.completed == true)
+    #expect(completed?.endTime != nil)
+    #expect(await runtime.killTask(handle.taskId) == .alreadyExited)
+}
+
 @Test("sandbox-required workspaces fail closed before spawning")
 func sandboxFailureIsTyped() async throws {
     let root = try temporaryDirectory()
