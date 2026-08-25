@@ -1446,6 +1446,11 @@ private func terminalSize(fd: Int32) -> TerminalSize? {
 public typealias PlatformTerminalInput = PosixTerminalInput
 public typealias PlatformTerminalResizeMonitor = PosixTerminalResizeMonitor
 
+#elseif os(Windows) && canImport(WinSDK)
+
+public typealias PlatformTerminalInput = WindowsTerminalInput
+public typealias PlatformTerminalResizeMonitor = WindowsTerminalResizeMonitor
+
 #else
 
 public struct UnsupportedTerminalInput: TerminalInput, Sendable {

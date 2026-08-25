@@ -45,7 +45,9 @@ struct LiveWrapExecutionDependencies: Sendable {
                 && isatty(STDOUT_FILENO) != 0
                 && isatty(STDERR_FILENO) != 0
             #elseif os(Windows)
-            false
+            PlatformTTYAdapter(fd: 0).isATTY()
+                && PlatformTTYAdapter(fd: 1).isATTY()
+                && PlatformTTYAdapter(fd: 2).isATTY()
             #else
             false
             #endif
@@ -257,10 +259,13 @@ enum LiveWrapComposition {
         }
 
         let writer = LiveWrapChildWriter(child)
-        let input = dependencies.forwardStandardInput ? LiveWrapInputPump(writer: writer) : nil
         let resize = LiveWrapResizePump(child: child)
         let tracker = LiveWrapTrackedModes()
+        var input: LiveWrapInputPump?
         do {
+            if dependencies.forwardStandardInput {
+                input = try LiveWrapInputPump(writer: writer)
+            }
             if let initialInput = dependencies.input, !initialInput.isEmpty {
                 try await writer.write(initialInput)
             }
@@ -579,7 +584,7 @@ private final class LiveWrapInputPump: @unchecked Sendable {
     private let continuation: AsyncStream<Data>.Continuation
     private let task: Task<Void, Never>
 
-    init(writer: LiveWrapChildWriter) {
+    init(writer: LiveWrapChildWriter) throws {
         let stream = AsyncStream<Data>.makeStream()
         continuation = stream.continuation
         task = Task {
@@ -616,8 +621,30 @@ private final class LiveWrapInputPump: @unchecked Sendable {
         continuation.finish()
         task.cancel()
     }
+    #elseif os(Windows)
+    private let input: PlatformTerminalInput
+    private let task: Task<Void, Never>
+
+    init(writer: LiveWrapChildWriter) throws {
+        let input = try PlatformTerminalInput(fd: 0, swallowXtversionReply: false)
+        self.input = input
+        self.task = Task {
+            do {
+                while !Task.isCancelled, let byte = try await input.readByte() {
+                    try await writer.write(Data([byte]))
+                }
+            } catch {
+                await input.close()
+            }
+        }
+    }
+
+    func cancel() {
+        task.cancel()
+        Task { await input.close() }
+    }
     #else
-    init(writer: LiveWrapChildWriter) {
+    init(writer: LiveWrapChildWriter) throws {
         _ = writer
     }
 

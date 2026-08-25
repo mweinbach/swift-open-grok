@@ -264,130 +264,50 @@ public typealias PlatformTTYAdapter = PosixTTYAdapter
 
 #elseif os(Windows)
 
-// Windows Console API raw-mode seam.
-// Full Win32 imports only typecheck under a Windows toolchain.
-
-/// Windows raw-mode lease restoring prior console modes on release/deinit.
-private final class WindowsRawModeLease: RawModeLease, @unchecked Sendable {
-    private let restore: () -> Void
-    private let lock = NSLock()
-    private var released = false
-
-    init(restore: @escaping () -> Void) {
-        self.restore = restore
-    }
-
-    deinit { releaseNow() }
-
-    func release() async { releaseNow() }
-
-    private func releaseNow() {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !released else { return }
-        released = true
-        restore()
-    }
-}
-
-/// Windows console TTY adapter (Console API).
-///
-/// Uses GetStdHandle / GetConsoleMode / SetConsoleMode when the WinSDK is
-/// linked. Nested leases preserve the original console modes for the epoch
-/// and restore them exactly once when the final lease releases.
+/// Windows console adapter. Modes belong to the console rather than an
+/// adapter instance, so all instances share the process-wide lease epoch.
 public final class WindowsTTYAdapter: TTYAdapter, @unchecked Sendable {
-    private let lock = NSLock()
-    private var liveLeases = 0
-    private var originalInputMode: UInt32?
-    private var originalOutputMode: UInt32?
-    private var rawApplied = false
+    private let fd: Int32
 
     public init(fd: Int32 = 1) {
-        _ = fd
+        self.fd = fd
     }
 
-    public var identifier: String? { "console" }
+    public var identifier: String? { "fd:\(fd)" }
 
     public func isATTY() -> Bool {
-        // Probe console attachment. Without WinSDK symbols this returns false
-        // so callers degrade to non-interactive I/O.
-        WindowsConsole.isAttached
+        #if canImport(WinSDK)
+        WindowsConsole.isAttached(fd: fd)
+        #else
+        false
+        #endif
     }
 
     public func size() -> TerminalSize? {
-        WindowsConsole.screenSize()
+        #if canImport(WinSDK)
+        WindowsConsole.screenSize(fd: fd)
+        #else
+        nil
+        #endif
     }
 
     public func capabilities() -> TerminalCapability { TerminalCapability() }
 
     public func enterRawMode() async throws -> any RawModeLease {
-        // NSLock is sync-only under Swift 6; keep the critical section off the
-        // async function body, the same split the other lock-holding actors in
-        // this port use. This arm is `#if os(Windows)`, so the diagnostic could
-        // only ever appear on the platform that had never compiled.
-        try acquireRawMode()
-    }
-
-    private func acquireRawMode() throws -> any RawModeLease {
-        lock.lock()
-        defer { lock.unlock() }
-        guard WindowsConsole.isAttached else {
-            throw TTYError.unsupported(
-                "Console raw mode requires an attached console (GetStdHandle/SetConsoleMode)."
-            )
-        }
-        if !rawApplied {
-            guard let modes = WindowsConsole.enterRawMode() else {
-                throw TTYError.ioFailed("SetConsoleMode(raw) failed")
-            }
-            originalInputMode = modes.input
-            originalOutputMode = modes.output
-            rawApplied = true
-        }
-        liveLeases += 1
-        return WindowsRawModeLease { [weak self] in
-            self?.releaseLease()
-        }
-    }
-
-    private func releaseLease() {
-        lock.lock()
-        defer { lock.unlock() }
-        guard liveLeases > 0 else { return }
-        liveLeases -= 1
-        if liveLeases == 0, rawApplied {
-            WindowsConsole.restoreModes(
-                input: originalInputMode,
-                output: originalOutputMode
-            )
-            originalInputMode = nil
-            originalOutputMode = nil
-            rawApplied = false
-        }
+        #if canImport(WinSDK)
+        try WindowsConsoleModeCoordinator.shared.enter(fd: fd)
+        #else
+        throw TTYError.unsupported("WinSDK console APIs are unavailable in this build.")
+        #endif
     }
 
     public func write(_ data: Data) async throws {
         guard !data.isEmpty else { return }
-        // Prefer WriteConsoleW when a console is attached; fall back to write.
-        if !WindowsConsole.write(data) {
-            FileHandle.standardOutput.write(data)
-        }
-    }
-}
-
-/// Win32 console primitives. Returns capability-absent results when the SDK
-/// symbols are not linked into this build (cross-compile hosts).
-enum WindowsConsole {
-    static var isAttached: Bool { false }
-    static func screenSize() -> TerminalSize? { nil }
-    static func enterRawMode() -> (input: UInt32, output: UInt32)? { nil }
-    static func restoreModes(input: UInt32?, output: UInt32?) {
-        _ = input
-        _ = output
-    }
-    static func write(_ data: Data) -> Bool {
-        _ = data
-        return false
+        #if canImport(WinSDK)
+        try WindowsConsole.write(data, fd: fd)
+        #else
+        throw TTYError.unsupported("WinSDK console APIs are unavailable in this build.")
+        #endif
     }
 }
 

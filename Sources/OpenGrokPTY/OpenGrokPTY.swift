@@ -126,6 +126,71 @@ public struct ProcessSpec: Sendable, Equatable {
     }
 }
 
+/// Portable, testable preparation for CreateProcessW's command line and environment.
+enum WindowsProcessLaunchSupport {
+    static func commandLine(command: String, arguments: [String]) -> String {
+        ([command] + arguments).map(quoteArgument).joined(separator: " ")
+    }
+
+    static func quoteArgument(_ argument: String) -> String {
+        guard argument.isEmpty
+            || argument.contains(where: \.isWhitespace)
+            || argument.contains("\"")
+        else { return argument }
+
+        var result = "\""
+        var backslashes = 0
+        for scalar in argument.unicodeScalars {
+            switch scalar.value {
+            case 0x5c:
+                backslashes += 1
+            case 0x22:
+                result += String(repeating: "\\", count: backslashes * 2 + 1)
+                result.append("\"")
+                backslashes = 0
+            default:
+                result += String(repeating: "\\", count: backslashes)
+                result.unicodeScalars.append(scalar)
+                backslashes = 0
+            }
+        }
+        result += String(repeating: "\\", count: backslashes * 2)
+        result.append("\"")
+        return result
+    }
+
+    static func environmentBlock(
+        inherited: [String: String],
+        overrides: [String: String]
+    ) throws -> [UInt16] {
+        var entries: [String: (name: String, value: String)] = [:]
+        for environment in [inherited, overrides] {
+            for (name, value) in environment {
+                guard !name.isEmpty,
+                      !name.contains("="),
+                      !name.utf8.contains(0),
+                      !value.utf8.contains(0)
+                else {
+                    throw PTYError.spawnFailed("invalid Windows environment entry: \(name)")
+                }
+                entries[name.uppercased()] = (name, value)
+            }
+        }
+
+        var result: [UInt16] = []
+        for key in entries.keys.sorted() {
+            guard let entry = entries[key] else { continue }
+            result.append(contentsOf: "\(entry.name)=\(entry.value)".utf16)
+            result.append(0)
+        }
+        result.append(0)
+        if entries.isEmpty {
+            result.append(0)
+        }
+        return result
+    }
+}
+
 // MARK: - Process handle protocol
 
 /// A running PTY/process handle.
@@ -1004,6 +1069,126 @@ public typealias PlatformPTYAdapter = PosixPTYAdapter
 
 #if canImport(WinSDK)
 import WinSDK
+
+private final class WindowsPTYOutputReader: @unchecked Sendable {
+    private let lock = NSLock()
+    private var handle: HANDLE?
+    private var continuation: AsyncThrowingStream<Data, Error>.Continuation?
+    private var buffered: [Data] = []
+    private var finished = false
+    private var failure: (any Error)?
+    private var stopping = false
+
+    init(handle: HANDLE) {
+        self.handle = handle
+    }
+
+    func start() {
+        let thread = Thread { [self] in readLoop() }
+        thread.name = "open-grok.windows-pty.output"
+        thread.stackSize = 512 * 1024
+        thread.start()
+    }
+
+    func output() -> AsyncThrowingStream<Data, Error> {
+        AsyncThrowingStream { continuation in
+            let snapshot = lock.withLock { () -> (chunks: [Data], finished: Bool, error: (any Error)?) in
+                let chunks = buffered
+                buffered.removeAll(keepingCapacity: false)
+                if !finished {
+                    self.continuation = continuation
+                }
+                return (chunks, finished, failure)
+            }
+            for chunk in snapshot.chunks {
+                continuation.yield(chunk)
+            }
+            if snapshot.finished {
+                if let error = snapshot.error {
+                    continuation.finish(throwing: error)
+                } else {
+                    continuation.finish()
+                }
+            } else {
+                continuation.onTermination = { [weak self] _ in self?.stop() }
+            }
+        }
+    }
+
+    func stop() {
+        let pipe = lock.withLock { () -> HANDLE? in
+            stopping = true
+            return handle
+        }
+        guard let pipe else { return }
+        if !CancelIoEx(pipe, nil), GetLastError() != DWORD(ERROR_NOT_FOUND) {
+            complete(PTYError.ioFailed("CancelIoEx(ConPTY) failed: \(GetLastError())"))
+        }
+    }
+
+    private func readLoop() {
+        defer {
+            let pipe = lock.withLock { () -> HANDLE? in
+                let pipe = handle
+                handle = nil
+                return pipe
+            }
+            if let pipe { CloseHandle(pipe) }
+        }
+
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            guard let pipe = lock.withLock({ handle }) else {
+                complete(nil)
+                return
+            }
+            var count: DWORD = 0
+            let read = buffer.withUnsafeMutableBytes { bytes -> Bool in
+                guard let base = bytes.baseAddress else { return false }
+                return ReadFile(pipe, base, DWORD(bytes.count), &count, nil)
+            }
+            if !read {
+                let error = GetLastError()
+                if error == DWORD(ERROR_BROKEN_PIPE)
+                    || error == DWORD(ERROR_NO_DATA)
+                    || lock.withLock({ stopping })
+                {
+                    complete(nil)
+                } else {
+                    complete(PTYError.ioFailed("ReadFile(ConPTY) failed: \(error)"))
+                }
+                return
+            }
+            guard count > 0 else {
+                complete(nil)
+                return
+            }
+            let chunk = Data(buffer.prefix(Int(count)))
+            let consumer = lock.withLock { () -> AsyncThrowingStream<Data, Error>.Continuation? in
+                if let continuation { return continuation }
+                if !finished { buffered.append(chunk) }
+                return nil
+            }
+            consumer?.yield(chunk)
+        }
+    }
+
+    private func complete(_ error: (any Error)?) {
+        let consumer = lock.withLock { () -> AsyncThrowingStream<Data, Error>.Continuation? in
+            guard !finished else { return nil }
+            finished = true
+            failure = error
+            let consumer = continuation
+            continuation = nil
+            return consumer
+        }
+        if let error {
+            consumer?.finish(throwing: error)
+        } else {
+            consumer?.finish()
+        }
+    }
+}
 #endif
 
 /// Windows process handle (ConPTY when the host exports the APIs).
@@ -1018,7 +1203,7 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
     private var jobHandle: HANDLE?
     private var pseudoConsole: HPCON?
     private var inputWrite: HANDLE?
-    private var outputRead: HANDLE?
+    private var outputReader: WindowsPTYOutputReader?
     #endif
 
     init(identifier: String, processID: Int32?) {
@@ -1034,23 +1219,25 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
         inputWrite: HANDLE?,
         outputRead: HANDLE?
     ) {
-        lock.lock()
-        defer { lock.unlock() }
-        self.processHandle = process
-        self.jobHandle = job
-        self.pseudoConsole = pseudoConsole
-        self.inputWrite = inputWrite
-        self.outputRead = outputRead
+        let reader = outputRead.map(WindowsPTYOutputReader.init(handle:))
+        lock.withLock {
+            self.processHandle = process
+            self.jobHandle = job
+            self.pseudoConsole = pseudoConsole
+            self.inputWrite = inputWrite
+            self.outputReader = reader
+        }
+        reader?.start()
     }
     #endif
 
     deinit {
         #if canImport(WinSDK)
-        if let h = inputWrite { CloseHandle(h) }
-        if let h = outputRead { CloseHandle(h) }
-        if let h = processHandle { CloseHandle(h) }
         if let h = jobHandle { CloseHandle(h) }
         if let h = pseudoConsole { ClosePseudoConsole(h) }
+        outputReader?.stop()
+        if let h = inputWrite { CloseHandle(h) }
+        if let h = processHandle { CloseHandle(h) }
         #endif
     }
 
@@ -1079,10 +1266,17 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
         }
         try data.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
-            var written: DWORD = 0
-            let ok = WriteFile(pipe, base, DWORD(raw.count), &written, nil)
-            if !ok {
-                throw PTYError.ioFailed("WriteFile(ConPTY) failed: \(GetLastError())")
+            var offset = 0
+            while offset < raw.count {
+                let requested = DWORD(min(raw.count - offset, Int(DWORD.max)))
+                var written: DWORD = 0
+                guard WriteFile(pipe, base.advanced(by: offset), requested, &written, nil) else {
+                    throw PTYError.ioFailed("WriteFile(ConPTY) failed: \(GetLastError())")
+                }
+                guard written > 0, written <= requested else {
+                    throw PTYError.ioFailed("WriteFile(ConPTY) returned an invalid byte count")
+                }
+                offset += Int(written)
             }
         }
         #else
@@ -1093,29 +1287,12 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
 
     public func output() -> AsyncThrowingStream<Data, Error> {
         #if canImport(WinSDK)
-        AsyncThrowingStream { continuation in
-            let pipe = self.lock.withLock { self.outputRead }
-            guard let pipe else {
+        guard let reader = lock.withLock({ outputReader }) else {
+            return AsyncThrowingStream { continuation in
                 continuation.finish(throwing: PTYError.unsupported("ConPTY output pipe missing"))
-                return
-            }
-            Task.detached {
-                var buf = [UInt8](repeating: 0, count: 65_536)
-                while !Task.isCancelled {
-                    var nread: DWORD = 0
-                    let ok = buf.withUnsafeMutableBytes { raw -> Bool in
-                        guard let base = raw.baseAddress else { return false }
-                        return ReadFile(pipe, base, DWORD(raw.count), &nread, nil)
-                    }
-                    if !ok || nread == 0 {
-                        continuation.finish()
-                        return
-                    }
-                    continuation.yield(Data(buf[0..<Int(nread)]))
-                }
-                continuation.finish()
             }
         }
+        return reader.output()
         #else
         AsyncThrowingStream { cont in
             cont.finish(throwing: PTYError.unsupported("ConPTY output path is unavailable."))
@@ -1125,19 +1302,15 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
 
     public func signal(_ signal: ProcessSignal) async throws {
         #if canImport(WinSDK)
-        let (proc, job) = lock.withLock { (processHandle, jobHandle) }
-        switch signal {
-        case .kill, .terminate:
-            if let job {
-                _ = TerminateJobObject(job, 1)
-            } else if let proc {
-                _ = TerminateProcess(proc, 1)
-            }
-        default:
-            // Windows has no direct SIGINT/SIGHUP mapping for ConPTY children;
-            // terminate is the portable fallback.
-            if let proc {
-                _ = TerminateProcess(proc, 1)
+        let (process, job) = lock.withLock { (processHandle, jobHandle) }
+        guard let process, let job else {
+            throw PTYError.ioFailed("ConPTY process has no mandatory Job Object")
+        }
+        if !TerminateJobObject(job, 1) {
+            let failure = GetLastError()
+            var code: DWORD = 0
+            guard GetExitCodeProcess(process, &code), code != DWORD(STILL_ACTIVE) else {
+                throw PTYError.ioFailed("TerminateJobObject failed: \(failure)")
             }
         }
         #else
@@ -1148,33 +1321,69 @@ public final class WindowsPTYProcess: PTYProcess, @unchecked Sendable {
 
     public func waitForExit() async throws -> ProcessExit {
         #if canImport(WinSDK)
-        let (currentExit, proc) = lock.withLock { (exitStatus, processHandle) }
-        if currentExit != .stillRunning { return currentExit }
-        guard let proc else { return .code(-1) }
-        _ = WaitForSingleObject(proc, INFINITE)
-        var code: DWORD = 0
-        GetExitCodeProcess(proc, &code)
-        let exit: ProcessExit = .code(Int32(bitPattern: code))
-        lock.withLock { exitStatus = exit }
-        return exit
+        let current = lock.withLock { exitStatus }
+        if current != .stillRunning { return current }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let thread = Thread { [self] in
+                    waitOnDedicatedThread(continuation)
+                }
+                thread.name = "open-grok.windows-pty.wait"
+                thread.stackSize = 512 * 1024
+                thread.start()
+            }
+        } onCancel: {
+            Task { await self.cancel() }
+        }
         #else
         return lock.withLock { exitStatus }
         #endif
     }
 
     public func cancel() async {
-        try? await signal(.terminate)
+        do {
+            try await signal(.terminate)
+        } catch {
+            #if canImport(WinSDK)
+            let handles = lock.withLock { (processHandle, jobHandle) }
+            if let process = handles.0, !TerminateProcess(process, 1) {
+                // Closing the mandatory kill-on-close job remains the final safeguard.
+            }
+            #endif
+        }
         #if canImport(WinSDK)
-        try? await Task.sleep(nanoseconds: 200_000_000)
-        try? await signal(.kill)
+        lock.withLock { outputReader }?.stop()
         #endif
         lock.withLock {
             cancelled = true
-            if exitStatus == .stillRunning {
-                exitStatus = .signal(9)
-            }
         }
     }
+
+    #if canImport(WinSDK)
+    private func waitOnDedicatedThread(_ continuation: CheckedContinuation<ProcessExit, any Error>) {
+        guard let process = lock.withLock({ processHandle }) else {
+            continuation.resume(throwing: PTYError.ioFailed("ConPTY process handle is unavailable"))
+            return
+        }
+        let result = WaitForSingleObject(process, DWORD(INFINITE))
+        guard result == DWORD(WAIT_OBJECT_0) else {
+            continuation.resume(throwing: PTYError.ioFailed(
+                "WaitForSingleObject failed: \(result), \(GetLastError())"
+            ))
+            return
+        }
+        var code: DWORD = 0
+        guard GetExitCodeProcess(process, &code) else {
+            continuation.resume(throwing: PTYError.ioFailed(
+                "GetExitCodeProcess failed: \(GetLastError())"
+            ))
+            return
+        }
+        let status: ProcessExit = .code(Int32(bitPattern: code))
+        lock.withLock { exitStatus = status }
+        continuation.resume(returning: status)
+    }
+    #endif
 }
 
 /// Windows ConPTY adapter.
@@ -1209,9 +1418,13 @@ public struct PlatformPTYAdapter: PTYAdapter, SignalHandling, Sendable {
         defer { CloseHandle(handle) }
         switch signal {
         case .kill, .terminate:
-            _ = TerminateProcess(handle, 1)
+            guard TerminateProcess(handle, 1) else {
+                throw PTYError.ioFailed("TerminateProcess failed: \(GetLastError())")
+            }
         default:
-            _ = TerminateProcess(handle, 1)
+            guard TerminateProcess(handle, 1) else {
+                throw PTYError.ioFailed("TerminateProcess failed: \(GetLastError())")
+            }
         }
         #else
         _ = signal
@@ -1237,11 +1450,42 @@ enum WindowsConPTY {
 
     static func spawn(_ spec: ProcessSpec, scope: ProcessScope?) throws -> WindowsPTYProcess {
         #if canImport(WinSDK)
-        // Create pipes for ConPTY input/output.
         var inputRead: HANDLE?
         var inputWrite: HANDLE?
         var outputRead: HANDLE?
         var outputWrite: HANDLE?
+        var pseudoConsole: HPCON?
+        var jobHandle: HANDLE?
+        var processInformation = PROCESS_INFORMATION()
+        var processCreated = false
+        var assignedToJob = false
+        var ownershipTransferred = false
+
+        defer {
+            if let inputRead { CloseHandle(inputRead) }
+            if let outputWrite { CloseHandle(outputWrite) }
+
+            if !ownershipTransferred {
+                if processCreated {
+                    if assignedToJob, let jobHandle {
+                        if !TerminateJobObject(jobHandle, 1),
+                           !TerminateProcess(processInformation.hProcess, 1)
+                        {
+                            // Closing the configured kill-on-close job still contains descendants.
+                        }
+                    } else if !TerminateProcess(processInformation.hProcess, 1) {
+                        // No resumed thread exists before successful job assignment.
+                    }
+                    CloseHandle(processInformation.hThread)
+                    CloseHandle(processInformation.hProcess)
+                }
+                if let jobHandle { CloseHandle(jobHandle) }
+                if let pseudoConsole { ClosePseudoConsole(pseudoConsole) }
+                if let inputWrite { CloseHandle(inputWrite) }
+                if let outputRead { CloseHandle(outputRead) }
+            }
+        }
+
         var sa = SECURITY_ATTRIBUTES()
         sa.nLength = DWORD(MemoryLayout<SECURITY_ATTRIBUTES>.size)
         sa.bInheritHandle = true
@@ -1252,56 +1496,56 @@ enum WindowsConPTY {
         }
 
         let size = spec.initialSize ?? TerminalSize(width: 80, height: 24)
-        var coord = COORD(X: Int16(clamping: size.width), Y: Int16(clamping: size.height))
-        var hpc: HPCON?
-        let hr = CreatePseudoConsole(coord, inputRead, outputWrite, 0, &hpc)
-        // Parent keeps inputWrite / outputRead; close the ends given to ConPTY.
-        CloseHandle(inputRead)
-        CloseHandle(outputWrite)
-        guard hr >= 0, let hpc else {
-            CloseHandle(inputWrite)
-            CloseHandle(outputRead)
+        let coord = COORD(X: Int16(clamping: size.width), Y: Int16(clamping: size.height))
+        let hr = CreatePseudoConsole(coord, inputRead, outputWrite, 0, &pseudoConsole)
+        if let handle = inputRead { CloseHandle(handle); inputRead = nil }
+        if let handle = outputWrite { CloseHandle(handle); outputWrite = nil }
+        guard hr >= 0, let console = pseudoConsole else {
             throw PTYError.spawnFailed("CreatePseudoConsole failed: \(hr)")
         }
 
-        // Build command line.
-        var cmd = spec.command
-        for arg in spec.arguments {
-            cmd += " " + arg
-        }
-        var cmdWide = Array(cmd.utf16)
+        let command = WindowsProcessLaunchSupport.commandLine(
+            command: spec.command,
+            arguments: spec.arguments
+        )
+        var cmdWide = Array(command.utf16)
         cmdWide.append(0)
+        var environmentBlock = try WindowsProcessLaunchSupport.environmentBlock(
+            inherited: ProcessInfo.processInfo.environment,
+            overrides: spec.environment
+        )
 
-        // Job object for descendant cleanup (kill-on-close).
-        let job = CreateJobObjectW(nil, nil)
-        if let job, job != INVALID_HANDLE_VALUE {
-            var info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-            info.BasicLimitInformation.LimitFlags = DWORD(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
-            _ = SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &info,
-                DWORD(MemoryLayout<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>.size)
-            )
+        guard let job = CreateJobObjectW(nil, nil), job != INVALID_HANDLE_VALUE else {
+            throw PTYError.spawnFailed("CreateJobObjectW failed: \(GetLastError())")
+        }
+        jobHandle = job
+        var info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = DWORD(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+        guard SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info,
+            DWORD(MemoryLayout<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>.size)
+        ) else {
+            throw PTYError.spawnFailed("SetInformationJobObject failed: \(GetLastError())")
         }
 
-        // Attribute list for PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE.
         var attrSize: SIZE_T = 0
-        InitializeProcThreadAttributeList(nil, 1, 0, &attrSize)
+        if InitializeProcThreadAttributeList(nil, 1, 0, &attrSize) || attrSize == 0 {
+            throw PTYError.spawnFailed("InitializeProcThreadAttributeList size query failed")
+        }
         let attrBuf = UnsafeMutableRawPointer.allocate(byteCount: Int(attrSize), alignment: 16)
         defer { attrBuf.deallocate() }
         let attrList = LPPROC_THREAD_ATTRIBUTE_LIST(attrBuf)
         guard InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize) else {
-            ClosePseudoConsole(hpc)
-            CloseHandle(inputWrite)
-            CloseHandle(outputRead)
-            if let job { CloseHandle(job) }
-            throw PTYError.spawnFailed("InitializeProcThreadAttributeList failed")
+            throw PTYError.spawnFailed(
+                "InitializeProcThreadAttributeList failed: \(GetLastError())"
+            )
         }
         defer { DeleteProcThreadAttributeList(attrList) }
 
-        var hpcRef = hpc
-        _ = UpdateProcThreadAttribute(
+        var hpcRef = console
+        guard UpdateProcThreadAttribute(
             attrList,
             0,
             DWORD_PTR(PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE),
@@ -1309,61 +1553,69 @@ enum WindowsConPTY {
             SIZE_T(MemoryLayout<HPCON>.size),
             nil,
             nil
-        )
+        ) else {
+            throw PTYError.spawnFailed("UpdateProcThreadAttribute failed: \(GetLastError())")
+        }
 
         var si = STARTUPINFOEXW()
         si.StartupInfo.cb = DWORD(MemoryLayout<STARTUPINFOEXW>.size)
         si.lpAttributeList = attrList
 
-        var pi = PROCESS_INFORMATION()
-        var envBlock: UnsafeMutablePointer<WCHAR>?
-        // Environment and CWD: use the process defaults when not specified;
-        // CreateProcessW accepts an optional lpCurrentDirectory.
         let cwdWide: [WCHAR]? = spec.workingDirectory.map { Array(($0 as String).utf16) + [0] }
 
-        let created = cmdWide.withUnsafeMutableBufferPointer { cmdBuf -> Bool in
-            let dirPtr: UnsafePointer<WCHAR>? = cwdWide.flatMap { wide in
-                wide.withUnsafeBufferPointer { $0.baseAddress }
+        func createProcess(directory: UnsafePointer<WCHAR>?) -> Bool {
+            cmdWide.withUnsafeMutableBufferPointer { command in
+                environmentBlock.withUnsafeMutableBufferPointer { environment in
+                    CreateProcessW(
+                        nil,
+                        command.baseAddress,
+                        nil,
+                        nil,
+                        false,
+                        DWORD(EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED),
+                        UnsafeMutableRawPointer(environment.baseAddress),
+                        directory,
+                        &si.StartupInfo,
+                        &processInformation
+                    )
+                }
             }
-            return CreateProcessW(
-                nil,
-                cmdBuf.baseAddress,
-                nil,
-                nil,
-                false,
-                DWORD(EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT),
-                nil,
-                dirPtr,
-                &si.StartupInfo,
-                &pi
-            )
+        }
+
+        let created: Bool
+        if let cwdWide {
+            created = cwdWide.withUnsafeBufferPointer { createProcess(directory: $0.baseAddress) }
+        } else {
+            created = createProcess(directory: nil)
         }
 
         guard created else {
-            let err = GetLastError()
-            ClosePseudoConsole(hpc)
-            CloseHandle(inputWrite)
-            CloseHandle(outputRead)
-            if let job { CloseHandle(job) }
-            throw PTYError.spawnFailed("CreateProcessW failed: \(err)")
+            throw PTYError.spawnFailed("CreateProcessW failed: \(GetLastError())")
         }
+        processCreated = true
 
-        if let job, job != INVALID_HANDLE_VALUE {
-            _ = AssignProcessToJobObject(job, pi.hProcess)
+        guard AssignProcessToJobObject(job, processInformation.hProcess) else {
+            throw PTYError.spawnFailed("AssignProcessToJobObject failed: \(GetLastError())")
         }
-        CloseHandle(pi.hThread)
+        assignedToJob = true
+        let previousSuspendCount = ResumeThread(processInformation.hThread)
+        guard previousSuspendCount != DWORD.max else {
+            throw PTYError.spawnFailed("ResumeThread failed: \(GetLastError())")
+        }
 
         let process = WindowsPTYProcess(
-            identifier: "pid:\(pi.dwProcessId)",
-            processID: Int32(bitPattern: pi.dwProcessId)
+            identifier: "pid:\(processInformation.dwProcessId)",
+            processID: Int32(bitPattern: processInformation.dwProcessId)
         )
         process.adopt(
-            process: pi.hProcess,
+            process: processInformation.hProcess,
             job: job,
-            pseudoConsole: hpc,
+            pseudoConsole: console,
             inputWrite: inputWrite,
             outputRead: outputRead
         )
+        CloseHandle(processInformation.hThread)
+        ownershipTransferred = true
         _ = scope
         return process
         #else
