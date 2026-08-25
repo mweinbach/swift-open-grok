@@ -981,6 +981,12 @@ public final class URLSessionHTTPTransport: NSObject, HTTPTransport, @unchecked 
 
     public func send(_ request: HTTPRequest) async throws -> HTTPResponse {
         try Task.checkCancellation()
+        #if os(Linux)
+        if sessionDelegate?.additionalTrustRootsUnavailable == true {
+            return try await LinuxEnterpriseHTTPTransport(configuration: configuration)
+                .send(request)
+        }
+        #endif
         if let failure = sessionDelegate?.additionalTrustRootsFailure {
             throw failure
         }
@@ -1015,6 +1021,12 @@ public final class URLSessionHTTPTransport: NSObject, HTTPTransport, @unchecked 
     }
 
     public func stream(_ request: HTTPRequest) -> AsyncThrowingStream<HTTPStreamEvent, Error> {
+        #if os(Linux)
+        if sessionDelegate?.additionalTrustRootsUnavailable == true {
+            return LinuxEnterpriseHTTPTransport(configuration: configuration)
+                .stream(request)
+        }
+        #endif
         let mailbox = BoundedStreamMailbox(
             maxPendingBytes: configuration.maxStreamBufferBytes
         )

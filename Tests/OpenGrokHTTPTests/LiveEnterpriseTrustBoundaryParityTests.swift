@@ -276,9 +276,9 @@ private final class EnterpriseTrustRecordingURLProtocol: URLProtocol, @unchecked
 
 #elseif os(Linux)
 
-@Suite("Live Linux enterprise TLS trust boundary")
+@Suite("Live Linux malformed enterprise TLS trust roots")
 struct LiveLinuxEnterpriseTrustBoundaryParityTests {
-    private var configuration: HTTPTransportConfiguration {
+    private var malformedRootConfiguration: HTTPTransportConfiguration {
         HTTPTransportConfiguration(
             tls: HTTPTLSConfiguration(
                 validateCertificates: true,
@@ -287,7 +287,7 @@ struct LiveLinuxEnterpriseTrustBoundaryParityTests {
         )
     }
 
-    private var request: HTTPRequest {
+    private var sensitiveRequest: HTTPRequest {
         HTTPRequest(
             method: .post,
             url: URL(string: "https://127.0.0.1:9/private?token=query-secret")!,
@@ -296,48 +296,58 @@ struct LiveLinuxEnterpriseTrustBoundaryParityTests {
         )
     }
 
-    @Test("the actual Linux buffered transport refuses configured unsupported roots")
-    func bufferedTransportFailsClosedBeforeNetwork() async {
+    @Test("buffered HTTPS rejects a malformed enterprise root before network access")
+    func bufferedHTTPSRejectsMalformedEnterpriseRootBeforeNetwork() async {
         do {
-            _ = try await URLSessionHTTPTransport(configuration: configuration).send(request)
-            Issue.record("Linux buffered transport ignored configured enterprise roots")
+            let response = try await URLSessionHTTPTransport(
+                configuration: malformedRootConfiguration
+            ).send(sensitiveRequest)
+            Issue.record(
+                "Linux buffered HTTPS accepted a malformed enterprise root with HTTP status \(response.metadata.statusCode)"
+            )
         } catch {
-            assertPermanentTrustFailure(error)
+            assertPermanentMalformedRootFailure(error)
         }
     }
 
-    @Test("the actual Linux streaming transport refuses before a data task starts")
-    func streamingTransportFailsClosedBeforeNetwork() async {
-        var iterator = URLSessionHTTPTransport(configuration: configuration)
-            .stream(request)
+    @Test("streaming HTTPS rejects a malformed enterprise root before network access")
+    func streamingHTTPSRejectsMalformedEnterpriseRootBeforeNetwork() async {
+        var iterator = URLSessionHTTPTransport(configuration: malformedRootConfiguration)
+            .stream(sensitiveRequest)
             .makeAsyncIterator()
         do {
-            _ = try await iterator.next()
-            Issue.record("Linux streaming transport ignored configured enterprise roots")
+            let unexpectedEvent = try await iterator.next()
+            Issue.record(
+                unexpectedEvent == nil
+                    ? "Linux streaming HTTPS silently accepted a malformed enterprise root"
+                    : "Linux streaming HTTPS produced an event for a malformed enterprise root"
+            )
         } catch {
-            assertPermanentTrustFailure(error)
+            assertPermanentMalformedRootFailure(error)
         }
     }
 
-    @Test("the actual Linux WebSocket transport refuses before its socket task starts")
-    func webSocketTransportFailsClosedBeforeNetwork() {
+    @Test("WebSockets reject a malformed enterprise root before network access")
+    func webSocketRejectsMalformedEnterpriseRootBeforeNetwork() {
         do {
-            _ = try URLSessionWebSocketClient.connect(
+            let unexpectedClient = try URLSessionWebSocketClient.connect(
                 url: URL(string: "wss://127.0.0.1:9/socket?token=query-secret")!,
-                configuration: configuration,
+                configuration: malformedRootConfiguration,
                 headers: ["Authorization": "Bearer bearer-secret"]
             )
-            Issue.record("Linux WebSocket transport ignored configured enterprise roots")
+            Issue.record(
+                "Linux WebSocket accepted a malformed enterprise root: \(type(of: unexpectedClient))"
+            )
         } catch {
-            assertPermanentTrustFailure(error)
+            assertPermanentMalformedRootFailure(error)
         }
     }
 
-    private func assertPermanentTrustFailure(_ error: any Error) {
+    private func assertPermanentMalformedRootFailure(_ error: any Error) {
         guard let httpError = error as? HTTPError,
               case .transport(let failure) = httpError
         else {
-            Issue.record("expected a typed Linux enterprise trust refusal, got \(error)")
+            Issue.record("expected a typed Linux malformed enterprise-root refusal, got \(error)")
             return
         }
         #expect(failure.kind == .permanent)

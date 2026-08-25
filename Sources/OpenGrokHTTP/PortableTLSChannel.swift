@@ -227,7 +227,7 @@ enum PortableTLSConnector {
         )
     }
 
-    private static func resolvedTrustBundle(extraRootCertificates: [Data]) throws -> Data? {
+    static func resolvedTrustBundle(extraRootCertificates: [Data]) throws -> Data? {
         guard !extraRootCertificates.isEmpty else { return nil }
         guard let url = FoundationTrustStoreBridge.systemBundleURL(
             environment: ProcessInfo.processInfo.environment

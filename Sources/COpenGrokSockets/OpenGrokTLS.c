@@ -49,6 +49,13 @@ static void og_tls_initialize_curl(void) {
     og_tls_curl_initialization = curl_global_init(CURL_GLOBAL_DEFAULT);
 }
 
+int og_tls_initialize_shared_curl(void) {
+    if (pthread_once(&og_tls_curl_once, og_tls_initialize_curl) != 0) {
+        return -1;
+    }
+    return (int)og_tls_curl_initialization;
+}
+
 static void og_tls_set_curl_error(CURLcode code) {
     og_tls_set_error((int)code, curl_easy_strerror(code));
 }
@@ -74,12 +81,13 @@ int og_tls_connect(
     }
     *handle = OG_TLS_INVALID;
 
-    if (pthread_once(&og_tls_curl_once, og_tls_initialize_curl) != 0) {
+    int curl_initialization = og_tls_initialize_shared_curl();
+    if (curl_initialization < 0) {
         og_tls_set_error(EINVAL, "could not initialize the secure socket transport");
         return -1;
     }
-    if (og_tls_curl_initialization != CURLE_OK) {
-        og_tls_set_curl_error(og_tls_curl_initialization);
+    if (curl_initialization != CURLE_OK) {
+        og_tls_set_curl_error((CURLcode)curl_initialization);
         return -1;
     }
 

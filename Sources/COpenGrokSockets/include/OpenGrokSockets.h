@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "OpenGrokCloudSigning.h"
+#include "OpenGrokHTTPS.h"
 #include "OpenGrokWindowsWebSocket.h"
 
 #ifdef _WIN32
