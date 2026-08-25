@@ -1,124 +1,167 @@
-// OpenGrokVersion.swift
-//
-// Open Grok — Swift port of `xai-grok-version`.
-//
-// Installed Open Grok CLI version, lockstepped with shipping binaries. The
-// compiled version is injected from the `GROK_VERSION` environment variable at
-// build time by `OpenGrokVersionBuildPlugin`, which invokes the portable
-// `OpenGrokVersionGenerator` executable to write `CompiledVersion.generated.swift`.
-// This mirrors the Rust crate's `option_env!("GROK_VERSION")` + `build.rs`
-// rerun-if-env-changed directive.
-// `GROK_TEST_VERSION` overrides at runtime for tests, matching the Rust
-// `TEST_VERSION_ENV` behavior. `displayVersion` and `displayVersionWithCommit`
-// format version strings with a channel label such as `" [stable]"` or `""`.
-
 import Foundation
 
-/// Errors thrown by Open Grok version parsing.
 public enum OpenGrokVersionError: Error, Equatable, Sendable, CustomStringConvertible {
     case invalidSemVer(input: String, reason: String)
+    case conflictingBuildIdentity(OpenGrokBuildInfo)
 
     public var description: String {
         switch self {
         case .invalidSemVer(let input, let reason):
             return "invalid semver '\(input)': \(reason)"
+        case .conflictingBuildIdentity(let identity):
+            return "conflicting Open Grok build identity: \(identity)"
         }
     }
 }
 
-/// Canonical Open Grok version surface, porting `xai-grok-version`.
+public enum OpenGrokBuildKind: String, Equatable, Sendable {
+    case local
+    case release
+}
+
+public struct OpenGrokBuildInfo: Equatable, Sendable, CustomStringConvertible {
+    public let version: String
+    public let versionWithCommit: String
+    public let kind: OpenGrokBuildKind
+
+    public init(version: String, versionWithCommit: String, kind: OpenGrokBuildKind) {
+        self.version = version
+        self.versionWithCommit = versionWithCommit
+        self.kind = kind
+    }
+
+    public static func local(versionWithCommit: String) -> Self {
+        Self(version: OpenGrokVersion.fallbackVersion, versionWithCommit: versionWithCommit, kind: .local)
+    }
+
+    public static func release(version: String, versionWithCommit: String) -> Self {
+        Self(version: version, versionWithCommit: versionWithCommit, kind: .release)
+    }
+
+    public static func fromCompileStamp(releaseVersion: String?, versionWithCommit: String) -> Self {
+        if let releaseVersion {
+            return .release(version: releaseVersion, versionWithCommit: versionWithCommit)
+        }
+        return .local(versionWithCommit: versionWithCommit)
+    }
+
+    public static func fromVersionStamp(releaseVersion: String?) -> Self {
+        if let releaseVersion {
+            return .release(version: releaseVersion, versionWithCommit: releaseVersion)
+        }
+        return .local(versionWithCommit: OpenGrokVersion.fallbackVersionWithCommit)
+    }
+
+    public var description: String {
+        "OpenGrokBuildInfo(version: \(version), versionWithCommit: \(versionWithCommit), kind: \(kind.rawValue))"
+    }
+}
+
+/// Separately constructible so the once-only invariant is testable without
+/// resetting process-global identity between concurrent tests.
+final class OpenGrokBuildIdentityCell: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: OpenGrokBuildInfo?
+
+    /// Returns nil after a successful first or identical registration, and
+    /// the rejected identity after a conflict.
+    func initialize(_ identity: OpenGrokBuildInfo) -> OpenGrokBuildInfo? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let stored {
+            return stored == identity ? nil : identity
+        }
+        stored = identity
+        return nil
+    }
+
+    var registered: OpenGrokBuildInfo? {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+}
+
 public enum OpenGrokVersion {
-
-    /// Environment variable that overrides the version for tests, matching
-    /// the Rust reference `TEST_VERSION_ENV`.
     public static let testVersionEnvironmentVariable = "GROK_TEST_VERSION"
-
-    /// The build-time env var that, when set, overrides the compiled version
-    /// string. The Rust crate reads this via `option_env!("GROK_VERSION")` at
-    /// compile time; the Swift port regenerates
-    /// `CompiledVersion.generated.swift` from this env var via the
-    /// `OpenGrokVersionBuildPlugin` build-tool plugin.
     public static let compileTimeVersionEnvironmentVariable = "GROK_VERSION"
 
-    /// Compiled-in Open Grok version, injected from `GROK_VERSION` at build
-    /// time via `CompiledVersion.generated.swift`. Mirrors the Rust `VERSION`
-    /// constant (`option_env!("GROK_VERSION")` with fallback to
-    /// `CARGO_PKG_VERSION`). The plugin reads `GROK_VERSION` from the environment,
-    /// falls back to the
-    /// `OPEN_GROK_VERSION` file at the package root, then to the canonical Open
-    /// Grok release string. Two builds with distinct `GROK_VERSION` values
-    /// produce distinct `compiledVersion` values.
-    public static var compiledVersion: String {
-        OpenGrokCompiledVersion.version
-    }
+    /// Mirrors the shared Rust crate package version. The shipping release
+    /// stamp belongs only to the final executable.
+    public static let fallbackVersion = "1.0.0"
+    public static let fallbackVersionWithCommit = "1.0.0 (unknown)"
 
-    /// Short commit embedded by release-configured builds. Development builds
-    /// intentionally leave this unset so their version output stays stable.
-    public static var compiledShortCommit: String? {
-        OpenGrokCompiledVersion.shortCommit
-    }
+    private static let buildIdentity = OpenGrokBuildIdentityCell()
 
-    public static var compiledVersionWithCommit: String {
-        guard let commit = compiledShortCommit, !commit.isEmpty else {
-            return compiledVersion
+    /// Re-registering an identical value is harmless. A conflict is rejected so
+    /// embedded callers cannot mutate security or updater behavior after startup.
+    public static func initialize(_ identity: OpenGrokBuildInfo) throws {
+        if let conflict = buildIdentity.initialize(identity) {
+            throw OpenGrokVersionError.conflictingBuildIdentity(conflict)
         }
-        return "\(compiledVersion) (\(commit))"
     }
 
-    /// Resolve the installed version string: `GROK_TEST_VERSION` override first
-    /// (trimmed), then the compiled version.
-    ///
-    /// Mirrors the Rust `installed()` exactly: the presence of
-    /// `GROK_TEST_VERSION` (even an empty value) is the override condition;
-    /// its trimmed value is returned. When `GROK_TEST_VERSION=` is set, the
-    /// result is `""` and `installedSemVer()` throws, matching
-    /// `std::env::var(TEST_VERSION_ENV).map(|v| v.trim().to_string())`.
-    ///
-    /// `environment` defaults to the live process environment but is injectable
-    /// so tests are deterministic without mutating process-global state.
+    public static var registeredBuildInfo: OpenGrokBuildInfo? { buildIdentity.registered }
+    public static var version: String { registeredBuildInfo?.version ?? fallbackVersion }
+    public static var versionWithCommit: String {
+        registeredBuildInfo?.versionWithCommit ?? fallbackVersionWithCommit
+    }
+
+    /// Missing initialization cannot make an optimized production-shaped
+    /// process look local and silently disable a security gate.
+    public static var isReleaseBuild: Bool {
+        classifyBuildKind(
+            registered: registeredBuildInfo?.kind,
+            debugAssertions: _isDebugAssertConfiguration()
+        ) == .release
+    }
+
+    static func classifyBuildKind(
+        registered: OpenGrokBuildKind?,
+        debugAssertions: Bool
+    ) -> OpenGrokBuildKind {
+        registered ?? (debugAssertions ? .local : .release)
+    }
+
+    // Compatibility names while shared consumers migrate to runtime identity.
+    public static var compiledVersion: String { version }
+    public static var compiledShortCommit: String? {
+        guard let registeredBuildInfo else { return nil }
+        let prefix = registeredBuildInfo.version + " ("
+        guard registeredBuildInfo.versionWithCommit.hasPrefix(prefix),
+              registeredBuildInfo.versionWithCommit.hasSuffix(")") else { return nil }
+        return String(registeredBuildInfo.versionWithCommit.dropFirst(prefix.count).dropLast())
+    }
+    public static var compiledVersionWithCommit: String { versionWithCommit }
+
     public static func installed(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> String {
         if let override = environment[testVersionEnvironmentVariable] {
             return override.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        return compiledVersion
+        return version
     }
 
-    /// Resolve the display version, retaining a release build's commit stamp
-    /// while treating a test override as the complete caller-provided value.
     public static func installedWithCommit(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> String {
         if environment[testVersionEnvironmentVariable] != nil {
             return installed(environment: environment)
         }
-        return compiledVersionWithCommit
+        return versionWithCommit
     }
 
-    /// Parse the installed version as a semver.
     public static func installedSemVer(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> SemVerVersion {
         try SemVerVersion.parse(installed(environment: environment))
     }
 
-    /// Format the compiled version with a channel label for user-facing
-    /// display.
-    ///
-    /// `channelLabel` is a pre-formatted suffix such as `" [alpha]"`,
-    /// `" [stable]"`, or `""` (empty when no cached pointer is available).
-    /// Obtain it from `OpenGrokUpdate.channelLabel()` once that slice lands.
-    ///
-    /// Example: `"0.2.5 [stable]"` or `"0.2.5 [alpha]"`.
     public static func displayVersion(channelLabel: String) -> String {
-        "\(compiledVersion)\(channelLabel)"
+        "\(version)\(channelLabel)"
     }
 
-    /// Format a version-with-commit string with a channel label.
-    ///
-    /// Same semantics as `displayVersion(channelLabel:)` but for the full
-    /// `"0.2.5 (abc1234)"` string.
     public static func displayVersionWithCommit(
         _ versionWithCommit: String,
         channelLabel: String

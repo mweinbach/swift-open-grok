@@ -29,18 +29,17 @@ private func runVersionFixtureProcessToTermination(_ process: Process) throws {
 struct OpenGrokVersionTests {
 
     private var expectedCompiledVersion: String {
-        ProcessInfo.processInfo.environment["GROK_TEST_EXPECTED_COMPILED_VERSION"]
-            ?? "1.0.0-open-grok.82"
+        OpenGrokVersion.fallbackVersion
     }
 
     // MARK: - Compiled version constant
 
-    @Test("Compiled version matches the reference OPEN_GROK_VERSION")
+    @Test("Shared version fallback matches the upstream package version")
     func compiledVersionMatchesReference() {
         #expect(OpenGrokVersion.compiledVersion == expectedCompiledVersion)
     }
 
-    @Test("package-root OPEN_GROK_VERSION matches the compiled default")
+    @Test("package release marker stays separate from shared fallback identity")
     func packageRootVersionMarkerMatchesCompiledDefault() throws {
         var root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
         while root.path != "/",
@@ -55,7 +54,7 @@ struct OpenGrokVersionTests {
             .first
             .map(String.init) ?? ""
         #expect(marker == "1.0.0-open-grok.82")
-        #expect(OpenGrokVersion.compiledVersion == marker)
+        #expect(OpenGrokVersion.compiledVersion == "1.0.0")
     }
 
     @Test("compiledVersion is driven by the build-tool plugin (GROK_VERSION injection)")

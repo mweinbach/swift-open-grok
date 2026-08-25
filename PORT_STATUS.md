@@ -4,8 +4,8 @@
 
 **Overall state:** First-class RunInfra, direct Google Gemini, explicitly enabled OpenRouter, machine-local session collaboration, ACP-hosted peer wake/interjection, owner-secure Windows named-pipe session transport, live MCP server changes and correlated tool progress, reverse ACP-hosted MCP servers, native Messages output, and upstream `.81` nested Code Mode streaming now reach their production seams. The executable version, protocol fixtures, release reference, and macOS/Windows/Linux distribution metadata are synchronized to the audited Rust commit. This remains **not complete parity or a release certification**: platform-coverage and remote-CI limits are recorded below.
 **Destination was empty at baseline:** yes.
-**Reference:** `xai-org/grok-build` at `538a16dfb6b5989d835bc1503b600b4d2be9aad6` (release `v1.0.0-open-grok.81`); historical original reference `650c1db7c2e73c59cec88bf3c6359751d6cef1bd`.
-**Current audited Rust snapshot:** `538a16dfb6b5989d835bc1503b600b4d2be9aad6`, product version `1.0.0-open-grok.81`, **178 commits beyond the historical original pin**.
+**Reference:** `xai-org/grok-build` at `00e176c8fb4035701c24199bf9225973c1b13c20` (release `v1.0.0-open-grok.82`); historical original reference `650c1db7c2e73c59cec88bf3c6359751d6cef1bd`.
+**Current audited Rust snapshot:** `00e176c8fb4035701c24199bf9225973c1b13c20`, product version `1.0.0-open-grok.82`, **190 commits beyond the historical original pin**.
 **Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
 
 ## Current upstream `.81` foundational closure (2026-08-22)

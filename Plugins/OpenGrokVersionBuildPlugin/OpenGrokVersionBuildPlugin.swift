@@ -22,16 +22,22 @@ import PackagePlugin
 @main
 struct OpenGrokVersionBuildPlugin: BuildToolPlugin {
     func createBuildCommands(context: PluginContext, target: Target) async throws -> [Command] {
-        let outputFile = context.pluginWorkDirectoryURL.appendingPathComponent("CompiledVersion.generated.swift")
+        let outputFile = context.pluginWorkDirectoryURL
+            .appendingPathComponent("OpenGrokExecutableBuildStamp.generated.swift")
 
         // Resolve the version string (same resolution order as the Rust
         // crate and `regenerate-compiled-version.sh`).
         let env = ProcessInfo.processInfo.environment
         let defaultVersion = "1.0.0-open-grok.82"
 
-        let version: String
-        if let grokVersion = env["GROK_VERSION"], !grokVersion.isEmpty {
-            version = grokVersion
+        let explicitReleaseVersion = env["GROK_VERSION"]?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        let releaseVersion = explicitReleaseVersion.flatMap { $0.isEmpty ? nil : $0 }
+
+        let displayVersion: String
+        if let releaseVersion {
+            displayVersion = releaseVersion
         } else {
             let versionFilePath = context.package.directoryURL
                 .appendingPathComponent("OPEN_GROK_VERSION")
@@ -40,14 +46,14 @@ struct OpenGrokVersionBuildPlugin: BuildToolPlugin {
                 let content = (try? String(contentsOfFile: versionFilePath, encoding: .utf8))?
                     .components(separatedBy: "\n").first?
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                version = content.isEmpty ? defaultVersion : content
+                displayVersion = content.isEmpty ? defaultVersion : content
             } else {
-                version = defaultVersion
+                displayVersion = defaultVersion
             }
         }
 
         // Validate the version is non-empty.
-        guard !version.isEmpty else {
+        guard !displayVersion.isEmpty else {
             throw NSError(
                 domain: "OpenGrokVersionBuildPlugin",
                 code: 1,
@@ -59,14 +65,14 @@ struct OpenGrokVersionBuildPlugin: BuildToolPlugin {
 
         let generator = try context.tool(named: "OpenGrokVersionGenerator")
 
-        var arguments = [outputFile.path, version]
+        var arguments = [outputFile.path, displayVersion, releaseVersion ?? ""]
         if let shortCommit, !shortCommit.isEmpty {
             arguments.append(shortCommit)
         }
 
         return [
             .buildCommand(
-                displayName: "Generate OpenGrokVersion from GROK_VERSION=\(version)",
+                displayName: "Generate executable Open Grok build identity",
                 executable: generator.url,
                 arguments: arguments,
                 inputFiles: [],

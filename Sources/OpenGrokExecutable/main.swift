@@ -1,6 +1,7 @@
 import Foundation
 import OpenGrokCLI
 import OpenGrokJavaScriptRuntime
+import OpenGrokVersion
 
 #if canImport(Glibc)
 import Glibc
@@ -13,6 +14,17 @@ import Glibc
 // own return value, which they already do.
 _ = signal(SIGPIPE, SIG_IGN)
 #endif
+
+do {
+    try OpenGrokVersion.initialize(
+        .fromCompileStamp(
+            releaseVersion: OpenGrokExecutableBuildStamp.releaseVersion,
+            versionWithCommit: OpenGrokExecutableBuildStamp.versionWithCommit
+        )
+    )
+} catch {
+    fatalError("\(error)")
+}
 
 if let workerExitCode = await JavaScriptRuntimeWorkerMain.runIfRequested() {
     exit(workerExitCode)

@@ -132,17 +132,15 @@ private func targets() -> [Target] {
     t.append(.target(name: "OpenGrokTestUtilities", dependencies: dep()))
     t.append(.target(name: "OpenGrokTestSupport", dependencies: dep(["OpenGrokTestUtilities", "COpenGrokSockets"])))
     // W0-S3: OpenGrokPaths and OpenGrokEnvironment are simple targets.
-    // OpenGrokVersion is declared separately with a build-tool plugin
-    // (OpenGrokVersionBuildPlugin) that generates CompiledVersion.generated.swift
-    // from the GROK_VERSION env var at build time, and an exclude for the
-    // manual regeneration script (which is no longer a compiled source).
+    // Release identity belongs to the final executable target. Keeping the
+    // generated GROK_VERSION stamp out of this widely imported library avoids
+    // rebuilding every reverse dependency for a version-only release.
     t.append(.target(name: "OpenGrokPaths", dependencies: dep()))
     t.append(.target(name: "OpenGrokEnvironment", dependencies: dep()))
     t.append(.target(
         name: "OpenGrokVersion",
         dependencies: dep(),
-        exclude: ["regenerate-compiled-version.sh", "CompiledVersion.generated.swift"],
-        plugins: [.plugin(name: "OpenGrokVersionBuildPlugin")]
+        exclude: ["regenerate-compiled-version.sh", "CompiledVersion.generated.swift"]
     ))
     t.append(.executableTarget(name: "OpenGrokVersionGenerator"))
     // W0-S4: the Rust `xai-grok-shared` crate depends on
@@ -388,7 +386,8 @@ private func targets() -> [Target] {
     t.append(contentsOf: libs(w11s5Lib, dep(["OpenGrokDistributionSupport"])))
     t.append(.executableTarget(
         name: "OpenGrokExecutable",
-        dependencies: dep(["OpenGrokCLI", "OpenGrokPager", "OpenGrokPagerMinimal", "OpenGrokShell", "OpenGrokVersion", "OpenGrokDistributionSupport", "OpenGrokJavaScriptRuntime"])
+        dependencies: dep(["OpenGrokCLI", "OpenGrokPager", "OpenGrokPagerMinimal", "OpenGrokShell", "OpenGrokVersion", "OpenGrokDistributionSupport", "OpenGrokJavaScriptRuntime"]),
+        plugins: [.plugin(name: "OpenGrokVersionBuildPlugin")]
     ))
 
     // ---- Test targets (one per library target) ----
@@ -538,12 +537,9 @@ private func targets() -> [Target] {
         dependencies: []
     ))
 
-    // Build-tool plugin that generates `CompiledVersion.generated.swift`
-    // from the `GROK_VERSION` environment variable at build time — the
-    // SwiftPM equivalent of the Rust crate's
-    // `option_env!("GROK_VERSION")` + `cargo:rerun-if-env-changed=GROK_VERSION`
-    // directive. Attached to the `OpenGrokVersion` target above via
-    // `plugins: [.plugin(name: "OpenGrokVersionBuildPlugin")]`.
+    // Build-tool plugin that generates the release stamp only for the final
+    // executable target. Shared libraries consume the process identity that
+    // the executable registers before dispatching any work.
     t.append(.plugin(
         name: "OpenGrokVersionBuildPlugin",
         capability: .buildTool(),
