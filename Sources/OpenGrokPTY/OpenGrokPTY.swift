@@ -1584,6 +1584,9 @@ enum WindowsConPTY {
 
         var si = STARTUPINFOEXW()
         si.StartupInfo.cb = DWORD(MemoryLayout<STARTUPINFOEXW>.size)
+        // Otherwise Windows duplicates redirected parent streams into the
+        // child even with handle inheritance disabled, bypassing its ConPTY.
+        si.StartupInfo.dwFlags = DWORD(STARTF_USESTDHANDLES)
         si.lpAttributeList = attrList
 
         let cwdWide: [WCHAR]? = spec.workingDirectory.map { Array(($0 as String).utf16) + [0] }
