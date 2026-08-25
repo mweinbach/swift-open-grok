@@ -89,6 +89,74 @@ struct WindowsNamedPipeControlParityTests {
             #expect(error is WindowsNamedPipeError)
         }
     }
+
+    @Test("repeated parked accepts stop without blocking the native listener owner", .timeLimit(.minutes(1)))
+    func repeatedBlockedAcceptTeardownIsBounded() async throws {
+        for index in 0..<20 {
+            let path = "C:\\opengrok-pipe-repeated-close\\\(UUID().uuidString)\\\(index).sock"
+            let listener = WindowsNamedPipeListener(
+                pipeName: WindowsNamedPipeName.fullName(forPath: path)
+            )
+            try listener.start()
+            let pending = Task {
+                try await listener.accept()
+            }
+            for _ in 0..<8 {
+                await Task.yield()
+            }
+
+            let started = ContinuousClock.now
+            listener.close()
+            do {
+                let unexpected = try await pending.value
+                await unexpected.close()
+                Issue.record("closed listener unexpectedly accepted a client on iteration \(index)")
+            } catch {
+                #expect(error is WindowsNamedPipeError)
+            }
+            #expect(started.duration(to: .now) < .seconds(1))
+        }
+    }
+
+    @Test("repeated native pipe connections restore blocking ping and acknowledgement semantics", .timeLimit(.minutes(1)))
+    func repeatedNativePingAcknowledgementsPreserveBlockingMode() async throws {
+        let path = "C:\\opengrok-pipe-ping\\\(UUID().uuidString)\\leader.sock"
+        let name = WindowsNamedPipeName.fullName(forPath: path)
+        let listener = WindowsNamedPipeListener(pipeName: name)
+        try listener.start()
+        defer { listener.close() }
+
+        for index in 0..<12 {
+            let accepting = Task {
+                try await listener.accept()
+            }
+            let client = try await WindowsNamedPipeDialer.connect(
+                pipeName: name,
+                timeoutSeconds: 2
+            )
+            let server = try await accepting.value
+            let ping = "ping-\(index)"
+            let acknowledgement = "ack-\(index)"
+
+            let reading = Task {
+                try #require(try await server.read())
+            }
+            for _ in 0..<4 {
+                await Task.yield()
+            }
+            try await client.write(Array(ping.utf8))
+            #expect(String(decoding: try await reading.value, as: UTF8.self) == ping)
+
+            let reply = Task {
+                try #require(try await client.read())
+            }
+            try await server.write(Array(acknowledgement.utf8))
+            #expect(String(decoding: try await reply.value, as: UTF8.self) == acknowledgement)
+
+            await server.close()
+            await client.close()
+        }
+    }
 }
 
 #endif

@@ -709,8 +709,11 @@ int og_socket_close(OGSocketHandle handle) {
 typedef struct OGNamedPipeListener {
     wchar_t *pipe_name;
     HANDLE pending;
+    HANDLE stop_event;
+    HANDLE idle_event;
     CRITICAL_SECTION lock;
     int closed;
+    int accept_active;
     int owner_only;
 } OGNamedPipeListener;
 
@@ -724,7 +727,10 @@ static HANDLE og_named_pipe_create_instance(
 ) {
     DWORD open_mode = PIPE_ACCESS_DUPLEX;
     if (first) open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
-    DWORD pipe_mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT;
+    /* Listener instances must never park a synchronous ConnectNamedPipe that
+       another thread cannot reliably interrupt. Accepted handles are restored
+       to PIPE_WAIT before either byte-channel implementation receives them. */
+    DWORD pipe_mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT;
     SECURITY_ATTRIBUTES *security_attributes = NULL;
     SECURITY_ATTRIBUTES attributes;
     SECURITY_DESCRIPTOR descriptor;
@@ -805,6 +811,29 @@ static int og_named_pipe_listener_create_inner(
     state->pending = pending;
     state->owner_only = owner_only;
     InitializeCriticalSection(&state->lock);
+    state->stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (state->stop_event == NULL) {
+        DWORD error = GetLastError();
+        DeleteCriticalSection(&state->lock);
+        CloseHandle(pending);
+        free(wide);
+        free(state);
+        SetLastError(error);
+        og_set_windows_error("could not create named-pipe listener stop event");
+        return -1;
+    }
+    state->idle_event = CreateEventW(NULL, TRUE, TRUE, NULL);
+    if (state->idle_event == NULL) {
+        DWORD error = GetLastError();
+        CloseHandle(state->stop_event);
+        DeleteCriticalSection(&state->lock);
+        CloseHandle(pending);
+        free(wide);
+        free(state);
+        SetLastError(error);
+        og_set_windows_error("could not create named-pipe listener idle event");
+        return -1;
+    }
     *listener = (OGSocketHandle)(uintptr_t)state;
     return 0;
 }
@@ -829,52 +858,132 @@ int og_named_pipe_listener_accept(OGSocketHandle listener, OGSocketHandle *handl
         og_set_error(ERROR_OPERATION_ABORTED, "named-pipe listener is closed");
         return -1;
     }
+    if (state->accept_active) {
+        LeaveCriticalSection(&state->lock);
+        og_set_error(ERROR_PIPE_BUSY, "named-pipe listener already has a pending accept");
+        return -1;
+    }
     if (state->pending == INVALID_HANDLE_VALUE) {
         state->pending = og_named_pipe_create_instance(state->pipe_name, 0, state->owner_only);
     }
     HANDLE pending = state->pending;
-    LeaveCriticalSection(&state->lock);
     if (pending == INVALID_HANDLE_VALUE) {
+        LeaveCriticalSection(&state->lock);
         og_set_windows_error("could not create the next named-pipe instance");
         return -1;
     }
-
-    BOOL connected = ConnectNamedPipe(pending, NULL);
-    if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
-        og_set_windows_error("could not accept a named-pipe client");
-        return -1;
-    }
-
-    EnterCriticalSection(&state->lock);
-    if (state->closed) {
-        int owns_pending = state->pending == pending;
-        if (owns_pending) state->pending = INVALID_HANDLE_VALUE;
-        LeaveCriticalSection(&state->lock);
-        if (owns_pending) CloseHandle(pending);
-        og_set_error(ERROR_OPERATION_ABORTED, "named-pipe listener is closed");
-        return -1;
-    }
-    if (state->pending == pending) {
-        state->pending = og_named_pipe_create_instance(state->pipe_name, 0, state->owner_only);
-    }
+    HANDLE stop_event = state->stop_event;
+    HANDLE idle_event = state->idle_event;
+    state->accept_active = 1;
+    ResetEvent(idle_event);
     LeaveCriticalSection(&state->lock);
-    *handle = (OGSocketHandle)(uintptr_t)pending;
-    return 0;
+
+    int connected = 0;
+    DWORD failure = ERROR_SUCCESS;
+    const char *reason = "could not accept a named-pipe client";
+    for (;;) {
+        DWORD stopped = WaitForSingleObject(stop_event, 0);
+        if (stopped == WAIT_OBJECT_0) {
+            failure = ERROR_OPERATION_ABORTED;
+            reason = "named-pipe listener is closed";
+            break;
+        }
+        if (stopped == WAIT_FAILED) {
+            failure = GetLastError();
+            reason = "could not inspect named-pipe listener stop event";
+            break;
+        }
+
+        if (ConnectNamedPipe(pending, NULL)) {
+            connected = 1;
+            break;
+        }
+        DWORD error = GetLastError();
+        if (error == ERROR_PIPE_CONNECTED) {
+            connected = 1;
+            break;
+        }
+        if (error == ERROR_NO_DATA) {
+            DisconnectNamedPipe(pending);
+        } else if (error != ERROR_PIPE_LISTENING && error != ERROR_PIPE_NOT_CONNECTED) {
+            failure = error;
+            break;
+        }
+
+        DWORD ready = WaitForSingleObject(stop_event, 10);
+        if (ready == WAIT_OBJECT_0) {
+            failure = ERROR_OPERATION_ABORTED;
+            reason = "named-pipe listener is closed";
+            break;
+        }
+        if (ready != WAIT_TIMEOUT) {
+            failure = ready == WAIT_FAILED ? GetLastError() : ERROR_INVALID_HANDLE;
+            reason = "could not wait for named-pipe listener stop event";
+            break;
+        }
+    }
+
+    if (connected) {
+        DWORD mode = PIPE_READMODE_BYTE | PIPE_WAIT;
+        if (!SetNamedPipeHandleState(pending, &mode, NULL, NULL)) {
+            failure = GetLastError();
+            reason = "could not restore blocking named-pipe byte mode";
+            connected = 0;
+        }
+    }
+
+    HANDLE owned_pending = INVALID_HANDLE_VALUE;
+    int accepted = 0;
+    EnterCriticalSection(&state->lock);
+    if (connected && !state->closed) {
+        if (state->pending == pending) {
+            state->pending = og_named_pipe_create_instance(state->pipe_name, 0, state->owner_only);
+        }
+        *handle = (OGSocketHandle)(uintptr_t)pending;
+        accepted = 1;
+    } else {
+        if (state->closed) {
+            failure = ERROR_OPERATION_ABORTED;
+            reason = "named-pipe listener is closed";
+        }
+        if (state->pending == pending) {
+            state->pending = state->closed
+                ? INVALID_HANDLE_VALUE
+                : og_named_pipe_create_instance(state->pipe_name, 0, state->owner_only);
+            owned_pending = pending;
+        }
+    }
+    state->accept_active = 0;
+    LeaveCriticalSection(&state->lock);
+
+    if (owned_pending != INVALID_HANDLE_VALUE) {
+        CancelIoEx(owned_pending, NULL);
+        CloseHandle(owned_pending);
+    }
+    SetEvent(idle_event);
+    if (accepted) return 0;
+    og_set_error((int)(failure == ERROR_SUCCESS ? ERROR_OPERATION_ABORTED : failure), reason);
+    return -1;
 }
 
 int og_named_pipe_listener_close(OGSocketHandle listener) {
     if (listener == OG_SOCKET_INVALID) return 0;
     OGNamedPipeListener *state = (OGNamedPipeListener *)(uintptr_t)listener;
+    HANDLE pending = INVALID_HANDLE_VALUE;
     EnterCriticalSection(&state->lock);
     if (!state->closed) {
         state->closed = 1;
-        if (state->pending != INVALID_HANDLE_VALUE) {
-            CancelIoEx(state->pending, NULL);
-            CloseHandle(state->pending);
+        SetEvent(state->stop_event);
+        if (!state->accept_active && state->pending != INVALID_HANDLE_VALUE) {
+            pending = state->pending;
             state->pending = INVALID_HANDLE_VALUE;
         }
     }
     LeaveCriticalSection(&state->lock);
+    if (pending != INVALID_HANDLE_VALUE) {
+        CancelIoEx(pending, NULL);
+        CloseHandle(pending);
+    }
     return 0;
 }
 
@@ -882,6 +991,14 @@ int og_named_pipe_listener_destroy(OGSocketHandle listener) {
     if (listener == OG_SOCKET_INVALID) return 0;
     OGNamedPipeListener *state = (OGNamedPipeListener *)(uintptr_t)listener;
     og_named_pipe_listener_close(listener);
+    DWORD idle = WaitForSingleObject(state->idle_event, 1000);
+    if (idle != WAIT_OBJECT_0) {
+        DWORD error = idle == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError();
+        og_set_error((int)error, "named-pipe listener did not finish its accept before destruction");
+        return -1;
+    }
+    CloseHandle(state->stop_event);
+    CloseHandle(state->idle_event);
     DeleteCriticalSection(&state->lock);
     free(state->pipe_name);
     free(state);
