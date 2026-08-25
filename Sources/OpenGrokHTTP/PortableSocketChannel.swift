@@ -13,6 +13,24 @@ enum PortableSocketError: Error, Sendable, CustomStringConvertible {
     }
 }
 
+private enum PortableSocketBlockingExecutor {
+    static func run<Value: Sendable>(
+        _ operation: @escaping @Sendable () throws -> Value
+    ) async throws -> Value {
+        try await withCheckedThrowingContinuation { continuation in
+            let worker = Thread {
+                do {
+                    continuation.resume(returning: try operation())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+            worker.name = "opengrok-socket-io"
+            worker.start()
+        }
+    }
+}
+
 final class PortableSocketChannel: WebSocketByteChannel, @unchecked Sendable {
     private let handle: OGSocketHandle
     private let stateLock = NSLock()
@@ -25,7 +43,7 @@ final class PortableSocketChannel: WebSocketByteChannel, @unchecked Sendable {
     func read() async throws -> [UInt8]? {
         guard !isClosed else { return nil }
         let handle = self.handle
-        return try await Task.detached(priority: .utility) {
+        return try await PortableSocketBlockingExecutor.run {
             var buffer = [UInt8](repeating: 0, count: 64 * 1024)
             let count = buffer.withUnsafeMutableBytes { rawBuffer -> Int64 in
                 og_socket_read(handle, rawBuffer.baseAddress, rawBuffer.count)
@@ -35,21 +53,21 @@ final class PortableSocketChannel: WebSocketByteChannel, @unchecked Sendable {
                 throw PortableSocketError.operationFailed(PortableSocketSupport.lastError())
             }
             return Array(buffer.prefix(Int(count)))
-        }.value
+        }
     }
 
     func write(_ bytes: [UInt8]) async throws {
         guard !isClosed else { throw WebSocketChannelError.closed }
         guard !bytes.isEmpty else { return }
         let handle = self.handle
-        try await Task.detached(priority: .utility) {
+        try await PortableSocketBlockingExecutor.run {
             let count = bytes.withUnsafeBytes { rawBuffer -> Int64 in
                 og_socket_write_all(handle, rawBuffer.baseAddress, rawBuffer.count)
             }
             guard count == Int64(bytes.count) else {
                 throw PortableSocketError.operationFailed(PortableSocketSupport.lastError())
             }
-        }.value
+        }
     }
 
     func close() async {
@@ -113,13 +131,13 @@ final class PortableSocketListener: @unchecked Sendable {
     func accept() async throws -> PortableSocketChannel {
         guard !isClosed else { throw PortableSocketError.operationFailed("socket listener is closed") }
         let listener = handle
-        return try await Task.detached(priority: .utility) {
+        return try await PortableSocketBlockingExecutor.run {
             var accepted: OGSocketHandle = -1
             guard og_socket_accept(listener, &accepted) == 0 else {
                 throw PortableSocketError.operationFailed(PortableSocketSupport.lastError())
             }
             return PortableSocketChannel(handle: accepted)
-        }.value
+        }
     }
 
     func close() {
@@ -142,12 +160,15 @@ final class PortableSocketListener: @unchecked Sendable {
 
 enum PortableSocketConnector {
     static func tcp(host: String, port: UInt16, timeoutSeconds: Double) async throws -> PortableSocketChannel {
-        var handle: OGSocketHandle = -1
-        let result = host.withCString { hostPointer in
-            og_socket_tcp_connect(hostPointer, port, timeoutSeconds, &handle)
-        }
-        guard result == 0 else {
-            throw PortableSocketError.operationFailed(PortableSocketSupport.lastError())
+        let handle = try await PortableSocketBlockingExecutor.run {
+            var handle: OGSocketHandle = -1
+            let result = host.withCString { hostPointer in
+                og_socket_tcp_connect(hostPointer, port, timeoutSeconds, &handle)
+            }
+            guard result == 0 else {
+                throw PortableSocketError.operationFailed(PortableSocketSupport.lastError())
+            }
+            return handle
         }
         return PortableSocketChannel(handle: handle)
     }
@@ -156,12 +177,15 @@ enum PortableSocketConnector {
         #if os(Windows)
         throw PortableSocketError.unsupported("Windows leader IPC requires named pipes")
         #else
-        var handle: OGSocketHandle = -1
-        let result = path.withCString { pathPointer in
-            og_socket_unix_connect(pathPointer, timeoutSeconds, &handle)
-        }
-        guard result == 0 else {
-            throw PortableSocketError.operationFailed(PortableSocketSupport.lastError())
+        let handle = try await PortableSocketBlockingExecutor.run {
+            var handle: OGSocketHandle = -1
+            let result = path.withCString { pathPointer in
+                og_socket_unix_connect(pathPointer, timeoutSeconds, &handle)
+            }
+            guard result == 0 else {
+                throw PortableSocketError.operationFailed(PortableSocketSupport.lastError())
+            }
+            return handle
         }
         return PortableSocketChannel(handle: handle)
         #endif

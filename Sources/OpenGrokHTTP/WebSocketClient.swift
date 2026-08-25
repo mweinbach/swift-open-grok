@@ -264,6 +264,7 @@ public struct WebSocketDialOptions: Sendable {
 public enum WebSocketDialBackend: Sendable, Hashable {
     case networkFramework
     case urlSession
+    case portableSockets
 }
 
 public enum WebSocketDialer {
@@ -271,7 +272,7 @@ public enum WebSocketDialer {
         #if canImport(Network)
         return .networkFramework
         #else
-        return .urlSession
+        return .portableSockets
         #endif
     }
 
@@ -333,7 +334,6 @@ public enum WebSocketDialer {
         to url: WebSocketURL,
         options: WebSocketDialOptions = WebSocketDialOptions()
     ) async throws -> any WebSocketClient {
-        #if canImport(Network)
         let channel = try await channel(to: url, connectTimeoutSeconds: options.connectTimeoutSeconds)
         do {
             return try await WebSocketClientUpgrade.connect(
@@ -347,33 +347,5 @@ public enum WebSocketDialer {
             await channel.close()
             throw error
         }
-        #else
-        guard let endpoint = URL(string: url.absoluteString) else {
-            throw WebSocketDialError.connectionFailed(
-                url: url.absoluteString,
-                reason: "Foundation rejected the WebSocket URL"
-            )
-        }
-        var headers: [String: String] = [:]
-        for (name, value) in options.headers {
-            headers[name] = value
-        }
-        do {
-            return try URLSessionWebSocketClient.connect(
-                url: endpoint,
-                configuration: HTTPTransportConfiguration(
-                    connectTimeout: options.connectTimeoutSeconds,
-                    requestTimeout: options.connectTimeoutSeconds
-                ),
-                headers: headers,
-                maximumMessageSize: options.maximumMessageSize
-            )
-        } catch {
-            throw WebSocketDialError.connectionFailed(
-                url: url.absoluteString,
-                reason: String(describing: error)
-            )
-        }
-        #endif
     }
 }

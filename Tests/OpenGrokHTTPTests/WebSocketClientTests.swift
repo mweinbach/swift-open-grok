@@ -146,9 +146,27 @@ struct WebSocketDialOptionsTests {
         #if canImport(Network)
         #expect(WebSocketDialer.outboundBackend == .networkFramework)
         #else
-        #expect(WebSocketDialer.outboundBackend == .urlSession)
+        #expect(WebSocketDialer.outboundBackend == .portableSockets)
         #endif
     }
+
+    #if !canImport(Network)
+    @Test("secure portable sockets fail closed without a trusted TLS transport")
+    func securePortableSocketsFailClosed() async throws {
+        let url = try WebSocketURL.parse("wss://code.grok.com/ws/code-agent")
+
+        do {
+            _ = try await WebSocketDialer.connect(to: url)
+            Issue.record("expected secure WebSocket transport to reject a plaintext fallback")
+        } catch let error as WebSocketDialError {
+            guard case .unsupportedPlatform(let reason) = error else {
+                Issue.record("expected unsupportedPlatform, got \(error)")
+                return
+            }
+            #expect(reason.contains("plaintext ws:// only"))
+        }
+    }
+    #endif
 }
 
 @Suite("Windows named-pipe names")
@@ -256,5 +274,47 @@ struct WebSocketDialerLiveTests {
         let reply = try await connection.receive()
         #expect(reply == .text("echo:hello"))
         await connection.close()
+    }
+}
+
+@Suite("Portable socket blocking isolation", .serialized)
+struct PortableSocketBlockingIsolationTests {
+    @Test("accept and bidirectional socket I/O never occupy cooperative workers")
+    func acceptAndExchangeBytes() async throws {
+        let listener = try PortableSocketListener.tcp(host: "127.0.0.1", port: 0)
+        defer { listener.close() }
+        let port = try #require(listener.port)
+        let accepted = Task { try await listener.accept() }
+        let client = try await PortableSocketConnector.tcp(
+            host: "127.0.0.1",
+            port: port,
+            timeoutSeconds: 5
+        )
+        let server = try await accepted.value
+
+        try await client.write(Array("request".utf8))
+        #expect(try await server.read() == Array("request".utf8))
+        try await server.write(Array("response".utf8))
+        #expect(try await client.read() == Array("response".utf8))
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("closing a listener releases its outstanding blocking accept")
+    func closingListenerUnblocksAccept() async throws {
+        let listener = try PortableSocketListener.tcp(host: "127.0.0.1", port: 0)
+        let accepted = Task {
+            do {
+                _ = try await listener.accept()
+                return false
+            } catch {
+                return true
+            }
+        }
+        try await Task.sleep(nanoseconds: 10_000_000)
+        listener.close()
+
+        #expect(await accepted.value)
     }
 }
