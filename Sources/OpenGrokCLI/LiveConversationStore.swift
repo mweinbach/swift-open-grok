@@ -1320,6 +1320,7 @@ actor LiveConversationHistory {
     private var record: LiveConversationRecord
     private let store: LiveConversationStore
     private let exportBoundary: ExportBoundary
+    private var writeback: LiveSessionWritebackSync?
     private var usageHandle: ChatStateHandle
     private var usageCancellationToken: ChatStateCancellationToken
     private var usageSamplingConfig: SamplingConfig
@@ -1375,6 +1376,16 @@ actor LiveConversationHistory {
 
     func snapshot() -> LiveConversationRecord { record }
 
+    func installWriteback(_ writeback: LiveSessionWritebackSync) {
+        self.writeback = writeback
+    }
+
+    func shutdownWriteback() async {
+        guard let writeback else { return }
+        self.writeback = nil
+        await writeback.shutdown()
+    }
+
     func stagePromptImages(promptID: String, images: [PastedImage]) {
         stagedPromptImages[promptID] = images
     }
@@ -1388,6 +1399,10 @@ actor LiveConversationHistory {
     /// durably written. The old record remains available through the store.
     func replace(with record: LiveConversationRecord) throws {
         try LiveConversationStore.validateSessionID(record.sessionID)
+        if let writeback, record.sessionID != self.record.sessionID {
+            self.writeback = nil
+            Task { await writeback.shutdown() }
+        }
         usageCancellationToken.cancel()
         let cancellationToken = ChatStateCancellationToken()
         var samplingConfig = usageSamplingConfig
@@ -1457,6 +1472,10 @@ actor LiveConversationHistory {
         next.currentProvider = provider
         if !provider.profile.allowsXaiServices {
             next.everUsedNonXAI = true
+            // Close the shared reference before the first actor suspension:
+            // a concurrent writeback request must never observe a still-open
+            // export boundary while this foreign route is being persisted.
+            exportBoundary.observe(provider)
         }
         if next != before {
             next.updatedAt = Date()
@@ -1470,6 +1489,7 @@ actor LiveConversationHistory {
         usageSamplingConfig.provider = provider
         usageHandle.updateSamplingConfig(usageSamplingConfig)
         exportBoundary.observe(provider)
+        await writeback?.observeRoute(record: next)
         return shouldSanitize ? before.items.count - sanitized.count : 0
     }
 
@@ -1501,6 +1521,7 @@ actor LiveConversationHistory {
         record.items = items
         record.updatedAt = Date()
         try await store.save(record)
+        await writeback?.recordDurableCommit(record)
         if let pending = record.pendingFirstPrompt,
            let firstChildUser = items.dropFirst(pending.inheritedItemCount).first(where: { item in
                guard case .user(let user) = item else { return false }
@@ -1626,6 +1647,7 @@ actor LiveConversationHistory {
         cancellationCategory: SessionEventCancellationCategory? = nil,
         cancellationContext: JSONValue? = nil
     ) async {
+        await writeback?.flush()
         guard let eventTracker else { return }
         let succeeded = await eventTracker.endTurn(
             outcome: outcome,
@@ -1757,6 +1779,7 @@ actor LiveConversationHistory {
         record.title = title
         record.updatedAt = Date()
         try await store.save(record)
+        await writeback?.setManualTitle(title, record: record)
     }
 
     /// Record a terminal tool-card display state for honest `/resume` seeding.

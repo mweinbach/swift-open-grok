@@ -120,10 +120,17 @@ struct LiveUnhonoredLaunchFlagTests {
         #expect(!error.contains("nothing in this composition honors yet"))
     }
 
-    @Test("--storage-mode is refused before launch")
+    @Test("--storage-mode writeback reaches first-party persistence authorization")
     func storageMode() async {
+        let (code, _, error) = await run(["--storage-mode", "writeback"])
+        #expect(code != CLIRunner.ExitCode.notImplemented.rawValue)
+        #expect(!error.contains("nothing in this composition honors yet"))
+    }
+
+    @Test("unknown --storage-mode values are refused before launch")
+    func unsupportedStorageMode() async {
         await expectRefusal(
-            extraArguments: ["--storage-mode", "writeback"],
+            extraArguments: ["--storage-mode", "unknown"],
             flag: "--storage-mode"
         )
     }

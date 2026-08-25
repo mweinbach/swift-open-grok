@@ -318,10 +318,20 @@ public enum LiveExportComposition {
             }
             envelopes.append(envelope)
         }
+        return privacyFilteredEnvelopes(
+            envelopes,
+            knownTransportIDs: journal.knownTransportIDs
+        )
+    }
+
+    static func privacyFilteredEnvelopes(
+        _ envelopes: [SessionUpdateEnvelope],
+        knownTransportIDs: Set<String>
+    ) -> [SessionUpdateEnvelope] {
         let live = filteredLiveEnvelopes(envelopes)
         let transportIDs = codeModeTransportCallIDs(
             in: live,
-            knownTransportIDs: journal.knownTransportIDs
+            knownTransportIDs: knownTransportIDs
         )
         return live.filter { !isCodeModeTransportUpdate($0, hiddenIDs: transportIDs) }
     }

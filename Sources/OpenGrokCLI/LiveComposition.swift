@@ -3269,7 +3269,8 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         if options.advanced.reauthenticate && options.agentRelay == nil {
             return "--reauth"
         }
-        if let storageMode = options.advanced.storageMode, storageMode != "local" {
+        if let storageMode = options.advanced.storageMode,
+           storageMode != "local", storageMode != "writeback" {
             return "--storage-mode"
         }
         if options.advanced.terminal { return "--terminal" }
@@ -3636,6 +3637,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         if !managedPolicyAlreadyEnforced {
             try await LiveManagedPolicyGate.enforce(environment: context.environment)
         }
+        let writebackMode = try LiveSessionWritebackSync.resolveMode(
+            cli: options.advanced.storageMode,
+            environment: context.environment
+        )
         try LiveInstallerLaunchConfiguration.apply(
             installer: options.advanced.installer,
             environment: context.environment
@@ -3723,6 +3728,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             }
             throw error
         }
+        let previouslyPersistedConversation = try await conversationStore.loadIfPresent(
+            sessionID: conversationRecord.sessionID
+        )
+        let createdFreshConversation = previouslyPersistedConversation == nil
+            || options.forkSession || options.worktree != nil
         let sessionID = conversationRecord.sessionID
         let permissionCoordinator = PagerPermissionCoordinator(defaultSelectedPermission: .allowOnce)
         let provisionalFileAccessPolicy = resolveFileAccessPolicy(
@@ -3849,6 +3859,19 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             provider: samplingConfiguration.provider
         )
         conversationRecord = await launchHistory.snapshot()
+        if let writeback = try await LiveSessionWritebackSync.start(
+            mode: writebackMode,
+            home: openGrokHome,
+            environment: context.environment,
+            record: conversationRecord,
+            boundary: await launchHistory.sharedExportBoundary,
+            transport: dependencies.makeImageTransport(),
+            createdFresh: createdFreshConversation,
+            clientIdentifier: options.advanced.clientIdentifier,
+            clientMode: options.mode.rawValue
+        ) {
+            await launchHistory.installWriteback(writeback)
+        }
         let feedback = try await LiveFeedbackComposition.production(
             sessionID: sessionID,
             openGrokHome: openGrokHome,
@@ -4324,6 +4347,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         foundation: LiveSessionFoundation,
         streams: CLIStreams
     ) async {
+        await foundation.conversationHistory.shutdownWriteback()
         if foundation.workingDirectoryCommandsAvailable {
             do {
                 try await LiveSessionWorkingDirectoryRegistry.shared.unregister(
