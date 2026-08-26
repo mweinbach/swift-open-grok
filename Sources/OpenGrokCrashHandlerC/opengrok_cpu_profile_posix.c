@@ -798,7 +798,7 @@ static void og_profile_symbol(uintptr_t address, char *destination, size_t capac
             && cursor < OG_PROFILE_MAX_SYMBOL
             && info.dli_sname[cursor] != '\0') {
             unsigned char value = (unsigned char)info.dli_sname[cursor];
-            destination[cursor] = (value < 32U || value == 127U || value == ';')
+            destination[cursor] = (value <= 32U || value == 127U || value == ';')
                 ? '_'
                 : (char)value;
             cursor++;
