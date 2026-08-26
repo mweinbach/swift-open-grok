@@ -11,10 +11,14 @@ import Testing
 private struct GoogleCloudTraceUploadFixture {
     static let bucket = "private-google-bucket"
     static let accessToken = "PRIVATE_GOOGLE_ACCESS_TOKEN"
+    static let impersonatedAccessToken = "PRIVATE_GOOGLE_IMPERSONATED_ACCESS_TOKEN"
     static let xaiToken = "PRIVATE_XAI_OAUTH_BEARER"
     static let clientSecret = "PRIVATE_GOOGLE_CLIENT_SECRET"
     static let refreshToken = "PRIVATE_GOOGLE_REFRESH_TOKEN"
     static let serviceAccountEmail = "trace-writer@test-project.iam.gserviceaccount.com"
+    static let impersonationPath = "/v1/projects/-/serviceAccounts/"
+        + serviceAccountEmail + ":generateAccessToken"
+    static let impersonationURL = "https://iamcredentials.googleapis.com" + impersonationPath
     static let subjectToken = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJwcml2YXRlIn0.cHJpdmF0ZS1zaWduYXR1cmU"
     static let rotatedSubjectToken = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJyb3RhdGVkIn0.cm90YXRlZC1zaWduYXR1cmU"
     static let workloadAudience = "//iam.googleapis.com/projects/123456789012/locations/global/"
@@ -116,7 +120,9 @@ private struct GoogleCloudTraceUploadFixture {
         format: String? = nil,
         subjectTokenField: String? = nil,
         documentOverrides: [String: Any] = [:],
-        sourceOverrides: [String: Any] = [:]
+        sourceOverrides: [String: Any] = [:],
+        impersonationURL: String? = nil,
+        impersonationLifetime: Int? = nil
     ) throws -> String {
         var source: [String: Any] = ["file": subjectTokenPath]
         if let format {
@@ -135,6 +141,14 @@ private struct GoogleCloudTraceUploadFixture {
             "token_url": tokenURL,
             "credential_source": source,
         ]
+        if let impersonationURL {
+            payload["service_account_impersonation_url"] = impersonationURL
+        }
+        if let impersonationLifetime {
+            payload["service_account_impersonation"] = [
+                "token_lifetime_seconds": impersonationLifetime,
+            ]
+        }
         payload.merge(documentOverrides) { _, override in override }
         return String(
             decoding: try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
@@ -172,6 +186,22 @@ private struct GoogleCloudTraceUploadFixture {
     ) -> MockHTTPTransport.ScriptedResponse {
         let response = body
             ?? "{\"bucket\":\"\(bucket)\",\"name\":\"\(sessionID)/trace_export.tar.gz\"}"
+        return MockHTTPTransport.ScriptedResponse(
+            metadata: HTTPResponseMetadata(statusCode: status, url: url),
+            body: Data(response.utf8)
+        )
+    }
+
+    static func impersonationResponse(
+        status: Int = 200,
+        body: String? = nil,
+        url: URL? = nil
+    ) -> MockHTTPTransport.ScriptedResponse {
+        let expiration = ISO8601DateFormatter().string(
+            from: Date().addingTimeInterval(300)
+        )
+        let response = body
+            ?? "{\"accessToken\":\"\(impersonatedAccessToken)\",\"expireTime\":\"\(expiration)\"}"
         return MockHTTPTransport.ScriptedResponse(
             metadata: HTTPResponseMetadata(statusCode: status, url: url),
             body: Data(response.utf8)
@@ -333,6 +363,28 @@ private actor GoogleCloudSubjectTokenRotationBoundary {
             )
         }
         return try GoogleCloudTraceUploadFixture.authorize(environment: environment)
+    }
+}
+
+private actor GoogleCloudImpersonationAccountRotationBoundary {
+    private let original: LiveGoogleCloudTraceUpload.Authorization
+    private let replacement: LiveGoogleCloudTraceUpload.Authorization
+    private let rotateInvocation: Int
+    private(set) var invocationCount = 0
+
+    init(
+        original: LiveGoogleCloudTraceUpload.Authorization,
+        replacement: LiveGoogleCloudTraceUpload.Authorization,
+        rotateInvocation: Int
+    ) {
+        self.original = original
+        self.replacement = replacement
+        self.rotateInvocation = rotateInvocation
+    }
+
+    func authorize() -> LiveGoogleCloudTraceUpload.Authorization {
+        invocationCount += 1
+        return invocationCount == rotateInvocation ? replacement : original
     }
 }
 
@@ -539,6 +591,135 @@ struct LiveGoogleCloudTraceUploadParityTests {
         }
     }
 
+    @Test(
+        "workload impersonation performs the exact isolated Rust STS, IAM, and Storage exchange",
+        arguments: [3_600, 900]
+    )
+    func workloadIdentityImpersonationMatchesPinnedRustWire(_ lifetime: Int) async throws {
+        let fixture = try GoogleCloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let subjectFile = try fixture.privateCredentialFile(
+            GoogleCloudTraceUploadFixture.subjectToken,
+            named: "impersonated-subject-token"
+        )
+        let credentials = try GoogleCloudTraceUploadFixture.externalAccountCredentials(
+            subjectTokenPath: subjectFile.path,
+            impersonationURL: GoogleCloudTraceUploadFixture.impersonationURL,
+            impersonationLifetime: lifetime == 3_600 ? nil : lifetime
+        )
+        let authorization = try GoogleCloudTraceUploadFixture.authorize(environment: [
+            "GOOGLE_APPLICATION_CREDENTIALS_JSON": credentials,
+            "XAI_API_KEY": "PRIVATE_FOREIGN_XAI_KEY",
+            "GROK_DEPLOYMENT_KEY": "PRIVATE_FOREIGN_DEPLOYMENT_KEY",
+        ])
+        let transport = MockHTTPTransport(responses: [
+            GoogleCloudTraceUploadFixture.tokenResponse(),
+            GoogleCloudTraceUploadFixture.impersonationResponse(),
+            GoogleCloudTraceUploadFixture.uploadResponse(sessionID: "google-session"),
+        ])
+        let boundary = GoogleCloudAuthorizationBoundary()
+
+        let result = try await GoogleCloudTraceUploadFixture.upload(
+            authorization: authorization,
+            transport: transport,
+            authorizeRequest: { try await boundary.authorize(authorization) }
+        )
+
+        #expect(result == "gs://private-google-bucket/google-session/trace_export.tar.gz")
+        #expect(await boundary.invocationCount == 3)
+        #expect(transport.recordedRequests.count == 3)
+
+        let exchange = transport.recordedRequests[0]
+        #expect(exchange.url.absoluteString == "https://sts.googleapis.com/v1/token")
+        #expect(exchange.headers["Authorization"] == nil)
+        let exchangeBody = String(decoding: try #require(exchange.body), as: UTF8.self)
+        #expect(exchangeBody.contains(GoogleCloudTraceUploadFixture.subjectToken))
+        #expect(!exchangeBody.contains(GoogleCloudTraceUploadFixture.accessToken))
+        #expect(!exchangeBody.contains(GoogleCloudTraceUploadFixture.impersonatedAccessToken))
+
+        let impersonation = transport.recordedRequests[1]
+        #expect(impersonation.method == .post)
+        #expect(impersonation.url.absoluteString == GoogleCloudTraceUploadFixture.impersonationURL)
+        #expect(impersonation.headers["Authorization"]
+            == "Bearer \(GoogleCloudTraceUploadFixture.accessToken)")
+        #expect(impersonation.headers["Content-Type"] == "application/json")
+        let impersonationData = try #require(impersonation.body)
+        let payload = try #require(JSONSerialization.jsonObject(
+            with: impersonationData
+        ) as? [String: Any])
+        #expect(payload.keys.sorted() == ["delegates", "lifetime", "scope"])
+        #expect((payload["delegates"] as? [Any])?.isEmpty == true)
+        #expect(payload["lifetime"] as? String == "\(lifetime)s")
+        #expect(payload["scope"] as? [String] == [
+            "https://www.googleapis.com/auth/cloud-platform",
+            "https://www.googleapis.com/auth/devstorage.full_control",
+            "https://www.googleapis.com/auth/cloud-platform",
+        ])
+        let impersonationBody = String(decoding: impersonationData, as: UTF8.self)
+        #expect(!impersonationBody.contains(GoogleCloudTraceUploadFixture.subjectToken))
+        #expect(!impersonationBody.contains(GoogleCloudTraceUploadFixture.impersonatedAccessToken))
+
+        let upload = transport.recordedRequests[2]
+        #expect(upload.url.host == "storage.googleapis.com")
+        #expect(upload.headers["Authorization"]
+            == "Bearer \(GoogleCloudTraceUploadFixture.impersonatedAccessToken)")
+        #expect(!upload.headers.values.contains("Bearer \(GoogleCloudTraceUploadFixture.accessToken)"))
+        #expect(!upload.headers.values.contains(GoogleCloudTraceUploadFixture.subjectToken))
+        for request in transport.recordedRequests {
+            #expect(request.headers[xaiTokenAuthHeader] == nil)
+            #expect(!request.headers.values.contains("PRIVATE_FOREIGN_XAI_KEY"))
+            #expect(!request.headers.values.contains("PRIVATE_FOREIGN_DEPLOYMENT_KEY"))
+        }
+    }
+
+    @Test("the launched trace command performs all three private Google impersonation requests")
+    func productionTraceCommandReachesGoogleServiceAccountImpersonation() async throws {
+        let fixture = try GoogleCloudTraceUploadFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("impersonated-google")
+        let subjectFile = try fixture.privateCredentialFile(
+            GoogleCloudTraceUploadFixture.subjectToken,
+            named: "launched-impersonation-subject-token"
+        )
+        let credentials = try GoogleCloudTraceUploadFixture.externalAccountCredentials(
+            subjectTokenPath: subjectFile.path,
+            impersonationURL: GoogleCloudTraceUploadFixture.impersonationURL
+        )
+        let transport = MockHTTPTransport(responses: [
+            GoogleCloudTraceUploadFixture.tokenResponse(),
+            GoogleCloudTraceUploadFixture.impersonationResponse(),
+            GoogleCloudTraceUploadFixture.uploadResponse(sessionID: "impersonated-google"),
+        ])
+
+        let result = await fixture.run(
+            "impersonated-google",
+            environment: try fixture.environment(credentials: credentials),
+            transport: transport
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.success.rawValue)
+        #expect(result.errors.isEmpty)
+        let output = try #require(JSONSerialization.jsonObject(
+            with: Data(result.output.utf8)
+        ) as? [String: Any])
+        #expect(output["url"] as? String
+            == "gs://private-google-bucket/impersonated-google/trace_export.tar.gz")
+        #expect(transport.recordedRequests.count == 3)
+        #expect(transport.recordedRequests[0].url.host == "sts.googleapis.com")
+        #expect(transport.recordedRequests[1].url.host == "iamcredentials.googleapis.com")
+        #expect(transport.recordedRequests[2].url.host == "storage.googleapis.com")
+        #expect(transport.recordedRequests[2].body?.starts(with: [0x1F, 0x8B]) == true)
+        for secret in [
+            GoogleCloudTraceUploadFixture.subjectToken,
+            GoogleCloudTraceUploadFixture.accessToken,
+            GoogleCloudTraceUploadFixture.impersonatedAccessToken,
+            GoogleCloudTraceUploadFixture.xaiToken,
+        ] {
+            #expect(!result.output.contains(secret))
+            #expect(!result.errors.contains(secret))
+        }
+    }
+
     @Test("the launched trace command exchanges a private workload JWT before uploading its real archive")
     func productionTraceCommandReachesGoogleWorkloadIdentityFederation() async throws {
         let fixture = try GoogleCloudTraceUploadFixture()
@@ -615,6 +796,76 @@ struct LiveGoogleCloudTraceUploadParityTests {
         #expect(transport.recordedRequests[0].url.absoluteString == origin + "/v1/token")
         #expect(transport.recordedRequests[1].url.host == "127.0.0.1")
         #expect(transport.recordedRequests[1].url.port == 24191)
+    }
+
+    @Test(
+        "loopback Google impersonation keeps STS, IAM, and Storage on one approved authority",
+        arguments: [false, true]
+    )
+    func workloadImpersonationLoopbackCannotCrossAuthorities(_ configuredLocally: Bool) async throws {
+        let fixture = try GoogleCloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let subjectFile = try fixture.privateCredentialFile(
+            GoogleCloudTraceUploadFixture.subjectToken,
+            named: "loopback-impersonation-subject-token"
+        )
+        let origin = "http://127.0.0.1:24191"
+        let configuredIAM = configuredLocally
+            ? origin + GoogleCloudTraceUploadFixture.impersonationPath
+            : GoogleCloudTraceUploadFixture.impersonationURL
+        let credentials = try GoogleCloudTraceUploadFixture.externalAccountCredentials(
+            subjectTokenPath: subjectFile.path,
+            tokenURL: origin + "/v1/token",
+            impersonationURL: configuredIAM
+        )
+        let authorization = try GoogleCloudTraceUploadFixture.authorize(environment: [
+            "GOOGLE_APPLICATION_CREDENTIALS_JSON": credentials,
+            "GROK_TRACE_UPLOAD_ENDPOINT_URL": origin,
+        ])
+        let transport = MockHTTPTransport(responses: [
+            GoogleCloudTraceUploadFixture.tokenResponse(),
+            GoogleCloudTraceUploadFixture.impersonationResponse(),
+            GoogleCloudTraceUploadFixture.uploadResponse(sessionID: "google-session"),
+        ])
+
+        let result = try await GoogleCloudTraceUploadFixture.upload(
+            authorization: authorization,
+            transport: transport
+        )
+
+        #expect(result == "gs://private-google-bucket/google-session/trace_export.tar.gz")
+        #expect(transport.recordedRequests.count == 3)
+        #expect(transport.recordedRequests[0].url.absoluteString == origin + "/v1/token")
+        #expect(transport.recordedRequests[1].url.absoluteString
+            == origin + GoogleCloudTraceUploadFixture.impersonationPath)
+        #expect(transport.recordedRequests.allSatisfy {
+            $0.url.host == "127.0.0.1" && $0.url.port == 24191
+        })
+    }
+
+    @Test("a loopback Google IAM authority cannot diverge from approved STS and Storage")
+    func workloadImpersonationLoopbackRejectsForeignAuthority() throws {
+        let fixture = try GoogleCloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let subjectFile = try fixture.privateCredentialFile(
+            GoogleCloudTraceUploadFixture.subjectToken,
+            named: "cross-authority-impersonation-subject-token"
+        )
+        let credentials = try GoogleCloudTraceUploadFixture.externalAccountCredentials(
+            subjectTokenPath: subjectFile.path,
+            tokenURL: "http://127.0.0.1:24191/v1/token",
+            impersonationURL: "http://127.0.0.1:24192"
+                + GoogleCloudTraceUploadFixture.impersonationPath
+        )
+        let transport = MockHTTPTransport()
+
+        #expect(throws: LiveGoogleCloudTraceUpload.Failure.self) {
+            try GoogleCloudTraceUploadFixture.authorize(environment: [
+                "GOOGLE_APPLICATION_CREDENTIALS_JSON": credentials,
+                "GROK_TRACE_UPLOAD_ENDPOINT_URL": "http://127.0.0.1:24191",
+            ])
+        }
+        #expect(transport.recordedRequests.isEmpty)
     }
 
     @Test("a loopback Google workload exchange cannot silently switch away from its storage authority")
@@ -843,6 +1094,76 @@ struct LiveGoogleCloudTraceUploadParityTests {
     #endif
 
     @Test(
+        "only the exact Google IAM service-account authority can receive a federated bearer",
+        arguments: [
+            "https://iamcredentials.googleapis.com.attacker.invalid/v1/projects/-/serviceAccounts/trace-writer@test-project.iam.gserviceaccount.com:generateAccessToken",
+            "https://attacker.invalid/v1/projects/-/serviceAccounts/trace-writer@test-project.iam.gserviceaccount.com:generateAccessToken",
+            "http://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/trace-writer@test-project.iam.gserviceaccount.com:generateAccessToken",
+            "https://iamcredentials.googleapis.com:443/v1/projects/-/serviceAccounts/trace-writer@test-project.iam.gserviceaccount.com:generateAccessToken",
+            "https://private@iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/trace-writer@test-project.iam.gserviceaccount.com:generateAccessToken",
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/trace-writer@test-project.iam.gserviceaccount.com:generateAccessToken?private=true",
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/trace-writer@test-project.iam.gserviceaccount.com:generateAccessToken#private",
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/trace-writer%40test-project.iam.gserviceaccount.com:generateAccessToken",
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/trace-writer@test-project.iam.gserviceaccount.com%3AgenerateAccessToken",
+            "https://iamcredentials.googleapis.com/v1/projects/private/serviceAccounts/trace-writer@test-project.iam.gserviceaccount.com:generateAccessToken",
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/trace-writer@attacker.invalid:generateAccessToken",
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/trace-writer@test-project.iam.gserviceaccount.com.attacker.invalid:generateAccessToken",
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/Trace-Writer@test-project.iam.gserviceaccount.com:generateAccessToken",
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/trace-writer@test-project.iam.gserviceaccount.com:generateIdToken",
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/../trace-writer@test-project.iam.gserviceaccount.com:generateAccessToken",
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/trace-writer@test-project.iam.gserviceaccount.com:generateAccessToken/",
+            "http://127.0.0.1:24191/v1/projects/-/serviceAccounts/trace-writer@test-project.iam.gserviceaccount.com:generateAccessToken",
+            " PRIVATE_DELEGATED_AUTHORITY ",
+        ]
+    )
+    func hostileServiceAccountImpersonationEndpointsFailBeforeNetwork(_ endpoint: String) throws {
+        let fixture = try GoogleCloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let subjectFile = try fixture.privateCredentialFile(
+            GoogleCloudTraceUploadFixture.subjectToken,
+            named: "hostile-iam-subject-token"
+        )
+        let credentials = try GoogleCloudTraceUploadFixture.externalAccountCredentials(
+            subjectTokenPath: subjectFile.path,
+            impersonationURL: endpoint
+        )
+        let transport = MockHTTPTransport()
+
+        #expect(throws: LiveGoogleCloudTraceUpload.Failure.self) {
+            try GoogleCloudTraceUploadFixture.authorize(environment: [
+                "GOOGLE_APPLICATION_CREDENTIALS_JSON": credentials,
+            ])
+        }
+        #expect(transport.recordedRequests.isEmpty)
+    }
+
+    @Test(
+        "service-account impersonation accepts only bounded positive token lifetimes",
+        arguments: [-1, 0, 3_601, Int.max]
+    )
+    func unsafeServiceAccountImpersonationLifetimesFailClosed(_ lifetime: Int) throws {
+        let fixture = try GoogleCloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let subjectFile = try fixture.privateCredentialFile(
+            GoogleCloudTraceUploadFixture.subjectToken,
+            named: "unsafe-lifetime-subject-token"
+        )
+        let credentials = try GoogleCloudTraceUploadFixture.externalAccountCredentials(
+            subjectTokenPath: subjectFile.path,
+            impersonationURL: GoogleCloudTraceUploadFixture.impersonationURL,
+            impersonationLifetime: lifetime
+        )
+        let transport = MockHTTPTransport()
+
+        #expect(throws: LiveGoogleCloudTraceUpload.Failure.self) {
+            try GoogleCloudTraceUploadFixture.authorize(environment: [
+                "GOOGLE_APPLICATION_CREDENTIALS_JSON": credentials,
+            ])
+        }
+        #expect(transport.recordedRequests.isEmpty)
+    }
+
+    @Test(
         "forged workload-identity STS authorities cannot receive private JWT subject tokens",
         arguments: [
             "https://sts.googleapis.com.attacker.invalid/v1/token",
@@ -978,7 +1299,7 @@ struct LiveGoogleCloudTraceUploadParityTests {
     }
 
     @Test(
-        "workload federation rejects mixed credentials, impersonation, delegated authority and alternate universes",
+        "workload federation rejects mixed credentials, invalid impersonation, delegation and alternate universes",
         arguments: [
             "client_email", "private_key_id", "private_key", "client_id", "client_secret",
             "refresh_token", "token_uri", "token_info_url", "service_account_impersonation_url",
@@ -1007,6 +1328,54 @@ struct LiveGoogleCloudTraceUploadParityTests {
         let credentials = try GoogleCloudTraceUploadFixture.externalAccountCredentials(
             subjectTokenPath: subjectFile.path,
             documentOverrides: [field: forbidden]
+        )
+        let transport = MockHTTPTransport()
+
+        #expect(throws: LiveGoogleCloudTraceUpload.Failure.self) {
+            try GoogleCloudTraceUploadFixture.authorize(environment: [
+                "GOOGLE_APPLICATION_CREDENTIALS_JSON": credentials,
+            ])
+        }
+        #expect(transport.recordedRequests.isEmpty)
+    }
+
+    @Test(
+        "Google IAM impersonation cannot activate unsupported dynamic subjects or delegation",
+        arguments: ["url", "headers", "executable", "aws", "non-jwt", "delegates", "workforce"]
+    )
+    func impersonationDoesNotWidenCredentialSourceAuthority(_ scenario: String) throws {
+        let fixture = try GoogleCloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let subjectFile = try fixture.privateCredentialFile(
+            GoogleCloudTraceUploadFixture.subjectToken,
+            named: "unsupported-impersonation-subject-token"
+        )
+        var sourceOverrides: [String: Any] = [:]
+        var documentOverrides: [String: Any] = [:]
+        switch scenario {
+        case "url":
+            sourceOverrides["url"] = "http://169.254.169.254/private-token"
+        case "headers":
+            sourceOverrides["headers"] = ["Authorization": "PRIVATE_METADATA_BEARER"]
+        case "executable":
+            sourceOverrides["executable"] = ["command": "/must/never/execute"]
+        case "aws":
+            sourceOverrides["environment_id"] = "aws1"
+        case "delegates":
+            documentOverrides["delegates"] = ["projects/-/serviceAccounts/stolen@attacker.invalid"]
+        case "workforce":
+            documentOverrides["workforce_pool_user_project"] = "PRIVATE_BILLING_PROJECT"
+        default:
+            break
+        }
+        let credentials = try GoogleCloudTraceUploadFixture.externalAccountCredentials(
+            subjectTokenPath: subjectFile.path,
+            subjectTokenType: scenario == "non-jwt"
+                ? "urn:ietf:params:oauth:token-type:access_token"
+                : "urn:ietf:params:oauth:token-type:jwt",
+            documentOverrides: documentOverrides,
+            sourceOverrides: sourceOverrides,
+            impersonationURL: GoogleCloudTraceUploadFixture.impersonationURL
         )
         let transport = MockHTTPTransport()
 
@@ -1147,6 +1516,260 @@ struct LiveGoogleCloudTraceUploadParityTests {
                 "GOOGLE_APPLICATION_CREDENTIALS_JSON": credentials,
             ])
         }
+    }
+
+    @Test(
+        "rotating a private workload JWT revokes STS, IAM, and Storage independently",
+        arguments: [1, 2, 3]
+    )
+    func impersonatedWorkloadTokenRotationFailsBeforeEveryRequest(_ rotateInvocation: Int) async throws {
+        let fixture = try GoogleCloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let subjectFile = try fixture.privateCredentialFile(
+            GoogleCloudTraceUploadFixture.subjectToken,
+            named: "rotating-impersonation-subject-token"
+        )
+        let credentials = try GoogleCloudTraceUploadFixture.externalAccountCredentials(
+            subjectTokenPath: subjectFile.path,
+            impersonationURL: GoogleCloudTraceUploadFixture.impersonationURL
+        )
+        let environment = ["GOOGLE_APPLICATION_CREDENTIALS_JSON": credentials]
+        let authorization = try GoogleCloudTraceUploadFixture.authorize(environment: environment)
+        let transport = MockHTTPTransport(responses: [
+            GoogleCloudTraceUploadFixture.tokenResponse(),
+            GoogleCloudTraceUploadFixture.impersonationResponse(),
+            GoogleCloudTraceUploadFixture.uploadResponse(sessionID: "google-session"),
+        ])
+        let boundary = GoogleCloudSubjectTokenRotationBoundary(
+            path: subjectFile,
+            environment: environment,
+            rotateInvocation: rotateInvocation
+        )
+
+        await #expect(throws: LiveGoogleCloudTraceUpload.Failure.self) {
+            try await GoogleCloudTraceUploadFixture.upload(
+                authorization: authorization,
+                transport: transport,
+                authorizeRequest: { try await boundary.authorize() }
+            )
+        }
+
+        #expect(await boundary.invocationCount == rotateInvocation)
+        #expect(transport.recordedRequests.count == rotateInvocation - 1)
+        #expect(transport.recordedRequests.allSatisfy { $0.url.host != "storage.googleapis.com" })
+    }
+
+    @Test(
+        "changing the impersonated account revokes authority before every outbound request",
+        arguments: [1, 2, 3]
+    )
+    func impersonatedWorkloadAccountRotationFailsBeforeEveryRequest(_ rotateInvocation: Int) async throws {
+        let fixture = try GoogleCloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let subjectFile = try fixture.privateCredentialFile(
+            GoogleCloudTraceUploadFixture.subjectToken,
+            named: "rotating-impersonated-account-subject-token"
+        )
+        let originalCredentials = try GoogleCloudTraceUploadFixture.externalAccountCredentials(
+            subjectTokenPath: subjectFile.path,
+            impersonationURL: GoogleCloudTraceUploadFixture.impersonationURL
+        )
+        let replacementURL = "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/"
+            + "other-writer@test-project.iam.gserviceaccount.com:generateAccessToken"
+        let replacementCredentials = try GoogleCloudTraceUploadFixture.externalAccountCredentials(
+            subjectTokenPath: subjectFile.path,
+            impersonationURL: replacementURL
+        )
+        let original = try GoogleCloudTraceUploadFixture.authorize(environment: [
+            "GOOGLE_APPLICATION_CREDENTIALS_JSON": originalCredentials,
+        ])
+        let replacement = try GoogleCloudTraceUploadFixture.authorize(environment: [
+            "GOOGLE_APPLICATION_CREDENTIALS_JSON": replacementCredentials,
+        ])
+        let transport = MockHTTPTransport(responses: [
+            GoogleCloudTraceUploadFixture.tokenResponse(),
+            GoogleCloudTraceUploadFixture.impersonationResponse(),
+            GoogleCloudTraceUploadFixture.uploadResponse(sessionID: "google-session"),
+        ])
+        let boundary = GoogleCloudImpersonationAccountRotationBoundary(
+            original: original,
+            replacement: replacement,
+            rotateInvocation: rotateInvocation
+        )
+
+        await #expect(throws: LiveGoogleCloudTraceUpload.Failure.self) {
+            try await GoogleCloudTraceUploadFixture.upload(
+                authorization: original,
+                transport: transport,
+                authorizeRequest: { await boundary.authorize() }
+            )
+        }
+
+        #expect(await boundary.invocationCount == rotateInvocation)
+        #expect(transport.recordedRequests.count == rotateInvocation - 1)
+        #expect(transport.recordedRequests.allSatisfy { $0.url.absoluteString != replacementURL })
+    }
+
+    @Test(
+        "privacy revocation prevents STS, service-account impersonation, and archive disclosure",
+        arguments: [1, 2, 3]
+    )
+    func impersonatedWorkloadPrivacyRevocationFailsAtEveryBoundary(_ revokedInvocation: Int) async throws {
+        let fixture = try GoogleCloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let subjectFile = try fixture.privateCredentialFile(
+            GoogleCloudTraceUploadFixture.subjectToken,
+            named: "privacy-impersonation-subject-token"
+        )
+        let credentials = try GoogleCloudTraceUploadFixture.externalAccountCredentials(
+            subjectTokenPath: subjectFile.path,
+            impersonationURL: GoogleCloudTraceUploadFixture.impersonationURL
+        )
+        let authorization = try GoogleCloudTraceUploadFixture.authorize(environment: [
+            "GOOGLE_APPLICATION_CREDENTIALS_JSON": credentials,
+        ])
+        let transport = MockHTTPTransport(responses: [
+            GoogleCloudTraceUploadFixture.tokenResponse(),
+            GoogleCloudTraceUploadFixture.impersonationResponse(),
+            GoogleCloudTraceUploadFixture.uploadResponse(sessionID: "google-session"),
+        ])
+        let boundary = GoogleCloudAuthorizationBoundary(revokedInvocation: revokedInvocation)
+
+        await #expect(throws: LiveGoogleCloudTraceUpload.Failure.self) {
+            try await GoogleCloudTraceUploadFixture.upload(
+                authorization: authorization,
+                transport: transport,
+                authorizeRequest: { try await boundary.authorize(authorization) }
+            )
+        }
+
+        #expect(await boundary.invocationCount == revokedInvocation)
+        #expect(transport.recordedRequests.count == revokedInvocation - 1)
+        #expect(transport.recordedRequests.allSatisfy { $0.url.host != "storage.googleapis.com" })
+    }
+
+    @Test(
+        "unsafe IAM impersonation responses never release the impersonated bearer or archive",
+        arguments: [
+            "rejected", "missing-token", "missing-expiry", "malformed", "expired", "future",
+            "malformed-expiry", "header-injection", "oversized",
+        ]
+    )
+    func unsafeServiceAccountImpersonationResponsesFailClosed(_ scenario: String) async throws {
+        let fixture = try GoogleCloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let subjectFile = try fixture.privateCredentialFile(
+            GoogleCloudTraceUploadFixture.subjectToken,
+            named: "unsafe-iam-response-subject-token"
+        )
+        let credentials = try GoogleCloudTraceUploadFixture.externalAccountCredentials(
+            subjectTokenPath: subjectFile.path,
+            impersonationURL: GoogleCloudTraceUploadFixture.impersonationURL
+        )
+        let authorization = try GoogleCloudTraceUploadFixture.authorize(environment: [
+            "GOOGLE_APPLICATION_CREDENTIALS_JSON": credentials,
+        ])
+        let formatter = ISO8601DateFormatter()
+        let safeExpiration = formatter.string(from: Date().addingTimeInterval(300))
+        let response: MockHTTPTransport.ScriptedResponse
+        switch scenario {
+        case "rejected":
+            response = GoogleCloudTraceUploadFixture.impersonationResponse(status: 403)
+        case "missing-token":
+            response = GoogleCloudTraceUploadFixture.impersonationResponse(
+                body: "{\"expireTime\":\"\(safeExpiration)\"}"
+            )
+        case "missing-expiry":
+            response = GoogleCloudTraceUploadFixture.impersonationResponse(
+                body: "{\"accessToken\":\"PRIVATE_IMPERSONATED\"}"
+            )
+        case "malformed":
+            response = GoogleCloudTraceUploadFixture.impersonationResponse(body: "{malformed-iam-response")
+        case "expired":
+            let expiration = formatter.string(from: Date().addingTimeInterval(-300))
+            response = GoogleCloudTraceUploadFixture.impersonationResponse(
+                body: "{\"accessToken\":\"PRIVATE_IMPERSONATED\",\"expireTime\":\"\(expiration)\"}"
+            )
+        case "future":
+            let expiration = formatter.string(from: Date().addingTimeInterval(7_200))
+            response = GoogleCloudTraceUploadFixture.impersonationResponse(
+                body: "{\"accessToken\":\"PRIVATE_IMPERSONATED\",\"expireTime\":\"\(expiration)\"}"
+            )
+        case "malformed-expiry":
+            response = GoogleCloudTraceUploadFixture.impersonationResponse(
+                body: "{\"accessToken\":\"PRIVATE_IMPERSONATED\",\"expireTime\":\"not-rfc3339\"}"
+            )
+        case "header-injection":
+            response = GoogleCloudTraceUploadFixture.impersonationResponse(
+                body: "{\"accessToken\":\"PRIVATE\\r\\nX-Stolen: true\",\"expireTime\":\"\(safeExpiration)\"}"
+            )
+        default:
+            response = GoogleCloudTraceUploadFixture.impersonationResponse(
+                body: "{\"accessToken\":\"\(String(repeating: "a", count: 70_000))\","
+                    + "\"expireTime\":\"\(safeExpiration)\"}"
+            )
+        }
+        let transport = MockHTTPTransport(responses: [
+            GoogleCloudTraceUploadFixture.tokenResponse(),
+            response,
+            GoogleCloudTraceUploadFixture.uploadResponse(sessionID: "google-session"),
+        ])
+
+        await #expect(throws: LiveGoogleCloudTraceUpload.Failure.self) {
+            try await GoogleCloudTraceUploadFixture.upload(
+                authorization: authorization,
+                transport: transport
+            )
+        }
+
+        #expect(transport.recordedRequests.count == 2)
+        #expect(transport.recordedRequests.last?.url.host == "iamcredentials.googleapis.com")
+    }
+
+    @Test(
+        "Google IAM 307, 308, and changed final origins never forward federated credentials",
+        arguments: ["redirect-307", "redirect-308", "foreign-origin"]
+    )
+    func impersonationRedirectsNeverReachStorage(_ scenario: String) async throws {
+        let fixture = try GoogleCloudTraceUploadFixture()
+        defer { fixture.clean() }
+        let subjectFile = try fixture.privateCredentialFile(
+            GoogleCloudTraceUploadFixture.subjectToken,
+            named: "redirected-impersonation-subject-token"
+        )
+        let credentials = try GoogleCloudTraceUploadFixture.externalAccountCredentials(
+            subjectTokenPath: subjectFile.path,
+            impersonationURL: GoogleCloudTraceUploadFixture.impersonationURL
+        )
+        let authorization = try GoogleCloudTraceUploadFixture.authorize(environment: [
+            "GOOGLE_APPLICATION_CREDENTIALS_JSON": credentials,
+        ])
+        let response: MockHTTPTransport.ScriptedResponse
+        if scenario == "foreign-origin" {
+            response = GoogleCloudTraceUploadFixture.impersonationResponse(
+                url: try #require(URL(string: "https://attacker.invalid/private-bearer"))
+            )
+        } else {
+            response = GoogleCloudTraceUploadFixture.impersonationResponse(
+                status: scenario == "redirect-307" ? 307 : 308
+            )
+        }
+        let transport = MockHTTPTransport(responses: [
+            GoogleCloudTraceUploadFixture.tokenResponse(),
+            response,
+            GoogleCloudTraceUploadFixture.uploadResponse(sessionID: "google-session"),
+        ])
+
+        await #expect(throws: LiveGoogleCloudTraceUpload.Failure.self) {
+            try await GoogleCloudTraceUploadFixture.upload(
+                authorization: authorization,
+                transport: transport
+            )
+        }
+
+        #expect(transport.recordedRequests.count == 2)
+        #expect(transport.recordedRequests.last?.url.host == "iamcredentials.googleapis.com")
+        #expect(transport.recordedRequests.allSatisfy { $0.url.host != "attacker.invalid" })
     }
 
     @Test(

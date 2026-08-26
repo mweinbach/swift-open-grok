@@ -68,7 +68,18 @@ enum LiveGoogleCloudTraceUpload {
     fileprivate enum Credentials: Sendable, Equatable {
         case serviceAccount(email: String, keyID: String?, privateKey: String)
         case authorizedUser(clientID: String, clientSecret: String, refreshToken: String)
-        case externalAccount(audience: String, subjectToken: String, sourcePath: String)
+        case externalAccount(
+            audience: String,
+            subjectToken: String,
+            sourcePath: String,
+            impersonation: ServiceAccountImpersonation?
+        )
+    }
+
+    fileprivate struct ServiceAccountImpersonation: Sendable, Equatable {
+        let account: String
+        let endpoint: URL
+        let lifetimeSeconds: Int
     }
 
     private struct CredentialSourceFormat: Decodable {
@@ -127,6 +138,17 @@ enum LiveGoogleCloudTraceUpload {
         let expires_in: Int?
     }
 
+    private struct ImpersonationTokenRequest: Encodable {
+        let delegates: [String]
+        let lifetime: String
+        let scope: [String]
+    }
+
+    private struct ImpersonationTokenResponse: Decodable {
+        let accessToken: String
+        let expireTime: String
+    }
+
     private struct UploadResponse: Decodable {
         let bucket: String
         let name: String
@@ -158,6 +180,10 @@ enum LiveGoogleCloudTraceUpload {
 
     private static let googleTokenURL = "https://oauth2.googleapis.com/token"
     private static let googleSecurityTokenURL = "https://sts.googleapis.com/v1/token"
+    private static let googleIAMCredentialsHost = "iamcredentials.googleapis.com"
+    private static let impersonationPathPrefix = "/v1/projects/-/serviceAccounts/"
+    private static let impersonationPathSuffix = ":generateAccessToken"
+    private static let maximumImpersonationLifetime = 3_600
     private static let jwtSubjectTokenType = "urn:ietf:params:oauth:token-type:jwt"
     private static let googleStorageHost = "storage.googleapis.com"
     private static let maximumCredentialBytes = 64 * 1024
@@ -184,8 +210,12 @@ enum LiveGoogleCloudTraceUpload {
             throw Failure.invalidCredentials
         }
 
-        let credentials = try validatedCredentials(credential, environment: environment)
         let testOrigin = try loopbackOrigin(document: document, environment: environment)
+        let credentials = try validatedCredentials(
+            credential,
+            environment: environment,
+            testOrigin: testOrigin
+        )
         let tokenEndpoint: URL
         switch credentials {
         case .externalAccount:
@@ -236,7 +266,11 @@ enum LiveGoogleCloudTraceUpload {
 
             let accessToken: String
             do {
-                accessToken = try await token(for: authorization, transport: transport)
+                accessToken = try await token(
+                    for: authorization,
+                    transport: transport,
+                    authorizeRequest: authorizeRequest
+                )
             } catch let failure as Failure {
                 if case .tokenRejected(let status) = failure,
                    retryableStatusCodes.contains(status),
@@ -328,7 +362,8 @@ enum LiveGoogleCloudTraceUpload {
 
     private static func token(
         for authorization: Authorization,
-        transport: any HTTPTransport
+        transport: any HTTPTransport,
+        authorizeRequest: @escaping @Sendable () async throws -> Authorization
     ) async throws -> String {
         let requestBody: Data
         let contentType: String
@@ -349,7 +384,7 @@ enum LiveGoogleCloudTraceUpload {
                 )
             )
             contentType = "application/json"
-        case .externalAccount(let audience, let subjectToken, _):
+        case .externalAccount(let audience, let subjectToken, _, _):
             requestBody = FormURLEncoding.encodeData([
                 "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
                 "audience": audience,
@@ -383,7 +418,76 @@ enum LiveGoogleCloudTraceUpload {
         else {
             throw Failure.malformedToken
         }
-        return token.access_token
+        guard case .externalAccount(_, _, _, let impersonation?) = authorization.credentials else {
+            return token.access_token
+        }
+
+        try Task.checkCancellation()
+        guard try await authorizeRequest() == authorization else {
+            throw Failure.authorizationChanged
+        }
+        return try await impersonatedToken(
+            for: impersonation,
+            federatedToken: token.access_token,
+            transport: transport
+        )
+    }
+
+    private static func impersonatedToken(
+        for impersonation: ServiceAccountImpersonation,
+        federatedToken: String,
+        transport: any HTTPTransport
+    ) async throws -> String {
+        // The pinned Rust provider appends cloud-platform even when Storage's
+        // existing scopes already contain it; removing the duplicate changes
+        // the impersonation request observed by Google IAM.
+        let scopes = storageScopes.split(separator: " ").map(String.init)
+            + ["https://www.googleapis.com/auth/cloud-platform"]
+        let body = try JSONEncoder().encode(
+            ImpersonationTokenRequest(
+                delegates: [],
+                lifetime: "\(impersonation.lifetimeSeconds)s",
+                scope: scopes
+            )
+        )
+        let request = HTTPRequest(
+            method: .post,
+            url: impersonation.endpoint,
+            headers: [
+                "Accept": "application/json",
+                "Authorization": "Bearer \(federatedToken)",
+                "Content-Type": "application/json",
+            ],
+            body: body,
+            timeout: requestTimeout
+        )
+        let response = try await send(request, using: transport)
+        guard response.metadata.url == nil || response.metadata.url == impersonation.endpoint else {
+            throw Failure.invalidEndpoint
+        }
+        guard (200..<300).contains(response.metadata.statusCode) else {
+            throw Failure.tokenRejected(response.metadata.statusCode)
+        }
+        guard response.body.count <= maximumResponseBytes,
+              let token = try? JSONDecoder().decode(ImpersonationTokenResponse.self, from: response.body),
+              validAccessToken(token.accessToken),
+              let expiry = impersonationExpiry(token.expireTime),
+              expiry > Date(),
+              expiry.timeIntervalSinceNow <= TimeInterval(impersonation.lifetimeSeconds + 60)
+        else {
+            throw Failure.malformedToken
+        }
+        return token.accessToken
+    }
+
+    private static func impersonationExpiry(_ value: String) -> Date? {
+        guard (20...64).contains(value.utf8.count) else { return nil }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let parsed = fractional.date(from: value) {
+            return parsed
+        }
+        return ISO8601DateFormatter().date(from: value)
     }
 
     private static func send(
@@ -517,7 +621,8 @@ enum LiveGoogleCloudTraceUpload {
 
     private static func validatedCredentials(
         _ document: CredentialDocument,
-        environment: [String: String]
+        environment: [String: String],
+        testOrigin: URL?
     ) throws -> Credentials {
         switch document.type {
         case "service_account":
@@ -555,7 +660,11 @@ enum LiveGoogleCloudTraceUpload {
                 refreshToken: refreshToken
             )
         case "external_account":
-            return try validatedExternalCredentials(document, environment: environment)
+            return try validatedExternalCredentials(
+                document,
+                environment: environment,
+                testOrigin: testOrigin
+            )
         default:
             throw Failure.unsupportedCredentialSource
         }
@@ -563,11 +672,12 @@ enum LiveGoogleCloudTraceUpload {
 
     private static func validatedExternalCredentials(
         _ document: CredentialDocument,
-        environment: [String: String]
+        environment: [String: String],
+        testOrigin: URL?
     ) throws -> Credentials {
-        // Upstream also supports URL/AWS subject sources and impersonation, but
-        // those require distinct network authorities; accepting them here would
-        // turn credential documents into SSRF or cross-account delegation.
+        // Dynamic subject providers choose additional untrusted authorities.
+        // Impersonation is safe only through the separately pinned Google IAM
+        // endpoint and never grants callers arbitrary delegation chains.
         guard document.client_email == nil,
               document.private_key_id == nil,
               document.private_key == nil,
@@ -576,8 +686,6 @@ enum LiveGoogleCloudTraceUpload {
               document.refresh_token == nil,
               document.token_uri == nil,
               document.token_info_url == nil,
-              document.service_account_impersonation_url == nil,
-              document.service_account_impersonation == nil,
               document.delegates == nil,
               document.quota_project_id == nil,
               document.workforce_pool_user_project == nil,
@@ -601,6 +709,7 @@ enum LiveGoogleCloudTraceUpload {
             throw Failure.unsupportedCredentialSource
         }
 
+        let impersonation = try validatedImpersonation(document, testOrigin: testOrigin)
         let data = try privateCredentialData(at: path, environment: environment)
         guard let contents = String(data: data, encoding: .utf8) else {
             throw Failure.invalidCredentials
@@ -630,7 +739,102 @@ enum LiveGoogleCloudTraceUpload {
         guard validSubjectToken(subjectToken) else {
             throw Failure.invalidCredentials
         }
-        return .externalAccount(audience: audience, subjectToken: subjectToken, sourcePath: path)
+        return .externalAccount(
+            audience: audience,
+            subjectToken: subjectToken,
+            sourcePath: path,
+            impersonation: impersonation
+        )
+    }
+
+    private static func validatedImpersonation(
+        _ document: CredentialDocument,
+        testOrigin: URL?
+    ) throws -> ServiceAccountImpersonation? {
+        guard let configuredEndpoint = document.service_account_impersonation_url else {
+            guard document.service_account_impersonation == nil else {
+                throw Failure.unsupportedCredentialSource
+            }
+            return nil
+        }
+
+        let lifetime: Int
+        if let configured = document.service_account_impersonation {
+            guard let seconds = configured.token_lifetime_seconds,
+                  (1...maximumImpersonationLifetime).contains(seconds)
+            else {
+                throw Failure.invalidCredentials
+            }
+            lifetime = seconds
+        } else {
+            lifetime = maximumImpersonationLifetime
+        }
+
+        guard let components = URLComponents(string: configuredEndpoint),
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil,
+              components.percentEncodedPath == components.path,
+              components.path.hasPrefix(impersonationPathPrefix),
+              components.path.hasSuffix(impersonationPathSuffix)
+        else {
+            throw Failure.invalidEndpoint
+        }
+        let accountStart = components.path.index(
+            components.path.startIndex,
+            offsetBy: impersonationPathPrefix.count
+        )
+        let accountEnd = components.path.index(
+            components.path.endIndex,
+            offsetBy: -impersonationPathSuffix.count
+        )
+        guard accountStart < accountEnd else { throw Failure.invalidEndpoint }
+        let account = String(components.path[accountStart..<accountEnd])
+        guard validImpersonationAccount(account),
+              let production = URL(
+                  string: "https://\(googleIAMCredentialsHost)\(impersonationPathPrefix)"
+                      + "\(account)\(impersonationPathSuffix)"
+              )
+        else {
+            throw Failure.invalidEndpoint
+        }
+
+        let endpoint: URL
+        if let testOrigin,
+           var localComponents = URLComponents(url: testOrigin, resolvingAgainstBaseURL: false) {
+            localComponents.percentEncodedPath = components.path
+            guard let local = localComponents.url,
+                  configuredEndpoint == production.absoluteString
+                    || configuredEndpoint == local.absoluteString
+            else {
+                throw Failure.invalidEndpoint
+            }
+            endpoint = local
+        } else {
+            guard configuredEndpoint == production.absoluteString else {
+                throw Failure.invalidEndpoint
+            }
+            endpoint = production
+        }
+
+        return ServiceAccountImpersonation(
+            account: account,
+            endpoint: endpoint,
+            lifetimeSeconds: lifetime
+        )
+    }
+
+    private static func validImpersonationAccount(_ account: String) -> Bool {
+        let parts = account.split(separator: "@", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              validWorkloadIdentitySegment(parts[0]),
+              parts[1].hasSuffix(".iam.gserviceaccount.com")
+        else {
+            return false
+        }
+        let project = parts[1].dropLast(".iam.gserviceaccount.com".count)
+        return validWorkloadIdentitySegment(project)
     }
 
     private static func tokenEndpoint(for configuredURL: String?, testOrigin: URL?) throws -> URL {
