@@ -3,6 +3,10 @@ import Testing
 
 @testable import OpenGrokCLI
 
+#if os(Windows)
+import OpenGrokConfig
+#endif
+
 #if canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
@@ -411,8 +415,13 @@ private struct CodexForeignParityFixture {
         home = root.appendingPathComponent("codex", isDirectory: true)
         outside = root.appendingPathComponent("outside", isDirectory: true)
         now = Date()
+        #if os(Windows)
+        try OpenGrokConfig.createDirAllOwnerOnly(home, stateRoot: home)
+        try OpenGrokConfig.createDirAllOwnerOnly(outside, stateRoot: outside)
+        #else
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        #endif
     }
 
     var dateSuffix: String {
