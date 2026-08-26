@@ -22,8 +22,13 @@ private struct ACPRemoteDeleteFixture: Sendable {
     let endpoint = "http://127.0.0.1:46392"
 
     init() throws {
+        #if os(Windows)
+        let rootName = "oad-\(UUID().uuidString.prefix(8))"
+        #else
+        let rootName = "opengrok-acp-remote-delete-\(UUID().uuidString)"
+        #endif
         root = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "opengrok-acp-remote-delete-\(UUID().uuidString)",
+            rootName,
             isDirectory: true
         )
         home = root.appendingPathComponent("owner", isDirectory: true)
