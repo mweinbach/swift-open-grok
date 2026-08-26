@@ -11,6 +11,7 @@
 
 import Foundation
 import OpenGrokACP
+import OpenGrokConfig
 import OpenGrokHTTP
 import OpenGrokSamplingTypes
 import OpenGrokShared
@@ -27,7 +28,11 @@ private typealias JSONValue = OpenGrokShared.JSONValue
 private func makeHome() throws -> URL {
     let home = FileManager.default.temporaryDirectory
         .appendingPathComponent("opengrok-acp-sessadmin-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+    #if os(Windows)
+    try OpenGrokConfig.createDirAllOwnerOnly(home, stateRoot: home)
+    #else
+    try OpenGrokConfig.createDirAllOwnerOnly(home)
+    #endif
     return home
 }
 

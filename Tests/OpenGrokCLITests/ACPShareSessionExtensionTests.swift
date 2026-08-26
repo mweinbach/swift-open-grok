@@ -7,6 +7,7 @@
 import Foundation
 import OpenGrokACP
 import OpenGrokAuth
+import OpenGrokConfig
 import OpenGrokConfigTypes
 import OpenGrokHTTP
 import OpenGrokSamplingTypes
@@ -49,7 +50,11 @@ private final class MockShareSignedUploadClient: ShareSignedUploadClient, @unche
 private func makeHome() throws -> URL {
     let home = FileManager.default.temporaryDirectory
         .appendingPathComponent("opengrok-acp-share-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+    #if os(Windows)
+    try OpenGrokConfig.createDirAllOwnerOnly(home, stateRoot: home)
+    #else
+    try OpenGrokConfig.createDirAllOwnerOnly(home)
+    #endif
     return home
 }
 
@@ -88,9 +93,11 @@ private func seedSession(
     id: String,
     items: [ConversationItem]
 ) async throws -> LiveConversationRecord {
+    let workingDirectory = home.appendingPathComponent("project", isDirectory: true)
+    try OpenGrokConfig.createDirAllOwnerOnly(workingDirectory)
     var record = LiveConversationRecord.new(
         sessionID: id,
-        workingDirectory: URL(fileURLWithPath: "/tmp/project")
+        workingDirectory: workingDirectory
     )
     record.items = items
     record.everUsedNonXAI = false

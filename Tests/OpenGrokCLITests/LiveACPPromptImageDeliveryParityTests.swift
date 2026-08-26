@@ -1,6 +1,7 @@
 import Foundation
 import OpenGrokACP
 import OpenGrokACPRuntime
+import OpenGrokConfig
 import OpenGrokSamplingTypes
 import OpenGrokShared
 import Testing
@@ -72,17 +73,32 @@ private struct LiveACPPromptImageFixture {
         let suffix = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8))
         #if os(macOS)
         root = URL(fileURLWithPath: "/private/tmp/ogapi-\(suffix)", isDirectory: true)
+        #elseif os(Windows)
+        root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "ogapi-\(suffix)", isDirectory: true
+        )
         #else
         root = URL(fileURLWithPath: "/tmp/ogapi-\(suffix)", isDirectory: true)
         #endif
         home = root.appendingPathComponent("home", isDirectory: true)
         workspace = root.appendingPathComponent("workspace", isDirectory: true)
-        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        #if os(Windows)
+        try OpenGrokConfig.createDirAllOwnerOnly(root, stateRoot: root)
+        try OpenGrokConfig.createDirAllOwnerOnly(home, stateRoot: home)
+        try OpenGrokConfig.createDirAllOwnerOnly(workspace, stateRoot: root)
+        #else
+        for directory in [root, home, workspace] {
+            try OpenGrokConfig.createDirAllOwnerOnly(directory)
+        }
+        #endif
         if installSkill {
             let directory = workspace
                 .appendingPathComponent(".opengrok/skills/inspect-image", isDirectory: true)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            #if os(Windows)
+            try OpenGrokConfig.createDirAllOwnerOnly(directory, stateRoot: root)
+            #else
+            try OpenGrokConfig.createDirAllOwnerOnly(directory)
+            #endif
             try """
             ---
             name: inspect-image

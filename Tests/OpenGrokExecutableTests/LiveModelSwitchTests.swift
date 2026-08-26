@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokConfig
 import OpenGrokModels
 import OpenGrokSamplingTypes
 import Testing
@@ -31,7 +32,11 @@ private final class SamplerFactorySpy: @unchecked Sendable {
 private func makeTemporaryHome() throws -> URL {
     let url = FileManager.default.temporaryDirectory
         .appendingPathComponent("open-grok-model-switch-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    #if os(Windows)
+    try OpenGrokConfig.createDirAllOwnerOnly(url, stateRoot: url)
+    #else
+    try OpenGrokConfig.createDirAllOwnerOnly(url)
+    #endif
     return url
 }
 
