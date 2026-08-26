@@ -6,9 +6,9 @@
 // parent-dir fsync). Cross-device renames surface as
 // `FileUtilsError.crossDevice`.
 //
-// When `noFollowFinal` is set, every path component is opened with
-// O_NOFOLLOW via openat and replacement uses renameat against a verified
-// parent directory descriptor — no preflight lstat race.
+// When `noFollowFinal` is set, Unix replacement uses openat / renameat against
+// a verified parent descriptor. Windows holds no-reparse directory handles
+// without delete sharing through creation and replacement.
 
 import Foundation
 
@@ -40,8 +40,9 @@ private final class WriteNonce: @unchecked Sendable {
 /// Options for an atomic write.
 public struct AtomicWriteOptions: Sendable, Equatable {
     /// Optional Unix permission mode applied to the temp file before rename
-    /// (e.g. `0o600`). Ignored on Windows; the final file never exists with
-    /// looser permissions than requested on Unix.
+    /// (e.g. `0o600`). Windows only interprets `0o600` together with
+    /// `noFollowFinal` as an owner-only DACL; ordinary writes ignore the mode.
+    /// The final file never exists with looser permissions than requested on Unix.
     public var mode: UInt32?
     /// When true (default), `fsync` the temp file before rename.
     public var syncFile: Bool
@@ -107,6 +108,9 @@ public enum AtomicFile: Sendable {
     ) throws {
         try PathSecurity.rejectHostileLexical(finalPath.path)
 
+        #if os(Windows)
+        try windowsWriteAtomically(finalPath, data: data, options: options)
+        #else
         if options.noFollowFinal {
             try writeNoFollow(finalPath, data: data, options: options)
             return
@@ -148,6 +152,7 @@ public enum AtomicFile: Sendable {
         }
 
         try applyDirectorySync(dir, policy: options.directorySync)
+        #endif
     }
 
     /// Atomically rename `source` over `destination` on the same filesystem.
@@ -158,9 +163,26 @@ public enum AtomicFile: Sendable {
     ) throws {
         try PathSecurity.rejectHostileLexical(source.path)
         try PathSecurity.rejectHostileLexical(destination.path)
+        #if os(Windows)
+        // Validate both complete endpoints before creating destination parents.
+        let nativeSource = try WindowsSecurePath.extendedLengthPath(source.path)
+        let nativeDestination = try WindowsSecurePath.extendedLengthPath(destination.path)
+        let prefixes = try windowsDirectoryPrefixes(nativeDestination)
+        try windowsPrepareDirectories(Array(prefixes.dropLast()))
+        #else
         try ensureParentDirectory(of: destination)
+        #endif
         do {
+            #if os(Windows)
+            try windowsRenameReplacing(
+                nativeSource,
+                to: nativeDestination,
+                sourcePath: source.path,
+                destinationPath: destination.path
+            )
+            #else
             try renameReplacing(source, to: destination)
+            #endif
         } catch let err as FileUtilsError {
             throw err
         } catch {
@@ -188,9 +210,25 @@ public enum AtomicFile: Sendable {
     /// `fsync` a file path (opens read-write if needed).
     public static func fsyncFile(at path: URL) throws {
         #if os(Windows)
-        let handle = try FileHandle(forUpdating: path)
-        defer { try? handle.close() }
-        try handle.synchronize()
+        let native = try WindowsSecurePath.extendedLengthPath(path.path)
+        let rawHandle = native.withCString(encodedAs: UTF16.self) {
+            CreateFileW(
+                $0,
+                DWORD(GENERIC_READ | GENERIC_WRITE),
+                DWORD(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+                nil,
+                DWORD(OPEN_EXISTING),
+                DWORD(FILE_ATTRIBUTE_NORMAL),
+                nil
+            )
+        }
+        guard let handle = rawHandle, handle != INVALID_HANDLE_VALUE else {
+            throw windowsFileError(path: path.path, operation: "open for fsync")
+        }
+        defer { CloseHandle(handle) }
+        guard FlushFileBuffers(handle) else {
+            throw windowsFileError(path: path.path, operation: "fsync")
+        }
         #else
         let fd = path.path.withCString { open($0, O_RDONLY) }
         guard fd >= 0 else {
@@ -328,95 +366,140 @@ private func applyDirectorySyncFD(
     }
 }
 #else
-private func writeNoFollow(
+private func windowsWriteAtomically(
     _ finalPath: URL,
     data: Data,
     options: AtomicWriteOptions
 ) throws {
-    let parent = finalPath.deletingLastPathComponent().standardizedFileURL
-    let finalName = finalPath.lastPathComponent
-    guard !finalName.isEmpty, finalName != "..", finalName != "." else {
+    let nativeFinal = try WindowsSecurePath.extendedLengthPath(finalPath.path)
+    let prefixes = try windowsDirectoryPrefixes(nativeFinal)
+    guard prefixes.count > 1,
+          let nativeParent = prefixes.dropLast().last,
+          let finalName = nativeFinal.split(separator: "\\").last
+    else {
         throw FileUtilsError.hostilePath(
             path: finalPath.path,
             reason: "invalid final component"
         )
     }
 
-    let directoryHandles = try windowsPrepareDirectoriesNoFollow(parent)
+    let pid = UInt64(ProcessInfo.processInfo.processIdentifier)
+    let nonce = WriteNonce.shared.next()
+    let separator = nativeParent.hasSuffix("\\") ? "" : "\\"
+    let nativeTemp = try WindowsSecurePath.extendedLengthPath(
+        "\(nativeParent)\(separator)\(finalName).\(pid).\(nonce).tmp"
+    )
+
+    // Validate final and derived temp names before creating even one parent.
+    // The ordinary path deliberately permits reparse parents and ignores mode.
+    let directoryHandles: [HANDLE]
+    if options.noFollowFinal {
+        directoryHandles = try windowsPrepareDirectoriesNoFollow(Array(prefixes.dropLast()))
+    } else {
+        try windowsPrepareDirectories(Array(prefixes.dropLast()))
+        directoryHandles = []
+    }
     defer {
         for handle in directoryHandles.reversed() {
             CloseHandle(handle)
         }
     }
 
-    try windowsRejectReparsePoint(at: finalPath, allowMissing: true)
-
-    let pid = UInt64(ProcessInfo.processInfo.processIdentifier)
-    let nonce = WriteNonce.shared.next()
-    let tmp = parent.appendingPathComponent("\(finalName).\(pid).\(nonce).tmp")
+    if options.noFollowFinal {
+        try windowsRejectReparsePoint(at: nativeFinal, allowMissing: true)
+    }
+    // Rust fs_atomic.rs:19-40 (pin 00e176c8) requires an exclusive, unique temp
+    // and cleanup on failure. Retain one native write handle so long paths do
+    // not fall back through Foundation's ordinary-path reopen.
+    try windowsCreateAndWriteTemp(nativeTemp, data: data, options: options)
     do {
-        try windowsCreateAndWriteTemp(tmp, data: data, options: options)
-
-        try windowsRejectReparsePoint(at: finalPath, allowMissing: true)
-        try renameReplacing(tmp, to: finalPath)
-        try applyDirectorySync(parent, policy: options.directorySync)
+        if options.noFollowFinal {
+            try windowsRejectReparsePoint(at: nativeFinal, allowMissing: true)
+        }
+        try windowsRenameReplacing(
+            nativeTemp,
+            to: nativeFinal,
+            sourcePath: nativeTemp,
+            destinationPath: finalPath.path
+        )
     } catch {
-        try? FileManager.default.removeItem(at: tmp)
+        try? windowsRemoveTemp(nativeTemp)
         throw error
     }
+    try applyDirectorySync(finalPath.deletingLastPathComponent(), policy: options.directorySync)
 }
 
 private func windowsCreateAndWriteTemp(
-    _ path: URL,
+    _ path: String,
     data: Data,
     options: AtomicWriteOptions
 ) throws {
-    if options.mode == 0o600 {
+    if options.noFollowFinal, options.mode == 0o600 {
         var handle: OGSocketHandle = -1
-        let created = path.path.withCString { pointer in
+        let created = path.withCString { pointer in
             og_file_create_owner_only(pointer, &handle)
         }
         guard created == 0 else {
-            throw windowsNativeFileError(path: path.path, operation: "create owner-only temp")
+            throw windowsNativeFileError(path: path, operation: "create owner-only temp")
         }
         var closed = false
+        var completed = false
         defer {
             if !closed { _ = og_file_handle_close(handle) }
+            if !completed { try? windowsRemoveTemp(path) }
         }
         let count = data.withUnsafeBytes { bytes in
             og_file_handle_write_all(handle, bytes.baseAddress, bytes.count)
         }
         guard count == data.count else {
-            throw windowsNativeFileError(path: path.path, operation: "write owner-only temp")
+            throw windowsNativeFileError(path: path, operation: "write owner-only temp")
         }
         if options.syncFile, og_file_handle_flush(handle) != 0 {
-            throw windowsNativeFileError(path: path.path, operation: "flush owner-only temp")
+            throw windowsNativeFileError(path: path, operation: "flush owner-only temp")
         }
         guard og_file_handle_close(handle) == 0 else {
-            throw windowsNativeFileError(path: path.path, operation: "close owner-only temp")
+            throw windowsNativeFileError(path: path, operation: "close owner-only temp")
         }
         closed = true
+        completed = true
         return
     }
 
-    let rawHandle = path.path.withCString(encodedAs: UTF16.self) { pointer in
+    let attributes = options.noFollowFinal ? FILE_ATTRIBUTE_TEMPORARY : FILE_ATTRIBUTE_NORMAL
+    let rawHandle = path.withCString(encodedAs: UTF16.self) { pointer in
         CreateFileW(
             pointer,
             DWORD(GENERIC_WRITE),
             DWORD(FILE_SHARE_READ),
             nil,
             DWORD(CREATE_NEW),
-            DWORD(FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_OPEN_REPARSE_POINT),
+            DWORD(attributes | FILE_FLAG_OPEN_REPARSE_POINT),
             nil
         )
     }
     guard let handle = rawHandle, handle != INVALID_HANDLE_VALUE else {
-        throw windowsFileError(path: path.path, operation: "create exclusive temp")
+        throw windowsFileError(path: path, operation: "create exclusive temp")
     }
-    defer { CloseHandle(handle) }
-    try windowsWriteAll(handle: handle, data: data, path: path.path)
+    var completed = false
+    defer {
+        CloseHandle(handle)
+        if !completed { try? windowsRemoveTemp(path) }
+    }
+    try windowsWriteAll(handle: handle, data: data, path: path)
     if options.syncFile, !FlushFileBuffers(handle) {
-        throw windowsFileError(path: path.path, operation: "flush temp")
+        throw windowsFileError(path: path, operation: "flush temp")
+    }
+    completed = true
+}
+
+private func windowsRemoveTemp(_ nativePath: String) throws {
+    // Only called after CREATE_NEW succeeded; never unlink another writer's
+    // colliding temp. Cleanup is best-effort and preserves the original error.
+    let removed = nativePath.withCString(encodedAs: UTF16.self) { DeleteFileW($0) }
+    if !removed {
+        let code = GetLastError()
+        if code == DWORD(ERROR_FILE_NOT_FOUND) || code == DWORD(ERROR_PATH_NOT_FOUND) { return }
+        throw windowsFileError(path: nativePath, operation: "remove temp", code: code)
     }
 }
 
@@ -429,25 +512,12 @@ private func windowsNativeFileError(path: String, operation: String) -> FileUtil
     )
 }
 
-private func windowsPrepareDirectoriesNoFollow(_ directory: URL) throws -> [HANDLE] {
-    let prefixes = try windowsDirectoryPrefixes(directory.path)
+private func windowsPrepareDirectoriesNoFollow(_ prefixes: [String]) throws -> [HANDLE] {
     var handles: [HANDLE] = []
     do {
         for (index, path) in prefixes.enumerated() {
             if index > 0 {
-                let created = path.withCString(encodedAs: UTF16.self) { pointer in
-                    CreateDirectoryW(pointer, nil)
-                }
-                if !created {
-                    let code = GetLastError()
-                    guard code == DWORD(ERROR_ALREADY_EXISTS) else {
-                        throw windowsFileError(
-                            path: path,
-                            operation: "create parent directory",
-                            code: code
-                        )
-                    }
-                }
+                try windowsCreateDirectory(path)
             }
             handles.append(try windowsOpenDirectoryNoFollow(path))
         }
@@ -460,42 +530,48 @@ private func windowsPrepareDirectoriesNoFollow(_ directory: URL) throws -> [HAND
     }
 }
 
-private func windowsDirectoryPrefixes(_ path: String) throws -> [String] {
-    let normalized = path.replacingOccurrences(of: "/", with: "\\")
-    if normalized.hasPrefix("\\\\") {
-        let components = normalized.dropFirst(2).split(separator: "\\", omittingEmptySubsequences: true)
-        guard components.count >= 2 else {
-            throw FileUtilsError.hostilePath(path: path, reason: "invalid UNC path")
-        }
-        var current = "\\\\\(components[0])\\\(components[1])\\"
-        var result = [current]
-        for component in components.dropFirst(2) {
-            current += "\(component)\\"
-            result.append(String(current.dropLast()))
-        }
-        return result
+private func windowsPrepareDirectories(_ prefixes: [String]) throws {
+    for (index, path) in prefixes.enumerated() {
+        if index > 0 { try windowsCreateDirectory(path) }
+        try windowsVerifyDirectoryFollowing(path)
     }
+}
 
-    guard normalized.count >= 3 else {
-        throw FileUtilsError.hostilePath(path: path, reason: "path is not absolute")
+private func windowsVerifyDirectoryFollowing(_ path: String) throws {
+    // GetFileAttributesW rejects a UNC share root. A following directory handle
+    // covers share roots and preserves ordinary writes through reparse parents.
+    let rawHandle = path.withCString(encodedAs: UTF16.self) { pointer in
+        CreateFileW(
+            pointer,
+            DWORD(FILE_READ_ATTRIBUTES),
+            DWORD(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+            nil,
+            DWORD(OPEN_EXISTING),
+            DWORD(FILE_FLAG_BACKUP_SEMANTICS),
+            nil
+        )
     }
-    let driveEnd = normalized.index(normalized.startIndex, offsetBy: 2)
-    guard normalized[normalized.index(after: normalized.startIndex)] == ":",
-          normalized[driveEnd] == "\\"
-    else {
-        throw FileUtilsError.hostilePath(path: path, reason: "path is not absolute")
+    guard let handle = rawHandle, handle != INVALID_HANDLE_VALUE else {
+        throw windowsFileError(path: path, operation: "open parent directory")
     }
+    defer { CloseHandle(handle) }
+    var information = BY_HANDLE_FILE_INFORMATION()
+    guard GetFileInformationByHandle(handle, &information) else {
+        throw windowsFileError(path: path, operation: "inspect parent directory")
+    }
+    guard information.dwFileAttributes & DWORD(FILE_ATTRIBUTE_DIRECTORY) != 0 else {
+        throw FileUtilsError.hostilePath(path: path, reason: "parent component is not a directory")
+    }
+}
 
-    let rootEnd = normalized.index(after: driveEnd)
-    var current = String(normalized[..<rootEnd])
-    var result = [current]
-    let remainder = normalized[rootEnd...]
-    for component in remainder.split(separator: "\\", omittingEmptySubsequences: true) {
-        if !current.hasSuffix("\\") { current += "\\" }
-        current += component
-        result.append(current)
+private func windowsCreateDirectory(_ path: String) throws {
+    let created = path.withCString(encodedAs: UTF16.self) { CreateDirectoryW($0, nil) }
+    if !created {
+        let code = GetLastError()
+        guard code == DWORD(ERROR_ALREADY_EXISTS) else {
+            throw windowsFileError(path: path, operation: "create parent directory", code: code)
+        }
     }
-    return result
 }
 
 private func windowsOpenDirectoryNoFollow(_ path: String) throws -> HANDLE {
@@ -531,8 +607,8 @@ private func windowsOpenDirectoryNoFollow(_ path: String) throws -> HANDLE {
     return handle
 }
 
-private func windowsRejectReparsePoint(at path: URL, allowMissing: Bool) throws {
-    let rawHandle = path.path.withCString(encodedAs: UTF16.self) { pointer in
+private func windowsRejectReparsePoint(at path: String, allowMissing: Bool) throws {
+    let rawHandle = path.withCString(encodedAs: UTF16.self) { pointer in
         CreateFileW(
             pointer,
             DWORD(FILE_READ_ATTRIBUTES),
@@ -548,19 +624,19 @@ private func windowsRejectReparsePoint(at path: URL, allowMissing: Bool) throws 
         if allowMissing, code == DWORD(ERROR_FILE_NOT_FOUND) || code == DWORD(ERROR_PATH_NOT_FOUND) {
             return
         }
-        throw windowsFileError(path: path.path, operation: "inspect final path", code: code)
+        throw windowsFileError(path: path, operation: "inspect final path", code: code)
     }
     defer { CloseHandle(handle) }
     var information = BY_HANDLE_FILE_INFORMATION()
     guard GetFileInformationByHandle(handle, &information) else {
-        throw windowsFileError(path: path.path, operation: "inspect final path")
+        throw windowsFileError(path: path, operation: "inspect final path")
     }
     let attributes = information.dwFileAttributes
     if attributes & DWORD(FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-        throw FileUtilsError.symlinkEncountered(path: path.path)
+        throw FileUtilsError.symlinkEncountered(path: path)
     }
     if attributes & DWORD(FILE_ATTRIBUTE_DIRECTORY) != 0 {
-        throw FileUtilsError.hostilePath(path: path.path, reason: "final component is a directory")
+        throw FileUtilsError.hostilePath(path: path, reason: "final component is a directory")
     }
 }
 
@@ -599,10 +675,70 @@ private func windowsFileError(
     }
     return .io(path: path, detail: "\(operation): Windows error \(code)")
 }
+
+private func windowsRenameReplacing(
+    _ nativeSource: String,
+    to nativeDestination: String,
+    sourcePath: String,
+    destinationPath: String
+) throws {
+    let maximumAttempts = 40
+    for attempt in 0..<maximumAttempts {
+        let moved = nativeSource.withCString(encodedAs: UTF16.self) { sourcePointer in
+            nativeDestination.withCString(encodedAs: UTF16.self) { destinationPointer in
+                MoveFileExW(
+                    sourcePointer,
+                    destinationPointer,
+                    DWORD(MOVEFILE_REPLACE_EXISTING) | DWORD(MOVEFILE_WRITE_THROUGH)
+                )
+            }
+        }
+        if moved { return }
+
+        let code = GetLastError()
+        if code == DWORD(ERROR_NOT_SAME_DEVICE) {
+            throw FileUtilsError.crossDevice(source: sourcePath, destination: destinationPath)
+        }
+        let isTransientCollision = code == DWORD(ERROR_ACCESS_DENIED)
+            || code == DWORD(ERROR_SHARING_VIOLATION)
+            || code == DWORD(ERROR_LOCK_VIOLATION)
+        if !isTransientCollision || attempt == maximumAttempts - 1 {
+            throw FileUtilsError.io(path: destinationPath, detail: "Windows error \(code)")
+        }
+        Sleep(DWORD(min(attempt + 1, 10)))
+    }
+}
 #endif
 
 // MARK: - Internals
 
+// Kept platform-independent so every host tests drive and UNC root splitting.
+// All prefixes inherit the complete path's validation before any Win32 call.
+func windowsDirectoryPrefixes(_ path: String) throws -> [String] {
+    let normalized = try WindowsSecurePath.extendedLengthPath(path)
+    let uncPrefix = "\\\\?\\UNC\\"
+    var current: String
+    let components: [Substring]
+    if normalized.hasPrefix(uncPrefix) {
+        let parts = normalized.dropFirst(uncPrefix.count).split(separator: "\\")
+        current = "\(uncPrefix)\(parts[0])\\\(parts[1])\\"
+        components = Array(parts.dropFirst(2))
+    } else {
+        let rootEnd = normalized.index(normalized.startIndex, offsetBy: 7)
+        current = String(normalized[..<rootEnd])
+        components = normalized[rootEnd...].split(separator: "\\")
+    }
+
+    var prefixes = [current]
+    for component in components {
+        if !current.hasSuffix("\\") { current += "\\" }
+        current += component
+        prefixes.append(current)
+    }
+    return prefixes
+}
+
+#if !os(Windows)
 private func ensureParentDirectory(of path: URL) throws {
     let parent = path.deletingLastPathComponent()
     guard !parent.path.isEmpty else { return }
@@ -620,14 +756,6 @@ private func ensureParentDirectory(of path: URL) throws {
 }
 
 private func createExclusiveFile(at path: URL, mode: UInt32?) throws {
-    #if os(Windows)
-    do {
-        try Data().write(to: path, options: [.withoutOverwriting])
-    } catch {
-        throw FileUtilsError.io(path: path.path, detail: error.localizedDescription)
-    }
-    _ = mode
-    #else
     var flags: Int32 = O_WRONLY | O_CREAT | O_EXCL
     #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
     flags |= O_NOFOLLOW
@@ -638,14 +766,9 @@ private func createExclusiveFile(at path: URL, mode: UInt32?) throws {
         throw posixError(path: path.path, op: "create exclusive temp")
     }
     close(fd)
-    #endif
 }
 
 private func applyUnixMode(_ mode: UInt32, to path: URL) throws {
-    #if os(Windows)
-    _ = mode
-    _ = path
-    #else
     // Use O_NOFOLLOW open + fchmod so a raced symlink is not chmod'd.
     var flags: Int32 = O_WRONLY
     #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS) || os(Linux)
@@ -662,37 +785,9 @@ private func applyUnixMode(_ mode: UInt32, to path: URL) throws {
     if fchmod(fd, mode_t(mode)) != 0 {
         throw posixError(path: path.path, op: "fchmod")
     }
-    #endif
 }
 
 private func renameReplacing(_ source: URL, to destination: URL) throws {
-    #if os(Windows)
-    let maximumAttempts = 40
-    for attempt in 0..<maximumAttempts {
-        let moved = source.path.withCString(encodedAs: UTF16.self) { sourcePointer in
-            destination.path.withCString(encodedAs: UTF16.self) { destinationPointer in
-                MoveFileExW(
-                    sourcePointer,
-                    destinationPointer,
-                    DWORD(MOVEFILE_REPLACE_EXISTING) | DWORD(MOVEFILE_WRITE_THROUGH)
-                )
-            }
-        }
-        if moved { return }
-
-        let code = GetLastError()
-        if code == DWORD(ERROR_NOT_SAME_DEVICE) {
-            throw FileUtilsError.crossDevice(source: source.path, destination: destination.path)
-        }
-        let isTransientCollision = code == DWORD(ERROR_ACCESS_DENIED)
-            || code == DWORD(ERROR_SHARING_VIOLATION)
-            || code == DWORD(ERROR_LOCK_VIOLATION)
-        if !isTransientCollision || attempt == maximumAttempts - 1 {
-            throw FileUtilsError.io(path: destination.path, detail: "Windows error \(code)")
-        }
-        Sleep(DWORD(min(attempt + 1, 10)))
-    }
-    #else
     let rc = source.path.withCString { src in
         destination.path.withCString { dst in
             rename(src, dst)
@@ -704,8 +799,8 @@ private func renameReplacing(_ source: URL, to destination: URL) throws {
         }
         throw posixError(path: destination.path, op: "rename")
     }
-    #endif
 }
+#endif
 
 private func applyDirectorySync(_ dir: URL, policy: DirectorySyncPolicy) throws {
     switch policy {

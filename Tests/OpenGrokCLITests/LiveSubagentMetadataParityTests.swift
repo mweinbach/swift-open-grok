@@ -1,4 +1,5 @@
 import Foundation
+import OpenGrokConfig
 import OpenGrokFastWorktree
 import OpenGrokFileUtils
 import OpenGrokSamplingTypes
@@ -8,20 +9,35 @@ import Testing
 
 @testable import OpenGrokCLI
 
+#if os(Windows)
+import COpenGrokSockets
+#endif
+
 private struct DurableSubagentMetadataFixture {
     let root: URL
     let home: URL
     let workspace: URL
     let store: LiveSubagentMetadataStore
 
-    init() throws {
+    init(homeComponent: String = "home") throws {
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("opengrok-durable-subagent-\(UUID().uuidString)")
             .standardizedFileURL.resolvingSymlinksInPath()
-        home = root.appendingPathComponent("home", isDirectory: true)
+        home = root.appendingPathComponent(homeComponent, isDirectory: true)
         workspace = root.appendingPathComponent("workspace", isDirectory: true)
-        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        #if os(Windows)
+        try OpenGrokConfig.createDirAllOwnerOnly(root, stateRoot: root)
+        try OpenGrokConfig.createDirAllOwnerOnly(home, stateRoot: home)
+        try OpenGrokConfig.createDirAllOwnerOnly(workspace, stateRoot: root)
+        #else
+        for directory in [root, home, workspace] {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        }
+        #endif
         store = LiveSubagentMetadataStore(
             openGrokHome: home,
             parentSessionID: "durable-parent",
@@ -120,6 +136,39 @@ struct LiveSubagentMetadataParityTests {
                           path.deletingLastPathComponent().deletingLastPathComponent()] {
             let attributes = try FileManager.default.attributesOfItem(atPath: directory.path)
             #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o700)
+        }
+        #endif
+    }
+
+    @Test("Long native subagent paths retain private metadata and restart recovery")
+    func longNativePathsPreservePrivateMetadataAndRecovery() throws {
+        let fixture = try DurableSubagentMetadataFixture(homeComponent: String(repeating: "h", count: 120))
+        defer { fixture.dispose() }
+
+        let id = "long-native-child"
+        let path = try fixture.store.metadataURL(id: id)
+        #expect(path.deletingLastPathComponent().path.utf16.count > 260)
+        try fixture.store.save(fixture.metadata(id: id))
+        try fixture.store.updateStatus(id: id, status: .completed, durationMS: 123)
+
+        let restarted = LiveSubagentMetadataStore(
+            openGrokHome: fixture.home,
+            parentSessionID: "durable-parent",
+            parentWorkingDirectory: fixture.workspace
+        )
+        let metadata = try #require(try restarted.load(id: id))
+        #expect(metadata.status == .completed)
+        #expect(metadata.durationMS == 123)
+        #expect(metadata.prompt == fixture.metadata(id: id).prompt)
+        let resumed = try #require(try restarted.resumeSource(id: id))
+        #expect(resumed.childSessionID == id)
+        #expect(resumed.modelRoute?.provider == "xai")
+        #expect(try SecureFile.isOwnerOnly(at: path))
+        #if os(Windows)
+        for directory in [path.deletingLastPathComponent(),
+                          path.deletingLastPathComponent().deletingLastPathComponent()] {
+            let native = try WindowsSecurePath.extendedLengthPath(directory.path)
+            #expect(native.withCString { og_path_is_private_to_current_user($0, 1) } == 1)
         }
         #endif
     }

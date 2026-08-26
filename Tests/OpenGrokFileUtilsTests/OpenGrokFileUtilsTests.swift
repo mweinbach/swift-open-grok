@@ -7,7 +7,9 @@ import Foundation
 import Testing
 @testable import OpenGrokFileUtils
 
-#if canImport(Darwin)
+#if os(Windows)
+import WinSDK
+#elseif canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
@@ -75,6 +77,266 @@ struct OpenGrokFileUtilsTests {
             .filter { $0.lastPathComponent.hasSuffix(".tmp") }
         #expect(leftovers.isEmpty)
     }
+
+    @Test("Windows atomic directory prefixes distinguish extended drive and UNC roots")
+    func windowsAtomicDirectoryPrefixes() throws {
+        let drive = [
+            #"\\?\C:\"#,
+            #"\\?\C:\Users"#,
+            #"\\?\C:\Users\me"#,
+            #"\\?\C:\Users\me\session"#,
+        ]
+        #expect(try windowsDirectoryPrefixes("C:/Users//me/session") == drive)
+        #expect(try windowsDirectoryPrefixes(#"\\?\C:\Users\me\session"#) == drive)
+        #expect(try windowsDirectoryPrefixes(#"C:\"#) == [#"\\?\C:\"#])
+
+        let unc = [
+            #"\\?\UNC\server\share\"#,
+            #"\\?\UNC\server\share\session"#,
+            #"\\?\UNC\server\share\session\child"#,
+        ]
+        #expect(try windowsDirectoryPrefixes(#"\\server\share\session\child"#) == unc)
+        #expect(try windowsDirectoryPrefixes(#"\\?\unc\server\share\session\child"#) == unc)
+        #expect(try windowsDirectoryPrefixes(#"\\server\share"#) == [unc[0]])
+    }
+
+    @Test("Windows atomic directory prefixes validate the entire path before returning parents")
+    func windowsAtomicDirectoryPrefixesRejectHostileNames() {
+        for path in [
+            #"C:relative\file"#,
+            #"C:\good\NUL.json"#,
+            #"C:\good\state.json:hidden"#,
+            #"C:\good\ambiguous.\state.json"#,
+            #"\\?\UNC\server\share\..\state.json"#,
+            #"\\?\GLOBALROOT\Device\HarddiskVolume1\state.json"#,
+        ] {
+            #expect(throws: FileUtilsError.self) { try windowsDirectoryPrefixes(path) }
+        }
+    }
+
+    #if os(Windows)
+    @Test("Windows atomic writes, replacement, rename and fsync work beyond MAX_PATH")
+    func windowsLongAtomicRoundTrip() throws {
+        let root = try tempDir()
+        defer { cleanupWindowsFixture(root) }
+        let longParent = windowsLongDirectory(under: root)
+        try #require(longParent.path.utf16.count > 300)
+
+        let modes: [AtomicWriteOptions] = [
+            AtomicWriteOptions(),
+            AtomicWriteOptions(mode: 0o600),
+            AtomicWriteOptions(mode: 0o644, noFollowFinal: true),
+            .ownerOnly,
+        ]
+        for (index, options) in modes.enumerated() {
+            let parent = longParent.appendingPathComponent("case-\(index)", isDirectory: true)
+            let path = parent.appendingPathComponent("state.json")
+            let ownerOnly = options.noFollowFinal && options.mode == 0o600
+            try AtomicFile.write(path, contents: "first", options: options)
+            #expect(try PathSecurity.readNoFollow(
+                path,
+                maximumBytes: 32_768,
+                requireOwnerOnly: ownerOnly
+            ) == Data("first".utf8))
+
+            let native = try WindowsSecurePath.extendedLengthPath(path.path)
+            let alreadyExtended = URL(fileURLWithPath: native)
+            try #require(try WindowsSecurePath.extendedLengthPath(alreadyExtended.path) == native)
+            let replacement = Data(repeating: UInt8(index + 1), count: 16_387)
+            try AtomicFile.write(alreadyExtended, data: replacement, options: options)
+            try AtomicFile.fsyncFile(at: alreadyExtended)
+            #expect(try PathSecurity.readNoFollow(
+                path,
+                maximumBytes: 32_768,
+                requireOwnerOnly: ownerOnly
+            ) == replacement)
+            if ownerOnly { #expect(try SecureFile.isOwnerOnly(at: path)) }
+
+            let destination = parent.appendingPathComponent("new-parent").appendingPathComponent("moved.json")
+            try AtomicFile.rename(path, to: destination)
+            #expect(try WindowsSecurePath.metadata(at: path) == nil)
+            #expect(try PathSecurity.readNoFollow(
+                destination,
+                maximumBytes: 32_768,
+                requireOwnerOnly: ownerOnly
+            ) == replacement)
+
+            try AtomicFile.write(path, contents: "replacement rename", options: options)
+            try AtomicFile.rename(path, to: destination)
+            #expect(try WindowsSecurePath.metadata(at: path) == nil)
+            #expect(try PathSecurity.readNoFollow(
+                destination,
+                maximumBytes: 64,
+                requireOwnerOnly: ownerOnly
+            ) == Data("replacement rename".utf8))
+            let entries = try WindowsSecurePath.contentsOfDirectory(
+                at: parent,
+                maximumEntries: 8,
+                skipsHiddenFiles: false
+            )
+            #expect(entries.map(\.lastPathComponent) == ["new-parent"])
+        }
+    }
+
+    @Test("Windows failed long-path replacement removes only its temp and preserves the directory")
+    func windowsLongAtomicFailedReplaceCleansTemp() throws {
+        let root = try tempDir()
+        defer { cleanupWindowsFixture(root) }
+        let parent = windowsLongDirectory(under: root)
+        try #require(parent.path.utf16.count > 300)
+        let blocked = parent.appendingPathComponent("existing-directory", isDirectory: true)
+        let survivor = blocked.appendingPathComponent("keep.txt")
+        try AtomicFile.write(survivor, contents: "keep")
+
+        #expect(throws: FileUtilsError.self) {
+            try AtomicFile.write(blocked, contents: "must not replace a directory")
+        }
+        #expect(try PathSecurity.readNoFollow(survivor) == Data("keep".utf8))
+        let entries = try WindowsSecurePath.contentsOfDirectory(
+            at: parent,
+            maximumEntries: 8,
+            skipsHiddenFiles: false
+        )
+        #expect(entries.map(\.lastPathComponent) == ["existing-directory"])
+    }
+
+    @Test("Windows hostile write and rename endpoints do not create parents or alter the source")
+    func windowsHostileAtomicPathsHaveNoSideEffects() throws {
+        let root = try tempDir()
+        defer { cleanupWindowsFixture(root) }
+        let source = root.appendingPathComponent("source.json")
+        try AtomicFile.write(source, contents: "keep source")
+        let names = [
+            "CON.json", "AUX", "state.json:hidden", "state.json.",
+            "state.json ", "state?.json", "ambiguous./state.json",
+        ]
+
+        for (index, name) in names.enumerated() {
+            for noFollow in [false, true] {
+                let parent = root.appendingPathComponent("write-\(index)-\(noFollow)")
+                let path = parent.appendingPathComponent("nested").appendingPathComponent(name)
+                expectWindowsHostilePath {
+                    try AtomicFile.write(
+                        path,
+                        contents: "must not create anything",
+                        options: AtomicWriteOptions(mode: 0o600, noFollowFinal: noFollow)
+                    )
+                }
+                #expect(try WindowsSecurePath.metadata(at: parent) == nil)
+            }
+
+            let parent = root.appendingPathComponent("rename-\(index)")
+            let invalidDestination = parent.appendingPathComponent("nested").appendingPathComponent(name)
+            expectWindowsHostilePath { try AtomicFile.rename(source, to: invalidDestination) }
+            #expect(try WindowsSecurePath.metadata(at: parent) == nil)
+
+            let invalidSource = root.appendingPathComponent(name)
+            let destination = parent.appendingPathComponent("nested").appendingPathComponent("valid.json")
+            expectWindowsHostilePath { try AtomicFile.rename(invalidSource, to: destination) }
+            #expect(try WindowsSecurePath.metadata(at: parent) == nil)
+            #expect(try PathSecurity.readNoFollow(source) == Data("keep source".utf8))
+        }
+        let entries = try WindowsSecurePath.contentsOfDirectory(
+            at: root,
+            maximumEntries: 8,
+            skipsHiddenFiles: false
+        )
+        #expect(entries.map(\.lastPathComponent) == ["source.json"])
+    }
+
+    @Test("Windows ordinary writes retain reparse and inherited-mode behavior while no-follow refuses links")
+    func windowsAtomicReparseAndModeSemantics() throws {
+        let root = try tempDir()
+        defer { cleanupWindowsFixture(root) }
+        let real = root.appendingPathComponent("real", isDirectory: true)
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        let inherited = real.appendingPathComponent("inherited.json")
+        try Data("inherited ACL".utf8).write(to: inherited)
+        let link = root.appendingPathComponent("link", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+        try #require(try WindowsSecurePath.metadata(at: link)?.isReparsePoint == true)
+
+        let ordinary = link.appendingPathComponent("ordinary.json")
+        try AtomicFile.write(ordinary, contents: "follow parent", options: AtomicWriteOptions(mode: 0o600))
+        let actual = real.appendingPathComponent("ordinary.json")
+        #expect(try PathSecurity.readNoFollow(actual) == Data("follow parent".utf8))
+        #expect(try SecureFile.isOwnerOnly(at: actual) == SecureFile.isOwnerOnly(at: inherited))
+
+        let rejectedParent = link.appendingPathComponent("must-not-create", isDirectory: true)
+        do {
+            try AtomicFile.write(rejectedParent.appendingPathComponent("private.json"), contents: "no", options: .ownerOnly)
+            Issue.record("no-follow write accepted a reparse parent")
+        } catch FileUtilsError.symlinkEncountered {
+        } catch {
+            Issue.record(error)
+        }
+        #expect(try WindowsSecurePath.metadata(at: real.appendingPathComponent("must-not-create")) == nil)
+
+        let victim = root.appendingPathComponent("victim.json")
+        try AtomicFile.write(victim, contents: "keep victim")
+        let alias = root.appendingPathComponent("alias.json")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: victim)
+        try #require(try WindowsSecurePath.metadata(at: alias)?.isReparsePoint == true)
+        do {
+            try AtomicFile.write(alias, contents: "no", options: .ownerOnly)
+            Issue.record("no-follow write accepted a final reparse point")
+        } catch FileUtilsError.symlinkEncountered {
+        } catch {
+            Issue.record(error)
+        }
+        try AtomicFile.write(alias, contents: "replace alias")
+        #expect(try WindowsSecurePath.metadata(at: alias)?.isReparsePoint == false)
+        #expect(try PathSecurity.readNoFollow(alias) == Data("replace alias".utf8))
+        #expect(try PathSecurity.readNoFollow(victim) == Data("keep victim".utf8))
+    }
+
+    private func windowsLongDirectory(under root: URL) -> URL {
+        var directory = root
+        for index in 0..<5 {
+            directory.appendPathComponent(String(repeating: "long-", count: 12) + "\(index)", isDirectory: true)
+        }
+        return directory
+    }
+
+    private func expectWindowsHostilePath(_ operation: () throws -> Void) {
+        do {
+            try operation()
+            Issue.record("hostile Windows path reached atomic filesystem operations")
+        } catch FileUtilsError.hostilePath {
+        } catch {
+            Issue.record(error)
+        }
+    }
+
+    private func cleanupWindowsFixture(_ root: URL) {
+        do { try removeWindowsFixture(root) }
+        catch { Issue.record(error) }
+    }
+
+    private func removeWindowsFixture(_ path: URL) throws {
+        guard let metadata = try WindowsSecurePath.metadata(at: path) else { return }
+        if metadata.isDirectory && !metadata.isReparsePoint {
+            for entry in try WindowsSecurePath.contentsOfDirectory(
+                at: path,
+                maximumEntries: 64,
+                skipsHiddenFiles: false
+            ) {
+                try removeWindowsFixture(entry)
+            }
+        }
+        let native = try WindowsSecurePath.extendedLengthPath(path.path)
+        let removed = native.withCString(encodedAs: UTF16.self) { pointer in
+            metadata.isDirectory ? RemoveDirectoryW(pointer) : DeleteFileW(pointer)
+        }
+        guard removed else {
+            throw WindowsSecurePath.windowsError(
+                path: path.path,
+                operation: "clean up atomic-write fixture",
+                code: GetLastError()
+            )
+        }
+    }
+    #endif
 
     @Test("atomic write with noFollow rejects parent symlink")
     func noFollowParentSymlink() throws {

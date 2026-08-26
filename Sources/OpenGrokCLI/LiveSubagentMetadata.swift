@@ -395,8 +395,10 @@ struct LiveSubagentMetadataStore: Sendable {
     private static func secureDirectory(_ path: URL) throws {
         try PathSecurity.rejectHostileLexical(path.path)
         #if os(Windows)
+        // The encoded workspace can push native metadata paths beyond MAX_PATH.
+        let native = try WindowsSecurePath.extendedLengthPath(path.path)
         try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
-        guard path.path.withCString({ og_directory_secure_current_user($0) }) == 0 else {
+        guard native.withCString({ og_directory_secure_current_user($0) }) == 0 else {
             throw LiveSubagentMetadataError.insecurePath(path.path)
         }
         #else
