@@ -238,8 +238,9 @@ public actor ACPLeaderClient {
         }
     }
 
-    /// Incoming ACP requests and notifications. Responses are consumed by the
-    /// matching `request` continuation and are not repeated in this stream.
+    /// Incoming requests, notifications, and replies to raw forwarded calls.
+    /// Responses matching a `request` continuation are consumed there and
+    /// are not repeated in this stream.
     public func events() throws -> AsyncThrowingStream<ACPMessage, Error> {
         guard started, !closed else { throw ACPLeaderClientError.notStarted }
         return eventStream
@@ -283,6 +284,16 @@ public actor ACPLeaderClient {
         guard started, !closed else { throw ACPLeaderClientError.notStarted }
         let message = ACPMessage.notification(method: method, params: params)
         try await writer.send(.acp(payload: Self.encode(message)))
+    }
+
+    /// The relay preserves peer-assigned IDs, including reverse responses.
+    /// Unmatched replies remain in `events`; the host still applies its own
+    /// request namespace and reverse-response ownership checks.
+    func forward(_ message: ACPMessage) async throws {
+        guard started, !closed else { throw ACPLeaderClientError.notStarted }
+        try Task.checkCancellation()
+        let payload = String(decoding: try message.encodedData(), as: UTF8.self)
+        try await writer.send(.acp(payload: payload))
     }
 
     public func control(_ command: [String: String]) async throws -> ACPLeaderControlPayload {
@@ -369,7 +380,9 @@ public actor ACPLeaderClient {
             )
         case .error(let code, let message):
             await failAll(ACPLeaderClientError.leaderError(code: code, message: message))
-        case .pong, .leaderReady, .shuttingDown, .shutdown:
+        case .shutdown:
+            await close()
+        case .pong, .leaderReady, .shuttingDown:
             break
         }
     }
@@ -430,21 +443,21 @@ public actor ACPLeaderClient {
 }
 
 private actor ACPLeaderClientWriter {
-    private let channel: any WebSocketByteChannel
+    private let frames: ACPLeaderFrameWriter
     private var closed = false
 
     init(channel: any WebSocketByteChannel) {
-        self.channel = channel
+        self.frames = ACPLeaderFrameWriter(channel: channel)
     }
 
     func send(_ message: ACPLeaderClientMessage) async throws {
         guard !closed else { throw ACPLeaderClientError.disconnected }
-        try await channel.write(try ACPLeaderCodec.encode(message))
+        try await frames.write(try ACPLeaderCodec.encode(message))
     }
 
     func close() async {
         guard !closed else { return }
         closed = true
-        await channel.close()
+        await frames.close()
     }
 }

@@ -120,6 +120,8 @@ public actor ACPAgentRuntime {
     private var reverseSender: (@Sendable (ACPMessage) async throws -> Void)?
     private var sessionOwnerVerifier: SessionOwnerVerifier?
     private var openedLifecycleSessions: Set<AcpSessionId> = []
+    private var sessionLifecycleAdmissions: [AcpSessionId: Int] = [:]
+    private var leaderHistoryReservations: Set<AcpSessionId> = []
 
     private struct RosterMetadata: Sendable {
         var title: String?
@@ -149,6 +151,10 @@ public actor ACPAgentRuntime {
         self.workspaceBoundary = workspaceBoundary
         if let extensionRouter {
             self.extensionRouter = extensionRouter
+        } else if let router = extensionHandler as? ACPExtensionMethodRouter {
+            // Carrier composition passes its typed router through the handler
+            // protocol. Keep the route identity used by authorization intact.
+            self.extensionRouter = router
         } else if let extensionHandler {
             self.extensionRouter = ACPExtensionMethodRouter().register(
                 catchAll: extensionHandler
@@ -183,6 +189,12 @@ public actor ACPAgentRuntime {
 
     public func setSessionOwnerVerifier(_ verifier: SessionOwnerVerifier?) {
         sessionOwnerVerifier = verifier
+    }
+
+    func cancelReverseRequests(_ requestIDs: [AcpRequestId]) async {
+        for requestID in requestIDs {
+            await reverseRequests.cancel(requestID)
+        }
     }
 
     /// Apply the effective `[ui].combine_queued_prompts` value to future turns.
@@ -499,7 +511,35 @@ public actor ACPAgentRuntime {
             guard let extensionRouter else {
                 throw ACPRuntimeError.methodNotFound(route.method)
             }
-            if await !mayControlLeaderSession(from: route.params) {
+            let historyTargetField = extensionRouter.hasExactRoute(route.method)
+                ? Self.historyAdministrationTargetField(for: route.method)
+                : nil
+            let targetSessionID: AcpSessionId?
+            let authorized: Bool
+            var reservedHistorySession: AcpSessionId?
+            defer {
+                if let reservedHistorySession {
+                    leaderHistoryReservations.remove(reservedHistorySession)
+                }
+            }
+            if let historyTargetField {
+                targetSessionID = route.params[historyTargetField]?.stringValue.map { AcpSessionId($0) }
+                if sessionOwnerVerifier != nil, let targetSessionID {
+                    // Hold through dispatch: an async handler can mutate disk
+                    // long after its initial residency/ownership checks finish.
+                    guard sessionLifecycleAdmissions[targetSessionID] == nil,
+                          leaderHistoryReservations.insert(targetSessionID).inserted
+                    else {
+                        throw ACPRuntimeError.sessionNotFound(targetSessionID)
+                    }
+                    reservedHistorySession = targetSessionID
+                }
+                authorized = await mayAdministerLeaderHistory(targetSessionID: targetSessionID)
+            } else {
+                targetSessionID = Self.sessionID(in: route.params)
+                authorized = await mayControlLeaderSession(from: route.params)
+            }
+            if !authorized {
                 if extensionRouter.hasExactRoute(route.method),
                    let hidden = Self.hiddenDeniedLeaderExtensionResponse(
                     method: route.method,
@@ -508,11 +548,13 @@ public actor ACPAgentRuntime {
                 {
                     return hidden
                 }
-                if let sessionID = Self.sessionID(in: route.params) {
+                if let sessionID = targetSessionID {
                     throw ACPRuntimeError.sessionNotFound(sessionID)
                 }
                 throw ACPRuntimeError.authenticationRequired
             }
+            try requireReady()
+            try Task.checkCancellation()
             return try await extensionRouter.dispatch(method: route.method, params: route.params)
         }
     }
@@ -694,9 +736,17 @@ public actor ACPAgentRuntime {
             createdAt: timestamp(),
             updatedAt: timestamp()
         )
+        try beginSessionLifecycleAdmission(session.sessionId)
+        defer { endSessionLifecycleAdmission(session.sessionId) }
+        try await promptDriver.admitSession(session)
+        try Task.checkCancellation()
+        try requireReady()
         try await openSessionLifecycle(sessionId: session.sessionId, meta: request.meta)
         do {
+            try Task.checkCancellation()
             try await store.create(session)
+            try Task.checkCancellation()
+            try requireReady()
         } catch {
             await closeSessionLifecycle(sessionId: session.sessionId)
             throw error
@@ -716,6 +766,8 @@ public actor ACPAgentRuntime {
     private func loadSession(_ params: JSONValue) async throws -> JSONValue {
         try requireReady()
         let request = try decode(LoadSessionRequest.self, from: params, method: AgentMethodNames.sessionLoad)
+        try beginSessionLifecycleAdmission(request.sessionId)
+        defer { endSessionLifecycleAdmission(request.sessionId) }
         let noReplay = Self.metaBool(request.meta, key: "noReplay") == true
         guard var session = try await store.read(request.sessionId) else {
             throw ACPRuntimeError.sessionNotFound(request.sessionId)
@@ -725,6 +777,9 @@ public actor ACPAgentRuntime {
            await !ownsSession(request.sessionId)
         {
             guard !session.closed else { throw ACPRuntimeError.sessionClosed(request.sessionId) }
+            try await promptDriver.admitSession(session)
+            try Task.checkCancellation()
+            try requireReady()
             if !noReplay {
                 await replay(session, leaderClientID: request.meta?[ACPLeaderCapabilityInjection.clientIDKey])
             }
@@ -738,11 +793,17 @@ public actor ACPAgentRuntime {
         session.mcpServers = request.mcpServers
         session.closed = false
         session.updatedAt = timestamp()
+        try await promptDriver.admitSession(session)
+        try Task.checkCancellation()
+        try requireReady()
         if request.meta != nil {
             try await openSessionLifecycle(sessionId: session.sessionId, meta: request.meta)
         }
         do {
+            try Task.checkCancellation()
             try await store.update(session)
+            try Task.checkCancellation()
+            try requireReady()
         } catch {
             if request.meta != nil {
                 await closeSessionLifecycle(sessionId: session.sessionId)
@@ -768,6 +829,8 @@ public actor ACPAgentRuntime {
                 .string("session/resume does not support additionalDirectories")
             )
         }
+        try beginSessionLifecycleAdmission(request.sessionId)
+        defer { endSessionLifecycleAdmission(request.sessionId) }
         guard var session = try await store.read(request.sessionId) else {
             throw ACPRuntimeError.sessionNotFound(request.sessionId)
         }
@@ -776,6 +839,9 @@ public actor ACPAgentRuntime {
            await !ownsSession(request.sessionId)
         {
             guard !session.closed else { throw ACPRuntimeError.sessionClosed(request.sessionId) }
+            try await promptDriver.admitSession(session)
+            try Task.checkCancellation()
+            try requireReady()
             if pendingPromptQueues[session.sessionId] != nil {
                 await publishQueueChanged(sessionID: session.sessionId)
             }
@@ -787,11 +853,17 @@ public actor ACPAgentRuntime {
         }
         session.closed = false
         session.updatedAt = timestamp()
+        try await promptDriver.admitSession(session)
+        try Task.checkCancellation()
+        try requireReady()
         if request.meta != nil {
             try await openSessionLifecycle(sessionId: session.sessionId, meta: request.meta)
         }
         do {
+            try Task.checkCancellation()
             try await store.update(session)
+            try Task.checkCancellation()
+            try requireReady()
         } catch {
             if request.meta != nil {
                 await closeSessionLifecycle(sessionId: session.sessionId)
@@ -825,7 +897,14 @@ public actor ACPAgentRuntime {
             updatedAt: now,
             durableUpdates: source.durableUpdates
         )
+        try beginSessionLifecycleAdmission(fork.sessionId)
+        defer { endSessionLifecycleAdmission(fork.sessionId) }
+        try await promptDriver.admitSession(fork)
+        try Task.checkCancellation()
+        try requireReady()
         try await store.create(fork)
+        try Task.checkCancellation()
+        try requireReady()
         rosterMetadata[fork.sessionId] = rosterMetadata[source.sessionId]
             ?? RosterMetadata(title: nil, yolo: false)
         await publishRosterUpsert(sessionId: fork.sessionId)
@@ -996,9 +1075,26 @@ public actor ACPAgentRuntime {
         return try encode(CloseSessionResponse())
     }
 
+    private func beginSessionLifecycleAdmission(_ sessionId: AcpSessionId) throws {
+        guard !leaderHistoryReservations.contains(sessionId) else {
+            throw ACPRuntimeError.sessionNotFound(sessionId)
+        }
+        sessionLifecycleAdmissions[sessionId, default: 0] += 1
+    }
+
+    private func endSessionLifecycleAdmission(_ sessionId: AcpSessionId) {
+        guard let count = sessionLifecycleAdmissions[sessionId] else { return }
+        if count == 1 {
+            sessionLifecycleAdmissions.removeValue(forKey: sessionId)
+        } else {
+            sessionLifecycleAdmissions[sessionId] = count - 1
+        }
+    }
+
     private func openSessionLifecycle(sessionId: AcpSessionId, meta: AcpMeta?) async throws {
         do {
             try await onSessionOpened?(sessionId, meta)
+            try Task.checkCancellation()
             guard state != .closed else {
                 throw ACPRuntimeError.transport("ACP client disconnected while opening its session")
             }
@@ -1511,9 +1607,11 @@ public actor ACPAgentRuntime {
             )
         }
         guard state != .closed,
+              !Task.isCancelled,
               startingPrompts.contains(request.sessionId)
         else {
             startingPrompts.remove(request.sessionId)
+            runningQueuePrompts.removeValue(forKey: request.sessionId)
             throw ACPRuntimeError.requestCancelled
         }
 
@@ -1549,7 +1647,11 @@ public actor ACPAgentRuntime {
         activePrompts[request.sessionId] = task
         startingPrompts.remove(request.sessionId)
         await publishRosterUpsert(sessionId: request.sessionId, activity: .working)
-        let outcome = await task.value
+        let outcome = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
         activePrompts.removeValue(forKey: request.sessionId)
         runningQueuePrompts.removeValue(forKey: request.sessionId)
         await emitPromptComplete(request: request, outcome: outcome)
@@ -1849,25 +1951,76 @@ public actor ACPAgentRuntime {
             }
         }
         do {
-            guard let session = try await store.read(sessionId) else { return false }
-            return !session.closed
+            guard let session = try await store.read(sessionId), !session.closed else { return false }
+            if let sessionOwnerVerifier {
+                guard let clientID = ACPLeaderRequestAuthority.clientID,
+                      await sessionOwnerVerifier(sessionId, clientID)
+                else {
+                    return false
+                }
+            }
+            try Task.checkCancellation()
+            try requireReady()
+            return openedLifecycleSessions.contains(sessionId)
         } catch {
             return false
         }
     }
 
     private func mayControlLeaderSession(from params: JSONValue) async -> Bool {
-        guard let sessionOwnerVerifier else { return true }
-        guard let clientID = ACPLeaderRequestAuthority.clientID else { return false }
+        guard sessionOwnerVerifier != nil else { return true }
+        guard ACPLeaderRequestAuthority.clientID != nil else { return false }
         if let sessionID = Self.sessionID(in: params) {
             return await ownsSession(sessionID)
         }
+        return await ownsAnyLeaderSession()
+    }
+
+    private func ownsAnyLeaderSession() async -> Bool {
         for sessionID in openedLifecycleSessions {
-            if await sessionOwnerVerifier(sessionID, clientID) {
+            if await ownsSession(sessionID) {
                 return true
             }
         }
         return false
+    }
+
+    private static func historyAdministrationTargetField(for method: String) -> String? {
+        switch method {
+        case "x.ai/session/delete", "x.ai/session/rename":
+            return "sessionId"
+        case "x.ai/session/fork":
+            return "sourceSessionId"
+        default:
+            return nil
+        }
+    }
+
+    private func mayAdministerLeaderHistory(targetSessionID: AcpSessionId?) async -> Bool {
+        guard sessionOwnerVerifier != nil else { return true }
+        guard ACPLeaderRequestAuthority.clientID != nil else { return false }
+        if let targetSessionID {
+            if openedLifecycleSessions.contains(targetSessionID) {
+                return await ownsSession(targetSessionID)
+            }
+            do {
+                if try await store.read(targetSessionID) != nil {
+                    // Even a closed runtime snapshot keeps its resident gate.
+                    // Deleting it safely requires coordinated live teardown.
+                    // This also refuses closed-snapshot rename/fork until that
+                    // eviction seam exists; a new root must not bypass it.
+                    return await ownsSession(targetSessionID)
+                }
+            } catch {
+                // A failed lookup cannot prove that the target is historical.
+                return false
+            }
+        }
+        // Rust session_admin.rs:134-172,434-483,950-960 administers disk history
+        // independently of residency. This carrier additionally requires a
+        // live owned root, and refuses overlapping admission rather than
+        // waiting: callers can retry after the reserved operation finishes.
+        return await ownsAnyLeaderSession()
     }
 
     private static func sessionID(in params: JSONValue) -> AcpSessionId? {
@@ -2203,10 +2356,17 @@ public struct ACPExtensionMethodRouter: ACPAgentExtensionHandler, Sendable {
     }
 
     fileprivate func hasExactRoute(_ method: String) -> Bool {
-        routes.contains { route in
-            guard case .exact(let registered, _) = route else { return false }
-            return registered == method
+        for route in routes {
+            switch route {
+            case .exact(let registered, _):
+                if registered == method { return true }
+            case .prefix(let prefix, _):
+                if method.hasPrefix(prefix) { return false }
+            case .catchAll:
+                return false
+            }
         }
+        return false
     }
 
     public func dispatch(method: String, params: JSONValue) async throws -> JSONValue {

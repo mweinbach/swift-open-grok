@@ -132,6 +132,7 @@ public actor ACPNotificationGateway {
         guard await runtime.hasConnectedReverseClient() else {
             throw ACPRuntimeError.transport("no ACP client is connected")
         }
+        let owningClientID = ACPLeaderRequestAuthority.clientID
 
         return { [weak runtime] method, params in
             guard let runtime else {
@@ -140,7 +141,12 @@ public actor ACPNotificationGateway {
             guard await runtime.hasConnectedReverseClient() else {
                 throw ACPRuntimeError.transport("the owning ACP client has disconnected")
             }
-            return try await runtime.requestClient(method: method, params: params)
+            // A stored closure does not capture TaskLocal values. SDK transports
+            // invoke this later, potentially from another client's task; neither
+            // that caller nor a newly promoted session driver owns this bridge.
+            return try await ACPLeaderRequestAuthority.$clientID.withValue(owningClientID) {
+                try await runtime.requestClient(method: method, params: params)
+            }
         }
     }
 

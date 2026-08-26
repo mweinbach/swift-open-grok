@@ -175,6 +175,50 @@ private struct ServedRuntime {
 
 // MARK: - Inbound: yolo / auto / permissions reset
 
+@Suite("Bound ACP reverse requester carrier authority")
+struct ACPBoundReverseRequesterTests {
+    @Test("deferred SDK callbacks preserve their captured carrier, including an absent carrier")
+    func deferredRequesterDoesNotAdoptInvokingTaskAuthority() async throws {
+        let payload: JSONValue = .object([
+            "serverId": .string("sdk-owner"),
+            "message": .object([
+                "jsonrpc": .string("2.0"),
+                "id": .number(.int64(7)),
+                "method": .string("tools/list"),
+            ]),
+        ])
+
+        for owner in [String?("original-carrier"), nil] {
+            let runtime = ACPAgentRuntime()
+            await runtime.setReverseSender { [weak runtime] message in
+                guard let runtime,
+                      case .request(let requestID, let method, let params) = message
+                else { throw ACPRuntimeError.transport("test carrier disconnected") }
+                #expect(method == "x.ai/mcp/sdk_call")
+                #expect(params == payload)
+                let response = JSONValue.object([
+                    "carrier": ACPLeaderRequestAuthority.clientID.map(JSONValue.string) ?? .null,
+                ])
+                let outgoing = await runtime.handle(.response(id: requestID, result: response, error: nil))
+                #expect(outgoing.isEmpty)
+            }
+            let gateway = ACPNotificationGateway()
+            await gateway.attach(runtime)
+            let requester = try await ACPLeaderRequestAuthority.$clientID.withValue(owner) {
+                try await gateway.connectedReverseRequester()
+            }
+
+            let result = try await Task.detached {
+                try await ACPLeaderRequestAuthority.$clientID.withValue("foreign-carrier") {
+                    try await requester("x.ai/mcp/sdk_call", payload)
+                }
+            }.value
+            #expect(result == .object(["carrier": owner.map(JSONValue.string) ?? .null]))
+            await runtime.close()
+        }
+    }
+}
+
 @Suite("ACP inbound permission notifications over ws://", .serialized)
 struct ACPInboundPermissionNotificationTests {
     private struct Fixture {

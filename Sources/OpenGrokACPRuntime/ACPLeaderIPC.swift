@@ -251,12 +251,20 @@ public actor ACPLeaderIPCHost {
     private var activated = false
     private var relaunchAdmissionClosed = false
     private var inFlightACPRequests = 0
+    private var clientWork: [UInt64: [UUID: ClientWork]] = [:]
     private var relaunchDrainTask: Task<Void, Never>?
     private var relaunchShutdownHandler: (@Sendable () async -> Void)?
 
     private static let relaunchIdleGraceNanoseconds: UInt64 = 5_000_000_000
     private static let relaunchFlushGraceNanoseconds: UInt64 = 5_000_000_000
     private static let relaunchPollNanoseconds: UInt64 = 100_000_000
+    static let maximumPendingWorkPerClient = 256
+    private static let maximumPendingWork = 1_024
+
+    private struct ClientWork: Sendable {
+        let task: Task<Void, Never>
+        let isACP: Bool
+    }
 
     private struct ClientHandle: Sendable {
         var clientType: String
@@ -281,6 +289,8 @@ public actor ACPLeaderIPCHost {
     }
 
     public func connectedClientCount() -> Int { clients.count }
+
+    func pendingWorkCount(clientID: UInt64) -> Int { clientWork[clientID]?.count ?? 0 }
 
     public func isStopped() -> Bool { stopped }
 
@@ -328,7 +338,9 @@ public actor ACPLeaderIPCHost {
     /// installing the sink is `async`.
     private func activate() async {
         guard !activated else { return }
-        activated = true
+        await runtime.setSessionOwnerVerifier { [router] sessionID, clientID in
+            await router.isDriver(clientID: clientID, for: sessionID)
+        }
         await runtime.setNotificationSink { [weak self] message in
             await self?.route(message)
         }
@@ -336,11 +348,17 @@ public actor ACPLeaderIPCHost {
             await self?.route(message)
         }
         await runtime.setReverseSender { [weak self] message in
-            await self?.route(message)
+            guard let self else {
+                throw ACPRuntimeError.transport("the owning ACP leader has stopped")
+            }
+            try await self.routeReverseRequest(
+                message,
+                owningClientID: ACPLeaderRequestAuthority.clientID
+            )
         }
-        await runtime.setSessionOwnerVerifier { [router] sessionID, clientID in
-            await router.isDriver(clientID: clientID, for: sessionID)
-        }
+        // Concurrent local/relay accepts may repeat these identical setters,
+        // but none can dispatch before its authority and reverse seams exist.
+        activated = true
     }
 
     public func serve(channel: any WebSocketByteChannel) async {
@@ -408,11 +426,22 @@ public actor ACPLeaderIPCHost {
         }
         log("leader: client \(clientID) registered (\(registration.clientType), \(registration.mode.rawValue))")
 
-        await readLoop(clientID: clientID, reader: reader, writer: writer)
+        await withTaskCancellationHandler {
+            await readLoop(clientID: clientID, reader: reader, writer: writer)
+        } onCancel: {
+            Task { await channel.close() }
+        }
 
         clients.removeValue(forKey: clientID)
         initializedClientIDs.remove(clientID)
-        await router.unregister(clientID: String(clientID))
+        // A backend may ignore cancellation. Keep its work counted until it
+        // actually exits, or reconnects could bypass the global work bound;
+        // carrier teardown must not join that potentially unbounded backend.
+        if let pending = clientWork[clientID] {
+            for work in pending.values { work.task.cancel() }
+        }
+        let cancelledRequests = await router.unregister(clientID: String(clientID))
+        await runtime.cancelReverseRequests(cancelledRequests)
         await channel.close()
         log("leader: client \(clientID) disconnected")
     }
@@ -437,9 +466,13 @@ public actor ACPLeaderIPCHost {
         } else {
             await controlPlane.finalize()
         }
+        for work in clientWork.values.flatMap({ $0.values }) {
+            work.task.cancel()
+        }
         for client in clients.values {
             await client.writer.send(.shuttingDown(reason: reason, delayMilliseconds: 0))
             await client.writer.send(.shutdown)
+            await client.writer.close()
         }
         if reason == .autoUpdate {
             await relaunchShutdownHandler?()
@@ -601,20 +634,24 @@ public actor ACPLeaderIPCHost {
                     continue
                 }
 
-                // `server.rs:1763-1817` spawns control handling per request: a
-                // workspace start can await a hub connect for seconds, and
-                // answering inline would stall this client's ACP traffic and
-                // pings behind it. Detached rather than `Task {}` for the same
-                // executor-inheritance reason as `withTimeout` above.
-                Task.detached { [weak self, writer] in
+                // A workspace connection must not block reverse replies or
+                // pings. Keep the work bounded and owned by this carrier.
+                guard startClientWork(clientID: clientID, isACP: false, operation: { [weak self, writer] in
                     await self?.handleControl(
                         requestID: requestID,
                         command: command,
                         writer: writer
                     )
+                }) else {
+                    await writer.send(.controlError(
+                        requestID: requestID,
+                        code: ACPLeaderControlErrorCode.internalError,
+                        message: "Leader client has too many pending requests"
+                    ))
+                    continue
                 }
             case .acp(let payload):
-                await forwardToAgent(payload: payload, clientID: clientID)
+                await dispatchACP(payload: payload, clientID: clientID)
             }
         }
     }
@@ -624,6 +661,7 @@ public actor ACPLeaderIPCHost {
         command: [String: String],
         writer: ACPLeaderChannelWriter
     ) async {
+        guard !stopped, !Task.isCancelled else { return }
         switch await controlPlane.run(command) {
         case .success(let payload):
             if case .relaunching = payload {
@@ -640,14 +678,76 @@ public actor ACPLeaderIPCHost {
         }
     }
 
-    private func forwardToAgent(payload: String, clientID: UInt64) async {
-        guard let handle = clients[clientID] else { return }
+    private func startClientWork(
+        clientID: UInt64,
+        isACP: Bool,
+        operation: @escaping @Sendable () async -> Void
+    ) -> Bool {
+        guard !stopped, clients[clientID] != nil,
+              clientWork[clientID, default: [:]].count < Self.maximumPendingWorkPerClient,
+              clientWork.values.reduce(0, { $0 + $1.count }) < Self.maximumPendingWork
+        else { return false }
+        let workID = UUID()
+        if isACP { inFlightACPRequests += 1 }
+        let task = Task { [weak self] in
+            if !Task.isCancelled { await operation() }
+            await self?.finishClientWork(clientID: clientID, workID: workID)
+        }
+        clientWork[clientID, default: [:]][workID] = ClientWork(task: task, isACP: isACP)
+        return true
+    }
+
+    private func finishClientWork(clientID: UInt64, workID: UUID) {
+        guard let work = clientWork[clientID]?.removeValue(forKey: workID) else { return }
+        if work.isACP { inFlightACPRequests -= 1 }
+        if clientWork[clientID]?.isEmpty == true {
+            clientWork.removeValue(forKey: clientID)
+        }
+    }
+
+    private func dispatchACP(payload: String, clientID: UInt64) async {
         guard let data = payload.data(using: .utf8),
-            let message = try? ACPMessage(data: data)
+              let message = try? ACPMessage(data: data)
         else {
             log("leader: client \(clientID) sent a frame that is not ACP JSON-RPC; dropping")
             return
         }
+
+        let route = ACPMethodRoute.normalize(method: message.method ?? "", params: message.params ?? .null)
+        // Initialize remains a per-carrier barrier. Responses and cancellation
+        // must bypass the work limit, or a full queue would block its own drain.
+        let immediate: Bool
+        switch message {
+        case .response:
+            immediate = true
+        case .request, .notification:
+            immediate = route.method == AgentMethodNames.initialize
+                || route.method == AgentMethodNames.sessionCancel
+        }
+        if immediate {
+            inFlightACPRequests += 1
+            defer { inFlightACPRequests -= 1 }
+            await forwardToAgent(message: message, clientID: clientID)
+            return
+        }
+        guard startClientWork(clientID: clientID, isACP: true, operation: { [weak self] in
+            await self?.forwardToAgent(message: message, clientID: clientID)
+        }) else {
+            if case .request(let requestID, _, _) = message {
+                await deliver(.response(
+                    id: requestID,
+                    result: nil,
+                    error: AcpError(code: .requestCancelled, message: "Leader client has too many pending requests")
+                ), to: clientID)
+            } else {
+                log("leader: dropping notification from overloaded client \(clientID)")
+            }
+            return
+        }
+    }
+
+    private func forwardToAgent(message: ACPMessage, clientID: UInt64) async {
+        guard !stopped, !Task.isCancelled, let handle = clients[clientID] else { return }
 
         if relaunchAdmissionClosed,
            case .request(let requestID, _, _) = message
@@ -705,11 +805,13 @@ public actor ACPLeaderIPCHost {
             return
         }
 
-        if case .response(let requestID, _, _) = injected,
-           await !router.acceptsReverseResponse(requestID, from: String(clientID))
-        {
-            log("leader: dropping reverse response from non-owning client \(clientID)")
-            return
+        if case .response(let requestID, _, _) = injected {
+            guard initializedClientIDs.contains(clientID),
+                  await router.acceptsReverseResponse(requestID, from: String(clientID))
+            else {
+                log("leader: dropping reverse response from non-owning client \(clientID)")
+                return
+            }
         }
 
         // Loading/resuming is the explicit observer-attach boundary. The
@@ -751,8 +853,6 @@ public actor ACPLeaderIPCHost {
             outbound = injected
         }
 
-        inFlightACPRequests += 1
-        defer { inFlightACPRequests -= 1 }
         let replies = await ACPLeaderRequestAuthority.$clientID.withValue(String(clientID)) {
             await runtime.handle(outbound)
         }
@@ -786,6 +886,30 @@ public actor ACPLeaderIPCHost {
 
     // MARK: Agent -> client
 
+    private func routeReverseRequest(
+        _ message: ACPMessage,
+        owningClientID: String?
+    ) async throws {
+        guard !stopped, !Task.isCancelled, case .request(let requestID, _, _) = message else {
+            throw ACPRuntimeError.requestCancelled
+        }
+        let recipient = try await router.registerReverseRequest(message, owningClientID: owningClientID)
+        guard let clientID = UInt64(recipient),
+              initializedClientIDs.contains(clientID),
+              let handle = clients[clientID]
+        else {
+            await router.discardReverseRequest(requestID)
+            throw ACPRuntimeError.transport("the owning ACP client is not connected and initialized")
+        }
+        do {
+            let payload = String(decoding: try message.encodedData(), as: UTF8.self)
+            try await handle.writer.sendThrowing(.acp(payload: payload))
+        } catch {
+            await router.discardReverseRequest(requestID)
+            throw error
+        }
+    }
+
     /// Deliver an agent message to one client, restoring its original id.
     private func deliver(_ message: ACPMessage, to clientID: UInt64) async {
         guard let handle = clients[clientID] else { return }
@@ -803,6 +927,14 @@ public actor ACPLeaderIPCHost {
     /// subscriptions. Everything else falls to `ACPLeaderRouter`, which already
     /// implements the session-scoped fan-out and the driver-only cases.
     public func route(_ message: ACPMessage) async {
+        if case .request = message {
+            do {
+                try await routeReverseRequest(message, owningClientID: ACPLeaderRequestAuthority.clientID)
+            } catch {
+                log("leader: dropping unroutable reverse request: \(error)")
+            }
+            return
+        }
         if case .response(let id, let result, _) = message,
             let split = ACPLeaderRequestNamespace.split(id)
         {
@@ -936,25 +1068,43 @@ public final class ACPLeaderChannelReader: @unchecked Sendable {
 /// fan-out and the client's own read loop both write — and two interleaved
 /// `write` calls would splice one frame's bytes into another's.
 public actor ACPLeaderChannelWriter {
-    private let channel: any WebSocketByteChannel
+    private let frameWriter: ACPLeaderFrameWriter
     private let maximumMessageSize: Int
     private var failed = false
 
     public init(channel: any WebSocketByteChannel, maximumMessageSize: Int) {
-        self.channel = channel
+        self.frameWriter = ACPLeaderFrameWriter(channel: channel)
         self.maximumMessageSize = maximumMessageSize
     }
 
     public func send(_ message: ACPLeaderServerMessage) async {
-        guard !failed else { return }
+        do {
+            try await sendThrowing(message)
+        } catch {}
+    }
+
+    func sendThrowing(_ message: ACPLeaderServerMessage) async throws {
+        guard !failed else { throw ACPLeaderProtocolError.connectionClosed }
         do {
             let frame = try ACPLeaderCodec.encode(message)
-            try await channel.write(frame)
+            try await frameWriter.write(frame)
+        } catch let error as CancellationError {
+            // The frame writer closes an interrupted active frame itself. A
+            // canceled queued/preflight write has sent no bytes; poisoning the
+            // carrier here would disconnect it during prompt-cancel cleanup.
+            throw error
         } catch {
-            // A dead client is not a leader-level failure; the read loop will
-            // notice the same end of stream and unregister it.
             failed = true
+            // Release the reader too, so unregister cancels this carrier's
+            // pending reverse requests instead of waiting for another read.
+            await frameWriter.close()
+            throw error
         }
+    }
+
+    func close() async {
+        failed = true
+        await frameWriter.close()
     }
 }
 

@@ -111,15 +111,23 @@ private actor ACPLeaderIsolationClient {
         method: String,
         params: JSONValue
     ) async throws -> JSONValue {
-        try await send(.request(id: .number(id), method: method, params: params))
-        let response = try await next { message in
-            if case .response(.number(id), _, _) = message { return true }
-            return false
-        }
+        let response = try await response(id: id, method: method, params: params)
         guard case .response(_, let result?, nil) = response else {
             throw ACPLeaderIsolationError.unsuccessfulResponse
         }
         return result
+    }
+
+    func response(
+        id: Int64,
+        method: String,
+        params: JSONValue
+    ) async throws -> ACPMessage {
+        try await send(.request(id: .number(id), method: method, params: params))
+        return try await next { message in
+            if case .response(.number(id), _, _) = message { return true }
+            return false
+        }
     }
 
     func next(
@@ -188,6 +196,204 @@ private struct ACPLeaderIsolationNotificationHandler: ACPAgentExtensionNotificat
     func handle(method: String, params: JSONValue) async {
         await counter.recordNotification()
     }
+}
+
+private final class ACPLeaderIsolationSessionIDs: @unchecked Sendable {
+    private let lock = NSLock()
+    private let identifiers: [String]
+    private var index = 0
+
+    init(_ identifiers: [String]) {
+        self.identifiers = identifiers
+    }
+
+    func next() -> String {
+        lock.withLock {
+            defer { index += 1 }
+            return index < identifiers.count ? identifiers[index] : UUID().uuidString
+        }
+    }
+}
+
+private actor ACPLeaderIsolationGate {
+    private var entered = false
+    private var released = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func suspend() async {
+        entered = true
+        guard !released else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitUntilEntered() async throws {
+        let deadline = Date().addingTimeInterval(2)
+        while !entered && Date() < deadline {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        guard entered else { throw ACPLeaderIsolationError.timedOut }
+    }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private actor ACPLeaderIsolationStore: ACPSessionStore {
+    private let storage = InMemoryACPSessionStore()
+    private var nextReadGate: (AcpSessionId, ACPLeaderIsolationGate)?
+    private var failingSession: AcpSessionId?
+    private var reads: [AcpSessionId: Int] = [:]
+
+    func suspendNextRead(of sessionID: AcpSessionId, gate: ACPLeaderIsolationGate) {
+        nextReadGate = (sessionID, gate)
+    }
+
+    func failReads(of sessionID: AcpSessionId?) {
+        failingSession = sessionID
+    }
+
+    func create(_ session: ACPSessionSnapshot) async throws {
+        try await storage.create(session)
+    }
+
+    func readCount(_ sessionID: AcpSessionId) -> Int {
+        reads[sessionID, default: 0]
+    }
+
+    func read(_ sessionID: AcpSessionId) async throws -> ACPSessionSnapshot? {
+        reads[sessionID, default: 0] += 1
+        if failingSession == sessionID {
+            throw ACPRuntimeError.transport("fixture store read failed")
+        }
+        let snapshot = await storage.read(sessionID)
+        if let (target, gate) = nextReadGate, target == sessionID {
+            nextReadGate = nil
+            await gate.suspend()
+        }
+        return snapshot
+    }
+
+    func update(_ session: ACPSessionSnapshot) async throws {
+        try await storage.update(session)
+    }
+
+    func list(cwd: String?) async throws -> [ACPSessionSnapshot] {
+        await storage.list(cwd: cwd)
+    }
+}
+
+private actor ACPLeaderIsolationOwnership {
+    private var nextVerificationGate: ACPLeaderIsolationGate?
+    private var revoked = false
+
+    func suspendNextVerification(gate: ACPLeaderIsolationGate) {
+        nextVerificationGate = gate
+    }
+
+    func revoke() {
+        revoked = true
+    }
+
+    func owns(_ sessionID: AcpSessionId, clientID: String) async -> Bool {
+        if let gate = nextVerificationGate {
+            nextVerificationGate = nil
+            await gate.suspend()
+        }
+        return !revoked && ((sessionID.rawValue == "owner-root" && clientID == "owner")
+            || (sessionID.rawValue == "history-target" && clientID == "foreign"))
+    }
+}
+
+private struct ACPLeaderIsolationClosureHandler: ACPAgentExtensionHandler {
+    let body: @Sendable (String, JSONValue) async throws -> JSONValue
+
+    func handle(method: String, params: JSONValue) async throws -> JSONValue {
+        try await body(method, params)
+    }
+}
+
+enum ACPLeaderHistoryPausePoint: CaseIterable, Equatable, Sendable {
+    case targetLookup
+    case ownerVerification
+    case ownerSnapshot
+    case dispatch
+}
+
+private func leaderAuthorityRequest(
+    _ runtime: ACPAgentRuntime,
+    clientID: String? = "owner",
+    id: Int64,
+    method: String,
+    params: JSONValue = .object([:])
+) async -> ACPMessage {
+    let replies = await ACPLeaderRequestAuthority.$clientID.withValue(clientID) {
+        await runtime.handle(.request(id: .number(id), method: method, params: params))
+    }
+    guard let response = replies.last else {
+        Issue.record("ACP request produced no response")
+        return .response(id: .number(id), result: nil, error: AcpError.internalError())
+    }
+    return response
+}
+
+private func expectLeaderSuccess(_ response: ACPMessage) {
+    guard case .response(_, _?, nil) = response else {
+        Issue.record("expected a successful ACP response, got \(response)")
+        return
+    }
+}
+
+private func expectLeaderSessionDenied(_ response: ACPMessage, sessionID: String) {
+    guard case .response(_, nil, let error?) = response else {
+        Issue.record("expected an owner-scoped ACP refusal, got \(response)")
+        return
+    }
+    #expect(error == ACPRuntimeError.sessionNotFound(AcpSessionId(sessionID)).acpError)
+}
+
+private func initializeLeaderAuthorityRuntime(_ runtime: ACPAgentRuntime) async throws {
+    let initialized = await leaderAuthorityRequest(
+        runtime,
+        id: 1,
+        method: AgentMethodNames.initialize,
+        params: try JSONValue.encode(InitializeRequest(protocolVersion: .v1))
+    )
+    expectLeaderSuccess(initialized)
+    let opened = await leaderAuthorityRequest(
+        runtime,
+        id: 2,
+        method: AgentMethodNames.sessionNew,
+        params: try JSONValue.encode(NewSessionRequest(cwd: FileManager.default.temporaryDirectory.path))
+    )
+    guard case .response(_, let result?, nil) = opened else {
+        throw ACPLeaderIsolationError.unsuccessfulResponse
+    }
+    #expect(try result.decode(NewSessionResponse.self).sessionId == AcpSessionId("owner-root"))
+}
+
+private func makeLeaderHistoryRuntime(
+    handler: any ACPAgentExtensionHandler,
+    store: any ACPSessionStore = InMemoryACPSessionStore(),
+    ownership: ACPLeaderIsolationOwnership = ACPLeaderIsolationOwnership(),
+    onSessionOpened: ACPAgentRuntime.SessionOpenedHook? = nil
+) async throws -> ACPAgentRuntime {
+    let identifiers = ACPLeaderIsolationSessionIDs([
+        "owner-root", "history-target", "history-target", "history-target",
+    ])
+    let runtime = ACPAgentRuntime(
+        store: store,
+        extensionHandler: handler,
+        onSessionOpened: onSessionOpened,
+        makeSessionId: { identifiers.next() }
+    )
+    await runtime.setSessionOwnerVerifier { sessionID, clientID in
+        await ownership.owns(sessionID, clientID: clientID)
+    }
+    try await initializeLeaderAuthorityRuntime(runtime)
+    return runtime
 }
 
 @Suite("ACP extension and leader router authority boundaries")
@@ -316,6 +522,350 @@ struct ACPLeaderAuthorityBoundaryTests {
             #expect(await router.recipients(for: reverse, from: "") == ["owner"])
         }
     }
+
+    @Test("history authorization never reaches a catch-all or a shadowing prefix", arguments: [false, true])
+    func historicalAuthorityRequiresEffectiveExactRoute(shadowedExact: Bool) async throws {
+        let counter = ACPLeaderIsolationExtensionCounter()
+        let implementation = ACPLeaderIsolationExtensionHandler(counter: counter)
+        let handler: any ACPAgentExtensionHandler
+        if shadowedExact {
+            handler = ACPExtensionMethodRouter()
+                .register(prefix: "x.ai/session/", handler: implementation)
+                .register(exact: "x.ai/session/delete", handler: implementation)
+        } else {
+            handler = implementation
+        }
+        let runtime = try await makeLeaderHistoryRuntime(handler: handler)
+        let refused = await leaderAuthorityRequest(
+            runtime,
+            id: 3,
+            method: "x.ai/session/delete",
+            params: .object(["sessionId": .string("history-target")])
+        )
+        expectLeaderSessionDenied(refused, sessionID: "history-target")
+        #expect(await counter.methods == 0)
+        await runtime.close()
+    }
+
+    @Test("exact history handlers validate malformed canonical fields without trusting forged identities")
+    func malformedHistoryParamsReachOnlyAuthorizedExactHandler() async throws {
+        let counter = ACPLeaderIsolationExtensionCounter()
+        let handler = ACPLeaderIsolationClosureHandler { _, _ in
+            await counter.recordMethod()
+            throw ACPRuntimeError.invalidParams("missing canonical history target")
+        }
+        let router = ACPExtensionMethodRouter().register(exact: "x.ai/session/fork", handler: handler)
+        let runtime = try await makeLeaderHistoryRuntime(handler: router)
+        let params: JSONValue = .object([
+            "source_session_id": .string("owner-root"),
+            "_meta": .object(["x.ai/leaderClientId": .string("owner")]),
+        ])
+        let missingAuthority = await leaderAuthorityRequest(
+            runtime, clientID: nil, id: 3, method: "x.ai/session/fork", params: params
+        )
+        let observer = await leaderAuthorityRequest(
+            runtime, clientID: "observer", id: 4, method: "x.ai/session/fork", params: params
+        )
+        for response in [missingAuthority, observer] {
+            guard case .response(_, nil, let error?) = response else {
+                Issue.record("forged request metadata granted history authority")
+                continue
+            }
+            #expect(error.code == .authRequired)
+        }
+        #expect(await counter.methods == 0)
+        let malformed = await leaderAuthorityRequest(
+            runtime, id: 5, method: "x.ai/session/fork", params: params
+        )
+        guard case .response(_, nil, let error?) = malformed else {
+            Issue.record("the exact handler's malformed-parameter error was lost")
+            await runtime.close()
+            return
+        }
+        #expect(error == ACPRuntimeError.invalidParams("missing canonical history target").acpError)
+        #expect(await counter.methods == 1)
+        await runtime.close()
+    }
+
+    @Test("history reservations exclude residency across every authorization and dispatch await", arguments: ACPLeaderHistoryPausePoint.allCases)
+    func historyReservationSurvivesSuspension(_ pause: ACPLeaderHistoryPausePoint) async throws {
+        let gate = ACPLeaderIsolationGate()
+        let store = ACPLeaderIsolationStore()
+        let ownership = ACPLeaderIsolationOwnership()
+        let counter = ACPLeaderIsolationExtensionCounter()
+        let handler = ACPLeaderIsolationClosureHandler { _, _ in
+            await counter.recordMethod()
+            if pause == .dispatch { await gate.suspend() }
+            return .object(["authorized": .bool(true)])
+        }
+        let runtime = try await makeLeaderHistoryRuntime(
+            handler: ACPExtensionMethodRouter().register(exact: "x.ai/session/delete", handler: handler),
+            store: store,
+            ownership: ownership
+        )
+        switch pause {
+        case .targetLookup:
+            await store.suspendNextRead(of: AcpSessionId("history-target"), gate: gate)
+        case .ownerVerification:
+            await ownership.suspendNextVerification(gate: gate)
+        case .ownerSnapshot:
+            await store.suspendNextRead(of: AcpSessionId("owner-root"), gate: gate)
+        case .dispatch:
+            break
+        }
+        let administration = Task {
+            await leaderAuthorityRequest(
+                runtime, id: 3, method: "x.ai/session/delete",
+                params: .object(["sessionId": .string("history-target")])
+            )
+        }
+        do {
+            try await gate.waitUntilEntered()
+            let newParams = try JSONValue.encode(NewSessionRequest(cwd: FileManager.default.temporaryDirectory.path))
+            let overlappingAdmission = await leaderAuthorityRequest(
+                runtime, clientID: "foreign", id: 4, method: AgentMethodNames.sessionNew, params: newParams
+            )
+            expectLeaderSessionDenied(overlappingAdmission, sessionID: "history-target")
+            let load = await leaderAuthorityRequest(
+                runtime, clientID: "foreign", id: 6, method: AgentMethodNames.sessionLoad,
+                params: try JSONValue.encode(LoadSessionRequest(
+                    sessionId: AcpSessionId("history-target"), cwd: FileManager.default.temporaryDirectory.path
+                ))
+            )
+            expectLeaderSessionDenied(load, sessionID: "history-target")
+            let resume = await leaderAuthorityRequest(
+                runtime, clientID: "foreign", id: 7, method: AgentMethodNames.sessionResume,
+                params: try JSONValue.encode(ResumeSessionRequest(
+                    sessionId: AcpSessionId("history-target"), cwd: FileManager.default.temporaryDirectory.path
+                ))
+            )
+            expectLeaderSessionDenied(resume, sessionID: "history-target")
+            #expect(await store.readCount(AcpSessionId("history-target")) == 1)
+            let fork = await leaderAuthorityRequest(
+                runtime, id: 8, method: AgentMethodNames.sessionFork,
+                params: try JSONValue.encode(ForkSessionRequest(sessionId: AcpSessionId("owner-root")))
+            )
+            expectLeaderSessionDenied(fork, sessionID: "history-target")
+            await gate.release()
+            expectLeaderSuccess(await administration.value)
+            #expect(await counter.methods == 1)
+            let retriedAdmission = await leaderAuthorityRequest(
+                runtime, clientID: "foreign", id: 5, method: AgentMethodNames.sessionNew, params: newParams
+            )
+            expectLeaderSuccess(retriedAdmission)
+        } catch {
+            await gate.release()
+            administration.cancel()
+            #expect(await administration.value.id == .number(3))
+            await runtime.close()
+            throw error
+        }
+        await runtime.close()
+    }
+
+    @Test("an opening lifecycle cannot be mistaken for unclaimed historical state")
+    func historyDeniesInFlightLifecycleAdmission() async throws {
+        let gate = ACPLeaderIsolationGate()
+        let counter = ACPLeaderIsolationExtensionCounter()
+        let router = ACPExtensionMethodRouter().register(
+            exact: "x.ai/session/delete",
+            handler: ACPLeaderIsolationExtensionHandler(counter: counter)
+        )
+        let runtime = try await makeLeaderHistoryRuntime(
+            handler: router,
+            onSessionOpened: { sessionID, _ in
+                if sessionID.rawValue == "history-target" { await gate.suspend() }
+            }
+        )
+        let newParams = try JSONValue.encode(NewSessionRequest(cwd: FileManager.default.temporaryDirectory.path))
+        let admission = Task {
+            await leaderAuthorityRequest(
+                runtime, clientID: "foreign", id: 3, method: AgentMethodNames.sessionNew, params: newParams
+            )
+        }
+        do {
+            try await gate.waitUntilEntered()
+            let refused = await leaderAuthorityRequest(
+                runtime, id: 4, method: "x.ai/session/delete",
+                params: .object(["sessionId": .string("history-target")])
+            )
+            expectLeaderSessionDenied(refused, sessionID: "history-target")
+            #expect(await counter.methods == 0)
+            await gate.release()
+            expectLeaderSuccess(await admission.value)
+            let nowResident = await leaderAuthorityRequest(
+                runtime, id: 5, method: "x.ai/session/delete",
+                params: .object(["sessionId": .string("history-target")])
+            )
+            expectLeaderSessionDenied(nowResident, sessionID: "history-target")
+            #expect(await counter.methods == 0)
+        } catch {
+            await gate.release()
+            admission.cancel()
+            #expect(await admission.value.id == .number(3))
+            await runtime.close()
+            throw error
+        }
+        await runtime.close()
+    }
+
+    @Test("a cancelled carrier cannot publish a session after its opening hook returns")
+    func cancelledLifecycleHookCannotPublishSession() async throws {
+        let gate = ACPLeaderIsolationGate()
+        let store = ACPLeaderIsolationStore()
+        let counter = ACPLeaderIsolationExtensionCounter()
+        let router = ACPExtensionMethodRouter().register(
+            exact: "x.ai/session/delete", handler: ACPLeaderIsolationExtensionHandler(counter: counter)
+        )
+        let runtime = try await makeLeaderHistoryRuntime(
+            handler: router,
+            store: store,
+            onSessionOpened: { sessionID, _ in
+                // Deliberately noncooperative: the runtime must recheck when
+                // the hook returns, even though the shared leader is still up.
+                if sessionID.rawValue == "history-target" { await gate.suspend() }
+            }
+        )
+        let params = try JSONValue.encode(NewSessionRequest(cwd: FileManager.default.temporaryDirectory.path))
+        let admission = Task {
+            await leaderAuthorityRequest(
+                runtime, clientID: "foreign", id: 3, method: AgentMethodNames.sessionNew, params: params
+            )
+        }
+        do {
+            try await gate.waitUntilEntered()
+            admission.cancel()
+            await gate.release()
+            let cancelled = await admission.value
+            guard case .response(_, nil, _?) = cancelled else {
+                Issue.record("cancelled admission unexpectedly published its session")
+                await runtime.close()
+                return
+            }
+            #expect(try await store.read(AcpSessionId("history-target")) == nil)
+            let history = await leaderAuthorityRequest(
+                runtime, id: 4, method: "x.ai/session/delete",
+                params: .object(["sessionId": .string("history-target")])
+            )
+            expectLeaderSuccess(history)
+            #expect(await counter.methods == 1)
+        } catch {
+            await gate.release()
+            admission.cancel()
+            #expect(await admission.value.id == .number(3))
+            await runtime.close()
+            throw error
+        }
+        await runtime.close()
+    }
+
+    @Test("history reservations release when a handler fails or is cancelled", arguments: [false, true])
+    func historyReservationReleasesOnHandlerFailure(cancelled: Bool) async throws {
+        let gate = ACPLeaderIsolationGate()
+        let handler = ACPLeaderIsolationClosureHandler { _, _ in
+            await gate.suspend()
+            try Task.checkCancellation()
+            throw ACPRuntimeError.transport("history fixture failure")
+        }
+        let runtime = try await makeLeaderHistoryRuntime(
+            handler: ACPExtensionMethodRouter().register(exact: "x.ai/session/delete", handler: handler)
+        )
+        let administration = Task {
+            await leaderAuthorityRequest(
+                runtime, id: 3, method: "x.ai/session/delete",
+                params: .object(["sessionId": .string("history-target")])
+            )
+        }
+        do {
+            try await gate.waitUntilEntered()
+            if cancelled { administration.cancel() }
+            await gate.release()
+            let failed = await administration.value
+            guard case .response(_, nil, _?) = failed else {
+                Issue.record("failed history handler unexpectedly returned success")
+                await runtime.close()
+                return
+            }
+            let admitted = await leaderAuthorityRequest(
+                runtime, clientID: "foreign", id: 4, method: AgentMethodNames.sessionNew,
+                params: try JSONValue.encode(NewSessionRequest(cwd: FileManager.default.temporaryDirectory.path))
+            )
+            expectLeaderSuccess(admitted)
+        } catch {
+            await gate.release()
+            administration.cancel()
+            #expect(await administration.value.id == .number(3))
+            await runtime.close()
+            throw error
+        }
+        await runtime.close()
+    }
+
+    @Test("a failing residency lookup denies and releases the historical reservation")
+    func historyLookupFailureFailsClosed() async throws {
+        let store = ACPLeaderIsolationStore()
+        let counter = ACPLeaderIsolationExtensionCounter()
+        let router = ACPExtensionMethodRouter().register(
+            exact: "x.ai/session/delete", handler: ACPLeaderIsolationExtensionHandler(counter: counter)
+        )
+        let runtime = try await makeLeaderHistoryRuntime(handler: router, store: store)
+        await store.failReads(of: AcpSessionId("history-target"))
+        let refused = await leaderAuthorityRequest(
+            runtime, id: 3, method: "x.ai/session/delete",
+            params: .object(["sessionId": .string("history-target")])
+        )
+        expectLeaderSessionDenied(refused, sessionID: "history-target")
+        #expect(await counter.methods == 0)
+        await store.failReads(of: nil)
+        let recovered = await leaderAuthorityRequest(
+            runtime, id: 4, method: "x.ai/session/delete",
+            params: .object(["sessionId": .string("history-target")])
+        )
+        expectLeaderSuccess(recovered)
+        #expect(await counter.methods == 1)
+        await runtime.close()
+    }
+
+    @Test("a stale owner snapshot cannot authorize history after closure or driver revocation", arguments: [false, true])
+    func historyAuthorityRechecksOwnerLifecycleAfterStoreAwait(closesRoot: Bool) async throws {
+        let gate = ACPLeaderIsolationGate()
+        let store = ACPLeaderIsolationStore()
+        let ownership = ACPLeaderIsolationOwnership()
+        let counter = ACPLeaderIsolationExtensionCounter()
+        let router = ACPExtensionMethodRouter().register(
+            exact: "x.ai/session/delete", handler: ACPLeaderIsolationExtensionHandler(counter: counter)
+        )
+        let runtime = try await makeLeaderHistoryRuntime(handler: router, store: store, ownership: ownership)
+        await store.suspendNextRead(of: AcpSessionId("owner-root"), gate: gate)
+        let administration = Task {
+            await leaderAuthorityRequest(
+                runtime, id: 3, method: "x.ai/session/delete",
+                params: .object(["sessionId": .string("history-target")])
+            )
+        }
+        do {
+            try await gate.waitUntilEntered()
+            if closesRoot {
+                let closed = await leaderAuthorityRequest(
+                    runtime, id: 4, method: AgentMethodNames.sessionClose,
+                    params: try JSONValue.encode(CloseSessionRequest(sessionId: AcpSessionId("owner-root")))
+                )
+                expectLeaderSuccess(closed)
+            } else {
+                await ownership.revoke()
+            }
+            await gate.release()
+            expectLeaderSessionDenied(await administration.value, sessionID: "history-target")
+            #expect(await counter.methods == 0)
+        } catch {
+            await gate.release()
+            administration.cancel()
+            #expect(await administration.value.id == .number(3))
+            await runtime.close()
+            throw error
+        }
+        await runtime.close()
+    }
 }
 
 #if os(macOS) || os(Linux)
@@ -346,6 +896,8 @@ private struct ACPLeaderIsolationFixture {
         let extensions = ACPExtensionMethodRouter()
             .register(exact: "x.ai/mcp/upsert", handler: extensionHandler)
             .register(exact: "x.ai/share_session", handler: extensionHandler)
+            .register(exact: "x.ai/session/delete", handler: extensionHandler)
+            .register(exact: "x.ai/session/rename", handler: extensionHandler)
             .register(exact: "x.ai/session/fork", handler: extensionHandler)
             .register(exact: "x.ai/interject", handler: extensionHandler)
             .register(exact: "x.ai/sessionless/control", handler: extensionHandler)
@@ -353,11 +905,12 @@ private struct ACPLeaderIsolationFixture {
         let notifications = ACPExtensionNotificationRouter()
             .register(exact: "x.ai/yolo_mode_changed", handler: notificationHandler)
             .register(exact: "x.ai/permissions/reset", handler: notificationHandler)
+        let identifiers = ACPLeaderIsolationSessionIDs(["leader-isolated-root"])
         let runtime = ACPAgentRuntime(
             promptDriver: ACPLeaderIsolationDriver(),
-            extensionRouter: extensions,
+            extensionHandler: extensions,
             extensionNotifications: notifications,
-            makeSessionId: { "leader-isolated-root" }
+            makeSessionId: { identifiers.next() }
         )
         let host = ACPLeaderIPCHost(runtime: runtime)
         let listener = ACPLeaderSocketListener(path: directory.appendingPathComponent("leader.sock"))
@@ -445,6 +998,117 @@ private func leaderIsolationReplayMetadata(_ message: ACPMessage) -> [String: JS
 
 @Suite("Leader ACP authenticated client ownership and private replay", .serialized)
 struct ACPLeaderClientIsolationParityTests {
+    @Test("leader history administration requires an owned root and never controls another live or closed session")
+    func historicalAdministrationPreservesTransportOwnership() async throws {
+        try await withLeaderIsolationFixture { fixture in
+            let methods = [
+                ("x.ai/session/delete", "sessionId"),
+                ("x.ai/session/rename", "sessionId"),
+                ("x.ai/session/fork", "sourceSessionId"),
+            ]
+            let historyID = "unloaded-private-history"
+            let beforeRoot = try await fixture.owner.response(
+                id: 10, method: "x.ai/session/delete",
+                params: .object(["sessionId": .string(historyID)])
+            )
+            expectLeaderSessionDenied(beforeRoot, sessionID: historyID)
+            let ownerSession = try await fixture.createSession()
+
+            for (offset, method) in methods.enumerated() {
+                let params: JSONValue = .object([
+                    method.1: .string(historyID),
+                    "_meta": .object([
+                        "x.ai/leaderClientId": .number(.uint64(fixture.ownerID)),
+                    ]),
+                ])
+                let observer = try await fixture.observer.response(
+                    id: Int64(20 + offset), method: method.0, params: params
+                )
+                expectLeaderSessionDenied(observer, sessionID: historyID)
+                let owner = try await fixture.owner.request(
+                    id: Int64(30 + offset), method: method.0, params: params
+                )
+                #expect(owner["authorized"]?.boolValue == true)
+            }
+            #expect(await fixture.extensionCounter.methods == methods.count)
+
+            let attached = try await fixture.observer.response(
+                id: 40,
+                method: AgentMethodNames.sessionLoad,
+                params: try JSONValue.encode(LoadSessionRequest(
+                    sessionId: ownerSession, cwd: fixture.directory.path
+                ))
+            )
+            expectLeaderSuccess(attached)
+            let observerSession = try await fixture.observer.request(
+                id: 41,
+                method: AgentMethodNames.sessionNew,
+                params: try JSONValue.encode(NewSessionRequest(cwd: fixture.directory.path))
+            ).decode(NewSessionResponse.self).sessionId
+            #expect(observerSession != ownerSession)
+
+            for (offset, method) in methods.enumerated() {
+                // The generic sessionId field must never override the fork
+                // handler's sourceSessionId authorization target.
+                var observerParams: [String: JSONValue] = [
+                    "sessionId": .string(observerSession.rawValue),
+                    "session_id": .string(observerSession.rawValue),
+                ]
+                observerParams[method.1] = .string(ownerSession.rawValue)
+                let observer = try await fixture.observer.response(
+                    id: Int64(50 + offset), method: method.0, params: .object(observerParams)
+                )
+                expectLeaderSessionDenied(observer, sessionID: ownerSession.rawValue)
+                let owner = try await fixture.owner.response(
+                    id: Int64(60 + offset), method: method.0,
+                    params: .object([method.1: .string(observerSession.rawValue)])
+                )
+                expectLeaderSessionDenied(owner, sessionID: observerSession.rawValue)
+            }
+            #expect(await fixture.extensionCounter.methods == methods.count)
+
+            let independentOwner = try await fixture.observer.request(
+                id: 65, method: "x.ai/session/delete",
+                params: .object(["sessionId": .string(historyID)])
+            )
+            #expect(independentOwner["authorized"]?.boolValue == true)
+
+            let coreFork = try await fixture.owner.response(
+                id: 66, method: AgentMethodNames.sessionFork,
+                params: .object(["sessionId": .string(historyID)])
+            )
+            expectLeaderSessionDenied(coreFork, sessionID: historyID)
+            let genericControl = try await fixture.owner.response(
+                id: 67, method: "x.ai/mcp/upsert",
+                params: .object(["session_id": .string(historyID)])
+            )
+            expectLeaderSessionDenied(genericControl, sessionID: historyID)
+            try await fixture.owner.send(.notification(
+                method: "x.ai/session/delete",
+                params: .object(["sessionId": .string(ownerSession.rawValue)])
+            ))
+            let closed = try await fixture.owner.response(
+                id: 70, method: AgentMethodNames.sessionClose,
+                params: try JSONValue.encode(CloseSessionRequest(sessionId: ownerSession))
+            )
+            expectLeaderSuccess(closed)
+            let replacement = try await fixture.owner.response(
+                id: 71, method: AgentMethodNames.sessionNew,
+                params: try JSONValue.encode(NewSessionRequest(cwd: fixture.directory.path))
+            )
+            expectLeaderSuccess(replacement)
+            for (offset, method) in methods.enumerated() {
+                let closedHistory = try await fixture.owner.response(
+                    id: Int64(80 + offset), method: method.0,
+                    params: .object([method.1: .string(ownerSession.rawValue)])
+                )
+                expectLeaderSessionDenied(closedHistory, sessionID: ownerSession.rawValue)
+            }
+            #expect(await fixture.extensionCounter.methods == methods.count + 1)
+            #expect(await fixture.extensionCounter.notifications == 0)
+        }
+    }
+
     @Test("failed mutations and loads cannot reserve a future session identifier")
     func failedRequestsDoNotPreclaimFutureSession() async throws {
         try await withLeaderIsolationFixture { fixture in

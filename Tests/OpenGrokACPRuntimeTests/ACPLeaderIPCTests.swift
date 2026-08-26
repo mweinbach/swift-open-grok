@@ -35,6 +35,74 @@ private struct LeaderEchoPromptDriver: ACPPromptDriver {
     func cancel(sessionId: AcpSessionId) async {}
 }
 
+private let leaderSDKPayload = JSONValue.object([
+    "serverId": .string("sdk-original-owner"),
+    "message": .object([
+        "jsonrpc": .string("2.0"),
+        "id": .number(.int64(1)),
+        "method": .string("initialize"),
+        "params": .object([:]),
+    ]),
+])
+
+private actor LeaderSDKRequesterCapture {
+    private var requester: ACPNotificationGateway.ReverseRequester?
+
+    func record(_ requester: @escaping ACPNotificationGateway.ReverseRequester) {
+        if self.requester == nil { self.requester = requester }
+    }
+
+    func value() -> ACPNotificationGateway.ReverseRequester? { requester }
+}
+
+private struct LeaderPermissionPromptDriver: ACPPromptDriver {
+    let gateway: ACPNotificationGateway
+
+    func run(
+        context: ACPPromptContext,
+        emit: @escaping @Sendable (SessionNotification, ACPNotificationDisposition) async -> Void
+    ) async throws -> PromptResponse {
+        do {
+            let response = try await gateway.requestClient(
+                method: ClientMethodNames.sessionRequestPermission,
+                params: .object(["sessionId": .string(context.session.sessionId.rawValue)])
+            )
+            guard response == .object(["allowed": .bool(true)]) else {
+                throw ACPRuntimeError.invalidParams("permission was not approved")
+            }
+            return PromptResponse(stopReason: .endTurn)
+        } catch {
+            try Task.checkCancellation()
+            throw error
+        }
+    }
+
+    func cancel(sessionId: AcpSessionId) async {}
+}
+
+private actor LeaderPendingWorkProbe {
+    private(set) var active = 0
+
+    func enter() { active += 1 }
+    func leave() { active -= 1 }
+}
+
+private struct LeaderBlockedExtensionHandler: ACPAgentExtensionHandler {
+    let probe: LeaderPendingWorkProbe
+
+    func handle(method: String, params: JSONValue) async throws -> JSONValue {
+        await probe.enter()
+        do {
+            try await Task.sleep(nanoseconds: 60_000_000_000)
+            await probe.leave()
+            return .object([:])
+        } catch {
+            await probe.leave()
+            throw error
+        }
+    }
+}
+
 // MARK: - A client of the leader
 
 /// The far end of one IPC channel, speaking the envelope by hand.
@@ -324,6 +392,330 @@ struct ACPLeaderIPCRoutingTests {
         }
         guard case .registered(let clientID, _, _, _, _) = reply else { return 0 }
         return clientID
+    }
+
+    private func initialize(_ client: LeaderTestClient) async throws {
+        try await client.sendACP(leaderInitialize(id: 1))
+        let response = try await client.nextACP { $0.id == .number(1) }
+        guard case .response(_, .some, nil) = response else {
+            throw ACPTransportError.invalidMessage("leader initialize failed: \(response)")
+        }
+    }
+
+    private func expectNoReverseRequestsUntilPong(_ client: LeaderTestClient) async throws {
+        try await client.send(.ping)
+        let pong = try await client.next { message in
+            if case .acp(let payload) = message,
+               let decoded = try? ACPMessage(data: Data(payload.utf8)),
+               case .request = decoded {
+                Issue.record("foreign carrier received reverse request: \(decoded)")
+            }
+            return message == .pong
+        }
+        #expect(pong == .pong)
+    }
+
+    @Test("sessionless SDK requests complete during session/new and keep their immutable carrier", .timeLimit(.minutes(1)))
+    func sessionlessSDKLifecycleAndDeferredCarrierIsolation() async throws {
+        let gateway = ACPNotificationGateway()
+        let captured = LeaderSDKRequesterCapture()
+        let broker = ACPReverseRequestBroker()
+        let accepted = JSONValue.object(["sdk": .string("original-owner")])
+        let runtime = ACPAgentRuntime(
+            reverseRequests: broker,
+            onSessionOpened: { _, _ in
+                let requester = try await gateway.connectedReverseRequester()
+                await captured.record(requester)
+                let response = try await requester("x.ai/mcp/sdk_call", leaderSDKPayload)
+                guard response == accepted else {
+                    throw ACPRuntimeError.invalidParams("SDK initialization answered by wrong carrier")
+                }
+            }
+        )
+        await gateway.attach(runtime)
+        let host = ACPLeaderIPCHost(runtime: runtime)
+        let (owner, ownerServed) = attach(to: host)
+        let (foreign, foreignServed) = attach(to: host)
+        defer {
+            ownerServed.cancel()
+            foreignServed.cancel()
+        }
+        let ownerID = try await register(owner, as: "sdk-owner")
+        let foreignID = try await register(foreign, as: "foreign-sdk")
+        #expect(ownerID != foreignID)
+        try await initialize(foreign)
+
+        // Pipeline creation behind initialize: the response is the carrier's
+        // barrier, but session/new must not block reading its SDK response.
+        try await owner.sendACP(leaderInitialize(id: 1))
+        try await owner.sendACP(leaderNewSession(id: 2))
+        let initialized = try await owner.nextACP { _ in true }
+        guard case .response(.number(1), .some, nil) = initialized else {
+            Issue.record("session creation overtook initialize: \(initialized)")
+            return
+        }
+        let request = try await owner.nextACP { $0.method == "x.ai/mcp/sdk_call" }
+        guard case .request(let requestID, _, let params) = request else {
+            Issue.record("SDK initialization did not use the reverse carrier")
+            return
+        }
+        #expect(params == leaderSDKPayload)
+        #expect(params["sessionId"] == nil)
+        #expect(await broker.pendingCount() == 1)
+
+        try await foreign.sendACP(.response(id: requestID, result: .string("forged"), error: nil))
+        try await expectNoReverseRequestsUntilPong(foreign)
+        #expect(await broker.pendingCount() == 1)
+        try await owner.sendACP(.response(id: requestID, result: accepted, error: nil))
+        let created = try await owner.nextACP { $0.id == .number(2) }
+        let session = try sessionID(from: created)
+        #expect(!session.isEmpty)
+        #expect(await broker.pendingCount() == 0)
+
+        // An observer can become driver after disconnect, but it cannot inherit
+        // an SDK server that exists only in the original client's process.
+        try await foreign.sendACP(.request(
+            id: .number(2),
+            method: AgentMethodNames.sessionLoad,
+            params: .object([
+                "sessionId": .string(session),
+                "cwd": .string(FileManager.default.currentDirectoryPath),
+                "mcpServers": .array([]),
+            ])
+        ))
+        let attached = try await foreign.nextACP { $0.id == .number(2) }
+        guard case .response(_, .some, nil) = attached else {
+            Issue.record("observer attachment failed: \(attached)")
+            return
+        }
+        let requester = try #require(await captured.value())
+        let deferred = Task.detached {
+            try await ACPLeaderRequestAuthority.$clientID.withValue(String(foreignID)) {
+                try await requester("x.ai/mcp/sdk_call", leaderSDKPayload)
+            }
+        }
+        defer { deferred.cancel() }
+        let later = try await owner.nextACP { $0.method == "x.ai/mcp/sdk_call" }
+        guard case .request(let laterID, _, let laterParams) = later else {
+            Issue.record("deferred SDK request did not reach its original carrier")
+            return
+        }
+        #expect(laterParams == leaderSDKPayload)
+        try await expectNoReverseRequestsUntilPong(foreign)
+        await owner.close()
+        await ownerServed.value
+
+        do {
+            let result = try await deferred.value
+            Issue.record("disconnected SDK carrier unexpectedly answered: \(result)")
+        } catch let error as AcpError {
+            #expect(error.code == .requestCancelled)
+        }
+        #expect(await broker.pendingCount() == 0)
+        #expect(await runtime.connectionState() == .initialized)
+
+        try await foreign.sendACP(.response(id: laterID, result: accepted, error: nil))
+        do {
+            let result = try await ACPLeaderRequestAuthority.$clientID.withValue(String(foreignID)) {
+                try await requester("x.ai/mcp/sdk_call", leaderSDKPayload)
+            }
+            Issue.record("old SDK callback retargeted to the promoted driver: \(result)")
+        } catch let error as ACPRuntimeError {
+            #expect(error == .transport("the owning ACP client has disconnected"))
+        }
+        try await expectNoReverseRequestsUntilPong(foreign)
+        #expect(await broker.pendingCount() == 0)
+        await foreign.close()
+        await foreignServed.value
+        await runtime.close()
+    }
+
+    @Test("sessionless reverse calls reject absent, departed, and uninitialized carrier authority", .timeLimit(.minutes(1)))
+    func sessionlessReverseRequiresInitializedOwner() async throws {
+        let gateway = ACPNotificationGateway()
+        let broker = ACPReverseRequestBroker()
+        let runtime = ACPAgentRuntime(reverseRequests: broker)
+        await gateway.attach(runtime)
+        let host = ACPLeaderIPCHost(runtime: runtime)
+        let (ready, readyServed) = attach(to: host)
+        let (uninitialized, uninitializedServed) = attach(to: host)
+        defer {
+            readyServed.cancel()
+            uninitializedServed.cancel()
+        }
+        let readyID = try await register(ready, as: "ready")
+        let uninitializedID = try await register(uninitialized, as: "not-initialized")
+        #expect(readyID != uninitializedID)
+        try await initialize(ready)
+
+        for authority in [String?.none, String(uninitializedID), "departed-carrier"] {
+            let requester = try await ACPLeaderRequestAuthority.$clientID.withValue(authority) {
+                try await gateway.connectedReverseRequester()
+            }
+            do {
+                let result = try await ACPLeaderRequestAuthority.$clientID.withValue(String(readyID)) {
+                    try await requester("x.ai/mcp/sdk_call", leaderSDKPayload)
+                }
+                Issue.record("unauthorized sessionless request returned: \(result)")
+            } catch let error as ACPRuntimeError {
+                guard case .transport = error else {
+                    Issue.record("unexpected reverse authorization failure: \(error)")
+                    continue
+                }
+            }
+            #expect(await broker.pendingCount() == 0)
+        }
+        try await expectNoReverseRequestsUntilPong(ready)
+        try await expectNoReverseRequestsUntilPong(uninitialized)
+        await ready.close()
+        await uninitialized.close()
+        await readyServed.value
+        await uninitializedServed.value
+        await runtime.close()
+    }
+
+    @Test("cancelling an unsent server frame leaves its healthy carrier usable", .timeLimit(.minutes(1)))
+    func cancelledUnsentServerFramePreservesCarrier() async throws {
+        let pair = InMemoryWebSocketChannel.makePair()
+        let writer = ACPLeaderChannelWriter(
+            channel: pair.a,
+            maximumMessageSize: ACPLeaderProtocolLimits.maximumMessageSize
+        )
+        let client = LeaderTestClient(channel: pair.b)
+        let cancelledWrite = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            do {
+                try await writer.sendThrowing(.pong)
+                Issue.record("an already-canceled task sent a frame")
+                return false
+            } catch is CancellationError {
+                return true
+            } catch {
+                Issue.record("unsent-frame cancellation changed error: \(error)")
+                return false
+            }
+        }
+        #expect(await cancelledWrite.value)
+
+        try await writer.sendThrowing(.leaderReady)
+        let received = try await client.next { _ in true }
+        #expect(received == .leaderReady)
+        await writer.close()
+        await client.close()
+    }
+
+    @Test("a saturated request queue still admits reverse replies and cancellation and drains on disconnect", .timeLimit(.minutes(1)))
+    func saturatedQueuePreservesReverseRepliesAndCancellation() async throws {
+        let gateway = ACPNotificationGateway()
+        let probe = LeaderPendingWorkProbe()
+        let broker = ACPReverseRequestBroker()
+        let runtime = ACPAgentRuntime(
+            promptDriver: LeaderPermissionPromptDriver(gateway: gateway),
+            extensionRouter: ACPExtensionMethodRouter().register(
+                exact: "x.ai/test/blocked",
+                handler: LeaderBlockedExtensionHandler(probe: probe)
+            ),
+            reverseRequests: broker
+        )
+        await gateway.attach(runtime)
+        let host = ACPLeaderIPCHost(runtime: runtime)
+        let (owner, ownerServed) = attach(to: host)
+        let (other, otherServed) = attach(to: host)
+        defer {
+            ownerServed.cancel()
+            otherServed.cancel()
+        }
+        let ownerID = try await register(owner, as: "blocked-driver")
+        let otherID = try await register(other, as: "independent-client")
+        #expect(ownerID != otherID)
+        try await initialize(owner)
+        try await initialize(other)
+        try await owner.sendACP(leaderNewSession(id: 2))
+        let created = try await owner.nextACP { $0.id == .number(2) }
+        let session = try sessionID(from: created)
+        try await owner.sendACP(leaderPrompt(id: 3, sessionId: session))
+        let permission = try await owner.nextACP { $0.method == ClientMethodNames.sessionRequestPermission }
+        guard case .request(let permissionID, _, _) = permission else {
+            Issue.record("prompt never requested permission")
+            return
+        }
+
+        for index in 1..<ACPLeaderIPCHost.maximumPendingWorkPerClient {
+            try await owner.sendACP(.request(
+                id: .number(Int64(100 + index)),
+                method: "x.ai/test/blocked",
+                params: .object(["sessionId": .string(session)])
+            ))
+        }
+        try await owner.sendACP(.request(
+            id: .number(999),
+            method: "x.ai/test/blocked",
+            params: .object(["sessionId": .string(session)])
+        ))
+        let overflow = try await owner.nextACP { $0.id == .number(999) }
+        guard case .response(_, nil, let error?) = overflow else {
+            Issue.record("the request queue did not enforce its bound: \(overflow)")
+            return
+        }
+        #expect(error.code == .requestCancelled)
+        #expect(error.message.contains("too many pending requests"))
+        #expect(await host.pendingWorkCount(clientID: ownerID) == ACPLeaderIPCHost.maximumPendingWorkPerClient)
+
+        try await owner.sendACP(.response(
+            id: permissionID,
+            result: .object(["allowed": .bool(true)]),
+            error: nil
+        ))
+        let approved = try await owner.nextACP { $0.id == .number(3) }
+        guard case .response(_, let approvedResult?, nil) = approved else {
+            Issue.record("a full queue blocked the rightful reverse response: \(approved)")
+            return
+        }
+        #expect(approvedResult["stopReason"] == .string("end_turn"))
+        for _ in 0..<100 {
+            if await host.pendingWorkCount(clientID: ownerID) < ACPLeaderIPCHost.maximumPendingWorkPerClient { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+
+        try await owner.sendACP(leaderPrompt(id: 4, sessionId: session))
+        let nextPermission = try await owner.nextACP { $0.method == ClientMethodNames.sessionRequestPermission }
+        #expect(nextPermission.id != permissionID)
+        #expect(await host.pendingWorkCount(clientID: ownerID) == ACPLeaderIPCHost.maximumPendingWorkPerClient)
+        try await owner.sendACP(.notification(
+            method: AgentMethodNames.sessionCancel,
+            params: .object(["sessionId": .string(session)])
+        ))
+        let cancelled = try await owner.nextACP { $0.id == .number(4) }
+        guard case .response(_, let cancelledResult?, nil) = cancelled else {
+            Issue.record("a full queue blocked prompt cancellation: \(cancelled)")
+            return
+        }
+        #expect(cancelledResult["stopReason"] == .string("cancelled"))
+        #expect(await broker.pendingCount() == 0)
+
+        await owner.close()
+        await ownerServed.value
+        for _ in 0..<100 {
+            if await host.pendingWorkCount(clientID: ownerID) == 0 { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        #expect(await host.pendingWorkCount(clientID: ownerID) == 0)
+        #expect(await probe.active == 0)
+        #expect(await host.connectedClientCount() == 1)
+        #expect(await runtime.connectionState() == .initialized)
+        try await other.sendACP(.request(
+            id: .number(2),
+            method: AgentMethodNames.sessionList,
+            params: .object([:])
+        ))
+        let survived = try await other.nextACP { $0.id == .number(2) }
+        guard case .response(_, .some, nil) = survived else {
+            Issue.record("disconnect closed the shared runtime: \(survived)")
+            return
+        }
+        await other.close()
+        await otherServed.value
+        await runtime.close()
     }
 
     @Test("a client drives a full session through the leader", .timeLimit(.minutes(1)))

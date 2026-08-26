@@ -226,11 +226,16 @@ public struct ACPPromptContext: Sendable {
 }
 
 public protocol ACPPromptDriver: Sendable {
+    func admitSession(_ session: ACPSessionSnapshot) async throws
     func run(
         context: ACPPromptContext,
         emit: @escaping @Sendable (SessionNotification, ACPNotificationDisposition) async -> Void
     ) async throws -> PromptResponse
     func cancel(sessionId: AcpSessionId) async
+}
+
+public extension ACPPromptDriver {
+    func admitSession(_ session: ACPSessionSnapshot) async throws {}
 }
 
 public struct ACPNoopPromptDriver: ACPPromptDriver {
@@ -386,8 +391,11 @@ public actor ACPLeaderRouter {
         clients[clientID] = Client(send: send, sessions: [])
     }
 
-    public func unregister(clientID: String) {
+    public func unregister(clientID: String) -> [AcpRequestId] {
         clients.removeValue(forKey: clientID)
+        let cancelledRequests = interactions.compactMap { requestID, owner in
+            owner == clientID ? requestID : nil
+        }
         interactions = interactions.filter { $0.value != clientID }
         for (sessionID, var route) in sessions {
             route.subscribers.remove(clientID)
@@ -396,6 +404,7 @@ public actor ACPLeaderRouter {
             }
             sessions[sessionID] = route
         }
+        return cancelledRequests
     }
 
     public func claim(sessionID: AcpSessionId, clientID: String, role: ACPClientRole = .driver) throws {
@@ -476,6 +485,42 @@ public actor ACPLeaderRouter {
         }
         interactions.removeValue(forKey: requestID)
         return true
+    }
+
+    /// Bind the reply before the request reaches the carrier. SDK MCP requests
+    /// intentionally have no sessionId, and may run before session/new returns.
+    /// The originating carrier is authority, not a hint for choosing a driver.
+    public func registerReverseRequest(
+        _ message: ACPMessage,
+        owningClientID: String?
+    ) throws -> String {
+        guard case .request(let requestID, let method, let params) = message else {
+            throw ACPRuntimeError.invalidParams("expected an ACP reverse request")
+        }
+        let recipient: String
+        if let owningClientID {
+            recipient = owningClientID
+        } else {
+            let route = ACPMethodRoute.normalize(method: method, params: params)
+            guard let sessionID = sessionID(in: route.params),
+                  let driver = sessions[sessionID]?.driver
+            else {
+                throw ACPRuntimeError.transport("ACP reverse request has no owning client")
+            }
+            recipient = driver
+        }
+        guard clients[recipient] != nil else {
+            throw ACPRuntimeError.transport("the owning ACP client has disconnected")
+        }
+        guard interactions[requestID] == nil else {
+            throw ACPRuntimeError.duplicateRequest(requestID)
+        }
+        interactions[requestID] = recipient
+        return recipient
+    }
+
+    public func discardReverseRequest(_ requestID: AcpRequestId) {
+        interactions.removeValue(forKey: requestID)
     }
 
     private func sessionID(in params: JSONValue) -> AcpSessionId? {

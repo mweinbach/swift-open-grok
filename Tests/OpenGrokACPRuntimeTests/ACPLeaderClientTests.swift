@@ -1,6 +1,6 @@
 import Foundation
 import OpenGrokACP
-import OpenGrokACPRuntime
+@testable import OpenGrokACPRuntime
 import OpenGrokHTTP
 import Testing
 
@@ -128,5 +128,228 @@ struct ACPLeaderClientTests {
 
         await client.close()
         #expect(try await pair.b.read() == nil)
+    }
+}
+
+private actor StalledLeaderWriteChannel: WebSocketByteChannel {
+    private var firstWrite: CheckedContinuation<Void, Error>?
+    private(set) var started: [[UInt8]] = []
+    private(set) var bytes: [UInt8] = []
+    private(set) var activeWrites = 0
+    private(set) var maximumConcurrentWrites = 0
+    private(set) var closeCalls = 0
+    private(set) var closed = false
+
+    func read() async throws -> [UInt8]? { nil }
+
+    func write(_ frame: [UInt8]) async throws {
+        guard !closed else { throw WebSocketChannelError.closed }
+        let isFirst = started.isEmpty
+        started.append(frame)
+        activeWrites += 1
+        maximumConcurrentWrites = max(maximumConcurrentWrites, activeWrites)
+        defer { activeWrites -= 1 }
+        let split = frame.count / 2
+        bytes.append(contentsOf: frame.prefix(split))
+        if isFirst {
+            try await withCheckedThrowingContinuation { firstWrite = $0 }
+        }
+        guard !closed else { throw WebSocketChannelError.closed }
+        bytes.append(contentsOf: frame.dropFirst(split))
+    }
+
+    func releaseFirstWrite() -> Bool {
+        guard let firstWrite else { return false }
+        self.firstWrite = nil
+        firstWrite.resume()
+        return true
+    }
+
+    func close() async {
+        closeCalls += 1
+        closed = true
+        let firstWrite = firstWrite
+        self.firstWrite = nil
+        firstWrite?.resume(throwing: WebSocketChannelError.closed)
+    }
+}
+
+private func waitForLeaderWriteState(
+    _ ready: @Sendable () async -> Bool
+) async throws {
+    let deadline = Date().addingTimeInterval(5)
+    while Date() < deadline {
+        if await ready() { return }
+        try await Task.sleep(nanoseconds: 1_000_000)
+    }
+    throw ACPTransportError.invalidMessage("leader write state did not arrive")
+}
+
+private func withStalledLeaderWriter(
+    maximumPendingFrames: Int = 64,
+    maximumPendingBytes: Int = ACPLeaderProtocolLimits.maximumMessageSize + 4,
+    _ body: @Sendable (ACPLeaderFrameWriter, StalledLeaderWriteChannel) async throws -> Void
+) async throws {
+    let channel = StalledLeaderWriteChannel()
+    let writer = ACPLeaderFrameWriter(
+        channel: channel,
+        maximumPendingFrames: maximumPendingFrames,
+        maximumPendingBytes: maximumPendingBytes
+    )
+    do {
+        try await body(writer, channel)
+        await writer.close()
+    } catch {
+        await writer.close()
+        throw error
+    }
+}
+
+private func leaderWriteFailure(_ task: Task<Void, Error>) async -> (any Error)? {
+    switch await task.result {
+    case .success:
+        Issue.record("leader frame write unexpectedly succeeded")
+        return nil
+    case .failure(let error):
+        return error
+    }
+}
+
+@Suite("Leader full-frame write serialization", .serialized)
+struct ACPLeaderFrameWriterTests {
+    @Test("concurrent frames remain FIFO while the first write is suspended",
+          .timeLimit(.minutes(1)))
+    func suspendedWriteCannotInterleaveFrames() async throws {
+        try await withStalledLeaderWriter { writer, channel in
+            let firstFrame = try ACPLeaderCodec.encode(ACPLeaderClientMessage.ping)
+            let secondFrame = try ACPLeaderCodec.encode(ACPLeaderClientMessage.disconnect)
+            let thirdFrame = try ACPLeaderCodec.encode(ACPLeaderClientMessage.acp(payload: "{}"))
+            let first = Task { try await writer.write(firstFrame) }
+            try await waitForLeaderWriteState { await channel.started.count == 1 }
+            let second = Task { try await writer.write(secondFrame) }
+            try await waitForLeaderWriteState { await writer.pendingFrameCount() == 2 }
+            let third = Task { try await writer.write(thirdFrame) }
+            try await waitForLeaderWriteState { await writer.pendingFrameCount() == 3 }
+            #expect(await channel.started == [firstFrame])
+            #expect(await channel.maximumConcurrentWrites == 1)
+            #expect(await channel.releaseFirstWrite())
+            try await first.value
+            try await second.value
+            try await third.value
+            #expect(await channel.started == [firstFrame, secondFrame, thirdFrame])
+            #expect(await channel.bytes == firstFrame + secondFrame + thirdFrame)
+            #expect(await writer.pendingFrameCount() == 0)
+            #expect(await channel.maximumConcurrentWrites == 1)
+        }
+    }
+
+    @Test("cancelling a queued frame removes it without closing another write",
+          .timeLimit(.minutes(1)))
+    func queuedCancellationPreservesCarrier() async throws {
+        try await withStalledLeaderWriter { writer, channel in
+            let firstFrame: [UInt8] = [1, 2, 3, 4]
+            let lastFrame: [UInt8] = [9, 10, 11, 12]
+            let first = Task { try await writer.write(firstFrame) }
+            try await waitForLeaderWriteState { await channel.started.count == 1 }
+            let cancelled = Task { try await writer.write([5, 6, 7, 8]) }
+            try await waitForLeaderWriteState { await writer.pendingFrameCount() == 2 }
+            cancelled.cancel()
+            #expect(await leaderWriteFailure(cancelled) is CancellationError)
+            #expect(await writer.pendingFrameCount() == 1)
+            #expect(await !channel.closed)
+            let last = Task { try await writer.write(lastFrame) }
+            try await waitForLeaderWriteState { await writer.pendingFrameCount() == 2 }
+            #expect(await channel.releaseFirstWrite())
+            try await first.value
+            try await last.value
+            #expect(await channel.bytes == firstFrame + lastFrame)
+            #expect(await channel.started == [firstFrame, lastFrame])
+        }
+    }
+
+    @Test("cancelling a partially written frame closes and fails queued frames",
+          .timeLimit(.minutes(1)))
+    func activeCancellationClosesPartialFrame() async throws {
+        try await withStalledLeaderWriter { writer, channel in
+            let first = Task { try await writer.write([1, 2, 3, 4]) }
+            try await waitForLeaderWriteState { await channel.started.count == 1 }
+            let queued = Task { try await writer.write([5, 6, 7, 8]) }
+            try await waitForLeaderWriteState { await writer.pendingFrameCount() == 2 }
+            first.cancel()
+            #expect(await leaderWriteFailure(first) is CancellationError)
+            let queuedFailure = await leaderWriteFailure(queued)
+            #expect(queuedFailure as? ACPLeaderProtocolError == .connectionClosed)
+            await writer.close()
+            #expect(await channel.closed)
+            #expect(await channel.closeCalls == 1)
+            #expect(await channel.activeWrites == 0)
+            #expect(await channel.started.count == 1)
+            #expect(await writer.pendingFrameCount() == 0)
+            do {
+                try await writer.write([9, 10])
+                Issue.record("a cancelled partial frame left its carrier writable")
+            } catch let error as ACPLeaderProtocolError {
+                #expect(error == .connectionClosed)
+            }
+        }
+    }
+
+    @Test("close releases the suspended channel write and every waiting sender",
+          .timeLimit(.minutes(1)))
+    func closeUnblocksEveryWrite() async throws {
+        try await withStalledLeaderWriter { writer, channel in
+            let first = Task { try await writer.write([1, 2, 3, 4]) }
+            try await waitForLeaderWriteState { await channel.started.count == 1 }
+            let queued = Task { try await writer.write([5, 6, 7, 8]) }
+            try await waitForLeaderWriteState { await writer.pendingFrameCount() == 2 }
+            await writer.close()
+            let firstFailure = await leaderWriteFailure(first)
+            let queuedFailure = await leaderWriteFailure(queued)
+            #expect(firstFailure as? ACPLeaderProtocolError == .connectionClosed)
+            #expect(queuedFailure as? ACPLeaderProtocolError == .connectionClosed)
+            #expect(await channel.activeWrites == 0)
+            #expect(await writer.pendingFrameCount() == 0)
+            #expect(await channel.started.count == 1)
+            await writer.close()
+            #expect(await channel.closeCalls == 1)
+        }
+    }
+
+    @Test("pending frame and byte caps fail explicitly without entering the channel",
+          .timeLimit(.minutes(1)))
+    func queueBoundsIncludeActiveFrame() async throws {
+        try await withStalledLeaderWriter(
+            maximumPendingFrames: 2,
+            maximumPendingBytes: 16
+        ) { writer, channel in
+            let first = Task { try await writer.write([1, 2, 3, 4]) }
+            try await waitForLeaderWriteState { await channel.started.count == 1 }
+            let queued = Task { try await writer.write([5, 6, 7, 8]) }
+            try await waitForLeaderWriteState { await writer.pendingFrameCount() == 2 }
+            let expected = ACPLeaderFrameWriterError.queueLimitExceeded(
+                maximumFrames: 2, maximumBytes: 16
+            )
+            do {
+                try await writer.write([9])
+                Issue.record("pending frame limit was not enforced")
+            } catch let error as ACPLeaderFrameWriterError {
+                #expect(error == expected)
+            }
+            queued.cancel()
+            #expect(await leaderWriteFailure(queued) is CancellationError)
+            do {
+                try await writer.write(Array(repeating: 9, count: 13))
+                Issue.record("pending byte limit did not include the active frame")
+            } catch let error as ACPLeaderFrameWriterError {
+                #expect(error == expected)
+            }
+            #expect(await writer.pendingFrameCount() == 1)
+            #expect(await channel.started.count == 1)
+            #expect(await channel.releaseFirstWrite())
+            try await first.value
+            try await writer.write(Array(repeating: 10, count: 16))
+            #expect(await channel.started.count == 2)
+            #expect(await writer.pendingFrameCount() == 0)
+        }
     }
 }
