@@ -3652,6 +3652,16 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
         LiveManagedPolicyLifecycle.start(environment: context.environment)
         let invocationCwd = try resolveWorkingDirectory(options.common.cwd)
         let openGrokHome = resolveOpenGrokHome(environment: context.environment)
+        try await LiveRemoteSessionHydration.hydrateIfMissing(
+            options: options,
+            invocationWorkingDirectory: invocationCwd,
+            openGrokHome: openGrokHome,
+            environment: context.environment,
+            transport: dependencies.makeImageTransport(),
+            remoteRegistryEnabled: dependencies.remoteSettingsSnapshot
+                .map(AllowlistedRemoteSettings.init(projecting:))?
+                .sessionRegistryEnabled
+        )
         let sourceCwd = try await resolveResumeWorkingDirectory(
             options: options,
             invocationWorkingDirectory: invocationCwd,

@@ -31,6 +31,7 @@ struct RemoteSettingsAllowlistTests {
         rs.privacyBannerReshowDays = 30
         rs.sharingEnabled = true
         rs.workspaceCommandEnabled = true
+        rs.sessionRegistryEnabled = true
         rs.zdrAccessEnabled = true
         rs.gateMessage = "upgrade required"
         let ann = RemoteAnnouncement(
@@ -50,6 +51,7 @@ struct RemoteSettingsAllowlistTests {
         #expect(projected.privacyBannerReshowDays == 30)
         #expect(projected.sharingEnabled == true)
         #expect(projected.workspaceCommandEnabled == true)
+        #expect(projected.sessionRegistryEnabled == true)
         #expect(projected.zdrAccessEnabled == true)
         #expect(projected.gateMessage == "upgrade required")
         #expect(projected.announcements?.count == 1)
@@ -70,6 +72,7 @@ struct RemoteSettingsAllowlistTests {
         #expect(projected.announcements == nil)
         #expect(projected.sharingEnabled == nil)
         #expect(projected.workspaceCommandEnabled == nil)
+        #expect(projected.sessionRegistryEnabled == nil)
         #expect(projected.zdrAccessEnabled == nil)
         #expect(projected.gateMessage == nil)
         #expect(projected.traceUploadEnabled == nil)
@@ -112,6 +115,7 @@ struct RemoteSettingsAllowlistTests {
         #expect(projected.announcements == nil)
         #expect(projected.sharingEnabled == nil)
         #expect(projected.workspaceCommandEnabled == nil)
+        #expect(projected.sessionRegistryEnabled == nil)
         #expect(projected.zdrAccessEnabled == nil)
         #expect(projected.gateMessage == nil)
         #expect(projected.sessionRecap == nil)
@@ -146,6 +150,49 @@ struct RemoteSettingsAllowlistTests {
         #expect(projected.todoGateMaxFiresPerPrompt == 4)
     }
 
+    @Test(
+        "reviewed session-registry authority preserves explicit remote true and false",
+        arguments: [true, false]
+    )
+    func sessionRegistryAuthorityProjectsReviewedWireValue(_ enabled: Bool) throws {
+        let payload = try JSONSerialization.data(withJSONObject: [
+            "session_registry_enabled": enabled,
+            "leader_mode": true,
+            "memory_enabled": true,
+            "folder_trust_enabled": false,
+            "permission_mode": "auto",
+        ])
+        let remote = try JSONDecoder().decode(RemoteSettings.self, from: payload)
+        let projected = AllowlistedRemoteSettings(projecting: remote)
+
+        #expect(projected.sessionRegistryEnabled == enabled)
+        #expect(projected.sessionSearch == nil)
+        #expect(projected.sessionRecap == nil)
+        #expect(projected.workspaceCommandEnabled == nil)
+        #expect(projected.telemetryEnabled == nil)
+        #expect(remoteSettingsAllowlistedWireNames.contains("session_registry_enabled"))
+        #expect(!remoteSettingsAllowlistedWireNames.contains("leader_mode"))
+        #expect(!remoteSettingsAllowlistedWireNames.contains("memory_enabled"))
+        #expect(!remoteSettingsAllowlistedWireNames.contains("folder_trust_enabled"))
+        #expect(!remoteSettingsAllowlistedWireNames.contains("permission_mode"))
+    }
+
+    @Test("missing and mistyped registry settings never silently enable remote authority")
+    func sessionRegistryAuthorityFailsClosed() throws {
+        let absent = try JSONDecoder().decode(
+            RemoteSettings.self,
+            from: Data(#"{"leader_mode":true,"memory_enabled":true}"#.utf8)
+        )
+        #expect(AllowlistedRemoteSettings(projecting: absent).sessionRegistryEnabled == nil)
+
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(
+                RemoteSettings.self,
+                from: Data(#"{"session_registry_enabled":"true"}"#.utf8)
+            )
+        }
+    }
+
     @Test("allowlisted wire name set is complete")
     func wireNameSetComplete() {
         let expected: Set<String> = [
@@ -153,7 +200,8 @@ struct RemoteSettingsAllowlistTests {
             "external_otel_content_gates_locked", "privacy_notice_rollout",
             "privacy_banner_reshow_days", "announcements", "sharing_enabled",
             "workspace_command_enabled", "zdr_access_enabled", "gate_message",
-            "session_recap", "session_search", "doom_loop_recovery", "trace_upload_enabled", "two_pass_compaction_enabled",
+            "session_recap", "session_search", "session_registry_enabled",
+            "doom_loop_recovery", "trace_upload_enabled", "two_pass_compaction_enabled",
             "ask_user_question_enabled", "write_file_enabled", "cancel_rewind_enabled",
             "compaction_mode", "compaction_detail", "remember_tool_approvals", "auto_mode",
             "todo_gate_enabled", "todo_gate_max_fires_per_prompt",

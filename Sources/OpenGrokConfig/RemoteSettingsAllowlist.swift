@@ -83,6 +83,12 @@ public struct AllowlistedRemoteSettings: Sendable, Equatable {
     /// (`resolve_session_search`, agent/config.rs:2759-2769).
     public var sessionSearch: Bool?
 
+    // -- Authenticated remote-session registry (LiveSessionRegistryHydrator) --
+
+    /// `session_registry_enabled` — authenticated default only; explicit
+    /// environment and local configuration overrides retain precedence.
+    public var sessionRegistryEnabled: Bool?
+
     // -- Sampling recovery (OpenGrokLiveApplicationLauncher) --
 
     /// `doom_loop_recovery` — consumed by the session-frozen trusted-policy
@@ -148,6 +154,7 @@ extension AllowlistedRemoteSettings {
         self.gateMessage = remote.gateMessage
         self.sessionRecap = remote.sessionRecap
         self.sessionSearch = remote.sessionSearch
+        self.sessionRegistryEnabled = remote.sessionRegistryEnabled
         self.doomLoopRecovery = remote.doomLoopRecovery
         self.traceUploadEnabled = remote.traceUploadEnabled
         self.twoPassCompactionEnabled = remote.twoPassCompactionEnabled
@@ -195,6 +202,7 @@ public let remoteSettingsAllowlistedWireNames: Set<String> = [
     "gate_message",
     "session_recap",
     "session_search",
+    "session_registry_enabled",
     "doom_loop_recovery",
     "trace_upload_enabled",
     "two_pass_compaction_enabled",
