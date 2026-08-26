@@ -359,7 +359,10 @@ actor LiveLeaderPagerRuntimeAdapter: OpenGrokPagerMinimalRuntimeAdapter, OpenGro
         let remoteSessionID = AcpSessionId(sessionID)
         let response = try await client.request(
             method: AgentMethodNames.sessionResume,
-            params: try JSONValue.encode(ResumeSessionRequest(sessionId: remoteSessionID))
+            params: try JSONValue.encode(ResumeSessionRequest(
+                sessionId: remoteSessionID,
+                cwd: workingDirectory.path
+            ))
         )
         _ = try response.decode(ResumeSessionResponse.self)
         self.sessionID = remoteSessionID

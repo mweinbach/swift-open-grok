@@ -647,9 +647,11 @@ struct TypedACPWireTests {
         let forkData = try JSONEncoder().encode(fork)
         #expect(try JSONDecoder().decode(ForkSessionRequest.self, from: forkData).sessionId.rawValue == "s1")
 
-        let resume = ResumeSessionRequest(sessionId: AcpSessionId("s1"))
+        let resume = ResumeSessionRequest(sessionId: AcpSessionId("s1"), cwd: "/tmp")
         let resumeData = try JSONEncoder().encode(resume)
-        #expect(try JSONDecoder().decode(ResumeSessionRequest.self, from: resumeData).sessionId.rawValue == "s1")
+        let decodedResume = try JSONDecoder().decode(ResumeSessionRequest.self, from: resumeData)
+        #expect(decodedResume.sessionId.rawValue == "s1")
+        #expect(decodedResume.cwd == "/tmp")
 
         let config = SetSessionConfigOptionRequest(
             sessionId: AcpSessionId("s1"),

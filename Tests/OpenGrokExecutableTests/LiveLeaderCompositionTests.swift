@@ -511,7 +511,7 @@ struct LiveLeaderInteractiveDashboardTests {
         let application = OpenGrokApplication.live(dependencies: dependencies, control: .never)
         let (streams, _, _) = CLIStreams.buffered()
         let code = await CLIRunner.run(
-            ["interactive", "--leader", "--fullscreen"],
+            ["interactive", "--leader", "--fullscreen", "--cwd", home.path],
             environment: [
                 "HOME": home.path,
                 "OPENGROK_HOME": home.appendingPathComponent("state").path,
@@ -532,7 +532,8 @@ struct LiveLeaderInteractiveDashboardTests {
         #expect(observations.resumed)
         #expect(observations.cwd)
         #expect(resume.sessionId.rawValue == "remote-session")
-        #expect(resume.cwd == nil)
+        #expect(resume.cwd == home.standardizedFileURL.path)
+        #expect(resume.cwd != "/remote/cwd")
         #expect(terminal.paintedText.contains("Agent Dashboard"))
         #expect(terminal.paintedText.contains("idle"))
         #expect(terminal.paintedText.contains("working"))
@@ -900,15 +901,16 @@ struct LiveLeaderPagerRuntimeAdapterTests {
         }
 
         _ = try await client.start()
+        let viewerWorkingDirectory = URL(fileURLWithPath: "/viewer")
         let runtime = LiveLeaderPagerRuntimeAdapter(
             client: client,
-            workingDirectory: URL(fileURLWithPath: "/viewer")
+            workingDirectory: viewerWorkingDirectory
         )
         #expect(try await runtime.resumeSession(sessionID: "remote-session") == "remote-session")
 
         let request = try await server.value
         #expect(request.sessionId.rawValue == "remote-session")
-        #expect(request.cwd == nil)
+        #expect(request.cwd == viewerWorkingDirectory.path)
         #expect(request.additionalDirectories.isEmpty)
         #expect(request.mcpServers.isEmpty)
         await client.close()

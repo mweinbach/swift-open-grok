@@ -1482,14 +1482,14 @@ public struct ForkSessionResponse: Hashable, Sendable, Codable {
 
 public struct ResumeSessionRequest: Hashable, Sendable, Codable {
     public var sessionId: AcpSessionId
-    public var cwd: String?
+    public var cwd: String
     public var additionalDirectories: [String]
     public var mcpServers: [McpServer]
     public var meta: AcpMeta?
 
     public init(
         sessionId: AcpSessionId,
-        cwd: String? = nil,
+        cwd: String,
         additionalDirectories: [String] = [],
         mcpServers: [McpServer] = [],
         meta: AcpMeta? = nil
@@ -1509,7 +1509,7 @@ public struct ResumeSessionRequest: Hashable, Sendable, Codable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         sessionId = try container.decode(AcpSessionId.self, forKey: .sessionId)
-        cwd = try container.decodeIfPresent(String.self, forKey: .cwd)
+        cwd = try container.decode(String.self, forKey: .cwd)
         additionalDirectories = try container.decodeIfPresent([String].self, forKey: .additionalDirectories) ?? []
         mcpServers = try container.decodeIfPresent([McpServer].self, forKey: .mcpServers) ?? []
         meta = try container.decodeIfPresent(AcpMeta.self, forKey: .meta)
@@ -1518,11 +1518,13 @@ public struct ResumeSessionRequest: Hashable, Sendable, Codable {
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(sessionId, forKey: .sessionId)
-        try container.encodeIfPresent(cwd, forKey: .cwd)
+        try container.encode(cwd, forKey: .cwd)
         if !additionalDirectories.isEmpty {
             try container.encode(additionalDirectories, forKey: .additionalDirectories)
         }
-        try container.encode(mcpServers, forKey: .mcpServers)
+        if !mcpServers.isEmpty {
+            try container.encode(mcpServers, forKey: .mcpServers)
+        }
         try container.encodeIfPresent(meta, forKey: .meta)
     }
 }

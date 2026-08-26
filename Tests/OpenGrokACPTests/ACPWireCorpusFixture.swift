@@ -71,7 +71,7 @@ enum ACPWireCorpusFixture {
           "direction": "agent",
           "method": "session/resume",
           "isNotification": false,
-          "params": { "sessionId": "sess-resume-1" }
+          "params": { "sessionId": "sess-resume-1", "cwd": "/tmp/proj" }
         },
         {
           "name": "session-fork-request",

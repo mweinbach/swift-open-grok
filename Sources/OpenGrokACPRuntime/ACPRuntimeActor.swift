@@ -716,6 +716,7 @@ public actor ACPAgentRuntime {
     private func loadSession(_ params: JSONValue) async throws -> JSONValue {
         try requireReady()
         let request = try decode(LoadSessionRequest.self, from: params, method: AgentMethodNames.sessionLoad)
+        let noReplay = Self.metaBool(request.meta, key: "noReplay") == true
         guard var session = try await store.read(request.sessionId) else {
             throw ACPRuntimeError.sessionNotFound(request.sessionId)
         }
@@ -724,7 +725,9 @@ public actor ACPAgentRuntime {
            await !ownsSession(request.sessionId)
         {
             guard !session.closed else { throw ACPRuntimeError.sessionClosed(request.sessionId) }
-            await replay(session, leaderClientID: request.meta?[ACPLeaderCapabilityInjection.clientIDKey])
+            if !noReplay {
+                await replay(session, leaderClientID: request.meta?[ACPLeaderCapabilityInjection.clientIDKey])
+            }
             if pendingPromptQueues[session.sessionId] != nil {
                 await publishQueueChanged(sessionID: session.sessionId)
             }
@@ -747,7 +750,9 @@ public actor ACPAgentRuntime {
             throw error
         }
         updateRosterMetadata(sessionId: session.sessionId, meta: request.meta)
-        await replay(session, leaderClientID: request.meta?[ACPLeaderCapabilityInjection.clientIDKey])
+        if !noReplay {
+            await replay(session, leaderClientID: request.meta?[ACPLeaderCapabilityInjection.clientIDKey])
+        }
         if pendingPromptQueues[session.sessionId] != nil {
             await publishQueueChanged(sessionID: session.sessionId)
         }
@@ -758,6 +763,11 @@ public actor ACPAgentRuntime {
     private func resumeSession(_ params: JSONValue) async throws -> JSONValue {
         try requireReady()
         let request = try decode(ResumeSessionRequest.self, from: params, method: AgentMethodNames.sessionResume)
+        guard request.additionalDirectories.isEmpty else {
+            throw AcpError.invalidParams().withData(
+                .string("session/resume does not support additionalDirectories")
+            )
+        }
         guard var session = try await store.read(request.sessionId) else {
             throw ACPRuntimeError.sessionNotFound(request.sessionId)
         }
@@ -766,18 +776,12 @@ public actor ACPAgentRuntime {
            await !ownsSession(request.sessionId)
         {
             guard !session.closed else { throw ACPRuntimeError.sessionClosed(request.sessionId) }
-            await replay(session, leaderClientID: request.meta?[ACPLeaderCapabilityInjection.clientIDKey])
             if pendingPromptQueues[session.sessionId] != nil {
                 await publishQueueChanged(sessionID: session.sessionId)
             }
             return try encode(ResumeSessionResponse(modes: configuration.modes, models: configuration.models))
         }
-        if let cwd = request.cwd {
-            session.cwd = try await validateWorkspace(cwd)
-        }
-        if !request.additionalDirectories.isEmpty {
-            session.additionalDirectories = request.additionalDirectories
-        }
+        session.cwd = try await validateWorkspace(request.cwd)
         if !request.mcpServers.isEmpty {
             session.mcpServers = request.mcpServers
         }
@@ -795,7 +799,6 @@ public actor ACPAgentRuntime {
             throw error
         }
         updateRosterMetadata(sessionId: session.sessionId, meta: request.meta)
-        await replay(session, leaderClientID: request.meta?[ACPLeaderCapabilityInjection.clientIDKey])
         if pendingPromptQueues[session.sessionId] != nil {
             await publishQueueChanged(sessionID: session.sessionId)
         }
