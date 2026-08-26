@@ -1,8 +1,8 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-25. The authoritative local macOS serial package gate passed **10,053 Swift Testing cases in 1,412 suites across 106 nonempty test-product summaries**, exit 0, after the exhaustive pinned Rust `.82` provider, authentication, protocol, security, persistence, live-executable, and terminal closures recorded immediately below. The unchanged 600-second verification ceiling remained in force; the complete run finished in approximately 429 seconds. Historical native Windows ARM64 evidence remains **7 named-pipe tests in 2 suites**, but was not refreshed against this exact head. These local results do not establish complete behavioral parity, current Linux execution, full Windows-suite health, remote CI, or release readiness.
+**As of:** 2026-08-25. The most recently completed full macOS serial package gate passed **10,053 Swift Testing cases in 1,412 suites across 106 nonempty test-product summaries**, exit 0, in approximately 429 seconds; it predates the newest authentication, writeback, cloud, session-administration, profiling, and platform changes and is not exact-head evidence. An integrated native Linux ARM64 gate passed **498 tests in 24 suites**, exit 0, including AWS profile-owned web-identity federation, Google service-account impersonation, remote-first ACP deletion, durable paginated ACP listing, backend hydration, Rust SQLite interoperability, and updater relaunch. Its subsequent remote-registry integration gate passed **370 tests in 18 suites**, exit 0, including authenticated remote entries through both core and extension ACP session lists. Earlier Linux matrices independently passed **421 tests in 23 suites** and **273 tests in 14 suites**, including **46 adversarial hydration tests**. A subsequent macOS native profiler, writeback, and SQLite interoperability matrix passed **105 tests in 7 suites**, exit 0. Earlier native Windows ARM64 runs independently passed **152 tests in 5 suites** for writeback/cloud/runtime, **47 tests in 3 suites** for remote deletion and portable profiling, **5 tests in 1 suite** for owner-authenticated named pipes and bounded listener shutdown, and **11 tests in 1 suite** for bounded native microphone discovery and real 16-kHz capture, each exit 0. A later SQLite-enabled Windows matrix independently passed all new owner-private foreign-session, genuine overlapped full-duplex pipe, and updater-relaunch regressions; **279 of its 280 tests passed**, with its sole failure isolated to an overlong test-fixture path and corrected. The resumed native Windows ARM64 gate at `f11094dad57a43eacc835c9486390444c1969e38` passed **350 tests in 21 suites**, with `WINDOWS_RESUME_GATE_EXIT=0`; its test phase took 51.190 seconds. The latest preceding Linux integration gate passed **424 tests in 38 suites**, exit 0. These checkpoints precede the in-progress leader-carrier continuation. Combined exact-head macOS/Linux/Windows execution and CI verification remain uncertified.
 
-**Overall state:** The audited Rust `.82` model catalog, managed authentication, fail-closed permission and media boundaries, canonical SQLite/BLAKE3 session and memory persistence, real MCP/plugin management, provider-isolated web/image/video tools, ACP/goal/session orchestration foundations, interactive terminal rendering, and explicitly enabled trace proxy uploads reach their production seams. The executable version, protocol fixtures, release reference, and platform distribution metadata agree with the exact pinned Rust commit. This remains **not complete parity or a release certification**: absent runtime, callback, pager, diagram, platform, and CI capabilities are explicitly recorded below and in `PARITY_ROADMAP.md`.
+**Overall state:** The audited Rust `.82` model catalog, managed authentication, persistent authenticated headless agent relay, actor-backed inference, independently verified goal orchestration, fail-closed permissions and media boundaries, native cross-platform SQLite/BLAKE3 session and memory persistence, authenticated first-party durable session writeback, remote-first CLI/ACP deletion, durable paginated ACP session listing with authenticated remote registry merging, live remote CLI registry discovery/search and secure CLI backend pull-on-miss hydration, real MCP/plugin management, provider-isolated web/image/video tools, semantic file/language tools, authenticated ACP queues, project-durable remembered approvals, additional working directories, every pinned Mermaid dispatcher family, interactive terminal rendering, authenticated trace proxy uploads, signed single-part/multipart S3 with managed/shared/legacy AWS credentials and secure environment/profile web-identity STS federation, native Google Cloud authorized-user/service-account/file-federated/impersonated uploads, real Linux enterprise HTTPS trust, secure restore-code, bounded portable gzip bundles, verified native secure WebSockets, Windows sampling diagnostics/private foreign-session discovery/native microphone capture, owner-authenticated local leader IPC, genuine overlapped Windows named-pipe I/O, real owner-private Unix CPU profiling, bounded update-driven leader relaunch, genuine Windows console/ConPTY processes, and isolated embedded Linux/Windows JavaScript Code Mode now have production implementations. The executable version, protocol fixtures, release reference, and platform distribution metadata agree with the exact pinned Rust commit. This remains **not complete cross-platform parity or a release certification**: Windows HTTPS enterprise-root augmentation, dynamic AWS metadata/role/SSO chains, Google metadata/non-file federation, core ACP durable/remote session hydration, full leader-carrier ACP component wiring, and complete exact-head native/remote gates remain incomplete or unverified.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `00e176c8fb4035701c24199bf9225973c1b13c20` (release `v1.0.0-open-grok.82`); historical original reference `650c1db7c2e73c59cec88bf3c6359751d6cef1bd`.
 **Current audited Rust snapshot:** `00e176c8fb4035701c24199bf9225973c1b13c20`, product version `1.0.0-open-grok.82`, **190 commits beyond the historical original pin**.
@@ -16,6 +16,314 @@ root Rust workspace members plus the separately rooted Markdown fuzz crate**
 and independently followed each major behavior from the Rust side through the
 actual Swift executable. Crate presence, passing composition tests, and
 implemented-but-unwired APIs were not treated as proof of live parity.
+
+### Latest authenticated storage, relay, and cloud closure
+
+**Recovered continuation checkpoint (2026-08-25):** native Windows ARM64
+completed the existing verifier on exact pushed commit
+`f11094dad57a43eacc835c9486390444c1969e38`: **350 tests / 21 suites**, native
+verifier exit **0**, test phase **51.190 seconds**. This includes the resumed
+ACP wire/replay changes and Windows canonical-session discovery beside
+scheduler sidecars. The previous Linux integration checkpoint passed
+**424 tests / 38 suites**, exit **0**, test phase **13.071 seconds**.
+The outer Windows launcher did not yet publish its own process exit when its
+native verifier printed the success marker; no outer-process completion or
+combined exact-head full-suite claim is inferred. New leader-carrier changes
+are not covered by these checkpoints.
+
+An integrated native Linux ARM64 gate completed with **498 tests / 24
+suites, exit 0**, through `workflows/swift-safe-verify.zsh test-target`,
+including AWS profile web identity, Google IAM impersonation, real remote-first
+ACP deletion, durable paginated core ACP listing, and all existing hydration,
+storage, updater, and account-security regressions. The subsequent integrated
+authenticated ACP registry gate passed **370 tests / 18 suites, exit 0**,
+including real extension/core remote metadata merging and account, deployment,
+privacy, repository, workspace, pagination, and hostile-input isolation.
+An earlier expanded Linux
+gate passed **421 tests / 23 suites, exit 0**. It
+exercised newly active native SQLite journals, persistent-memory Rust
+interoperability, FTS5 session-search Rust interoperability, genuine Codex
+foreign SQLite databases, live remote session listing/search, authenticated
+session writeback/deletion, AWS web-identity federation, S3/Google uploads,
+owner-private Unix CPU profiling, secure leader IPC, and update relaunch.
+A newer Linux hydration/configuration/storage integration gate independently
+passed **273 tests / 14 suites**, including all **46 authenticated backend
+restore and security regressions**.
+The corresponding macOS native profiler, canonical writeback, and SQLite
+interoperability regressions passed **105 tests / 7 suites**, exit 0. An
+earlier Linux cloud/relay/embedded-runtime matrix independently passed
+**180 tests / 8 suites**, including 64 completed or abandoned embedded-
+JavaScript teardowns.
+
+- **LIVE — authenticated first-party remote session registry discovery.**
+  Production `sessions list`, `sessions search`, ACP `x.ai/session/list`, and
+  core ACP `session/list` now query the distinct
+  Rust-compatible `/v1/sessions/search` chat-proxy endpoint, apply deployment
+  versus refreshable first-party account precedence, preserve the user marker,
+  bound overfetch/responses, reject redirects and unsafe authorities, and
+  revalidate the durable account identity across token rotation. Remote rows
+  merge with canonical local sessions using repository-host-aware workspace
+  matching, deterministic identity/de-duplication, and real full-text session
+  search. Metadata-only discovery remains available to zero-data-retention
+  accounts without exporting conversation content. ACP discovery additionally
+  requires the same real owner-private first-party OIDC/external account even
+  when deployment credentials authorize the registry request, and pins that
+  account before/after the response. The immutable launch workspace and trusted
+  configuration alone select credential authority; untrusted request workspaces
+  never do. ACP preserves source identity, first-prompt and hostname metadata,
+  host-sensitive Git repository scope, stable merged pagination/facets, and
+  upstream's double bounded overfetch. Deployment credentials remain confined
+  to metadata discovery and never become backend transcript authority
+  (`Sources/OpenGrokCLI/LiveSessionRegistryClient.swift:94-213`;
+  `Sources/OpenGrokCLI/LiveRemoteSessionMerge.swift:25`;
+  `Sources/OpenGrokCLI/LiveSessionsComposition.swift:424-469,749`;
+  `Sources/OpenGrokCLI/LivePersistentSessionRemoteRegistry.swift:12-142`;
+  `Sources/OpenGrokCLI/LivePersistentSessionACPHandlers.swift:93-228`;
+  `Sources/OpenGrokCLI/LiveACPExtensionMethods.swift:151-174`;
+  Rust `xai-grok-shell/src/agent/session_registry_client.rs:300-302`).
+
+- **LIVE — authenticated backend transcript pull-on-local-miss.** Real
+  explicit `--resume <uuid>` and hidden `--load <uuid>` launches now issue the
+  genuine authenticated first-party `GET /sessions/{id}/data` only when
+  upstream's registry feature is enabled. Reviewed precedence is explicit
+  `GROK_SESSION_REGISTRY` > trusted owner-global `[cli].session_registry` >
+  authenticated allowlisted `session_registry_enabled` > false; untrusted
+  project configuration, writeback mode alone, ambiguous selectors, continue,
+  fork, remote restore-code/worktrees, and deployment keys never grant
+  transcript authority. Existing canonical/legacy sessions always win and
+  corrupt local state never falls back. Responses enforce exact outer/inner
+  session identities, canonical same-workspace ownership, first-party
+  refreshable OIDC/external non-ZDR authentication, bounded ACP rows,
+  Rust-compatible update methods, provider/export boundaries, Code Mode secret
+  filtering, and a second exact account/bearer identity check after download.
+  Valid user, assistant, tool, and compaction histories publish through
+  owner-private canonical `summary.json`/JSONL state; metadata honors both
+  snake/camel spellings, explicit empty titles, manual titles, model/parent
+  provenance, timestamps, and stable cache affinity. Remote 404/null/cwd
+  misses remain genuine local misses
+  (`Sources/OpenGrokCLI/LiveRemoteSessionHydration.swift:26-169`;
+  `Sources/OpenGrokCLI/LiveComposition.swift:3655-3665`;
+  `Sources/OpenGrokConfig/RemoteSettingsAllowlist.swift:86-92`;
+  Rust `xai-grok-shell/src/util/config/mcp.rs:1870-1887,1909-1917`;
+  `xai-grok-shell/src/agent/mvp_agent/session_setup.rs:835-849`;
+  `xai-grok-shell/src/session/persistence.rs:3389-3398,3499-3525`;
+  `xai-grok-shell/src/remote/pull.rs:14-52,86-181,197-251`).
+
+- **LIVE — Linux/Windows native SQLite production graph.** Linux now imports
+  and links its system `sqlite3`; Windows imports the SDK's native
+  `winsqlite3`; Darwin preserves its existing SDK module. The same production
+  SQLite journals, persistent memory, Rust-compatible BLAKE3/FTS5 search, and
+  private foreign-session databases are therefore reachable across all three
+  platforms instead of silently compiling out on Linux/Windows. Linux CI
+  installs the SQLite development headers. Foreign-session SQL uses portable
+  `length(CAST(value AS BLOB))` to preserve exact bounded UTF-8 byte semantics
+  on older supported system SQLite versions without dropping descriptor,
+  no-follow, identity, ownership, or bounded-query protections. Windows mapped
+  network drives now use the pinned Rust bounded Win32 volume/drive probe and
+  select safe rollback journals instead of unsafe shared-memory WAL. Platform
+  system SQLite versions can differ from Rust's bundled SQLite 3.50.2; optional
+  native `sqlite-vec` acceleration remains unavailable
+  (`Package.swift:118-140`; `Sources/SQLite3/include/OpenGrokSQLite.h:4-8`;
+  `Sources/OpenGrokCLI/CodexSessionDatabaseScanner.swift:409-423`;
+  `Sources/OpenGrokSQLiteJournal/NetworkFS.swift:155-225`;
+  Rust `xai-grok-foreign-sessions/src/codex/db.rs:244-270`;
+  `xai-sqlite-journal/src/lib.rs:473-511`).
+
+- **LIVE — durable first-party session writeback.** Explicit
+  `--storage-mode writeback` or `GROK_STORAGE_MODE=writeback` now creates a
+  real, bounded synchronizer after the canonical local session is durable.
+  Rust-compatible ACP notification POSTs precede best-effort session-row
+  PUTs; the 512-entry emergency threshold drops exactly the oldest 64 entries
+  only after a failed flush. Full-history Code Mode transport provenance is
+  filtered before any credential-bearing request, while same-name ordinary
+  plugin tools remain visible. Every request revalidates a refreshable
+  first-party OIDC/external account, immutable user/principal/team identity,
+  the current on-disk token, a non-ZDR account, the explicit durable marker,
+  and the same monotonic provider-export boundary. Redirects and foreign
+  backends fail closed; local mode remains the default, and non-ZDR coding-data
+  opt-out does not disable upstream writeback. The real asynchronous
+  `sessions delete` command now performs authenticated remote erasure before
+  touching local summary/history/update/state/rewind/search documents;
+  backend errors, unsafe origins, redirects, logout, and account changes
+  preserve every local artifact, while remote 404s remain idempotent.
+  The attempt follows upstream's valid non-ZDR first-party account gate
+  independently of current storage mode, and unauthenticated/foreign/ZDR
+  sessions retain local-only deletion. The real ACP `x.ai/session/delete`
+  extension also performs remote-first deletion, but only for a writeback-mode
+  agent with owner-private refreshable first-party non-ZDR authentication;
+  malformed/chat/resident requests never reach the backend, remote-only/404
+  cases remain idempotent, account changes preserve every local artifact, and
+  same-owner bearer refresh remains safe because DELETE exports no transcript
+  (`Sources/OpenGrokCLI/LiveSessionWritebackClient.swift`;
+  `Sources/OpenGrokCLI/LiveSessionWritebackSync.swift`;
+  `Sources/OpenGrokCLI/LiveSessionsComposition.swift`;
+  `Sources/OpenGrokCLI/LiveACPSessionRemoteAdministration.swift`;
+  `Sources/OpenGrokCLI/LiveSessionAdminACPHandlers.swift:313-351`; Rust
+  `xai-grok-pager/src/sessions_cmd.rs:174-193`;
+  `xai-grok-shell/src/extensions/session_admin.rs:434-483`;
+  `xai-grok-shell/src/session/persistence.rs:3666-3709`;
+  `xai-grok-shell/src/remote/client.rs:240-260,438-543`;
+  `xai-grok-shell/src/remote/sync.rs:25-31,108-227`;
+  `xai-grok-shell/src/session/export.rs:29-139`;
+  `xai-grok-shell/src/agent/init.rs:95-119`).
+
+- **LIVE — durable paginated core ACP session listing.** The real core
+  `session/list` route now preserves upstream's ordered
+  `additionalDirectories`, opaque request `cursor`, response `nextCursor`,
+  and both row/response `_meta`; it dispatches through the same live durable
+  `x.ai/session/list` extension instead of returning only resident in-memory
+  sessions. The runtime enforces the upstream build-only facet and exact
+  workspace scope, preserves explicit empty titles, excludes paths that are
+  not absolute for the current platform, and falls back only for the exact
+  missing-extension error. Malformed pages and backend failures never become
+  silent empty successes. When the trusted registry feature is enabled, both
+  routes merge authenticated first-party remote metadata into the same durable
+  list; first-party owner identity, immutable launch workspace/configuration,
+  host-sensitive repository matching, ZDR metadata boundaries, bounded double
+  overfetch, and cursor/facet pagination remain enforced. Core `session/load`
+  and `session/resume` still cannot hydrate nonresident durable/remote sessions,
+  and the leader carrier does not yet install its full ACP component bundle
+  (`Sources/OpenGrokACP/AcpAgentSchema.swift:1629-1748`;
+  `Sources/OpenGrokACPRuntime/ACPRuntimeActor.swift:836-951`; Rust
+  `xai-grok-shell/src/agent/handlers/session.rs:292-313,344-366,373-426`;
+  pinned `agent-client-protocol-schema-0.11.4/src/agent.rs:1697-1795`).
+
+- **LIVE — persistent authenticated agent relay and secure restore-code.**
+  `agent` / `agent headless` now run the actual authenticated first-party ACP
+  WebSocket relay, including streamed initialize/session/prompt handling and
+  transactional `agent --reauth`. Failed reauthentication deliberately
+  preserves existing credentials instead of copying upstream's destructive
+  pre-login clear. `--restore-code` restores the exact persisted Git parent
+  commit with clean/dirty tracked and untracked files preserved in a private
+  managed worktree; an unavailable local object fails closed rather than
+  implementing upstream's authenticated remote fetch
+  (`Sources/OpenGrokCLI/LiveAgentRelayComposition.swift`;
+  `Sources/OpenGrokCLI/LiveRestoreCodeLaunch.swift`; Rust
+  `xai-grok-pager-bin/src/main.rs:1279-1289,1362-1369`;
+  `xai-grok-shell/src/agent/app.rs:434-450,538-573`;
+  `xai-grok-shell/src/auth/flow.rs:534-539`;
+  `xai-grok-shell/src/agent/mvp_agent/session_setup.rs:1156-1221`).
+
+- **LIVE — Linux enterprise HTTPS and private Google workload federation.**
+  Native Linux HTTPS, incremental SSE, web fetch, managed setup, and cloud
+  uploads retain system trust and add request-scoped enterprise anchors with
+  strict hostname/peer validation, bounded cancellation, credential isolation,
+  and no redirect bypass. Private Google `external_account` JWT subject files
+  now exchange through the exact pinned Security Token Service endpoint and
+  Rust-compatible six-field workload-identity form before Storage upload.
+  Optional service-account impersonation performs the complete pinned
+  STS -> Google IAM `generateAccessToken` -> Storage sequence with exact
+  scopes, bounded lifetimes, nonexpired RFC3339 tokens, isolated per-hop
+  bearer credentials, and strict account/authority rechecks. Files are
+  owner-private/no-follow and bounded, unsafe audience/authority changes fail
+  closed, and token rotation is rechecked before each outbound step. Google
+  metadata, AWS/URL subject providers, and non-JWT federation remain
+  unsupported. Executable subject
+  providers are explicitly unimplemented in pinned Rust, while workforce
+  project fields and impersonation delegates are parsed but unused; these are
+  therefore not missing working upstream features.
+  S3 additionally honors the pinned AWS SDK's `SECRET_ACCESS_KEY` fallback,
+  including blank-primary precedence, and supports both environment-owned and
+  owner-private merged AWS config/credentials-profile web identity. A selected
+  default/named profile with `role_arn` and `web_identity_token_file`, or
+  ambient `AWS_WEB_IDENTITY_TOKEN_FILE` plus `AWS_ROLE_ARN`, produces an
+  unsigned, bounded regional `AssumeRoleWithWebIdentity` exchange followed by
+  temporary SigV4 single-part or multipart S3 requests; managed and static
+  credentials retain precedence, profile providers never inherit ambient role
+  authority, an implicit missing default profile correctly falls through,
+  config/credential/token files remain owner-private/no-follow/bounded, and
+  every STS/S3 step
+  rechecks account identity, privacy, token rotation, and pinned authorities
+  without exposing signing secrets
+  (`Sources/OpenGrokHTTP/LinuxEnterpriseHTTPTransport.swift`;
+  `Sources/OpenGrokCLI/LiveGoogleCloudTraceUpload.swift`;
+  `Sources/OpenGrokCLI/LiveAWSWebIdentityCredentials.swift:40-54,119,214-260`;
+  `Sources/OpenGrokCLI/LiveCloudTraceUpload.swift`; Rust
+  `xai-grok-extra-ca/src/lib.rs:29-38,49-55,163-169`;
+  `xai-grok-http/src/lib.rs:324,368,395,587`;
+  root `Cargo.toml:168`; pinned `gcloud-auth-1.3.0`
+  `external_account_source/mod.rs:37-57,64-86,97-116` and
+  `file_credential_source.rs:17-35`;
+  `external_account_source/impersonate_token_source.rs:40-70`; pinned
+  `aws-config-1.8.8/src/default_provider/credentials.rs:183-193`;
+  `aws-config-1.8.8/src/profile/credentials/exec.rs:119-139`).
+
+- **IMPLEMENTED — real overlapped full-duplex Windows leader pipes.** Native
+  named-pipe server/client handles now use `FILE_FLAG_OVERLAPPED`, private
+  per-operation events, independent concurrent reads/writes, bounded
+  cancelable accepts, and cancellation-safe buffer/event ownership while
+  preserving owner-protected security descriptors and mutually authenticated
+  peer SIDs. The updater sends a validated best-effort disconnect after its
+  exact acknowledgement so shutdown can drain cleanly. Native Windows
+  compilation succeeded; the expanded Windows security/concurrency suite is
+  still running and this feature cannot yet be called independently verified
+  (`Sources/COpenGrokSockets/OpenGrokSockets.c:723-1168`;
+  `Sources/OpenGrokCLI/LiveUpdateLeaderRelaunch.swift:273-292`; Rust
+  `xai-grok-shell/src/local_ipc.rs:103-171,191-263`).
+
+- **DIVERGED — safe embedded runtime teardown and Windows enterprise TLS.**
+  Linux/Windows QuickJS executes a bounded asynchronous global wrapper rather
+  than an asynchronous ES module because upstream QuickJS module teardown can
+  free still-live module values and abort the process. Top-level `await`,
+  import denial, isolated host bindings, nested tools, and interruption stay
+  live; module-only lexical/import-meta behavior is intentionally unavailable.
+  Rust's WebSocket paths do not apply enterprise roots, so Windows WebSockets
+  correctly retain strict native system verification without consulting HTTP
+  roots. General Windows HTTPS still fails closed on private enterprise roots:
+  WinHTTP/Schannel cannot safely install additive request-local roots while
+  preserving the native verifier, and complete parity requires an independent
+  TLS backend (`Sources/OpenGrokJavaScriptRuntime/QuickJSCellRuntime.swift`;
+  Rust `xai-grok-shell/src/remote/relay.rs:431-435`;
+  `xai-grok-pager/src/stt/streaming.rs:63-66`).
+
+- **LIVE / DIVERGED — genuine owner-private Unix CPU profiling.** macOS/Linux
+  production leaders advertise profiling only when the real native backend is
+  available and expose exact upstream `cpu_profile_started`,
+  `cpu_profile_status`, and `cpu_profile_stopped` control payloads. A
+  process-wide `SIGPROF`/`ITIMER_PROF` sampler records real program counters
+  and bounded frame-pointer stacks; every prospective frame is copied through
+  a pre-opened nonblocking validation pipe, so unmapped memory cannot crash
+  the signal handler. Finalization resolves genuine symbols outside signal
+  context and writes bounded, sorted folded stacks. Only canonical
+  current-owner `0700` state/profile directories and exclusively reserved,
+  pinned, no-follow `0600` artifacts are accepted; traversal, symlinks,
+  collisions, changed ancestry, and post-start hard links fail closed.
+  Existing profilers, active timers, invalid 1–4,000 Hz frequencies,
+  concurrent starts/stops, empty captures, and shutdown are explicitly
+  controlled. Unix leader sockets now force owner-private parent/socket
+  permissions, while Windows leader pipes use current-user-only ACLs and
+  verify the peer SID on both ends. Windows truthfully leaves profiling
+  unavailable. Deliberate divergences: optimized code without preserved
+  frame pointers can produce shorter genuine stacks than Rust's DWARF
+  unwinder; explicit output names are confined to the private profile root
+  instead of accepting arbitrary remote-controlled paths; legacy Swift
+  control errors retain their documented integer encoding
+  (`Sources/OpenGrokCrashHandlerC/opengrok_cpu_profile_posix.c`;
+  `Sources/OpenGrokACPRuntime/ACPLeaderCPUProfiler.swift`;
+  `Sources/OpenGrokACPRuntime/ACPLeaderSocket.swift`; Rust
+  `xai-grok-shell-base/src/cpu_profile.rs:14-18,233-335,382-398,401-516,559-685`;
+  `xai-grok-shell/src/leader/protocol.rs:174-182,193-204,245-264`;
+  `xai-grok-shell/src/leader/server.rs:950-1003,1243-1288,1302-1377`).
+
+- **ABSENT UPSTREAM / LIVE — two distinct remote restoration paths.**
+  The pinned Rust release explicitly aliases its session restoration module to
+  `restore_stub.rs`; both registry/GCS archive restoration entry points always
+  fail with `"Remote session restore is not available in this build"`, and
+  their download/application helpers fail or skip. Consequently, missing
+  registry/GCS archive restoration is **not** a Swift parity gap. Separately,
+  Rust really does enable authenticated backend transcript pull-on-local-miss
+  when its session-registry feature is enabled. It issues
+  `GET /sessions/{id}/data`, hydrates owner-private canonical updates/summary,
+  and reconstructs local chat independently of the selected storage mode. The
+  Swift now wires that exact authenticated GET into real UUID-scoped resume
+  and load launches, while continuing to refuse unsafe remote archive/code
+  restoration (`Sources/OpenGrokCLI/LiveRemoteSessionHydration.swift`;
+  `Sources/OpenGrokCLI/LiveSessionWritebackClient.swift`; Rust
+  `xai-grok-shell/src/session/mod.rs:379-380`;
+  `xai-grok-shell/src/session/restore_stub.rs:8,155-171,182-203,222-227`;
+  `xai-grok-shell/src/agent/mvp_agent/session_setup.rs:835-849`;
+  `xai-grok-shell/src/session/persistence.rs:3389-3398,3499-3525`;
+  `xai-grok-shell/src/remote/pull.rs:14-52,71-100,197-250`).
 
 ### Verified local macOS gates and real executable evidence
 
@@ -32,6 +340,206 @@ implemented-but-unwired APIs were not treated as proof of live parity.
 | Actual MCP management lifecycle | Real executable `mcp add`, JSON list inspection, `mcp disable`, `mcp enable`, `mcp remove`, and final empty JSON list all exited 0. |
 | Actual plugin management and hostile fixture | Real executable `plugin install --trust`, `plugin details`, `plugin disable`, `plugin enable`, `plugin uninstall`, and final empty list all exited 0. A hostile source file symlink and directory symlink were absent from the installed copy. |
 | `env GROK_XAI_API_BASE_URL=http://127.0.0.1:9/v1 zsh workflows/verify-transcript-pager.zsh` | Exit 0: **`PROOF-OK: /transcript suspended into $PAGER and the child saw the transcript`**, 96 transcript bytes. The PTY driver now explicitly answers the real folder-trust prompt; production trust enforcement remains intact. |
+
+### Native cross-platform and launch-control closure
+
+The additional Rust-first pass exercised actual aarch64 Linux and Windows
+executables instead of inferring platform behavior from Darwin conditional
+compilation. An earlier native Linux matrix passed **158 tests / 17 suites**,
+exit 0, covering verified secure WebSockets and additive private trust roots,
+descriptor-pinned Linux sandbox mount verification, privacy-preserving S3
+uploads, OAuth/browser recovery, external authentication, ACP ordering,
+session-scoped voice authorization, folder consent, secure sampling
+diagnostics, genuine gzip subagent bundles, and portable Windows terminal
+protocol cases. The newer auth/storage/cloud/runtime matrix independently
+passed **180 tests / 8 suites**, exit 0. Expanded Linux SQLite,
+registry, AWS, cloud, writeback, profiler, and updater matrices passed
+**421 tests / 23 suites**, **273 tests / 14 suites**,
+**498 tests / 24 suites**, and **370 tests / 18 suites**, each exit 0.
+A subsequent Linux profiler,
+owner-private leader IPC, remote-first deletion, and live workspace gate
+passed **102 tests / 14 suites**, exit 0. Native Windows ARM64 independently
+passed **152 tests / 5 suites**, exit 0, against authenticated storage/cloud
+paths; **47 tests / 3 suites** against remote deletion and portable profiler
+lifecycle; **5 tests / 1 suite** against mutually owner-authenticated pipes
+and bounded listener shutdown; and **11 tests / 1 suite** against bounded
+microphone discovery, worker-thread confinement, and actual native 16-kHz
+capture. An earlier Windows matrix passed
+**50 tests / 6 suites**, exit 0, against real
+gzip extraction, console input, ConPTY children, and wrapped processes; its actual `.82`
+executable exposed **18 models**, default `grok-4.6`, honored an isolated
+Windows state directory, and ran `wrap` successfully.
+
+1. **Launch controls reach their actual owners.** Compaction mode/detail,
+   explicit hunk-tracker selection, bounded headless background-task waits,
+   trusted installer configuration, forced interactive authentication,
+   first-party auxiliary endpoint overrides, root-bound client identity,
+   permission-correct ACP capability advertisement, owner-private bounded
+   sampling logs, first-party `agent --reauth`, real
+   `--storage-mode writeback`, and safe local `--restore-code` now reach
+   production session, provider, tool, and persistence paths. Standalone
+   reverse-terminal/filesystem controls remain refused because the pinned Rust
+   client advertises them but implements none of its reverse handlers; its
+   leader explicitly forces those capabilities false. Untrusted plugin
+   directories and authentication without a genuine interactive presenter
+   still refuse explicitly rather than claiming capabilities they lack
+   (Rust `xai-grok-pager/src/app/cli.rs:530`, `:718`, `:722`, `:743`, and
+   `:763`; `Sources/OpenGrokCLI/LiveComposition.swift:3235`).
+
+2. **Direct S3 and Google Cloud uploads preserve their real export boundaries.**
+   Explicit AWS environment credentials, owner-private default/named shared
+   credential profiles, temporary session tokens, and secure environment- or
+   private-profile-owned AWS web-identity federation produce AWS Signature
+   Version 4 requests. Archives at the upstream **8 MiB** threshold use signed
+   initiate/ordered-part/complete requests and bounded fail-closed abort;
+   every request independently rechecks the durable account, provider, and
+   privacy authorization. Direct `gs://` uploads accept private Google ADC
+   authorized-user refresh credentials, RSA service accounts, and owner-private
+   file-backed JWT workload identity federation with optional pinned Google
+   service-account impersonation, including native
+   Security/OpenSSL/CNG-backed RS256 signing on Darwin, Linux, and Windows.
+   Google token/STS and Storage authorities are pinned, redirects and
+   cross-provider credentials are refused, responses are bounded and checked,
+   and OAuth/STS/IAM plus upload each reauthorize the actual session boundary.
+   AWS metadata/role/SSO providers beyond file-backed web identity and Google
+   metadata/non-file federation remain unsupported and fail closed; those are not
+   equivalent to the now-live private file credential paths
+   (`Sources/OpenGrokCLI/LiveCloudTraceUpload.swift`;
+   `Sources/OpenGrokCLI/LiveS3MultipartUpload.swift`;
+   `Sources/OpenGrokCLI/LiveGoogleCloudTraceUpload.swift`; Rust
+   `xai-file-utils/src/s3.rs:34-37,226-322,336-340`;
+   `xai-file-utils/src/gcs.rs:101-135,488-510,549-575`).
+
+3. **Windows interactive terminals use actual console and ConPTY backends.**
+   Console mode, native UTF-16 keyboard/mouse/focus/resize records, resize
+   forwarding, suspended process creation, Job Object kill-on-close, real
+   pseudoconsole output, bounded draining, and pseudoconsole ownership release
+   have native ARM64 coverage. The process is assigned to its Job Object
+   before resume, and redirected parent handles cannot bypass the assigned
+   pseudoconsole (`Sources/OpenGrokPTY/OpenGrokPTY.swift:1589` and `:1627`):
+
+   ```swift
+   si.StartupInfo.dwFlags = DWORD(STARTF_USESTDHANDLES)
+   ```
+
+   ```swift
+   guard AssignProcessToJobObject(job, processInformation.hProcess) else {
+       throw PTYError.spawnFailed("AssignProcessToJobObject failed: \(GetLastError())")
+   }
+   ```
+
+4. **Linux hook isolation verifies the opened object, not a replaceable
+   pathname.** The native Linux implementation pins each prospective file or
+   directory with `O_NOFOLLOW`, rejects changed device/inode/type/hard-link
+   identity, and derives mount writability from `fstatvfs` on the same live
+   descriptor. Writable or unverifiable hook-bearing mounts remain denied
+   (`Sources/OpenGrokSandbox/HookWriteDeny.swift:622` and `:641`):
+
+   ```swift
+   let flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+       | (identity.isDirectory ? O_DIRECTORY : 0)
+   ```
+
+   ```swift
+   guard fstatvfs(descriptor, &information) == 0 else {
+       throw hookIOError(identity.path)
+   }
+   ```
+
+5. **Subagent bundles now really decode gzip across supported platforms.**
+   Rust's bounded `flate2::read::GzDecoder` / tar contract now maps to native
+   zlib on Linux and Darwin plus the existing dynamically resolved Windows
+   zlib bridge. Genuine stored and dynamically compressed DEFLATE streams,
+   maximum output, trailing/truncated input, gzip CRC32, and declared output
+   size all have production-path coverage; test fixtures no longer substitute
+   uncompressed tar on non-Apple platforms
+   (`Sources/OpenGrokCLI/SubagentBundleArchive.swift:58`; Rust
+   `xai-grok-bundle/src/lib.rs:20`, `:161`, and `:195`).
+
+6. **Portable secure WebSocket connections use verified native transports.**
+   Linux uses a dedicated libcurl/OpenSSL adapter that retains the system
+   anchors, adds configured private enterprise roots only to the connection,
+   validates hostnames and certificates, rejects redirects, and keeps file
+   descriptors close-on-exec. Windows uses WinHTTP system trust and applies
+   bounded keepalive/close settings on the upgraded handle. Pinned Rust
+   WebSocket paths do not consume enterprise HTTP roots, so Windows correctly
+   ignores those roots while preserving strict native certificate validation;
+   unsupported Windows HTTP-root augmentation still fails closed. The landed
+   Linux security
+   settings are explicit (`Sources/COpenGrokSockets/OpenGrokTLS.c:112-124`):
+
+   ```c
+   curl_easy_setopt(connection->easy, CURLOPT_SSL_VERIFYPEER, 1L)
+   curl_easy_setopt(connection->easy, CURLOPT_SSL_VERIFYHOST, 2L)
+   curl_easy_setopt(connection->easy, CURLOPT_FOLLOWLOCATION, 0L)
+   ```
+
+   Both server and client now use the actual RFC 6455 handshake GUID and the
+   independently published `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=` acceptance vector;
+   previous self-consistent Swift fixtures concealed a typo that made real
+   WinHTTP/Rust peers reject every upgrade. Native WinHTTP honors the
+   upstream 15-second keepalive interval but does
+   not expose an immediate manually emitted ping; that observable API
+   limitation is an intentional recorded divergence, not disabled TLS.
+
+7. **Windows private authority is native rather than POSIX-shaped.**
+   Codex/Claude session scanners, bounded diagnostic logs, private cloud
+   credential fixtures, and folder-trust state use owner-private protected
+   DACLs, reject reparse points/hard-link replacement, and derive directory
+   ancestry from native drive/UNC components rather than Foundation's
+   synthetic `/` parent. Folder trust only accepts input sequenced after the
+   displayed question; startup typeahead, unrelated keys, EOF, gated
+   identities, and untrusted repository configuration cannot grant consent.
+
+8. **Native Windows voice capture owns its actual WASAPI microphone.**
+   A dedicated COM MTA worker opens the Rust/cpal-equivalent default
+   `eCapture`/`eConsole` input endpoint, negotiates 16-bit mono PCM through
+   native support or Windows' channel/sample-rate converter, and publishes
+   event-driven chunks through a bounded 64-item drop-oldest stream. Device
+   startup and stop have strict five-/two-second ceilings, silent packets are
+   zero-filled, permission/device/service failures remain explicit, and COM
+   objects are always released on their owning thread. Production only claims
+   microphone capability when a real default device can be probed; the
+   Windows-only suite includes a real one-second hardware capture rather than
+   substituting a generated recording
+   (`Sources/COpenGrokWASAPI/OpenGrokWASAPI.c`;
+   `Sources/OpenGrokVoice/WindowsVoiceCapture.swift`; Rust
+   `xai-grok-pager/src/audio/capture.rs:72-139,240-264,385-426`).
+
+9. **Non-Apple Code Mode now has a self-contained embedded engine.**
+   Linux and Windows conditionally embed MIT-licensed QuickJS-NG rather than
+   depending on JavaScriptCore, an installed Node binary, or a host shell.
+   Each cell owns an isolated 128 MiB runtime with a bounded native stack,
+   immediate atomic interruption, isolated asynchronous top-level-await
+   evaluation,
+   explicit host-only globals, nested asynchronous tools and bounded progress,
+   timer callbacks, media/text output budgets, durable session-local values,
+   and fail-closed static/dynamic import denial. macOS continues using its
+   existing JavaScriptCore adapter. The change activates 72 previously
+   platform-hidden runtime/Code Mode regressions and adds dedicated hostile
+   ambient-global, dynamic-import, resource-bound, and interrupt coverage.
+   Native Linux has additionally passed 64 repeated completed/abandoned
+   runtime teardowns; asynchronous global evaluation deliberately avoids a
+   QuickJS asynchronous-module teardown allocator abort, at the cost of
+   module-only lexical/import-meta semantics. Exact-head Windows runtime
+   coverage remains required before claiming complete verified parity
+   (`Sources/COpenGrokQuickJS/`;
+   `Sources/OpenGrokJavaScriptRuntime/QuickJSCellRuntime.swift`;
+   `Sources/OpenGrokJavaScriptRuntime/QuickJSHostBindings.swift`; Rust
+   `xai-grok-code-mode/src/runtime/mod.rs` and `runtime/globals.rs`).
+
+10. **Update-driven leaders expose a real bounded relaunch control.**
+    The leader now advertises only its genuinely implemented relaunch
+    capability, emits upstream-exact `relaunching`/`relaunch_declined`
+    payloads, refuses malformed/non-newer semantic versions, deduplicates
+    concurrent requests, delivers the acceptance ACK before closing admission,
+    bounds active-work/exposure draining to Rust's advertised 10-second total,
+    broadcasts `auto_update`, and stops its real listener/relay. Manual stop
+    retains its previous reason. macOS/Linux advertise only their genuinely
+    injected native profiler; Windows leaves the unsupported profiler dark
+    (`Sources/OpenGrokACPRuntime/ACPLeaderControlPlane.swift`;
+    `Sources/OpenGrokACPRuntime/ACPLeaderIPC.swift`; Rust
+    `xai-grok-shell/src/leader/server.rs:1376-1464,1758-1822`).
 
 ### Landed production behavior
 
@@ -103,9 +611,11 @@ implemented-but-unwired APIs were not treated as proof of live parity.
    `workflows/verify-transcript-pager.zsh:60`).
 
 6. **Trace upload preserves explicit authorization and privacy.** The real
-   authenticated proxy path refuses uploads without explicit enablement,
-   enforces managed account/team and data-collection policy, and rejects
-   direct `gs://`/`s3://` destinations until scoped cloud credentials exist
+   authenticated proxy, Signature Version 4 signed single-part/multipart
+   `s3://` uploads, and native authenticated `gs://` paths refuse uploads
+   without explicit enablement, enforce managed account/team and
+   data-collection policy, and fail closed for unsupported dynamic cloud
+   credential providers
    (`Sources/OpenGrokCLI/LiveTraceUpload.swift:84`; Rust
    `xai-grok-shell/src/agent/config.rs:529`):
 
@@ -117,19 +627,158 @@ implemented-but-unwired APIs were not treated as proof of live parity.
 
 ### Honest remaining parity boundary
 
-**Complete Rust parity is not established.** Still absent are complete account
-privacy enrichment; planner/evaluator/strategist/skeptic orchestration and
-TodoGate; ACP queue synchronization, adaptive provider quotas, interactive
-subagent questions, and image interjections; an operational authenticated
-tools-callback server; PDF/PPTX extraction, recursive listing, and semantic
-LSP tools; multiple upstream slash commands, follow-up chips, model chooser
-and approval persistence; and additional Mermaid families/SVG actions.
-Linux enterprise certificate roots deliberately fail closed rather than widen
-process-global trust, and direct cloud-bucket trace upload deliberately remains
-unavailable. Native Linux execution, full current Windows runtime, Linux
-aarch64 updating, remote CI, signed distribution, and release certification
-were not verified. `PARITY_ROADMAP.md` records exact Rust citations and the
-LIVE / ABSENT / DIVERGED / UNVERIFIED classifications.
+The second Rust-first pass closed the previously enumerated macOS runtime gaps
+through production paths, not only standalone composition types:
+
+1. **Provider account and actor-backed inference are live.** Browser/device
+   login now enriches the authenticated xAI account via the trusted proxy's
+   `/v1/user`; production inference uses the actual sampler actor, bounded
+   retry/idle/cancellation policy, first-output replay protection, image
+   stripping, Codex turn affinity, real attempt metrics, and suffix-only 401
+   attribution. Adaptive subagent retries remain provider-local and never
+   replay after output or a tool side effect
+   (`Sources/OpenGrokAuth/UserProfileEnrichment.swift:48`;
+   `Sources/OpenGrokCLI/LiveSamplingRuntimeParity.swift:19`; Rust
+   `xai-grok-sampler/src/retry.rs:783`).
+
+2. **Goal completion now requires independent evidence.** The executable wires
+   planner, implementer, evaluator, strategist, and adversarial skeptic roles;
+   completion is denied when the independently sampled verifier is absent,
+   invalid, unconvinced, cancelled, or outside the configured budget. The real
+   content-only turn path injects bounded continuation reminders, and
+   `--todo-gate` plus authenticated reviewed remote policy now activate the
+   actual pending-work gate
+   (`Sources/OpenGrokCLI/LiveGoalComposition.swift:173` and `:299`; Rust
+   `xai-grok-shell/src/session/goal_classifier.rs:3`;
+   `xai-grok-pager/src/app/cli.rs:738`).
+
+3. **ACP and child interaction preserve their real security boundaries.**
+   Authenticated ACP queues implement edit/remove/clear/reorder/send-now,
+   ownership, bounded pending requests, hold/release state, and actual
+   combine-on-promote with owner, session, edit-hold, image, and 128 KiB
+   boundaries. Running,
+   stranded, queued, and genuine initial ACP prompts can carry bounded image
+   blocks through the exact provider-owned conversation. Actual subagents
+   inherit interactive questions only from the authenticated root's genuinely
+   advertised presenter and the same immutable root authorization scope
+   (`Sources/OpenGrokACPRuntime/ACPRuntimeActor.swift:956` and `:975`).
+
+4. **Additional working directories are live and revoke immediately.** The
+   actual `/add-dir` and `/remove-dir` commands restore Rust-compatible
+   owner-private `working_dirs.json`, enforce canonical roots and the real OS
+   sandbox, disclose changes to the model, propagate only to authenticated
+   descendants, and remove authority on explicit revocation, folder-trust
+   downgrade, reset, and teardown. Missing or foreign session identity cannot
+   authorize a file request
+   (`Sources/OpenGrokSessionPersistence/SessionWorkingDirectories.swift:32`;
+   `Sources/OpenGrokWorkspace/PermissionManager.swift:909`; Rust
+   `xai-grok-shell/src/session/acp_session_impl/working_dirs.rs:93`):
+
+   ```swift
+   guard let sessionID,
+         !sessionID.isEmpty,
+         let roots = sessionWorkingDirectoryRoots[sessionID],
+         !roots.isEmpty
+   ```
+
+5. **Rust file and language tools now reach their production surfaces.**
+   `read_file` securely extracts PDF/PPTX, page ranges, image-rendered PDF
+   pages, and bounded no-network XML/ZIP/DEFLATE; the same PPTX inflater also
+   has a Windows-compatible bridge. `list_dir` performs Rust-compatible
+   recursive, ignore-aware bounded walks. The live top-level `lsp` tool runs
+   six genuine semantic operations through configured stdio servers while
+   enforcing workspace containment, UTF-16 positions, cancellation, and
+   immediate trust revocation. Canonical `run_terminal_command` and its legacy
+   alias share exactly the same deny/capability gates; neither spelling can
+   bypass a read-only profile. Foreign Codex `.jsonl.zst` imports use bounded
+   trusted-library streaming rather than executing an external decoder
+   (`Sources/OpenGrokFileTools/DocumentExtraction.swift:36`;
+   `Sources/OpenGrokCLI/CodexZstdSessionReader.swift:27`; Rust
+   `xai-grok-tools/src/implementations/grok_build/list_dir/mod.rs:283`).
+
+6. **Missing interactive commands and model settings are executable-backed.**
+   `/auto`, `/yolo-2`, `/share`, `/edit-prompt`, `/add-dir`, `/remove-dir`, and
+   `/import-claude` all have actual implementations and hide when their
+   authority/backing is absent. Claude migration is selected-only, owner-safe,
+   transactional, and disables the previous implicit Claude permission fallback
+   without weakening separately managed administrator denials. Custom models
+   now persist as canonical `[model.<key>]` tables in owner-private
+   `config.toml`, migrate legacy JSON safely, and expose real provider/OpenCode
+   choosers. Remembered approvals default off, restore Rust-compatible,
+   owner-private project-durable `permission.toml` or client-scoped
+   `permission_<client>.toml`, remain root-session-scoped, reject symlinks,
+   hard links, foreign owners, and non-`0600` files, honor deny precedence,
+   and consume one-shot grants exactly once
+   (`Sources/OpenGrokCLI/LiveClaudeSettingsImport.swift:134`;
+   `Sources/OpenGrokCLI/LiveSecurityPolicy.swift:428`;
+   `Sources/OpenGrokWorkspace/ProjectPermissionApprovalState.swift:280`;
+   `Sources/OpenGrokWorkspace/PermissionManager.swift:589`; Rust
+   `xai-grok-pager/src/slash/commands/mod.rs:121`;
+   `xai-grok-shell/src/util/config/settings_writes.rs:776`):
+
+   ```swift
+   guard information.st_uid == geteuid(),
+         information.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+         information.st_mode & 0o777 == 0o600,
+         information.st_nlink == 1
+   ```
+
+7. **Every pinned upstream Mermaid dispatch family and actual follow-up chips
+   render.** All 20 newly missing diagram tokens now have real semantic models,
+   geometry, and SVG output, in addition to the previously live graph/state,
+   class, ER, and sequence renderers. Server-provided suggestion chips bind to
+   the exact live session, connection, response, and painted screen geometry;
+   clicking a chip submits the genuine prompt. The dedicated upstream row
+   renders in both normal and compact layouts, suppresses itself on short
+   terminals, and never exposes stale hit targets
+   (`Sources/OpenGrokPagerRender/OpenGrokPagerRender.swift:535`; Rust
+   `third_party/mermaid-to-svg/src/lib.rs:49`;
+   `xai-grok-pager/src/views/agent.rs:190` and `:245`).
+
+**Complete cross-platform Rust parity is still not certified.** Native Linux
+and Windows ARM64 production code and focused suites exercise real Windows
+console/input, ConPTY, process-tree Job Objects, verified secure WebSockets,
+owner-private cross-platform state, signed direct single-part/multipart S3,
+private AWS shared profiles/legacy secrets/environment-and-profile web-identity
+STS, direct Google Cloud OAuth/service-account/file-federated/impersonated
+uploads, real Linux enterprise HTTPS,
+authenticated persistent agent relay, restored Git commits, and durable
+first-party writeback, authenticated remote registry discovery/search,
+remote-first CLI/ACP deletion, durable core ACP pagination, owner-secured
+leader control sockets, and genuine Unix CPU sampling. Remaining genuine gaps
+are Windows HTTPS enterprise
+root augmentation; dynamic AWS role/SSO/metadata and Google
+metadata/non-file federation credentials; remote ACP-session registry listing
+and core ACP hydration;
+authenticated remote fetch for restore-code objects missing locally;
+unsupported explicit plugin
+directories; and full exact-head cross-platform verification. Pinned Rust
+itself leaves both advertised standalone reverse terminal/filesystem handlers
+and registry/GCS session archive restoration unimplemented, so their absence
+is not an absent working upstream feature. Forced authentication without an
+interactive presenter also remains safely refused. Rust release builds
+do **not** compile `--chat` or `--local-workspace*`: those options are guarded
+by the nondefault `local-workspace` Cargo feature, so their absence cannot be
+reported as a release-parity gap (`xai-grok-pager-bin/Cargo.toml:87-99`;
+`xai-grok-pager/src/app/cli.rs:612-643`). Rust itself limits
+automatic updating to macOS/aarch64, Linux/x86_64, and Windows/x86_64, so
+rejecting Linux/aarch64 auto-updates matches upstream; both implementations
+separately support Linux/aarch64 distribution. Rust's Windows security sandbox
+is itself a no-op, whereas Swift deliberately refuses unsupported confinement.
+Complete native Linux/Windows package suites, current remote exact-head CI,
+signed distribution, and release certification were not verified.
+`PARITY_ROADMAP.md` records the remaining LIVE / ABSENT / DIVERGED /
+UNVERIFIED classifications.
+
+One apparent callback-server gap was disproved by a whole-tree audit of the
+exact pinned Rust revision: `GrokToolsCallbackService` exists only as protobuf
+declarations and wire-shape tests (`xai-grok-tools-api/proto/grok-tools.proto:178`;
+`xai-grok-tools-api/tests/wire_shape.rs:120`). There is no upstream operational
+client, server, finalize-time dial, or secret-authentication implementation.
+Swift's existing callback messages, field tags, service descriptor, secret
+redaction, and **17 focused regression tests** therefore already match the
+actual Rust behavior; inventing a network callback host would be a divergence,
+not a parity fix.
 
 ## Historical upstream `.81` foundational closure (2026-08-22)
 
