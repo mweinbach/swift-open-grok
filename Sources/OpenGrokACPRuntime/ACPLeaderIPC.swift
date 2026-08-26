@@ -593,30 +593,50 @@ public actor ACPLeaderIPCHost {
             case .disconnect:
                 return
             case .control(let requestID, let command):
+                if case .relaunchForUpdate = try? ACPLeaderControlCommand.parse(command) {
+                    // A synchronous Windows pipe serializes reads and writes
+                    // on one handle. Send this immediate decision before the
+                    // read loop can park again and block its acknowledgement.
+                    await handleControl(requestID: requestID, command: command, writer: writer)
+                    continue
+                }
+
                 // `server.rs:1763-1817` spawns control handling per request: a
                 // workspace start can await a hub connect for seconds, and
                 // answering inline would stall this client's ACP traffic and
                 // pings behind it. Detached rather than `Task {}` for the same
                 // executor-inheritance reason as `withTimeout` above.
-                Task.detached { [weak self, controlPlane, writer] in
-                    switch await controlPlane.run(command) {
-                    case .success(let payload):
-                        if case .relaunching = payload {
-                            await self?.closeRelaunchAdmission()
-                        }
-                        await writer.send(.controlResult(requestID: requestID, payload: payload))
-                        if case .relaunching = payload {
-                            await self?.armUpdateRelaunch()
-                        }
-                    case .failure(let code, let message):
-                        await writer.send(
-                            .controlError(requestID: requestID, code: code, message: message)
-                        )
-                    }
+                Task.detached { [weak self, writer] in
+                    await self?.handleControl(
+                        requestID: requestID,
+                        command: command,
+                        writer: writer
+                    )
                 }
             case .acp(let payload):
                 await forwardToAgent(payload: payload, clientID: clientID)
             }
+        }
+    }
+
+    private func handleControl(
+        requestID: String,
+        command: [String: String],
+        writer: ACPLeaderChannelWriter
+    ) async {
+        switch await controlPlane.run(command) {
+        case .success(let payload):
+            if case .relaunching = payload {
+                closeRelaunchAdmission()
+            }
+            await writer.send(.controlResult(requestID: requestID, payload: payload))
+            if case .relaunching = payload {
+                armUpdateRelaunch()
+            }
+        case .failure(let code, let message):
+            await writer.send(
+                .controlError(requestID: requestID, code: code, message: message)
+            )
         }
     }
 
