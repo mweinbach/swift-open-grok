@@ -120,10 +120,12 @@ jobs:
       - name: Product
         run: zsh workflows/swift-safe-verify.zsh build --product open-grok
       - name: Build tests
-        # The cold 106-product test graph exceeds the local 600-second ceiling
-        # on shared Linux runners even after the production build is warm.
+        # Run 32933808318 was still compiling at 1088/1122 after 1,200s,
+        # with no compiler error. Allow 1,800s for this cold CI build only.
+        # Cost: a compile hang can last ten minutes longer; reaching this
+        # ceiling still needs investigation. Local and test limits stay fixed.
         env:
-          SWIFT_SAFE_TIMEOUT_SECONDS: "1200"
+          SWIFT_SAFE_TIMEOUT_SECONDS: "1800"
         run: zsh workflows/swift-safe-verify.zsh build-tests
       # Same reasoning as the macOS gate above.
       - name: Test (serial gate)
@@ -163,8 +165,11 @@ jobs:
         run: zsh workflows/swift-safe-verify.zsh build
       - name: Build tests
         shell: msys2 {0}
+        # Run 32933808318 reached 976/1020 at the 1,200s cold-build ceiling.
+        # This adds at most ten minutes before a compile hang is reported;
+        # source-build, local, and test ceilings remain unchanged.
         env:
-          SWIFT_SAFE_TIMEOUT_SECONDS: "1200"
+          SWIFT_SAFE_TIMEOUT_SECONDS: "1800"
         run: zsh workflows/swift-safe-verify.zsh build-tests
 
   windows-diagnostic-tests:
