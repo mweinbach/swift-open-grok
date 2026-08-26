@@ -6,7 +6,9 @@
 
 import Foundation
 
-#if canImport(Darwin)
+#if os(Windows)
+import WinSDK
+#elseif canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
@@ -151,6 +153,17 @@ enum NetworkFS {
         return !rest.hasPrefix(".\\")
     }
 
+    /// Keep the Win32 probe injectable so mapped-drive classification is
+    /// exercised even on hosts without Windows or a mounted network share.
+    static func isWindowsNetworkPath(
+        _ path: String,
+        driveType: (String) -> UInt32?
+    ) -> Bool {
+        if isWindowsUNC(path) { return true }
+        // DRIVE_REMOTE has the same published value on every Win32 target.
+        return driveType(path) == 4
+    }
+
     // MARK: - Platform probes
 
     #if os(macOS)
@@ -188,11 +201,29 @@ enum NetworkFS {
 
     #if os(Windows)
     private static func classifyWindows(_ path: URL) -> Bool {
-        let p = path.path
-        if isWindowsUNC(p) { return true }
-        // Mapped drives: without Win32 GetDriveTypeW linkage in SwiftPM,
-        // treat non-UNC as local. Adapter can be strengthened later.
-        return false
+        isWindowsNetworkPath(path.path, driveType: windowsDriveType)
+    }
+
+    private static func windowsDriveType(_ path: String) -> UInt32? {
+        guard !path.isEmpty,
+              path.utf16.count <= 32_767,
+              !path.utf16.contains(0)
+        else { return nil }
+
+        // Match Rust's fixed 261-WCHAR output buffer: an unresolved or
+        // oversized volume root retains upstream's best-effort local fallback.
+        var volumeRoot = [WCHAR](repeating: 0, count: 261)
+        let resolved = volumeRoot.withUnsafeMutableBufferPointer { root in
+            path.withCString(encodedAs: UTF16.self) { candidate in
+                GetVolumePathNameW(candidate, root.baseAddress, DWORD(root.count))
+            }
+        }
+        guard resolved else { return nil }
+
+        return volumeRoot.withUnsafeBufferPointer { root in
+            guard let pointer = root.baseAddress else { return nil }
+            return UInt32(GetDriveTypeW(pointer))
+        }
     }
     #endif
 }

@@ -135,6 +135,40 @@ struct OpenGrokSQLiteJournalTests {
         #expect(!NetworkFS.isWindowsUNC("/home/x"))
     }
 
+    @Test("mapped Windows drives distinguish remote, local, unknown, and failed volume probes")
+    func windowsMappedDriveClassification() {
+        let mapped = #"Z:\shared\project\index.sqlite"#
+        var probes: [String] = []
+
+        let remote = NetworkFS.isWindowsNetworkPath(mapped) { path in
+            probes.append(path)
+            return 4
+        }
+        let local = NetworkFS.isWindowsNetworkPath(mapped) { path in
+            probes.append(path)
+            return 3
+        }
+        let unknown = NetworkFS.isWindowsNetworkPath(mapped) { path in
+            probes.append(path)
+            return 0
+        }
+        let failed = NetworkFS.isWindowsNetworkPath(mapped) { path in
+            probes.append(path)
+            return nil
+        }
+        let unc = NetworkFS.isWindowsNetworkPath(#"\\server\share\index.sqlite"#) { path in
+            probes.append(path)
+            return 3
+        }
+
+        #expect(remote)
+        #expect(!local)
+        #expect(!unknown)
+        #expect(!failed)
+        #expect(unc)
+        #expect(probes == [mapped, mapped, mapped, mapped])
+    }
+
     @Test("local temp paths are not network")
     func localTempNotNetwork() throws {
         let dir = try tempDir()
