@@ -9,6 +9,7 @@ import Testing
 
 #if os(Windows)
 import COpenGrokSockets
+import WinSDK
 #endif
 
 @Suite("Windows extended-length durable session persistence")
@@ -224,7 +225,28 @@ struct WindowsLongPathPersistenceParityTests {
         let sessionID = UUID().uuidString
         let store = SessionDocumentStore(grokHome: stateRoot)
         let session = try store.sessionDirectory(sessionID: sessionID, cwd: workspace.path)
-        try FileManager.default.createDirectory(at: session, withIntermediateDirectories: true)
+        let directories = [
+            stateRoot,
+            stateRoot.appendingPathComponent("sessions"),
+            session.deletingLastPathComponent(),
+            session,
+        ]
+        // Inherit the parent's broad DACL: an owner-private creation helper
+        // would remove the preexisting-ancestor negative control.
+        for directory in directories {
+            let native = try WindowsSecurePath.extendedLengthPath(directory.path)
+            let failure = native.withCString(encodedAs: UTF16.self) { path -> DWORD? in
+                guard CreateDirectoryW(path, nil) else { return GetLastError() }
+                return nil
+            }
+            if let failure {
+                throw NSError(
+                    domain: "WindowsLongPathPersistenceFixture",
+                    code: Int(failure),
+                    userInfo: [NSFilePathErrorKey: directory.path]
+                )
+            }
+        }
         #expect(stateRoot.path.withCString { og_path_is_private_to_current_user($0, 1) } != 1)
 
         let history = try JSONValue.encode(ConversationItem.user("owner-private session history"))
@@ -237,12 +259,7 @@ struct WindowsLongPathPersistenceParityTests {
             chatHistory: [history]
         ))
 
-        for directory in [
-            stateRoot,
-            stateRoot.appendingPathComponent("sessions"),
-            session.deletingLastPathComponent(),
-            session,
-        ] {
+        for directory in directories {
             let extended = try RelocationFS.windowsExtendedLengthPath(directory.standardizedFileURL.path)
             #expect(extended.withCString { og_path_is_private_to_current_user($0, 1) } == 1)
         }

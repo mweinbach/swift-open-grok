@@ -1,5 +1,6 @@
 import Foundation
 import OpenGrokAgentCoordinator
+import OpenGrokConfig
 import OpenGrokFileUtils
 import OpenGrokSamplingTypes
 import OpenGrokSessionPersistence
@@ -221,8 +222,8 @@ struct LiveSubagentMetadataStore: Sendable {
 
         let path = try metadataURL(id: metadata.subagentID)
         let parent = path.deletingLastPathComponent()
-        try Self.secureDirectory(parent.deletingLastPathComponent())
-        try Self.secureDirectory(parent)
+        try Self.secureDirectory(parent.deletingLastPathComponent(), stateRoot: openGrokHome)
+        try Self.secureDirectory(parent, stateRoot: openGrokHome)
 
         // Recheck all existing ancestors after creating directories: an atomic
         // final-file write cannot compensate for a redirected parent directory.
@@ -392,12 +393,12 @@ struct LiveSubagentMetadataStore: Sendable {
         return provider
     }
 
-    private static func secureDirectory(_ path: URL) throws {
+    private static func secureDirectory(_ path: URL, stateRoot: URL) throws {
         try PathSecurity.rejectHostileLexical(path.path)
         #if os(Windows)
         // The encoded workspace can push native metadata paths beyond MAX_PATH.
         let native = try WindowsSecurePath.extendedLengthPath(path.path)
-        try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        try OpenGrokConfig.createDirAllOwnerOnly(path, stateRoot: stateRoot)
         guard native.withCString({ og_directory_secure_current_user($0) }) == 0 else {
             throw LiveSubagentMetadataError.insecurePath(path.path)
         }

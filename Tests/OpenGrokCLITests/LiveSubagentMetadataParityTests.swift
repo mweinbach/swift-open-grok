@@ -113,11 +113,12 @@ struct LiveSubagentMetadataParityTests {
     func exactRustShapeAndPrivateStorage() throws {
         let fixture = try DurableSubagentMetadataFixture()
         defer { fixture.dispose() }
+        // Windows' temporary-directory spelling can differ from its on-disk casing.
+        let expectedParent = try SessionDocumentStore(grokHome: fixture.home.resolvingSymlinksInPath())
+            .sessionDirectory(sessionID: "durable-parent", cwd: fixture.workspace.path)
         try fixture.store.save(fixture.metadata())
 
         let path = try fixture.store.metadataURL(id: "child-one")
-        let expectedParent = try SessionDocumentStore(grokHome: fixture.home)
-            .sessionDirectory(sessionID: "durable-parent", cwd: fixture.workspace.path)
         #expect(path == expectedParent
             .appendingPathComponent("subagents")
             .appendingPathComponent("child-one")

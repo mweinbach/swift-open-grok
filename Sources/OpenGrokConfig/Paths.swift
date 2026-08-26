@@ -501,10 +501,31 @@ private func createWindowsOwnerOnlyDirectoryChain(_ directory: URL, stateRoot: U
 
     for (index, component) in ancestry.enumerated() {
         if try inspectWindowsOwnerDirectory(component) == .missing {
-            try FileManager.default.createDirectory(
-                at: component,
-                withIntermediateDirectories: false
-            )
+            // Keep the validated extended namespace at creation too; Foundation
+            // can hit MAX_PATH even after native inspection of the same path.
+            let nativePath = nativeAncestry[index + 1]
+            let failure = nativePath.withCString(encodedAs: UTF16.self) { path -> DWORD? in
+                guard CreateDirectoryW(path, nil) else { return GetLastError() }
+                return nil
+            }
+            if let code = failure {
+                guard code == DWORD(ERROR_ALREADY_EXISTS) else {
+                    throw windowsOwnerDirectoryError(
+                        component,
+                        operation: "create session directory",
+                        detail: "Windows error \(code)"
+                    )
+                }
+            }
+            // A concurrent creator may win, but never accept its file/reparse
+            // point, even for ancestors outside the owner-private boundary.
+            guard try inspectWindowsOwnerDirectory(component, nativePath: nativePath) == .directory else {
+                throw windowsOwnerDirectoryError(
+                    component,
+                    operation: "create session directory",
+                    detail: "directory disappeared after creation"
+                )
+            }
         }
         if index >= secureFrom {
             try secureExistingWindowsOwnerDirectory(component)
