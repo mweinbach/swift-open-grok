@@ -196,8 +196,12 @@ public enum ClaudeSessionScanner {
     }
 
     private static func discoverGitTopology(startingAt directory: URL) -> GitTopology? {
-        var checkout = directory
-        while true {
+        var checkout = directory.standardizedFileURL
+        var visitedAncestors = Set<String>()
+        let maximumAncestors = max(2, checkout.pathComponents.count + 2)
+        while visitedAncestors.count < maximumAncestors {
+            let checkoutPath = checkout.resolvingSymlinksInPath().standardizedFileURL.path
+            guard visitedAncestors.insert(checkoutPath).inserted else { return nil }
             if let gitDirectory = gitDirectory(for: checkout) {
                 let commonDirectory: ForeignSessionApprovedRoot
                 if let commonPath = readGitMetadata(named: "commondir", under: gitDirectory),
@@ -215,10 +219,18 @@ public enum ClaudeSessionScanner {
                 )
             }
 
-            let parent = checkout.deletingLastPathComponent()
-            guard parent.path != checkout.path else { return nil }
+            // NSURL can grow /.. above a root. Stop Git expansion at a
+            // non-shrinking or repeated parent; the directly scoped project
+            // candidates remain available even when topology discovery stops.
+            let candidate = checkout.deletingLastPathComponent()
+            guard candidate.path.count < checkout.path.count else { return nil }
+            let parent = candidate.standardizedFileURL
+            guard parent.resolvingSymlinksInPath().standardizedFileURL.path != checkoutPath else {
+                return nil
+            }
             checkout = parent
         }
+        return nil
     }
 
     private static func gitDirectory(for checkout: URL) -> ForeignSessionApprovedRoot? {

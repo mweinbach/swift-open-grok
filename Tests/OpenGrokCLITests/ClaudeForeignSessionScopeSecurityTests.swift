@@ -118,17 +118,21 @@ struct ClaudeForeignSessionScopeSecurityTests {
         ) == nil)
     }
 
-    @Test("unrelated Claude projects are never qualified even when their transcript claims this cwd")
-    func unrelatedProjectTranscriptIsNeverRead() throws {
+    @Test(
+        "non-Git and filesystem-root scans terminate without qualifying unrelated Claude projects",
+        arguments: [false, true]
+    )
+    func unrelatedProjectTranscriptIsNeverRead(atFilesystemRoot: Bool) throws {
         let fixture = try ClaudeScopeFixture("foreign-project")
         defer { fixture.dispose() }
+        let cwd = atFilesystemRoot ? "/" : fixture.workspace.path
 
-        let expected = try fixture.project(for: fixture.workspace.path)
-        try fixture.session(in: expected, title: "current workspace")
+        let expected = try fixture.project(for: cwd)
+        try fixture.session(in: expected, cwd: cwd, title: "current workspace")
         let foreign = try fixture.project(for: "/someone/elses/project")
-        try fixture.session(in: foreign, cwd: fixture.workspace.path, title: "foreign secret")
+        try fixture.session(in: foreign, cwd: cwd, title: "foreign secret")
 
-        let sessions = fixture.scan()
+        let sessions = fixture.scan(cwd: cwd)
         #expect(sessions.map(\.title) == ["current workspace"])
     }
 
@@ -282,23 +286,30 @@ struct ClaudeForeignSessionScopeSecurityTests {
         #expect(fixture.scan().isEmpty)
     }
 
-    @Test("linked Git worktrees include the main checkout without scanning unrelated projects")
-    func linkedWorktreeRecognizesItsMainRepositoryProject() throws {
+    @Test(
+        "linked Git worktrees include the main checkout without scanning unrelated projects",
+        arguments: [false, true]
+    )
+    func linkedWorktreeRecognizesItsMainRepositoryProject(fromNestedDirectory: Bool) throws {
         let fixture = try ClaudeScopeFixture("linked-main")
         defer { fixture.dispose() }
 
         let linked = fixture.root.appendingPathComponent("linked", isDirectory: true)
         try fixture.configureLinkedWorktree(linked)
+        let cwd = fromNestedDirectory
+            ? linked.appendingPathComponent("nested", isDirectory: true)
+            : linked
+        try FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
         let mainProject = try fixture.project(for: fixture.workspace.path)
         try fixture.session(
             in: mainProject,
-            cwd: linked.path,
+            cwd: cwd.path,
             title: "linked worktree in primary project"
         )
         let unrelated = try fixture.project(for: "/unrelated/repository")
-        try fixture.session(in: unrelated, cwd: linked.path, title: "unrelated secret")
+        try fixture.session(in: unrelated, cwd: cwd.path, title: "unrelated secret")
 
-        let sessions = fixture.scan(cwd: linked.path)
+        let sessions = fixture.scan(cwd: cwd.path)
         #expect(sessions.map(\.title) == ["linked worktree in primary project"])
     }
 
