@@ -409,8 +409,8 @@ enum CodexSessionDatabaseScanner {
               AND archived = 0
               AND cwd = ?1
               AND source IN ('cli', 'vscode', '{"custom":"atlas"}', '{"custom":"chatgpt"}')
-              AND octet_length(id) <= \(maxIDBytes)
-              AND octet_length(rollout_path) <= \(maxPathBytes)
+              AND length(CAST(id AS BLOB)) <= \(maxIDBytes)
+              AND length(CAST(rollout_path AS BLOB)) <= \(maxPathBytes)
               AND \(normalizedTimestamp) BETWEEN ?2 AND ?3
             ORDER BY \(normalizedTimestamp) DESC, id ASC
             LIMIT \(maxCandidates)
@@ -420,7 +420,7 @@ enum CodexSessionDatabaseScanner {
     private static func boundedText(_ column: String, limit: Int, fallback: String) -> String {
         """
         CASE WHEN typeof(\(column)) = 'text'
-                  AND octet_length(\(column)) <= \(limit)
+                  AND length(CAST(\(column) AS BLOB)) <= \(limit)
              THEN \(column) ELSE \(fallback) END
         """
     }

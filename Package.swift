@@ -118,7 +118,25 @@ private func targets() -> [Target] {
     let w11s3Lib = ["OpenGrokPagerPTYHarness"]
     let w11s5Lib = ["OpenGrokReleaseValidation"]
 
+    #if os(Linux) || os(Windows)
+    let platformSQLite = ["SQLite3"]
+    #else
+    let platformSQLite: [String] = []
+    #endif
+
     var t: [Target] = []
+
+    #if os(Linux) || os(Windows)
+    t.append(.target(
+        name: "SQLite3",
+        path: "Sources/SQLite3",
+        publicHeadersPath: "include",
+        linkerSettings: [
+            .linkedLibrary("sqlite3", .when(platforms: [.linux])),
+            .linkedLibrary("winsqlite3", .when(platforms: [.windows])),
+        ]
+    ))
+    #endif
 
     // ---- Wave 0 ----
     t.append(.target(name: "OpenGrokBuildSupport", dependencies: dep(["OpenGrokShared"])))
@@ -217,7 +235,10 @@ private func targets() -> [Target] {
     t.append(.target(name: "OpenGrokTelemetry", dependencies: dep(w0s3, w0s4, w1s5, ["OpenGrokTracing", "OpenGrokHTTP"])))
     // W2-S2: FileUtils base; SQLiteJournal/Secrets build on it.
     t.append(.target(name: "OpenGrokFileUtils", dependencies: dep(w0s2, w0s3, w0s4, w1s5, ["COpenGrokSockets"])))
-    t.append(.target(name: "OpenGrokSQLiteJournal", dependencies: dep(w0s2, w0s3, w0s4, w1s5, ["OpenGrokFileUtils"])))
+    t.append(.target(
+        name: "OpenGrokSQLiteJournal",
+        dependencies: dep(w0s2, w0s3, w0s4, w1s5, ["OpenGrokFileUtils"], platformSQLite)
+    ))
     t.append(.target(name: "OpenGrokSecrets", dependencies: dep(w0s2, w0s3, w0s4, w1s5, ["OpenGrokFileUtils"])))
     // W2-S3: FSNotify / CodebaseGraph / HunkTracker share base deps; GitStatus
     // depends on a thin C zlib shim for standards-compatible Git object and
@@ -347,7 +368,14 @@ private func targets() -> [Target] {
     ))
     t.append(.target(name: "OpenGrokCodeMode", dependencies: dep(w0s2, w1s1, w1s3, w1s4, w2s1, w5s1, w5s2, w5s3, ["OpenGrokJavaScriptRuntime"])))
     t.append(contentsOf: libs(w6s2, dep(w0s2, w1s3, w2s1, w3s2, w3s3)))
-    t.append(contentsOf: libs(w6s3, dep(w0s2, w0s3, w0s4, w1s3, w1s5, w2s2, w2s3, w3s3)))
+    t.append(.target(
+        name: "OpenGrokMemory",
+        dependencies: dep(w0s2, w0s3, w0s4, w1s3, w1s5, w2s2, w2s3, w3s3, platformSQLite)
+    ))
+    t.append(.target(
+        name: "OpenGrokGoalState",
+        dependencies: dep(w0s2, w0s3, w0s4, w1s3, w1s5, w2s2, w2s3, w3s3)
+    ))
     // W6-S4: ShellBase base; ShellSessionSupport -> ShellBase.
     t.append(.target(name: "OpenGrokShellBase", dependencies: dep(w0s2, w0s3, w0s4, w1s1, w1s2, w1s3, w1s4, w1s5, w2s1, w2s2, w3s1, w3s2, w3s3, w4s1, w4s3, w5s1)))
     t.append(.target(name: "OpenGrokShellSessionSupport", dependencies: dep(w0s2, w0s3, w0s4, w1s1, w1s2, w1s3, w1s4, w1s5, w2s1, w2s2, w3s1, w3s2, w3s3, w4s3, w5s1, ["OpenGrokShellBase"])))
@@ -414,7 +442,7 @@ private func targets() -> [Target] {
     // target must never import back (see its declaration).
     // Windows session-bus ownership checks import the C socket bridge directly;
     // relying on OpenGrokHTTP's transitive edge hides guest-only build failures.
-    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s1, w2s3, w2s4, w2s5, w3s1, w3s2, w3s3, w4s2, w4s3, w4s4, w5s4, w5s5, w5s6, w6s3, w6s4, w6s5, w7s3, w7s4, w8s1, w8s3, w8s4, w8s5, w4s1, w9s5, w10s1, ["COpenGrokSockets", "COpenGrokZlib", "OpenGrokFileTools", "OpenGrokFileUtils", "OpenGrokToolRegistry", "OpenGrokToolTypes", "OpenGrokCodeMode", "OpenGrokReleaseValidation", "OpenGrokDiagnostics", "OpenGrokScheduler", "OpenGrokLSP"])))
+    t.append(contentsOf: libs(w10s2, dep(w0s3, w0s4, w1s3, w1s5, w2s1, w2s3, w2s4, w2s5, w3s1, w3s2, w3s3, w4s2, w4s3, w4s4, w5s4, w5s5, w5s6, w6s3, w6s4, w6s5, w7s3, w7s4, w8s1, w8s3, w8s4, w8s5, w4s1, w9s5, w10s1, ["COpenGrokSockets", "COpenGrokZlib", "OpenGrokFileTools", "OpenGrokFileUtils", "OpenGrokToolRegistry", "OpenGrokToolTypes", "OpenGrokCodeMode", "OpenGrokReleaseValidation", "OpenGrokDiagnostics", "OpenGrokScheduler", "OpenGrokLSP"], platformSQLite)))
 
     // ---- Wave 11 (libraries + executable) ----
     // Distribution support only imports build support, version, and update
@@ -501,7 +529,11 @@ private func targets() -> [Target] {
     t.append(contentsOf: tests(w5s6))
     t.append(contentsOf: tests(["OpenGrokJavaScriptRuntime", "OpenGrokCodeMode"]))
     t.append(contentsOf: tests(w6s2))
-    t.append(contentsOf: tests(w6s3))
+    t.append(.testTarget(
+        name: "OpenGrokMemoryTests",
+        dependencies: dep(["OpenGrokMemory", "OpenGrokTestUtilities"], platformSQLite)
+    ))
+    t.append(contentsOf: tests(["OpenGrokGoalState"]))
     t.append(contentsOf: tests(["OpenGrokShellBase", "OpenGrokShellSessionSupport"]))
     t.append(contentsOf: tests(w6s5))
     t.append(.testTarget(
@@ -545,7 +577,7 @@ private func targets() -> [Target] {
     // helper gives a test target only its own library.
     t.append(.testTarget(
         name: "OpenGrokCLITests",
-        dependencies: dep(w10s2, w4s4, w4s3, ["COpenGrokSockets"])
+        dependencies: dep(w10s2, w4s4, w4s3, ["COpenGrokSockets"], platformSQLite)
     ))
     // OpenGrokExecutable tests exercise the composition via libraries (test
     // targets do not depend on the executable target directly).
