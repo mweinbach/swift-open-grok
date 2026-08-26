@@ -131,7 +131,11 @@ enum LiveCloudTraceUpload {
     private static let unsupportedCredentialProfileKeys: Set<String> = [
         "credential_process",
         "credential_source",
+        "duration_seconds",
+        "external_id",
+        "mfa_serial",
         "role_arn",
+        "role_session_name",
         "source_profile",
         "web_identity_token_file",
         "sso_session",
@@ -232,9 +236,23 @@ enum LiveCloudTraceUpload {
         }
     }
 
+    private enum SharedProfileFileKind {
+        case configuration
+        case credentials
+    }
+
+    private struct SharedProfile {
+        let path: String?
+        let exists: Bool
+        let selected: Bool
+        let values: [String: String]
+    }
+
     /// Rust `agent/config.rs:507-550` supplies managed inline credentials before
     /// managed files; `xai-file-utils/src/s3.rs:39-90,121-147` selects those
     /// static JSON/INI credentials before the ambient AWS provider chain.
+    /// `aws-config-1.8.8/src/default_provider/credentials.rs:183-193` then
+    /// orders environment, merged profile and environment web-identity providers.
     private static func resolveCredentials(
         document: TOMLValue,
         environment: [String: String]
@@ -280,9 +298,6 @@ enum LiveCloudTraceUpload {
             )
         }
 
-        let webIdentityConfigured = try LiveAWSWebIdentityCredentials.configurationIsPresent(
-            environment: environment
-        )
         if unsupportedCredentialEnvironmentKeys.contains(where: {
             configured(environment[$0]) != nil
         }) {
@@ -295,96 +310,90 @@ enum LiveCloudTraceUpload {
         guard isValidProfile(profile) else {
             throw Failure.invalidCredentials
         }
-        try rejectDynamicSharedConfiguration(profile: profile, environment: environment)
 
-        let credentialPath: String
-        if let configuredPath = configured(environment["AWS_SHARED_CREDENTIALS_FILE"]) {
-            if configuredPath.hasPrefix("~/") || configuredPath.hasPrefix("~\\") {
-                let home = try sharedCredentialHome(environment: environment)
-                let relativePath = String(configuredPath.dropFirst(2))
-                do {
-                    try PathSecurity.rejectHostileLexical(relativePath)
-                } catch {
-                    throw Failure.invalidCredentials
-                }
-                credentialPath = URL(fileURLWithPath: home, isDirectory: true)
-                    .appendingPathComponent(relativePath, isDirectory: false)
-                    .path
-            } else {
-                credentialPath = configuredPath
-            }
-        } else if let home = configured(environment["HOME"])
-            ?? configured(environment["USERPROFILE"])
-        {
-            guard (home as NSString).isAbsolutePath else {
-                throw Failure.invalidCredentials
-            }
-            do {
-                try PathSecurity.rejectHostileLexical(home)
-            } catch {
-                throw Failure.invalidCredentials
-            }
-            credentialPath = URL(fileURLWithPath: home, isDirectory: true)
-                .appendingPathComponent(".aws", isDirectory: true)
-                .appendingPathComponent("credentials", isDirectory: false)
-                .path
-        } else {
-            if webIdentityConfigured {
-                return .webIdentity(try LiveAWSWebIdentityCredentials.descriptor(
-                    environment: environment
-                ))
-            }
-            throw Failure.missingCredentials
+        let configuration = try sharedProfile(
+            kind: .configuration,
+            profile: profile,
+            environment: environment
+        )
+        let credentials = try sharedProfile(
+            kind: .credentials,
+            profile: profile,
+            environment: environment
+        )
+        var values = configuration.values
+        values.merge(credentials.values) { _, credentialValue in credentialValue }
+
+        let webIdentityKeys: Set<String> = [
+            "role_arn",
+            "role_session_name",
+            "web_identity_token_file",
+        ]
+        if values.keys.contains(where: {
+            unsupportedCredentialProfileKeys.contains($0) && !webIdentityKeys.contains($0)
+        }) {
+            throw Failure.unsupportedCredentialSource
         }
 
-        guard (credentialPath as NSString).isAbsolutePath else {
-            throw Failure.invalidCredentials
+        let staticKeys: Set<String> = [
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "aws_session_token",
+        ]
+        let hasStaticKeys = values.keys.contains(where: staticKeys.contains)
+        let hasWebIdentityKeys = values.keys.contains(where: webIdentityKeys.contains)
+
+        if hasWebIdentityKeys {
+            guard !hasStaticKeys,
+                  let roleARN = values["role_arn"],
+                  let tokenFile = values["web_identity_token_file"]
+            else {
+                throw Failure.unsupportedCredentialSource
+            }
+            return .webIdentity(try LiveAWSWebIdentityCredentials.descriptor(
+                profile: profile,
+                tokenFile: tokenFile,
+                roleARN: roleARN,
+                sessionName: values["role_session_name"],
+                configurationPath: configuration.exists ? configuration.path : nil,
+                credentialPath: credentials.exists ? credentials.path : nil,
+                environment: environment
+            ))
         }
 
-        let bytes: Data
-        do {
-            try PathSecurity.rejectHostileLexical(credentialPath)
-            bytes = try PathSecurity.readNoFollow(
-                URL(fileURLWithPath: credentialPath),
-                maximumBytes: maximumCredentialFileBytes,
-                requireOwnerOnly: true
-            )
-        } catch let error as FileUtilsError {
-            if case .notFound = error {
-                if webIdentityConfigured {
-                    return .webIdentity(try LiveAWSWebIdentityCredentials.descriptor(
-                        environment: environment
-                    ))
-                }
+        // Keep the pre-existing strict rejection of partial ambient identity
+        // settings for static profiles; complete profile providers above own
+        // their authority and never consult ambient role or session values.
+        let webIdentityConfigured = try LiveAWSWebIdentityCredentials.configurationIsPresent(
+            environment: environment
+        )
+        if hasStaticKeys {
+            guard let accessKeyID = values["aws_access_key_id"],
+                  let secretAccessKey = values["aws_secret_access_key"]
+            else {
                 throw Failure.missingCredentials
             }
-            throw Failure.invalidCredentials
-        } catch {
-            throw Failure.invalidCredentials
+            return .staticKeys(
+                accessKeyID: accessKeyID,
+                secretAccessKey: secretAccessKey,
+                sessionToken: values["aws_session_token"]
+            )
         }
 
-        guard let content = String(data: bytes, encoding: .utf8) else {
-            throw Failure.invalidCredentials
+        if credentials.selected
+            || (explicitlySelectedProfile != nil
+                && (configuration.exists || credentials.exists)
+                && !configuration.selected
+                && !credentials.selected)
+        {
+            throw Failure.missingCredentials
         }
-        do {
-            return try ResolvedCredentials(parseSharedCredentials(content, profile: profile))
-        } catch let error as Failure {
-            guard case .missingCredentials = error,
-                  explicitlySelectedProfile == nil,
-                  webIdentityConfigured,
-                  !content.split(whereSeparator: \.isNewline).contains(where: { rawLine in
-                      let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-                      guard line.hasPrefix("["), line.hasSuffix("]") else { return false }
-                      return line.dropFirst().dropLast()
-                          .trimmingCharacters(in: .whitespacesAndNewlines) == "default"
-                  })
-            else {
-                throw error
-            }
+        if webIdentityConfigured {
             return .webIdentity(try LiveAWSWebIdentityCredentials.descriptor(
                 environment: environment
             ))
         }
+        throw Failure.missingCredentials
     }
 
     private static func managedCredentialData(
@@ -595,12 +604,24 @@ enum LiveCloudTraceUpload {
         return home
     }
 
-    private static func rejectDynamicSharedConfiguration(
+    private static func sharedProfile(
+        kind: SharedProfileFileKind,
         profile: String,
         environment: [String: String]
-    ) throws {
+    ) throws -> SharedProfile {
+        let environmentKey: String
+        let filename: String
+        switch kind {
+        case .configuration:
+            environmentKey = "AWS_CONFIG_FILE"
+            filename = "config"
+        case .credentials:
+            environmentKey = "AWS_SHARED_CREDENTIALS_FILE"
+            filename = "credentials"
+        }
+
         let path: String
-        if let configuredPath = configured(environment["AWS_CONFIG_FILE"]) {
+        if let configuredPath = configured(environment[environmentKey]) {
             if configuredPath.hasPrefix("~/") || configuredPath.hasPrefix("~\\") {
                 let relativePath = String(configuredPath.dropFirst(2))
                 do {
@@ -619,10 +640,10 @@ enum LiveCloudTraceUpload {
         {
             path = URL(fileURLWithPath: try sharedCredentialHome(environment: environment), isDirectory: true)
                 .appendingPathComponent(".aws", isDirectory: true)
-                .appendingPathComponent("config", isDirectory: false)
+                .appendingPathComponent(filename, isDirectory: false)
                 .path
         } else {
-            return
+            return SharedProfile(path: nil, exists: false, selected: false, values: [:])
         }
 
         guard (path as NSString).isAbsolutePath else {
@@ -633,10 +654,13 @@ enum LiveCloudTraceUpload {
             try PathSecurity.rejectHostileLexical(path)
             bytes = try PathSecurity.readNoFollow(
                 URL(fileURLWithPath: path),
-                maximumBytes: maximumCredentialFileBytes
+                maximumBytes: maximumCredentialFileBytes,
+                requireOwnerOnly: true
             )
         } catch let error as FileUtilsError {
-            if case .notFound = error { return }
+            if case .notFound = error {
+                return SharedProfile(path: path, exists: false, selected: false, values: [:])
+            }
             throw Failure.invalidCredentials
         } catch {
             throw Failure.invalidCredentials
@@ -644,33 +668,23 @@ enum LiveCloudTraceUpload {
         guard let content = String(data: bytes, encoding: .utf8) else {
             throw Failure.invalidCredentials
         }
-
-        var selected = false
-        for rawLine in content.split(whereSeparator: \.isNewline) {
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !line.isEmpty, !line.hasPrefix("#"), !line.hasPrefix(";") else { continue }
-            if line.hasPrefix("[") {
-                guard line.hasSuffix("]") else { throw Failure.invalidCredentials }
-                let section = String(line.dropFirst().dropLast())
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                selected = section == profile || section == "profile \(profile)"
-                continue
-            }
-            guard selected, let separator = line.firstIndex(of: "=") else { continue }
-            let key = line[..<separator].trimmingCharacters(in: .whitespacesAndNewlines)
-            if unsupportedCredentialProfileKeys.contains(key) {
-                throw Failure.unsupportedCredentialSource
-            }
-        }
+        return try parseSharedProfile(content, kind: kind, profile: profile, path: path)
     }
 
-    private static func parseSharedCredentials(
+    private static func parseSharedProfile(
         _ content: String,
-        profile: String
-    ) throws -> (accessKeyID: String, secretAccessKey: String, sessionToken: String?) {
-        var currentProfile: String?
-        var values: [String: String] = [:]
-        var selectedProfileFound = false
+        kind: SharedProfileFileKind,
+        profile: String,
+        path: String
+    ) throws -> SharedProfile {
+        var selectedRank: Int?
+        var selectedSections: Set<Int> = []
+        var valuesByRank: [Int: [String: String]] = [:]
+        let credentialKeys: Set<String> = [
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "aws_session_token",
+        ]
 
         for rawLine in content.split(whereSeparator: \.isNewline) {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -682,26 +696,36 @@ enum LiveCloudTraceUpload {
                 guard line.hasSuffix("]") else {
                     throw Failure.invalidCredentials
                 }
-                currentProfile = String(line.dropFirst().dropLast())
+                let section = String(line.dropFirst().dropLast())
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                if currentProfile == profile {
-                    selectedProfileFound = true
+                switch kind {
+                case .credentials:
+                    selectedRank = section == profile ? 0 : nil
+                case .configuration:
+                    if section == "profile \(profile)" {
+                        selectedRank = 1
+                    } else if profile == "default", section == "default" {
+                        selectedRank = 0
+                    } else {
+                        selectedRank = nil
+                    }
+                }
+                if let selectedRank,
+                   !selectedSections.insert(selectedRank).inserted
+                {
+                    throw Failure.invalidCredentials
                 }
                 continue
             }
 
-            guard currentProfile == profile else { continue }
+            guard let selectedRank else { continue }
             guard let separator = line.firstIndex(of: "=") else {
                 throw Failure.invalidCredentials
             }
 
             let key = line[..<separator].trimmingCharacters(in: .whitespacesAndNewlines)
-            if unsupportedCredentialProfileKeys.contains(key) {
-                throw Failure.unsupportedCredentialSource
-            }
-            guard key == "aws_access_key_id"
-                || key == "aws_secret_access_key"
-                || key == "aws_session_token"
+            guard unsupportedCredentialProfileKeys.contains(key)
+                || credentialKeys.contains(key)
             else {
                 continue
             }
@@ -710,18 +734,20 @@ enum LiveCloudTraceUpload {
             let value = rawValue.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
                 .first?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            var values = valuesByRank[selectedRank] ?? [:]
             guard !value.isEmpty, values.updateValue(value, forKey: key) == nil else {
                 throw Failure.invalidCredentials
             }
+            valuesByRank[selectedRank] = values
         }
 
-        guard selectedProfileFound,
-              let accessKeyID = values["aws_access_key_id"],
-              let secretAccessKey = values["aws_secret_access_key"]
-        else {
-            throw Failure.missingCredentials
-        }
-        return (accessKeyID, secretAccessKey, values["aws_session_token"])
+        let highestRank = selectedSections.max()
+        return SharedProfile(
+            path: path,
+            exists: true,
+            selected: highestRank != nil,
+            values: highestRank.flatMap { valuesByRank[$0] } ?? [:]
+        )
     }
 
     private static func isValidProfile(_ value: String) -> Bool {

@@ -77,6 +77,57 @@ private struct AWSWebIdentityTraceFixture {
         return environment
     }
 
+    func profileEnvironment(
+        profile: String = "default",
+        configuration: String?,
+        credentials: String? = nil,
+        ambient: [String: String] = [:]
+    ) throws -> [String: String] {
+        let directory = root.appendingPathComponent(".aws", isDirectory: true)
+        #if os(Windows)
+        try OpenGrokConfig.createDirAllOwnerOnly(directory, stateRoot: root)
+        #else
+        try OpenGrokConfig.createDirAllOwnerOnly(directory)
+        #endif
+        if let configuration {
+            try SecureFile.write(
+                at: directory.appendingPathComponent("config"),
+                contents: configuration
+            )
+        }
+        if let credentials {
+            try SecureFile.write(
+                at: directory.appendingPathComponent("credentials"),
+                contents: credentials
+            )
+        }
+
+        var environment = try self.environment()
+        environment.removeValue(forKey: "AWS_WEB_IDENTITY_TOKEN_FILE")
+        environment.removeValue(forKey: "AWS_ROLE_ARN")
+        environment.removeValue(forKey: "AWS_ROLE_SESSION_NAME")
+        if profile != "default" {
+            environment["AWS_PROFILE"] = profile
+        }
+        environment.merge(ambient) { _, override in override }
+        return environment
+    }
+
+    static func profileConfiguration(
+        section: String = "default",
+        tokenPath: String,
+        roleARN: String = AWSWebIdentityTraceFixture.roleARN,
+        sessionName: String? = AWSWebIdentityTraceFixture.sessionName
+    ) -> String {
+        var configuration = "[\(section)]\n"
+            + "role_arn = \(roleARN)\n"
+            + "web_identity_token_file = \(tokenPath)\n"
+        if let sessionName {
+            configuration += "role_session_name = \(sessionName)\n"
+        }
+        return configuration
+    }
+
     @discardableResult
     func seed(_ sessionID: String, provider: ModelProvider = .xai) async throws -> LiveConversationRecord {
         var record = LiveConversationRecord.new(sessionID: sessionID, workingDirectory: workspace)
@@ -269,6 +320,853 @@ struct LiveAWSWebIdentityCredentialParityTests {
         }
         #expect(!result.output.contains(AWSWebIdentityTraceFixture.secretAccessKey))
         #expect(!result.errors.contains(AWSWebIdentityTraceFixture.jwt))
+    }
+
+    @Test(
+        "the real trace command loads owner-private default, named, credentials-only and merged profile web identity",
+        arguments: [
+            "default-config", "named-config", "legacy-named-config", "credentials-only",
+            "split-files", "crlf-config",
+        ]
+    )
+    func executableProfileWebIdentityLaunchUsesThePinnedRegionalExchange(
+        _ scenario: String
+    ) async throws {
+        let fixture = try AWSWebIdentityTraceFixture()
+        defer { fixture.clean() }
+        let sessionID = "profile-web-identity-\(scenario)"
+        try await fixture.seed(sessionID)
+        let profile = scenario == "named-config" || scenario == "legacy-named-config"
+            || scenario == "split-files"
+            ? "deployment"
+            : "default"
+        let section = profile == "default" ? "default" : "profile \(profile)"
+        let configuration: String?
+        let credentials: String?
+        switch scenario {
+        case "credentials-only":
+            configuration = nil
+            credentials = AWSWebIdentityTraceFixture.profileConfiguration(
+                tokenPath: fixture.tokenFile.path
+            )
+        case "split-files":
+            configuration = "[\(section)]\nrole_arn = \(AWSWebIdentityTraceFixture.roleARN)\n"
+            credentials = "[\(profile)]\n"
+                + "web_identity_token_file = \(fixture.tokenFile.path)\n"
+                + "role_session_name = \(AWSWebIdentityTraceFixture.sessionName)\n"
+        default:
+            let contents = AWSWebIdentityTraceFixture.profileConfiguration(
+                section: section,
+                tokenPath: fixture.tokenFile.path
+            )
+            configuration = scenario == "crlf-config"
+                ? contents.replacingOccurrences(of: "\n", with: "\r\n")
+                : contents
+            credentials = nil
+        }
+        var environment = try fixture.profileEnvironment(
+            profile: profile,
+            configuration: configuration,
+            credentials: credentials
+        )
+        if scenario == "legacy-named-config" {
+            environment.removeValue(forKey: "AWS_PROFILE")
+            environment["AWS_DEFAULT_PROFILE"] = profile
+        }
+        let descriptor = try #require(fixture.cloudAuthorization(
+            sessionID: sessionID,
+            environment: environment
+        ).webIdentity)
+        if case .profile(let selected, let configurationPath, let credentialPath) = descriptor.source {
+            #expect(selected == profile)
+            #expect((configurationPath != nil) == (configuration != nil))
+            #expect((credentialPath != nil) == (credentials != nil))
+        } else {
+            Issue.record("Profile credentials were silently downgraded to ambient identity")
+        }
+
+        let transport = MockHTTPTransport(responses: [
+            AWSWebIdentityTraceFixture.stsResponse(),
+            .init(metadata: HTTPResponseMetadata(statusCode: 200)),
+        ])
+        let result = await fixture.run(sessionID, environment: environment, transport: transport)
+
+        #expect(result.status == CLIRunner.ExitCode.success.rawValue)
+        #expect(result.errors.isEmpty)
+        #expect(transport.recordedRequests.map(\.method) == [.post, .put])
+        let exchange = try #require(transport.recordedRequests.first)
+        #expect(exchange.url.absoluteString == "https://sts.us-west-2.amazonaws.com/")
+        #expect(exchange.headers["Authorization"] == nil)
+        #expect(exchange.headers[xaiTokenAuthHeader] == nil)
+        let body = String(decoding: try #require(exchange.body), as: UTF8.self)
+        let fields = try #require(URLComponents(
+            string: "https://unused.invalid/?" + body
+        )?.queryItems)
+        #expect(fields.map(\.name) == [
+            "Action", "Version", "RoleArn", "RoleSessionName", "WebIdentityToken",
+        ])
+        #expect(fields.first { $0.name == "RoleArn" }?.value == AWSWebIdentityTraceFixture.roleARN)
+        #expect(fields.first { $0.name == "WebIdentityToken" }?.value == AWSWebIdentityTraceFixture.jwt)
+        let upload = try #require(transport.recordedRequests.last)
+        #expect(upload.url.host == "trace-private-bucket.s3.us-west-2.amazonaws.com")
+        #expect(upload.headers["Authorization"]?.contains(
+            "Credential=\(AWSWebIdentityTraceFixture.accessKeyID)/"
+        ) == true)
+        #expect(upload.headers["X-Amz-Security-Token"] == AWSWebIdentityTraceFixture.sessionToken)
+        #expect(upload.headers[xaiTokenAuthHeader] == nil)
+    }
+
+    @Test(
+        "complete selected profile identity owns its role, subject and session independently of ambient identity variables",
+        arguments: ["complete-hostile", "role-only", "token-only", "ambient-session"]
+    )
+    func selectedProfileWebIdentityNeverBorrowsAmbientAuthority(
+        _ scenario: String
+    ) async throws {
+        let fixture = try AWSWebIdentityTraceFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("isolated-profile-authority")
+        let configuration = AWSWebIdentityTraceFixture.profileConfiguration(
+            section: "profile deployment",
+            tokenPath: fixture.tokenFile.path,
+            sessionName: "overridden-config-session"
+        )
+        let credentials = "[deployment]\nrole_session_name = \(AWSWebIdentityTraceFixture.sessionName)\n"
+        var ambient: [String: String] = [:]
+        switch scenario {
+        case "complete-hostile":
+            ambient["AWS_ROLE_ARN"] = "arn:aws:iam::999999999999:role/foreign-authority"
+            ambient["AWS_WEB_IDENTITY_TOKEN_FILE"] = "/PRIVATE_FOREIGN_SUBJECT"
+            ambient["AWS_ROLE_SESSION_NAME"] = "PRIVATE_FOREIGN_SESSION"
+        case "role-only":
+            ambient["AWS_ROLE_ARN"] = "PRIVATE_MALFORMED_AMBIENT_ROLE"
+        case "token-only":
+            ambient["AWS_WEB_IDENTITY_TOKEN_FILE"] = "/PRIVATE_FOREIGN_SUBJECT"
+        default:
+            ambient["AWS_ROLE_SESSION_NAME"] = "PRIVATE/UNSAFE/AMBIENT"
+        }
+        let environment = try fixture.profileEnvironment(
+            profile: "deployment",
+            configuration: configuration,
+            credentials: credentials,
+            ambient: ambient
+        )
+        let transport = MockHTTPTransport(responses: [
+            AWSWebIdentityTraceFixture.stsResponse(),
+            .init(metadata: HTTPResponseMetadata(statusCode: 200)),
+        ])
+
+        let result = await fixture.run(
+            "isolated-profile-authority",
+            environment: environment,
+            transport: transport
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.success.rawValue)
+        #expect(transport.recordedRequests.map(\.method) == [.post, .put])
+        let body = String(decoding: try #require(transport.recordedRequests.first?.body), as: UTF8.self)
+        let fields = try #require(URLComponents(
+            string: "https://unused.invalid/?" + body
+        )?.queryItems)
+        #expect(fields.first { $0.name == "RoleArn" }?.value == AWSWebIdentityTraceFixture.roleARN)
+        #expect(fields.first { $0.name == "RoleSessionName" }?.value
+            == AWSWebIdentityTraceFixture.sessionName)
+        #expect(fields.first { $0.name == "WebIdentityToken" }?.value
+            == AWSWebIdentityTraceFixture.jwt)
+        #expect(!body.contains("PRIVATE_FOREIGN"))
+        #expect(!result.errors.contains("PRIVATE_FOREIGN"))
+    }
+
+    @Test("profile federation uses its Rust profile-specific default role-session name")
+    func profileDefaultSessionNameCannotInheritTheAmbientDefault() async throws {
+        let fixture = try AWSWebIdentityTraceFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("default-profile-role-session")
+        let environment = try fixture.profileEnvironment(
+            configuration: AWSWebIdentityTraceFixture.profileConfiguration(
+                tokenPath: fixture.tokenFile.path,
+                sessionName: nil
+            ),
+            ambient: ["AWS_ROLE_SESSION_NAME": "PRIVATE_AMBIENT_SESSION"]
+        )
+        let descriptor = try #require(fixture.cloudAuthorization(environment: environment).webIdentity)
+        #expect(descriptor.sessionName.hasPrefix("web-identity-token-profile-"))
+        #expect(descriptor.sessionName != "PRIVATE_AMBIENT_SESSION")
+        let transport = MockHTTPTransport(responses: [
+            AWSWebIdentityTraceFixture.stsResponse(
+                body: AWSWebIdentityTraceFixture.responseXML(sessionName: descriptor.sessionName)
+            ),
+            .init(metadata: HTTPResponseMetadata(statusCode: 200)),
+        ])
+
+        let result = await fixture.run(
+            "default-profile-role-session",
+            environment: environment,
+            transport: transport
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.success.rawValue)
+        #expect(transport.recordedRequests.count == 2)
+        let body = String(decoding: try #require(transport.recordedRequests.first?.body), as: UTF8.self)
+        #expect(body.contains("RoleSessionName=\(descriptor.sessionName)"))
+        #expect(!body.contains("PRIVATE_AMBIENT_SESSION"))
+    }
+
+    @Test("the explicit [profile default] configuration section supersedes legacy [default] values")
+    func prefixedDefaultProfileTakesPriorityWithoutImportingIgnoredProviders() async throws {
+        let fixture = try AWSWebIdentityTraceFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("prefixed-default-profile")
+        let configuration = "[default]\ncredential_process = PRIVATE_IGNORED_EXECUTION\n"
+            + AWSWebIdentityTraceFixture.profileConfiguration(
+                section: "profile default",
+                tokenPath: fixture.tokenFile.path
+            )
+        let environment = try fixture.profileEnvironment(configuration: configuration)
+        let transport = MockHTTPTransport(responses: [
+            AWSWebIdentityTraceFixture.stsResponse(),
+            .init(metadata: HTTPResponseMetadata(statusCode: 200)),
+        ])
+
+        let result = await fixture.run(
+            "prefixed-default-profile",
+            environment: environment,
+            transport: transport
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.success.rawValue)
+        #expect(transport.recordedRequests.map(\.method) == [.post, .put])
+        #expect(!result.errors.contains("PRIVATE_IGNORED_EXECUTION"))
+    }
+
+    @Test(
+        "private AWS configuration and web-identity token paths accept only absolute or safe home-relative files",
+        arguments: ["absolute-config", "home-config", "home-token"]
+    )
+    func profileConfigurationAndTokenSupportOnlySafeResolvedPaths(
+        _ scenario: String
+    ) async throws {
+        let fixture = try AWSWebIdentityTraceFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("safe-profile-path")
+        let subject = fixture.root.appendingPathComponent("private-home-subject.jwt")
+        try SecureFile.write(at: subject, contents: AWSWebIdentityTraceFixture.jwt)
+        let configuredTokenPath = scenario == "home-token" ? "~/private-home-subject.jwt" : subject.path
+        let contents = AWSWebIdentityTraceFixture.profileConfiguration(tokenPath: configuredTokenPath)
+        var environment = try fixture.profileEnvironment(configuration: nil)
+        let configPath = fixture.root.appendingPathComponent("private-aws-profile.ini")
+        try SecureFile.write(at: configPath, contents: contents)
+        environment["AWS_CONFIG_FILE"] = scenario == "home-config"
+            ? "~/private-aws-profile.ini"
+            : configPath.path
+        let transport = MockHTTPTransport(responses: [
+            AWSWebIdentityTraceFixture.stsResponse(),
+            .init(metadata: HTTPResponseMetadata(statusCode: 200)),
+        ])
+
+        let result = await fixture.run(
+            "safe-profile-path",
+            environment: environment,
+            transport: transport
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.success.rawValue)
+        #expect(transport.recordedRequests.map(\.method) == [.post, .put])
+    }
+
+    @Test(
+        "relative and traversal-bearing AWS config or shared-profile paths fail before opening a credential endpoint",
+        arguments: ["relative-config", "traversal-config", "relative-credentials", "traversal-credentials"]
+    )
+    func hostileConfiguredProfilePathsCannotReachSTS(_ scenario: String) async throws {
+        let fixture = try AWSWebIdentityTraceFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("hostile-configured-profile-path")
+        var environment = try fixture.profileEnvironment(
+            configuration: AWSWebIdentityTraceFixture.profileConfiguration(
+                tokenPath: fixture.tokenFile.path
+            )
+        )
+        switch scenario {
+        case "relative-config":
+            environment["AWS_CONFIG_FILE"] = "private-relative-config"
+        case "traversal-config":
+            environment["AWS_CONFIG_FILE"] = fixture.workspace.path + "/../private-config"
+        case "relative-credentials":
+            environment["AWS_SHARED_CREDENTIALS_FILE"] = "private-relative-credentials"
+        default:
+            environment["AWS_SHARED_CREDENTIALS_FILE"] =
+                fixture.workspace.path + "/../private-credentials"
+        }
+        let transport = MockHTTPTransport()
+
+        let result = await fixture.run(
+            "hostile-configured-profile-path",
+            environment: environment,
+            transport: transport
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
+        #expect(transport.recordedRequests.isEmpty)
+        #expect(!result.errors.contains(AWSWebIdentityTraceFixture.jwt))
+    }
+
+    @Test(
+        "managed and environment static AWS credentials retain precedence over inaccessible or hostile profile providers",
+        arguments: ["managed-inline", "managed-file", "environment"]
+    )
+    func earlierStaticCredentialsNeverReadOrMintProfileWebIdentity(
+        _ provider: String
+    ) async throws {
+        let fixture = try AWSWebIdentityTraceFixture()
+        defer { fixture.clean() }
+        let sessionID = "profile-static-precedence-\(provider)"
+        try await fixture.seed(sessionID)
+        var environment = try fixture.profileEnvironment(
+            configuration: AWSWebIdentityTraceFixture.profileConfiguration(
+                tokenPath: "/PRIVATE_UNREADABLE_PROFILE_SUBJECT"
+            )
+        )
+        let expectedKey: String
+        switch provider {
+        case "managed-inline":
+            expectedKey = "PRIVATEINLINEKEY"
+            environment["GROK_TRACE_UPLOAD_CREDENTIALS"] =
+                "{\"aws_access_key_id\":\"\(expectedKey)\",\"aws_secret_access_key\":\"PRIVATE_MANAGED_SECRET\"}"
+        case "managed-file":
+            expectedKey = "PRIVATEMANAGEDFILEKEY"
+            let path = fixture.workspace.appendingPathComponent("owner-private-managed.json")
+            try SecureFile.write(
+                at: path,
+                contents: "{\"aws_access_key_id\":\"\(expectedKey)\",\"aws_secret_access_key\":\"PRIVATE_MANAGED_SECRET\"}"
+            )
+            environment["GROK_TRACE_UPLOAD_CREDENTIALS_FILE"] = path.path
+        default:
+            expectedKey = "PRIVATEENVIRONMENTKEY"
+            environment["AWS_ACCESS_KEY_ID"] = expectedKey
+            environment["AWS_SECRET_ACCESS_KEY"] = "PRIVATE_ENVIRONMENT_SECRET"
+        }
+        let transport = MockHTTPTransport(responses: [
+            .init(metadata: HTTPResponseMetadata(statusCode: 200)),
+        ])
+
+        let result = await fixture.run(sessionID, environment: environment, transport: transport)
+
+        #expect(result.status == CLIRunner.ExitCode.success.rawValue)
+        #expect(transport.recordedRequests.count == 1)
+        #expect(transport.recordedRequests.first?.method == .put)
+        #expect(transport.recordedRequests.first?.headers["Authorization"]?.contains(
+            "Credential=\(expectedKey)/"
+        ) == true)
+        #expect(!result.errors.contains("PRIVATE_UNREADABLE_PROFILE_SUBJECT"))
+    }
+
+    @Test("an owner-private configuration-only static profile precedes complete ambient web identity")
+    func configurationOnlyStaticProfileBeatsLaterAmbientWebIdentity() async throws {
+        let fixture = try AWSWebIdentityTraceFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("configuration-only-static-profile")
+        let configuration = "[default]\naws_access_key_id = CONFIGURATIONONLYKEY\n"
+            + "aws_secret_access_key = PRIVATE_CONFIGURATION_ONLY_SECRET\n"
+        let environment = try fixture.profileEnvironment(
+            configuration: configuration,
+            ambient: [
+                "AWS_WEB_IDENTITY_TOKEN_FILE": fixture.tokenFile.path,
+                "AWS_ROLE_ARN": AWSWebIdentityTraceFixture.roleARN,
+            ]
+        )
+        let transport = MockHTTPTransport(responses: [
+            .init(metadata: HTTPResponseMetadata(statusCode: 200)),
+        ])
+
+        let result = await fixture.run(
+            "configuration-only-static-profile",
+            environment: environment,
+            transport: transport
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.success.rawValue)
+        #expect(transport.recordedRequests.count == 1)
+        #expect(transport.recordedRequests.first?.method == .put)
+        #expect(transport.recordedRequests.first?.headers["Authorization"]?.contains(
+            "Credential=CONFIGURATIONONLYKEY/"
+        ) == true)
+        #expect(!result.output.contains("PRIVATE_CONFIGURATION_ONLY_SECRET"))
+        #expect(!result.errors.contains("PRIVATE_CONFIGURATION_ONLY_SECRET"))
+    }
+
+    @Test("owner-private shared credentials override the same selected configuration keys before validation")
+    func credentialsFileOverridesEarlierConfigurationIdentityValues() async throws {
+        let fixture = try AWSWebIdentityTraceFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("merged-profile-override")
+        let configuration = "[profile deployment]\n"
+            + "role_arn = PRIVATE_INVALID_EARLIER_ROLE\n"
+            + "web_identity_token_file = /PRIVATE_INVALID_EARLIER_TOKEN\n"
+            + "role_session_name = PRIVATE/INVALID/EARLIER/SESSION\n"
+        let credentials = AWSWebIdentityTraceFixture.profileConfiguration(
+            section: "deployment",
+            tokenPath: fixture.tokenFile.path
+        )
+        let environment = try fixture.profileEnvironment(
+            profile: "deployment",
+            configuration: configuration,
+            credentials: credentials
+        )
+        let transport = MockHTTPTransport(responses: [
+            AWSWebIdentityTraceFixture.stsResponse(),
+            .init(metadata: HTTPResponseMetadata(statusCode: 200)),
+        ])
+
+        let result = await fixture.run(
+            "merged-profile-override",
+            environment: environment,
+            transport: transport
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.success.rawValue)
+        #expect(transport.recordedRequests.map(\.method) == [.post, .put])
+        let body = String(decoding: try #require(transport.recordedRequests.first?.body), as: UTF8.self)
+        #expect(!body.contains("PRIVATE_INVALID_EARLIER"))
+        #expect(!result.errors.contains("PRIVATE_INVALID_EARLIER"))
+    }
+
+    @Test(
+        "partial, ambiguous, malformed, foreign and unsupported selected profile providers fail closed before networking",
+        arguments: [
+            "missing-role", "missing-token", "session-only", "mixed-static-config",
+            "mixed-static-credentials", "credential-process", "credential-source", "source-profile",
+            "sso-session", "sso-start-url", "external-id", "mfa-serial", "duration",
+            "duplicate-role", "duplicate-token", "duplicate-section", "malformed-header",
+            "wrong-named-section", "wrong-credentials-section", "relative-token", "token-traversal", "foreign-role",
+            "invalid-account", "wrong-partition", "invalid-session", "empty-token",
+            "oversized-config", "invalid-config-utf8", "oversized-credentials",
+        ]
+    )
+    func hostileSelectedProfileProvidersNeverReachSTS(_ scenario: String) async throws {
+        let fixture = try AWSWebIdentityTraceFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("hostile-selected-profile")
+        var configuration = AWSWebIdentityTraceFixture.profileConfiguration(
+            tokenPath: fixture.tokenFile.path
+        )
+        var credentials: String?
+        var profile = "default"
+
+        switch scenario {
+        case "missing-role":
+            configuration = configuration.replacingOccurrences(
+                of: "role_arn = \(AWSWebIdentityTraceFixture.roleARN)\n",
+                with: ""
+            )
+        case "missing-token":
+            configuration = configuration.replacingOccurrences(
+                of: "web_identity_token_file = \(fixture.tokenFile.path)\n",
+                with: ""
+            )
+        case "session-only":
+            configuration = "[default]\nrole_session_name = private-incomplete-session\n"
+        case "mixed-static-config":
+            configuration += "aws_access_key_id = PRIVATE_STATIC_KEY\n"
+                + "aws_secret_access_key = PRIVATE_STATIC_SECRET\n"
+        case "mixed-static-credentials":
+            credentials = "[default]\naws_access_key_id = PRIVATE_STATIC_KEY\n"
+                + "aws_secret_access_key = PRIVATE_STATIC_SECRET\n"
+        case "credential-process": configuration += "credential_process = PRIVATE_EXECUTE_ME\n"
+        case "credential-source": configuration += "credential_source = PRIVATE_METADATA_SOURCE\n"
+        case "source-profile": configuration += "source_profile = PRIVATE_CHAINED_PROFILE\n"
+        case "sso-session": configuration += "sso_session = PRIVATE_SSO_SESSION\n"
+        case "sso-start-url": configuration += "sso_start_url = https://PRIVATE_SSO.invalid/\n"
+        case "external-id": configuration += "external_id = PRIVATE_EXTERNAL_ID\n"
+        case "mfa-serial": configuration += "mfa_serial = PRIVATE_MFA_SERIAL\n"
+        case "duration": configuration += "duration_seconds = 3600\n"
+        case "duplicate-role": configuration += "role_arn = \(AWSWebIdentityTraceFixture.roleARN)\n"
+        case "duplicate-token": configuration += "web_identity_token_file = \(fixture.tokenFile.path)\n"
+        case "duplicate-section":
+            configuration += "[default]\nrole_session_name = private-duplicate-session\n"
+        case "malformed-header": configuration = "[default\n" + configuration
+        case "wrong-named-section":
+            profile = "deployment"
+            configuration = AWSWebIdentityTraceFixture.profileConfiguration(
+                section: "deployment",
+                tokenPath: fixture.tokenFile.path
+            )
+        case "wrong-credentials-section":
+            profile = "deployment"
+            configuration = "[profile other]\nregion = us-west-2\n"
+            credentials = AWSWebIdentityTraceFixture.profileConfiguration(
+                section: "profile deployment",
+                tokenPath: fixture.tokenFile.path
+            )
+        case "relative-token":
+            configuration = AWSWebIdentityTraceFixture.profileConfiguration(
+                tokenPath: "private-relative.jwt"
+            )
+        case "token-traversal":
+            configuration = AWSWebIdentityTraceFixture.profileConfiguration(
+                tokenPath: fixture.workspace.path + "/../private-subject.jwt"
+            )
+        case "foreign-role":
+            configuration = AWSWebIdentityTraceFixture.profileConfiguration(
+                tokenPath: fixture.tokenFile.path,
+                roleARN: "arn:foreign:iam::123456789012:role/private/trace-writer"
+            )
+        case "invalid-account":
+            configuration = AWSWebIdentityTraceFixture.profileConfiguration(
+                tokenPath: fixture.tokenFile.path,
+                roleARN: "arn:aws:iam::12A456789012:role/private/trace-writer"
+            )
+        case "wrong-partition":
+            configuration = AWSWebIdentityTraceFixture.profileConfiguration(
+                tokenPath: fixture.tokenFile.path,
+                roleARN: "arn:aws-cn:iam::123456789012:role/private/trace-writer"
+            )
+        case "invalid-session":
+            configuration = AWSWebIdentityTraceFixture.profileConfiguration(
+                tokenPath: fixture.tokenFile.path,
+                sessionName: "PRIVATE/INVALID/SESSION"
+            )
+        case "empty-token":
+            configuration = configuration.replacingOccurrences(
+                of: "web_identity_token_file = \(fixture.tokenFile.path)",
+                with: "web_identity_token_file = "
+            )
+        case "oversized-config": configuration += String(repeating: "#", count: 65_537)
+        case "oversized-credentials":
+            credentials = "[other]\n#" + String(repeating: "x", count: 65_537)
+        default: break
+        }
+
+        let environment = try fixture.profileEnvironment(
+            profile: profile,
+            configuration: configuration,
+            credentials: credentials
+        )
+        if scenario == "invalid-config-utf8" {
+            try SecureFile.write(
+                at: fixture.root
+                    .appendingPathComponent(".aws", isDirectory: true)
+                    .appendingPathComponent("config"),
+                contents: Data([0xFF, 0xFE])
+            )
+        }
+        let transport = MockHTTPTransport()
+        let result = await fixture.run(
+            "hostile-selected-profile",
+            environment: environment,
+            transport: transport
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
+        #expect(transport.recordedRequests.isEmpty)
+        #expect(!result.errors.contains("PRIVATE_EXECUTE_ME"))
+        #expect(!result.errors.contains("PRIVATE_STATIC_SECRET"))
+        #expect(!result.errors.contains(AWSWebIdentityTraceFixture.jwt))
+    }
+
+    #if !os(Windows)
+    @Test(
+        "profile configuration, credential and subject files must all remain owner-private regular no-follow files",
+        arguments: [
+            "config-symlink", "config-directory", "config-group-readable",
+            "credentials-symlink", "credentials-directory", "credentials-group-readable",
+            "token-symlink", "token-group-readable",
+        ]
+    )
+    func profileCredentialFilesRejectLinksDirectoriesAndBroadPermissions(
+        _ scenario: String
+    ) async throws {
+        let fixture = try AWSWebIdentityTraceFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("owner-private-profile-files")
+        let awsDirectory = fixture.root.appendingPathComponent(".aws", isDirectory: true)
+        let configPath = awsDirectory.appendingPathComponent("config")
+        let credentialPath = awsDirectory.appendingPathComponent("credentials")
+        let credentials: String? = scenario.hasPrefix("credentials")
+            ? "[other]\naws_access_key_id = OTHERKEY\naws_secret_access_key = PRIVATE_OTHER_SECRET\n"
+            : nil
+        var configuration = AWSWebIdentityTraceFixture.profileConfiguration(
+            tokenPath: fixture.tokenFile.path
+        )
+        if scenario == "token-symlink" {
+            let link = fixture.workspace.appendingPathComponent("linked-profile-subject.jwt")
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: fixture.tokenFile)
+            configuration = AWSWebIdentityTraceFixture.profileConfiguration(tokenPath: link.path)
+        }
+        let environment = try fixture.profileEnvironment(
+            configuration: configuration,
+            credentials: credentials
+        )
+
+        switch scenario {
+        case "config-symlink", "credentials-symlink":
+            let path = scenario == "config-symlink" ? configPath : credentialPath
+            let original = fixture.workspace.appendingPathComponent("private-link-target")
+            try SecureFile.write(at: original, contents: configuration)
+            try FileManager.default.removeItem(at: path)
+            try FileManager.default.createSymbolicLink(at: path, withDestinationURL: original)
+        case "config-directory", "credentials-directory":
+            let path = scenario == "config-directory" ? configPath : credentialPath
+            try FileManager.default.removeItem(at: path)
+            try OpenGrokConfig.createDirAllOwnerOnly(path)
+        case "config-group-readable":
+            try FileManager.default.setAttributes([.posixPermissions: 0o640], ofItemAtPath: configPath.path)
+        case "credentials-group-readable":
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o640],
+                ofItemAtPath: credentialPath.path
+            )
+        case "token-group-readable":
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o640],
+                ofItemAtPath: fixture.tokenFile.path
+            )
+        default: break
+        }
+        let transport = MockHTTPTransport()
+
+        let result = await fixture.run(
+            "owner-private-profile-files",
+            environment: environment,
+            transport: transport
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
+        #expect(transport.recordedRequests.isEmpty)
+        #expect(!result.errors.contains("PRIVATE_OTHER_SECRET"))
+    }
+    #endif
+
+    @Test(
+        "profile federation preserves provider, privacy and metadata-network gates before attempting STS",
+        arguments: ["opted-out", "foreign-provider", "container", "metadata"]
+    )
+    func profileWebIdentityCannotBypassProviderPrivacyOrMetadataGates(
+        _ scenario: String
+    ) async throws {
+        let fixture = try AWSWebIdentityTraceFixture()
+        defer { fixture.clean() }
+        try await fixture.seed(
+            "closed-profile-web-boundary",
+            provider: scenario == "foreign-provider" ? .codex : .xai
+        )
+        var environment = try fixture.profileEnvironment(
+            configuration: AWSWebIdentityTraceFixture.profileConfiguration(
+                tokenPath: fixture.tokenFile.path
+            )
+        )
+        switch scenario {
+        case "opted-out":
+            let account = GrokAuth(
+                key: AWSWebIdentityTraceFixture.xaiToken,
+                authMode: .oidc,
+                userID: "aws-web-identity-user",
+                codingDataRetentionOptOut: true,
+                oidcIssuer: "https://auth.x.ai"
+            )
+            environment["OPENGROK_AUTH"] = try fixture.environment(auth: account)["OPENGROK_AUTH"]
+        case "container":
+            environment["AWS_CONTAINER_CREDENTIALS_FULL_URI"] =
+                "http://169.254.170.2/PRIVATE_CONTAINER_METADATA"
+        case "metadata":
+            environment["AWS_EC2_METADATA_SERVICE_ENDPOINT"] =
+                "http://169.254.169.254/PRIVATE_INSTANCE_METADATA"
+        default: break
+        }
+        let transport = MockHTTPTransport()
+
+        let result = await fixture.run(
+            "closed-profile-web-boundary",
+            environment: environment,
+            transport: transport
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
+        #expect(transport.recordedRequests.isEmpty)
+        #expect(!result.errors.contains("PRIVATE_CONTAINER_METADATA"))
+        #expect(!result.errors.contains("PRIVATE_INSTANCE_METADATA"))
+    }
+
+    @Test("profile federation exchanges once and signs the complete production multipart request sequence")
+    func productionMultipartUploadUsesOneProfileWebIdentityExchange() async throws {
+        let fixture = try AWSWebIdentityTraceFixture()
+        defer { fixture.clean() }
+        let sessionID = "profile-web-identity-multipart"
+        try await fixture.seed(sessionID)
+        let environment = try fixture.profileEnvironment(
+            profile: "deployment",
+            configuration: AWSWebIdentityTraceFixture.profileConfiguration(
+                section: "profile deployment",
+                tokenPath: fixture.tokenFile.path
+            )
+        )
+        let document = LiveManagedSetupComposition.trustedConfigDocument(environment: environment)
+        let initial = try await LiveTraceUpload.authorize(
+            sessionID: sessionID,
+            home: fixture.home,
+            document: document,
+            environment: environment,
+            uploadEnabled: true
+        )
+        let transport = MockHTTPTransport(responses: [
+            AWSWebIdentityTraceFixture.stsResponse(),
+            AWSWebIdentityTraceFixture.initiation(sessionID: sessionID),
+            .init(metadata: HTTPResponseMetadata(statusCode: 200, headers: ["ETag": "\"private-profile-one\""])),
+            .init(metadata: HTTPResponseMetadata(statusCode: 200, headers: ["ETag": "\"private-profile-two\""])),
+            AWSWebIdentityTraceFixture.completion(sessionID: sessionID),
+        ])
+        let services = LiveTraceUploadServices(makeTransport: { transport }, sleep: { _ in })
+
+        let result = try await LiveTraceUpload.upload(
+            sessionID: sessionID,
+            archive: Data(count: LiveCloudTraceUpload.maximumArchiveBytes + 1),
+            initialAuthorization: initial,
+            home: fixture.home,
+            document: document,
+            environment: environment,
+            uploadEnabled: true,
+            services: services,
+            retryNotice: nil
+        )
+
+        #expect(result == "s3://trace-private-bucket/\(sessionID)/trace_export.tar.gz")
+        #expect(transport.recordedRequests.map(\.method) == [.post, .post, .put, .put, .post])
+        #expect(transport.recordedRequests.first?.url.host == "sts.us-west-2.amazonaws.com")
+        #expect(transport.recordedRequests.first?.headers["Authorization"] == nil)
+        for request in transport.recordedRequests.dropFirst() {
+            #expect(request.url.host == "trace-private-bucket.s3.us-west-2.amazonaws.com")
+            #expect(request.headers["Authorization"]?.contains(
+                "Credential=\(AWSWebIdentityTraceFixture.accessKeyID)/"
+            ) == true)
+            #expect(request.headers["X-Amz-Security-Token"] == AWSWebIdentityTraceFixture.sessionToken)
+            #expect(request.headers[xaiTokenAuthHeader] == nil)
+        }
+    }
+
+    @Test(
+        "profile configuration, shared credential, subject-token and provider-source rotation after STS blocks all S3 dispatch",
+        arguments: ["configuration", "credentials", "token", "ambient-downgrade"]
+    )
+    func profileIdentityRotationDuringSTSCannotReachStorage(
+        _ scenario: String
+    ) async throws {
+        let fixture = try AWSWebIdentityTraceFixture()
+        defer { fixture.clean() }
+        try await fixture.seed("rotating-profile-provider")
+        let awsDirectory = fixture.root.appendingPathComponent(".aws", isDirectory: true)
+        let configPath = awsDirectory.appendingPathComponent("config")
+        let credentialPath = awsDirectory.appendingPathComponent("credentials")
+        let credentials: String? = scenario == "credentials"
+            ? "[default]\nrole_session_name = \(AWSWebIdentityTraceFixture.sessionName)\n"
+            : nil
+        let ambient: [String: String]
+        if scenario == "ambient-downgrade" {
+            ambient = [
+                "AWS_WEB_IDENTITY_TOKEN_FILE": fixture.tokenFile.path,
+                "AWS_ROLE_ARN": AWSWebIdentityTraceFixture.roleARN,
+                "AWS_ROLE_SESSION_NAME": AWSWebIdentityTraceFixture.sessionName,
+            ]
+        } else {
+            ambient = [:]
+        }
+        let environment = try fixture.profileEnvironment(
+            configuration: AWSWebIdentityTraceFixture.profileConfiguration(
+                tokenPath: fixture.tokenFile.path
+            ),
+            credentials: credentials,
+            ambient: ambient
+        )
+        let tokenFile = fixture.tokenFile
+        let scripted = MockHTTPTransport(responses: [AWSWebIdentityTraceFixture.stsResponse()])
+        let transport = AWSWebIdentityMutationTransport(wrapped: scripted, invocation: 1) {
+            switch scenario {
+            case "configuration":
+                try SecureFile.write(
+                    at: configPath,
+                    contents: AWSWebIdentityTraceFixture.profileConfiguration(
+                        tokenPath: tokenFile.path,
+                        sessionName: "private-rotated-profile-session"
+                    )
+                )
+            case "credentials":
+                try SecureFile.write(
+                    at: credentialPath,
+                    contents: "[default]\nrole_session_name = private-rotated-profile-session\n"
+                )
+            case "token":
+                try SecureFile.write(at: tokenFile, contents: AWSWebIdentityTraceFixture.rotatedJWT)
+            default:
+                try SecureFile.write(at: configPath, contents: "[other]\nregion = us-west-2\n")
+            }
+        }
+
+        let result = await fixture.run(
+            "rotating-profile-provider",
+            environment: environment,
+            transport: transport
+        )
+
+        #expect(result.status == CLIRunner.ExitCode.failure.rawValue)
+        #expect(scripted.recordedRequests.count == 1)
+        #expect(scripted.recordedRequests.first?.url.host == "sts.us-west-2.amazonaws.com")
+        #expect(!result.errors.contains(AWSWebIdentityTraceFixture.jwt))
+        #expect(!result.errors.contains(AWSWebIdentityTraceFixture.rotatedJWT))
+    }
+
+    @Test("changing selected private profile credentials after multipart initiation suppresses parts and aborts")
+    func multipartProfileRotationPreventsEverySubsequentStorageRequest() async throws {
+        let fixture = try AWSWebIdentityTraceFixture()
+        defer { fixture.clean() }
+        let sessionID = "rotating-profile-multipart"
+        try await fixture.seed(sessionID)
+        let environment = try fixture.profileEnvironment(
+            configuration: AWSWebIdentityTraceFixture.profileConfiguration(
+                tokenPath: fixture.tokenFile.path
+            )
+        )
+        let document = LiveManagedSetupComposition.trustedConfigDocument(environment: environment)
+        let initial = try await LiveTraceUpload.authorize(
+            sessionID: sessionID,
+            home: fixture.home,
+            document: document,
+            environment: environment,
+            uploadEnabled: true
+        )
+        let scripted = MockHTTPTransport(responses: [
+            AWSWebIdentityTraceFixture.stsResponse(),
+            AWSWebIdentityTraceFixture.initiation(sessionID: sessionID),
+        ])
+        let configurationPath = fixture.root
+            .appendingPathComponent(".aws", isDirectory: true)
+            .appendingPathComponent("config")
+        let tokenPath = fixture.tokenFile.path
+        let transport = AWSWebIdentityMutationTransport(wrapped: scripted, invocation: 2) {
+            try SecureFile.write(
+                at: configurationPath,
+                contents: AWSWebIdentityTraceFixture.profileConfiguration(
+                    tokenPath: tokenPath,
+                    sessionName: "private-multipart-rotated-session"
+                )
+            )
+        }
+        let services = LiveTraceUploadServices(makeTransport: { transport }, sleep: { _ in })
+
+        await #expect(throws: (any Error).self) {
+            try await LiveTraceUpload.upload(
+                sessionID: sessionID,
+                archive: Data(count: LiveCloudTraceUpload.maximumArchiveBytes),
+                initialAuthorization: initial,
+                home: fixture.home,
+                document: document,
+                environment: environment,
+                uploadEnabled: true,
+                services: services,
+                retryNotice: nil
+            )
+        }
+        #expect(scripted.recordedRequests.map(\.method) == [.post, .post])
+        #expect(scripted.recordedRequests.first?.url.host == "sts.us-west-2.amazonaws.com")
+        #expect(scripted.recordedRequests.last?.url.query == "uploads=")
     }
 
     @Test("an unminted web-identity authorization cannot sign or dispatch an S3 request")

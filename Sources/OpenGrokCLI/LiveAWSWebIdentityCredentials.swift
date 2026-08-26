@@ -7,7 +7,13 @@ import OpenGrokShared
 /// STS explicitly marks this operation unsigned; only the later S3 request
 /// receives SigV4 (`aws-sdk-sts-1.88.0/src/config/auth.rs:62-73`).
 enum LiveAWSWebIdentityCredentials {
+    enum Source: Sendable, Equatable {
+        case environment
+        case profile(name: String, configurationPath: String?, credentialPath: String?)
+    }
+
     struct Descriptor: Sendable, Equatable {
+        let source: Source
         let tokenPath: String
         let token: String
         let roleARN: String
@@ -35,6 +41,8 @@ enum LiveAWSWebIdentityCredentials {
     private static let requestTimeout: TimeInterval = 60
     private static let defaultSessionName = "web-identity-token-"
         + String(Int64(Date().timeIntervalSince1970 * 1_000))
+    private static let defaultProfileSessionName = "web-identity-token-profile-"
+        + String(Int64(Date().timeIntervalSince1970 * 1_000))
 
     static func configurationIsPresent(environment: [String: String]) throws -> Bool {
         let tokenFile = environment["AWS_WEB_IDENTITY_TOKEN_FILE"]
@@ -51,7 +59,52 @@ enum LiveAWSWebIdentityCredentials {
     static func descriptor(environment: [String: String]) throws -> Descriptor {
         guard try configurationIsPresent(environment: environment),
               let configuredPath = environment["AWS_WEB_IDENTITY_TOKEN_FILE"],
-              let roleARN = environment["AWS_ROLE_ARN"],
+              let roleARN = environment["AWS_ROLE_ARN"]
+        else {
+            throw LiveCloudTraceUpload.Failure.invalidCredentials
+        }
+        return try descriptor(
+            configuredPath: configuredPath,
+            roleARN: roleARN,
+            sessionName: environment["AWS_ROLE_SESSION_NAME"] ?? defaultSessionName,
+            source: .environment,
+            environment: environment
+        )
+    }
+
+    /// `aws-config-1.8.8/src/profile/credentials/exec.rs:119-139` constructs
+    /// profile credentials independently; ambient role and session variables
+    /// belong to the later fallback provider and must never override them.
+    static func descriptor(
+        profile: String,
+        tokenFile: String,
+        roleARN: String,
+        sessionName: String?,
+        configurationPath: String?,
+        credentialPath: String?,
+        environment: [String: String]
+    ) throws -> Descriptor {
+        try descriptor(
+            configuredPath: tokenFile,
+            roleARN: roleARN,
+            sessionName: sessionName ?? defaultProfileSessionName,
+            source: .profile(
+                name: profile,
+                configurationPath: configurationPath,
+                credentialPath: credentialPath
+            ),
+            environment: environment
+        )
+    }
+
+    private static func descriptor(
+        configuredPath: String,
+        roleARN: String,
+        sessionName: String,
+        source: Source,
+        environment: [String: String]
+    ) throws -> Descriptor {
+        guard !configuredPath.isEmpty,
               configuredPath == configuredPath.trimmingCharacters(in: .whitespacesAndNewlines),
               roleARN == roleARN.trimmingCharacters(in: .whitespacesAndNewlines),
               let role = validatedRole(roleARN)
@@ -59,7 +112,6 @@ enum LiveAWSWebIdentityCredentials {
             throw LiveCloudTraceUpload.Failure.invalidCredentials
         }
 
-        let sessionName = environment["AWS_ROLE_SESSION_NAME"] ?? defaultSessionName
         guard validSessionName(sessionName) else {
             throw LiveCloudTraceUpload.Failure.invalidCredentials
         }
@@ -82,6 +134,7 @@ enum LiveAWSWebIdentityCredentials {
         }
 
         return Descriptor(
+            source: source,
             tokenPath: tokenPath,
             token: token,
             roleARN: roleARN,
