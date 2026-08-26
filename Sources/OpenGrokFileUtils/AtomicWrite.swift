@@ -214,7 +214,7 @@ public enum AtomicFile: Sendable {
         let rawHandle = native.withCString(encodedAs: UTF16.self) {
             CreateFileW(
                 $0,
-                DWORD(GENERIC_READ | GENERIC_WRITE),
+                DWORD(GENERIC_READ) | DWORD(GENERIC_WRITE),
                 DWORD(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
                 nil,
                 DWORD(OPEN_EXISTING),
