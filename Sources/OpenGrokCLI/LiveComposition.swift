@@ -4952,6 +4952,16 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
             // close over the same spine; close is latched so a second call
             // reports notResident (session_lifecycle.rs:26-39).
             let sessionCloseLatch = LiveSessionCloseLatch()
+            let acpWritebackMode = try LiveSessionWritebackSync.resolveMode(
+                cli: launch.options.advanced.storageMode,
+                environment: launch.environment
+            )
+            let remoteSessionAdministration = LiveACPSessionRemoteAdministration(
+                home: foundation.openGrokHome,
+                environment: launch.environment,
+                storageMode: acpWritebackMode,
+                transport: dependencies.makeImageTransport()
+            )
             let sessionAdmin = LiveSessionAdminACPHandler(
                 openGrokHome: foundation.openGrokHome,
                 gateway: gateway,
@@ -4977,7 +4987,10 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                         )
                     )
                 },
-                closeLive: { sessionCloseLatch.close() }
+                closeLive: { sessionCloseLatch.close() },
+                remoteDelete: { sessionID in
+                    try await remoteSessionAdministration.deleteIfEligible(sessionID: sessionID)
+                }
             )
             // Same registry the headless `share` route consults: register
             // the resident ACP session's boundary so `x.ai/share_session`

@@ -13,10 +13,9 @@
 //     `LiveConversationHistory.rename` for the resident one (the turn loop
 //     re-saves the whole record per commit, so the resident title MUST go
 //     through the history actor or the next commit clobbers it).
-//   * `x.ai/session/delete` (session_admin.rs:267-318) — idempotent local
-//     delete: the session file plus its rewind sidecar
-//     (`LiveSessionCatalog.delete`, the same removal `open-grok sessions
-//     delete` performs).
+//   * `x.ai/session/delete` (session_admin.rs:434-483) — authenticated
+//     writeback agents erase the first-party backend copy before deleting the
+//     canonical local session, rewind sidecar, and search-index entry.
 //   * `x.ai/session/fork`   (session_admin.rs:799-810 → session/fork.rs) —
 //     copy a saved session under a new id/cwd with parent tracking
 //     (`LiveConversationStore.fork`, the same coupled transcript+rewind
@@ -41,9 +40,8 @@
 // peers listing persisted local history still use the CLI surface.
 //
 // Recorded divergences (beyond the refusals above):
-//   1. No remote writeback: upstream syncs renames/deletes to the backend
-//      registry when auth allows (session_admin.rs:144-195, 289-306); this
-//      port is local-store only, same as `LiveSessionsComposition`.
+//   1. Dormant-session rename does not synchronize its updated title to the
+//      backend; resident rename and writeback-gated deletion both do.
 //   2. `delete` of the RESIDENT session is refused with internal_error:
 //      upstream tears the live actor down first
 //      (`teardown_live_session_before_delete`, session_admin.rs:295-297);
@@ -113,6 +111,9 @@ struct LiveSessionAdminACPHandler: ACPAgentExtensionHandler, Sendable {
     /// Called from `x.ai/session/close`. A nil value means no live session
     /// is available (compositions without a spine).
     let closeLive: (@Sendable () async -> LiveSessionCloseOutcome)?
+    /// Erase a writeback agent's remote copy before any local lookup or
+    /// mutation. A missing callback preserves local-only test compositions.
+    let remoteDelete: (@Sendable (String) async throws -> Void)?
 
     init(
         openGrokHome: URL,
@@ -120,7 +121,8 @@ struct LiveSessionAdminACPHandler: ACPAgentExtensionHandler, Sendable {
         liveSessionID: String? = nil,
         renameLive: (@Sendable (String) async throws -> Void)? = nil,
         sessionInfoSnapshot: (@Sendable () async -> LiveSessionInfoSnapshot)? = nil,
-        closeLive: (@Sendable () async -> LiveSessionCloseOutcome)? = nil
+        closeLive: (@Sendable () async -> LiveSessionCloseOutcome)? = nil,
+        remoteDelete: (@Sendable (String) async throws -> Void)? = nil
     ) {
         self.openGrokHome = openGrokHome
         self.gateway = gateway
@@ -128,6 +130,7 @@ struct LiveSessionAdminACPHandler: ACPAgentExtensionHandler, Sendable {
         self.renameLive = renameLive
         self.sessionInfoSnapshot = sessionInfoSnapshot
         self.closeLive = closeLive
+        self.remoteDelete = remoteDelete
     }
 
     func handle(method: String, params: JSONValue) async throws -> JSONValue {
@@ -310,9 +313,9 @@ struct LiveSessionAdminACPHandler: ACPAgentExtensionHandler, Sendable {
 
     // MARK: x.ai/session/delete
 
-    /// `handle_session_delete` (session_admin.rs:267-318) over
-    /// `delete_session_history` (persistence.rs:3227-3280): idempotent — a
-    /// locally-missing session still answers `{"success": true}`.
+    /// `handle_session_delete` (session_admin.rs:434-483) over
+    /// `delete_session_history` (persistence.rs:3681-3746): remote erasure is
+    /// authoritative and precedes even the local-miss success response.
     private func handleDelete(_ params: JSONValue) async throws -> JSONValue {
         guard let sessionID = params["sessionId"]?.stringValue else {
             throw invalidParams("invalid params: missing field `sessionId`")
@@ -331,8 +334,22 @@ struct LiveSessionAdminACPHandler: ACPAgentExtensionHandler, Sendable {
             )
         }
 
-        // A malformed id or a cwd mismatch matches no summary upstream —
-        // local_removed:false, still success (persistence.rs:3260-3265).
+        // Malformed identifiers never reach a credential-bearing URL. Keep
+        // their existing idempotent local-miss response unchanged.
+        do {
+            try LiveConversationStore.validateSessionID(sessionID)
+        } catch {
+            return .object(["success": .bool(true)])
+        }
+
+        do {
+            try await remoteDelete?(sessionID)
+        } catch {
+            throw internalError("failed to delete remote session data: \(error)")
+        }
+
+        // A cwd mismatch matches no local summary upstream, but it does not
+        // prevent the preceding account-scoped remote deletion.
         let cwd = params["cwd"]?.stringValue
         guard let record = await lookupRecord(sessionID: sessionID, cwd: cwd) else {
             return .object(["success": .bool(true)])
