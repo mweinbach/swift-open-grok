@@ -475,8 +475,13 @@ private struct CodexForeignParityFixture {
         namespace: String = "sessions",
         base: URL? = nil
     ) throws -> URL {
-        let directory = dateDirectory(base: base ?? home, namespace: namespace)
+        let approvedBase = base ?? home
+        let directory = dateDirectory(base: approvedBase, namespace: namespace)
+        #if os(Windows)
+        try OpenGrokConfig.createDirAllOwnerOnly(directory, stateRoot: approvedBase)
+        #else
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        #endif
         let path = directory.appendingPathComponent(
             "rollout-2027-01-15T12-00-00-\(id).jsonl"
         )
