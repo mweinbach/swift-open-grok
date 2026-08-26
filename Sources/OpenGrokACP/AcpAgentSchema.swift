@@ -1628,27 +1628,42 @@ public struct CloseSessionResponse: Hashable, Sendable, Codable {
 
 public struct ListSessionsRequest: Hashable, Sendable, Codable {
     public var cwd: String?
+    public var additionalDirectories: [String]
+    public var cursor: String?
     public var meta: AcpMeta?
 
-    public init(cwd: String? = nil, meta: AcpMeta? = nil) {
+    public init(
+        cwd: String? = nil,
+        additionalDirectories: [String] = [],
+        cursor: String? = nil,
+        meta: AcpMeta? = nil
+    ) {
         self.cwd = cwd
+        self.additionalDirectories = additionalDirectories
+        self.cursor = cursor
         self.meta = meta
     }
 
     private enum CodingKeys: String, CodingKey {
-        case cwd
+        case cwd, additionalDirectories, cursor
         case meta = "_meta"
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         cwd = try container.decodeIfPresent(String.self, forKey: .cwd)
+        additionalDirectories = try container.decodeIfPresent([String].self, forKey: .additionalDirectories) ?? []
+        cursor = try container.decodeIfPresent(String.self, forKey: .cursor)
         meta = try container.decodeIfPresent(AcpMeta.self, forKey: .meta)
     }
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encodeIfPresent(cwd, forKey: .cwd)
+        if !additionalDirectories.isEmpty {
+            try container.encode(additionalDirectories, forKey: .additionalDirectories)
+        }
+        try container.encodeIfPresent(cursor, forKey: .cursor)
         try container.encodeIfPresent(meta, forKey: .meta)
     }
 }
@@ -1705,27 +1720,35 @@ public struct AcpSessionInfo: Hashable, Sendable, Codable {
 
 public struct ListSessionsResponse: Hashable, Sendable, Codable {
     public var sessions: [AcpSessionInfo]
+    public var nextCursor: String?
     public var meta: AcpMeta?
 
-    public init(sessions: [AcpSessionInfo] = [], meta: AcpMeta? = nil) {
+    public init(
+        sessions: [AcpSessionInfo] = [],
+        nextCursor: String? = nil,
+        meta: AcpMeta? = nil
+    ) {
         self.sessions = sessions
+        self.nextCursor = nextCursor
         self.meta = meta
     }
 
     private enum CodingKeys: String, CodingKey {
-        case sessions
+        case sessions, nextCursor
         case meta = "_meta"
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         sessions = try container.decodeIfPresent([AcpSessionInfo].self, forKey: .sessions) ?? []
+        nextCursor = try container.decodeIfPresent(String.self, forKey: .nextCursor)
         meta = try container.decodeIfPresent(AcpMeta.self, forKey: .meta)
     }
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(sessions, forKey: .sessions)
+        try container.encodeIfPresent(nextCursor, forKey: .nextCursor)
         try container.encodeIfPresent(meta, forKey: .meta)
     }
 }

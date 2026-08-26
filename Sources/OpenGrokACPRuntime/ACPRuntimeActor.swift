@@ -836,11 +836,125 @@ public actor ACPAgentRuntime {
     private func listSessions(_ params: JSONValue) async throws -> JSONValue {
         try requireReady()
         let request = try decode(ListSessionsRequest.self, from: params, method: AgentMethodNames.sessionList)
+
+        if let extensionRouter {
+            let method = "x.ai/session/list"
+            guard case .object(var forwarded) = try encode(request) else {
+                throw ACPRuntimeError.transport("malformed durable session-list request")
+            }
+            var metadata = request.meta ?? [:]
+            var filters = metadata["x.ai/facetFilters"]?.objectValue ?? [:]
+            filters["kind"] = .array([.string("build")])
+            metadata["x.ai/facetFilters"] = .object(filters)
+            forwarded["_meta"] = .object(metadata)
+            forwarded["allowRelax"] = .bool(false)
+
+            do {
+                let response = try await extensionRouter.dispatch(
+                    method: method,
+                    params: .object(forwarded)
+                )
+                return try encode(Self.durableListSessionsResponse(response))
+            } catch let error as AcpError
+                where error == ACPExtensionMethodRouter.unknownExtensionMethodError(method)
+            {
+                // Minimal embeddings without the durable extension retain their
+                // resident session store; backend failures never take this path.
+            } catch let error as ACPRuntimeError
+                where error == .methodNotFound(method)
+            {
+                // Legacy catch-all embeddings can report the same exact method
+                // through the runtime error family rather than the ACP envelope.
+            }
+        }
+
         let stored = try await store.list(cwd: request.cwd)
         let sessions = stored.map {
             AcpSessionInfo(sessionId: $0.sessionId, cwd: $0.cwd, updatedAt: $0.updatedAt)
         }
         return try encode(ListSessionsResponse(sessions: sessions))
+    }
+
+    private static func durableListSessionsResponse(_ response: JSONValue) throws -> ListSessionsResponse {
+        guard case .object(let envelope) = response,
+              case .object(let result)? = envelope["result"],
+              case .array(let entries)? = result["sessions"]
+        else {
+            throw ACPRuntimeError.transport("malformed durable session-list response")
+        }
+
+        let nextCursor = try optionalDurableListString(result, key: "nextCursor")
+        let metadata = try optionalDurableListMetadata(result)
+        var sessions: [AcpSessionInfo] = []
+        sessions.reserveCapacity(entries.count)
+        for entry in entries {
+            guard case .object(let fields) = entry,
+                  case .string(let sessionId)? = fields["sessionId"],
+                  !sessionId.isEmpty,
+                  case .string(let cwd)? = fields["cwd"]
+            else {
+                throw ACPRuntimeError.transport("malformed durable session-list entry")
+            }
+
+            guard isAbsoluteDurableSessionDirectory(cwd) else { continue }
+            let title = try optionalDurableListString(fields, key: "title")
+            let updatedAt = try optionalDurableListString(fields, key: "updatedAt")
+            let rowMetadata = try optionalDurableListMetadata(fields)
+
+            sessions.append(AcpSessionInfo(
+                sessionId: AcpSessionId(sessionId),
+                cwd: cwd,
+                title: title,
+                updatedAt: updatedAt,
+                meta: rowMetadata
+            ))
+        }
+
+        return ListSessionsResponse(
+            sessions: sessions,
+            nextCursor: nextCursor,
+            meta: metadata
+        )
+    }
+
+    private static func optionalDurableListString(
+        _ values: [String: JSONValue],
+        key: String
+    ) throws -> String? {
+        guard let value = values[key] else { return nil }
+        guard case .string(let text) = value else {
+            throw ACPRuntimeError.transport("malformed durable session-list \(key)")
+        }
+        return text
+    }
+
+    private static func optionalDurableListMetadata(
+        _ values: [String: JSONValue]
+    ) throws -> AcpMeta? {
+        guard let value = values["_meta"] else { return nil }
+        guard case .object(let metadata) = value else {
+            throw ACPRuntimeError.transport("malformed durable session-list metadata")
+        }
+        return metadata
+    }
+
+    private static func isAbsoluteDurableSessionDirectory(_ value: String) -> Bool {
+        #if os(Windows)
+        if value.hasPrefix("\\\\") || value.hasPrefix("//") {
+            let components = value
+                .replacingOccurrences(of: "\\", with: "/")
+                .dropFirst(2)
+                .split(separator: "/", omittingEmptySubsequences: true)
+            return components.count >= 2
+        }
+        let bytes = Array(value.utf8)
+        guard bytes.count >= 3 else { return false }
+        return ((0x41...0x5A).contains(bytes[0]) || (0x61...0x7A).contains(bytes[0]))
+            && bytes[1] == 0x3A
+            && (bytes[2] == 0x2F || bytes[2] == 0x5C)
+        #else
+        return (value as NSString).isAbsolutePath
+        #endif
     }
 
     private func listRoster() async throws -> JSONValue {
