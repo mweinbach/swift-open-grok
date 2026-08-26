@@ -141,8 +141,9 @@ behavior is implemented or reachable from the executable.
   launch workspace/configuration authority, a real owner-private first-party
   account even for deployment-backed requests, ZDR-safe metadata, host-aware
   repository matching, bounded double overfetch, and stable merged pagination.
-  Core ACP durable/remote `session/load` and `session/resume` hydration and the
-  leader carrier's full ACP extension/gateway/permission wiring remain absent.
+  Core ACP durable/remote `session/load` and `session/resume` hydration remain
+  absent. Full leader extension/gateway/permission wiring is live; independent
+  production session bundles and core client MCP installation remain unsupported.
   Registry/GCS archive
   restoration is not a gap: the
   pinned Rust release explicitly aliases its restore module to
@@ -158,6 +159,22 @@ behavior is implemented or reachable from the executable.
   `xai-grok-shell/src/remote/client.rs:240-260,438-543`;
   `xai-grok-shell/src/remote/sync.rs:25-31,108-227`;
   `xai-grok-shell/src/session/export.rs:29-139`).
+- **LIVE / DIVERGED — complete leader bundles and registered relay carriers.**
+  Local and authenticated relay carriers share the full bundle with owner-scoped
+  routing, bounded concurrent work, preserved reverse correlations, and safe
+  same-session lifecycle reopening. Production admits one independent wire ID
+  per launch; configured/SDK MCP differs from unsupported core declarations.
+  Mixed-carrier fixtures use echo/no-op sampling; one genuine-bundle fixture
+  injects an unused sampler, not an external model. Exact source/counts/commands,
+  Windows long-path security limits, and divergence costs are in the
+  [verified continuation](PORT_STATUS.md#leader-carrier-continuation).
+  Native proof is scoped and does not resolve CI or certify a release.
+- **LIVE / DIVERGED — bounded Claude topology discovery.** Canonical visited
+  ancestors, strict parent shortening, and an initial depth bound terminate
+  pathological Foundation parent walks while retaining directly scoped project
+  candidates and existing Git/worktree authority. Rust delegates discovery to
+  `git2::Repository::discover` (`xai-grok-foreign-sessions/src/claude/projects.rs:7-42`).
+  The separate macOS CI exit's cause remains unproven.
 - **LIVE / DIVERGED — headless agent relay and restore-code.** `agent` and
   `agent headless` own persistent first-party authenticated ACP relay sessions;
   `agent --reauth` uses transactional browser authentication and retains the

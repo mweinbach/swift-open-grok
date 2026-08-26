@@ -1,12 +1,429 @@
 # Swift Open Grok Port Status
 
-**As of:** 2026-08-25. The most recently completed full macOS serial package gate passed **10,053 Swift Testing cases in 1,412 suites across 106 nonempty test-product summaries**, exit 0, in approximately 429 seconds; it predates the newest authentication, writeback, cloud, session-administration, profiling, and platform changes and is not exact-head evidence. An integrated native Linux ARM64 gate passed **498 tests in 24 suites**, exit 0, including AWS profile-owned web-identity federation, Google service-account impersonation, remote-first ACP deletion, durable paginated ACP listing, backend hydration, Rust SQLite interoperability, and updater relaunch. Its subsequent remote-registry integration gate passed **370 tests in 18 suites**, exit 0, including authenticated remote entries through both core and extension ACP session lists. Earlier Linux matrices independently passed **421 tests in 23 suites** and **273 tests in 14 suites**, including **46 adversarial hydration tests**. A subsequent macOS native profiler, writeback, and SQLite interoperability matrix passed **105 tests in 7 suites**, exit 0. Earlier native Windows ARM64 runs independently passed **152 tests in 5 suites** for writeback/cloud/runtime, **47 tests in 3 suites** for remote deletion and portable profiling, **5 tests in 1 suite** for owner-authenticated named pipes and bounded listener shutdown, and **11 tests in 1 suite** for bounded native microphone discovery and real 16-kHz capture, each exit 0. A later SQLite-enabled Windows matrix independently passed all new owner-private foreign-session, genuine overlapped full-duplex pipe, and updater-relaunch regressions; **279 of its 280 tests passed**, with its sole failure isolated to an overlong test-fixture path and corrected. The resumed native Windows ARM64 gate at `f11094dad57a43eacc835c9486390444c1969e38` passed **350 tests in 21 suites**, with `WINDOWS_RESUME_GATE_EXIT=0`; its test phase took 51.190 seconds. The latest preceding Linux integration gate passed **424 tests in 38 suites**, exit 0. These checkpoints precede the in-progress leader-carrier continuation. Combined exact-head macOS/Linux/Windows execution and CI verification remain uncertified.
+**As of:** 2026-08-26. Exact source `e6a5e4b44072f946ffa697f12a182e1f57ff0b02`: full macOS serial gate 11,147 tests / 1,497 suites / 106 nonempty test summaries; focused Linux 758 tests / 119 suites / 1 nonempty test summaries; focused native Windows 730 tests / 112 suites / 1 nonempty test summaries; each executed gate exited 0. Credential-free isolated CLI smoke and cleanup also passed. Exact commands, elapsed times, source digest, raw-evidence links, and coverage limits are in the [leader continuation](#leader-carrier-continuation). **CI remains unresolved; focused native matrices do not certify complete cross-platform parity or a release.**
 
-**Overall state:** The audited Rust `.82` model catalog, managed authentication, persistent authenticated headless agent relay, actor-backed inference, independently verified goal orchestration, fail-closed permissions and media boundaries, native cross-platform SQLite/BLAKE3 session and memory persistence, authenticated first-party durable session writeback, remote-first CLI/ACP deletion, durable paginated ACP session listing with authenticated remote registry merging, live remote CLI registry discovery/search and secure CLI backend pull-on-miss hydration, real MCP/plugin management, provider-isolated web/image/video tools, semantic file/language tools, authenticated ACP queues, project-durable remembered approvals, additional working directories, every pinned Mermaid dispatcher family, interactive terminal rendering, authenticated trace proxy uploads, signed single-part/multipart S3 with managed/shared/legacy AWS credentials and secure environment/profile web-identity STS federation, native Google Cloud authorized-user/service-account/file-federated/impersonated uploads, real Linux enterprise HTTPS trust, secure restore-code, bounded portable gzip bundles, verified native secure WebSockets, Windows sampling diagnostics/private foreign-session discovery/native microphone capture, owner-authenticated local leader IPC, genuine overlapped Windows named-pipe I/O, real owner-private Unix CPU profiling, bounded update-driven leader relaunch, genuine Windows console/ConPTY processes, and isolated embedded Linux/Windows JavaScript Code Mode now have production implementations. The executable version, protocol fixtures, release reference, and platform distribution metadata agree with the exact pinned Rust commit. This remains **not complete cross-platform parity or a release certification**: Windows HTTPS enterprise-root augmentation, dynamic AWS metadata/role/SSO chains, Google metadata/non-file federation, core ACP durable/remote session hydration, full leader-carrier ACP component wiring, and complete exact-head native/remote gates remain incomplete or unverified.
+**Overall state:** The audited Rust `.82` model catalog, managed authentication, persistent authenticated headless agent relay, actor-backed inference, independently verified goal orchestration, fail-closed permissions and media boundaries, native cross-platform SQLite/BLAKE3 session and memory persistence, authenticated first-party durable session writeback, remote-first CLI/ACP deletion, durable paginated ACP session listing with authenticated remote registry merging, live remote CLI registry discovery/search and secure CLI backend pull-on-miss hydration, real MCP/plugin management, provider-isolated web/image/video tools, semantic file/language tools, authenticated ACP queues, project-durable remembered approvals, additional working directories, every pinned Mermaid dispatcher family, interactive terminal rendering, authenticated trace proxy uploads, signed single-part/multipart S3 with managed/shared/legacy AWS credentials and secure environment/profile web-identity STS federation, native Google Cloud authorized-user/service-account/file-federated/impersonated uploads, real Linux enterprise HTTPS trust, secure restore-code, bounded portable gzip bundles, verified native secure WebSockets, Windows sampling diagnostics/private foreign-session discovery/native microphone capture, owner-authenticated local leader IPC with complete ACP bundles and registered relay carriers, genuine overlapped Windows named-pipe I/O, real owner-private Unix CPU profiling, bounded update-driven leader relaunch, genuine Windows console/ConPTY processes, and isolated embedded Linux/Windows JavaScript Code Mode now have production implementations. The executable version, protocol fixtures, release reference, and platform distribution metadata agree with the exact pinned Rust commit. This remains **not complete cross-platform parity or a release certification**: Windows HTTPS enterprise-root augmentation, dynamic AWS metadata/role/SSO chains, Google metadata/non-file federation, core ACP durable/remote session hydration, independent production ACP session bundles, core client MCP installation, and complete cross-platform/remote certification with unresolved CI remain incomplete or unverified.
 **Destination was empty at baseline:** yes.
 **Reference:** `xai-org/grok-build` at `00e176c8fb4035701c24199bf9225973c1b13c20` (release `v1.0.0-open-grok.82`); historical original reference `650c1db7c2e73c59cec88bf3c6359751d6cef1bd`.
 **Current audited Rust snapshot:** `00e176c8fb4035701c24199bf9225973c1b13c20`, product version `1.0.0-open-grok.82`, **190 commits beyond the historical original pin**.
-**Swift toolchain used:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
+**Earlier toolchain checkpoint:** Apple Swift 6.4 (`swift-tools-version: 6.1`, `swiftLanguageModes: [.v6]`); `swift --version` reported target `arm64-apple-macosx27.0.0`.
+
+<!-- verified-leader-continuation:begin -->
+<a id="leader-carrier-continuation"></a>
+
+## Leader-carrier, production admission, and Windows persistence continuation (2026-08-26)
+
+Verified source: `e6a5e4b44072f946ffa697f12a182e1f57ff0b02`. Source/count/exit evidence below
+covers this exact commit; earlier implementation/CI commits remain historical.
+Rust pin: `00e176c8fb4035701c24199bf9225973c1b13c20` (`.82`).
+Unless fully qualified, Rust paths below are relative to
+`crates/codegen/xai-grok-shell/src/`.
+
+**Verified native scope:**
+
+| Gate | Executed scope | Exit | Recorded elapsed seconds |
+| --- | --- | --- | --- |
+| macOS full serial | 11,147 tests / 1,497 suites / 106 nonempty test summaries | 0 | 545.031 |
+| Linux focused serial | 758 tests / 119 suites / 1 nonempty test summaries | 0 | 25.83 |
+| Native Windows focused serial | 730 tests / 112 suites / 1 nonempty test summaries | 0 | 132.017383 wall |
+
+Verified at `2026-08-26T14:37:38.084548+00:00`; source `e6a5e4b44072f946ffa697f12a182e1f57ff0b02`;
+source SHA-256 `f5dba2fdb75dc378be58b1d469366e7b595ac68f0d49ae14852ac4e7a91f9c47`. Native Windows raw recovery
+manifest verifies 30 files. Zero-match/compile-only results are excluded.
+The Linux/Windows matrices are focused, not full-package or release certification.
+**CI remains unresolved; these native results do not assert CI green.**
+
+Exact recorded commands/selections:
+
+- macOS: `env -u OPENGROK_TEST_TIER DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer zsh workflows/swift-safe-verify.zsh test --no-parallel`.
+- Linux: `orb -m swift-open-grok-linux env PATH=/home/mweinbach/.local/share/swiftly/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin SWIFT_SAFE_SCRATCH_PATH=/home/mweinbach/.build/swift-open-grok zsh workflows/swift-safe-verify.zsh test-target 'ACP|LiveLeader|LiveUpdateLeader|WindowsNamedPipe|LiveModelSwitchTests|LiveRemoteSessionHydrationParityTests|LiveSubagentMetadataParityTests|WindowsLongPathPersistenceParityTests|OpenGrokFileUtilsTests|WindowsSecureReadParityTests|ClaudeSessionScannerTests|ClaudeForeignSessionScopeSecurityTests' --no-parallel`.
+- Native Windows gate action/arguments: `test-target 'ACP|LiveLeader|LiveUpdateLeader|WindowsNamedPipe|LiveModelSwitchTests|LiveRemoteSessionHydrationParityTests|LiveSubagentMetadataParityTests|WindowsLongPathPersistenceParityTests|OpenGrokFileUtilsTests|WindowsSecureReadParityTests|ClaudeSessionScannerTests|ClaudeForeignSessionScopeSecurityTests' --no-parallel`;
+  filter `ACP|LiveLeader|LiveUpdateLeader|WindowsNamedPipe|LiveModelSwitchTests|LiveRemoteSessionHydrationParityTests|LiveSubagentMetadataParityTests|WindowsLongPathPersistenceParityTests|OpenGrokFileUtilsTests|WindowsSecureReadParityTests|ClaudeSessionScannerTests|ClaudeForeignSessionScopeSecurityTests`; Swift `C:\WINDOWS\system32\config\systemprofile\AppData\Local\Programs\Swift\Toolchains\6.3.3+Asserts\usr\bin\swift.exe`;
+  jobs 2; timeout 600 s;
+  scratch `C:/swift-open-grok-build`. These are native gate arguments,
+  not a claim that the Swift executable accepts the wrapper's test-target verb.
+
+CLI smoke used binary `/Users/mweinbach/Projects/swift-open-grok/.build/workflow-safe/out/Products/Debug/open-grok`, SHA-256
+`b3c0d98d75b31b78df5bc3639277cb53694273f8c131c72058e819cd09332c1d`, with isolated state removed.
+All 8 recorded helper steps exited 0;
+the smoke is credential-free CLI reachability, not an external-model turn.
+Its helper argv were:
+
+- `zsh /Users/mweinbach/Projects/swift-open-grok/.agents/skills/verify-open-grok/scripts/control-open-grok launch`: exit 0.
+- `zsh /Users/mweinbach/Projects/swift-open-grok/.agents/skills/verify-open-grok/scripts/control-open-grok doctor`: exit 0.
+- `zsh /Users/mweinbach/Projects/swift-open-grok/.agents/skills/verify-open-grok/scripts/control-open-grok evidence cli version -- version --json`: exit 0.
+- `zsh /Users/mweinbach/Projects/swift-open-grok/.agents/skills/verify-open-grok/scripts/control-open-grok evidence cli paths -- paths --json`: exit 0.
+- `zsh /Users/mweinbach/Projects/swift-open-grok/.agents/skills/verify-open-grok/scripts/control-open-grok evidence cli models -- models --json`: exit 0.
+- `zsh /Users/mweinbach/Projects/swift-open-grok/.agents/skills/verify-open-grok/scripts/control-open-grok evidence cli sessions -- sessions list --json`: exit 0.
+- `zsh /Users/mweinbach/Projects/swift-open-grok/.agents/skills/verify-open-grok/scripts/control-open-grok evidence cli product-doctor -- doctor --json`: exit 0.
+- `zsh /Users/mweinbach/Projects/swift-open-grok/.agents/skills/verify-open-grok/scripts/control-open-grok cleanup`: exit 0.
+
+Windows temporary window-close policy restoration is recorded as complete: `suspend`; `/Users/mweinbach/.codex/artifacts/swift-open-grok-resume-20260826/windows-window-policy.json` has `restored: true`. This is a metadata-backed restoration claim, not a new VM operation by the ledger integrator.
+
+Proof: `/Users/mweinbach/.codex/artifacts/swift-open-grok-resume-20260826/final-proof.json`, SHA-256 `302fb379c376761b37050437aeeb2b030c6ba7817df676dd5cd67d54b469d0b4`.
+macOS metadata/log: `/Users/mweinbach/.codex/artifacts/swift-open-grok-resume-20260826/macos-full-serial-e6a5e4b.json`; `/Users/mweinbach/.codex/artifacts/swift-open-grok-resume-20260826/macos-full-serial-e6a5e4b.log`.
+Linux metadata/log: `/Users/mweinbach/.codex/artifacts/swift-open-grok-resume-20260826/linux-final-e6a5e4b.json`; `/Users/mweinbach/.codex/artifacts/swift-open-grok-resume-20260826/linux-final-e6a5e4b.log`.
+Native metadata/raw evidence: `/Users/mweinbach/.codex/artifacts/swift-open-grok-resume-20260826/windows/leader-e6a5e4b-final`.
+CLI step durations were not recorded; none are inferred.
+
+“LIVE” denotes executable wiring, not complete multi-session ACP, external-model
+end-to-end proof, or exact-head cross-platform release certification.
+
+### LIVE — complete leader bundle and registered relay carriers
+
+The leader retains the full `LiveACPLaunchComponents` contract used by stdio,
+serve, and headless relay: exact extension routing, extension notifications,
+lifecycle hooks, gateway, reverse permission prompter, and production permission
+pipeline. Initialization uses the actual workspace and bundle-derived
+capabilities. Listener failure and normal shutdown close runtime lifecycles
+before provider shutdown (`Sources/OpenGrokCLI/LiveLeaderComposition.swift:225,243-264,284,324-325,441-442`).
+
+Authenticated relay connections register through `ACPLeaderRelayBridge` on the
+existing host instead of replacing/clearing shared runtime sinks. Reconnection
+creates a fresh carrier identity, preserves raw peer request IDs, and requires
+explicit session reattachment; the handshake uses the installed product version
+(`LiveLeaderComposition.swift:377-387`;
+`Sources/OpenGrokACPRuntime/ACPLeaderRelayBridge.swift:26-75`).
+**Divergence/cost:** Rust `agent/app.rs:1259-1307` mirrors output to both carriers.
+Swift owner-scoped routing deliberately provides neither implicit mirroring nor
+inherited driver authority after reconnect.
+
+Real local socket/named-pipe and authenticated loopback WebSocket regressions
+exercise durable/remote listing, deletion, hooks, notifications, reciprocal
+mutation denial, private prompt updates, approvals, disconnect, and reconnect.
+**Mixed-carrier fixtures use echo/no-op prompt drivers and injected backends.**
+One separate test constructs genuine `liveACPServices` with an injected sampler
+that it never calls. This establishes composition/carrier behavior, not an
+external-provider/model turn
+(`Tests/OpenGrokCLITests/LiveLeaderACPCompositionParityTests.swift:33-63,578,1024-1053,1133,1202,1277`).
+
+### LIVE / DIVERGED — bounded carrier work, frame writing, and authority
+
+Initialization remains a barrier; ordinary work is capped at 256 requests per
+client and 1,024 per host. Reverse replies and prompt cancellation remain
+receivable at saturation. Disconnect cancels only that carrier's handlers and
+reverse correlations; noncooperative canceled handlers remain counted until
+completion, and the shared runtime stays open
+(`Sources/OpenGrokACPRuntime/ACPLeaderIPC.swift:261-262,695-696`).
+
+One FIFO drain serializes complete frames across awaited partial writes, with
+at most 64 retained frames and 64 MiB plus framing prefix. Overload fails explicitly.
+**Active-frame cancellation closes the carrier even before any byte is sent;
+queued/not-yet-admitted cancellation does not.**
+Rust `leader/client.rs:498-523` and `leader/server.rs:2476-2504` use one mutable
+writer; Swift's explicit bounds add overload refusals and conservative active
+cancellation (`Sources/OpenGrokACPRuntime/ACPLeaderFrameWriter.swift:31-32,108-139`).
+
+Only an effective exact history route receives the nonresident-administration
+exception; prefix/shadowed registrations do not. Delete/rename inspect
+`sessionId`; historical fork inspects `sourceSessionId`. Malformed arguments
+remain with the exact handler, while generic core control/notifications retain
+strict authority. Nonresident history administration requires an authenticated
+live root owned by that carrier; resident targets require ownership of that
+target. A reservation excludes concurrent core lifecycle admission through
+asynchronous authorization and handler completion.
+
+Landed guard, `Sources/OpenGrokACPRuntime/ACPRuntimeActor.swift:530-534`:
+
+```swift
+guard sessionLifecycleAdmissions[targetSessionID] == nil,
+      leaderHistoryReservations.insert(targetSessionID).inserted
+else {
+    throw ACPRuntimeError.sessionNotFound(targetSessionID)
+}
+```
+
+Closed runtime snapshots remain refused for historical mutation until coordinated
+eviction exists; a new root cannot bypass their resident gate
+(`ACPRuntimeActor.swift:2026-2050`).
+**Cost:** overlapping admission is refused rather than queued; closed snapshots
+cannot be administered as disk-only history, and live carrier authority is
+required even for nonresident targets.
+Rust: `extensions/session_admin.rs:134-172,434-483,950-960`,
+`session/fork.rs:15-24`, `leader/server.rs:1855-1867,1931-1932`.
+
+Deferred SDK requests preserve the originating initialized carrier across task
+boundaries without changing sessionless `{serverId,message}` payloads.
+Missing/departed owners fail explicitly; foreign/late replies cannot resolve
+another carrier's request. This corrects Rust's sessionless routing gap:
+`session/acp_mcp.rs:71-103` emits that shape, but
+`leader/server.rs:2301-2307` drops sessionless non-notifications.
+
+### LIVE — metadata-independent lifecycle reopening
+
+Load/resume reopens missing lifecycle state without optional `_meta`; already-open
+metadata-free attachment does not duplicate SDK registration. Closed foreign
+observers cannot reopen an incumbent driver's snapshot. Ownerless reconnects
+may retain the host's provisional driver claim. Authority/cancellation is
+rechecked after asynchronous admission and hooks.
+
+Landed guard inside the configured leader-verifier branch,
+`Sources/OpenGrokACPRuntime/ACPRuntimeActor.swift:1986-1994`:
+
+```swift
+guard let clientID = ACPLeaderRequestAuthority.clientID,
+      await sessionOwnerVerifier(sessionId, clientID)
+else {
+    throw ACPRuntimeError.sessionNotFound(sessionId)
+}
+```
+
+The open condition is `request.meta != nil || !openedLifecycleSessions.contains(session.sessionId)`
+at lines805/869. Regressions cover omitted/present metadata, callback rollback,
+real closed-observer transport denial, production peer wake before ordinary
+user prompting, and retained provider history—not external-model execution.
+Rust `agent/mvp_agent/session_setup.rs:998-1073,1689-1691` attaches lifecycle
+residency independently of optional metadata.
+
+### DIVERGED / ABSENT — independent production sessions and core client MCP
+
+Production still creates one launch-wide foundation/provider/history bundle
+before a wire ID exists. Immutable admission rejects a second independent ID,
+another canonical workspace, or nonempty core additional roots. Close or failed
+hook rollback never releases the binding; direct driver entry checks it before
+emission, permission interaction, or persistence.
+
+Landed guards, `Sources/OpenGrokCLI/LiveACPSingleSessionBinding.swift:70-72,55-57`:
+
+```swift
+if let wireSessionID, wireSessionID != session.sessionId {
+    throw ACPRuntimeError.invalidParams(Self.independentSessionMessage)
+}
+```
+
+```swift
+guard session.mcpServers.isEmpty else {
+    throw ACPRuntimeError.invalidParams(Self.unsupportedClientMCPServersMessage)
+}
+```
+
+Additional-root and canonical-workspace guards remain at lines49-50/64-65;
+binding persistence is explicit at lines74-76. Production omits core fork
+capability and advertises HTTP/SSE client MCP as unsupported
+(`Sources/OpenGrokCLI/LiveComposition.swift:4878-4881`).
+Core `mcpServers` declarations are not installed on the provider tool surface:
+new/mutating production admissions and direct driver entry reject them.
+
+Active observer attachment is read-only and retains the incumbent snapshot,
+never applying supplied MCP/workspace/additional-root mutations.
+**Resume rejects nonempty `additionalDirectories` before the observer branch;
+load ignores supplied mutation fields on its observer path**
+(`ACPRuntimeActor.swift:775,833-848`).
+Configured MCP and SDK `_meta` remain live through separate installation paths.
+Custom/library embeddings with independent drivers keep multi-session behavior;
+their tests do not establish independent production wire sessions.
+
+**Cost/remaining gap:** production cannot accept a second independent wire
+identity, different workspace, extra core roots, or core client MCP declarations.
+Full parity requires a complete provider/history/tool bundle per canonical ACP
+ID, separate bootstrap authority, explicit create/attach semantics, actual core
+client MCP installation, then durable/remote core load/resume hydration/replay.
+Core load/resume still read the in-memory store (lines772/840); authenticated
+remote listing is live and must not be confused with hydration.
+Rust `agent/mvp_agent/session_setup.rs:309-346,469-545` builds per-session
+resources, `:197-205,261-265` resolves core MCP, and `:843-868,998-1047`
+restores matching history.
+
+### Windows native atomic persistence and owner-private directory corrections
+
+Windows atomic writes validate final, derived temporary, and rename endpoints
+before parent I/O, retaining extended-length drive/UNC strings through native
+creation, write/flush, inspection, replacement, rename, file fsync, and cleanup.
+Ordinary writes retain reparse-following/mode-ignore semantics
+(`Sources/OpenGrokFileUtils/AtomicWrite.swift:168-169,213-217,374-429`).
+
+Owner-private temporary creation retains this exact gate at line437:
+
+```swift
+if options.noFollowFinal, options.mode == 0o600 {
+```
+
+No-follow parent handles stay held through replacement, use exactly
+`DWORD(FILE_SHARE_READ | FILE_SHARE_WRITE)` without delete sharing, and open with
+`FILE_FLAG_OPEN_REPARSE_POINT` (lines577-607). The rejection remains:
+
+```swift
+guard attributes & DWORD(FILE_ATTRIBUTE_REPARSE_POINT) == 0 else {
+    CloseHandle(handle)
+    throw FileUtilsError.symlinkEncountered(path: path)
+}
+```
+
+Exclusive creation installs cleanup only after owning the created file
+(lines414,442-449,480-486). A collision therefore leaves the preexisting file
+untouched and fails this write. This is **deliberately stricter** than Rust
+`crates/codegen/xai-grok-config/src/fs_atomic.rs:19-40`, whose lines39-40 attempt
+removal after any error, including failed creation. Requested file flush,
+bounded replacement retries, write-through replacement, and cross-device errors
+remain (lines685-700).
+
+Ordinary directory probes use following handles (lines540-563), avoiding the
+[documented GetFileAttributesW UNC share-root limitation](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileattributesw#remarks).
+**Live SMB behavior is unverified. Windows `directorySync` remains a no-op,
+including “required”** (lines816-822); file flush/write-through is not Unix
+containing-directory fsync or a stronger Windows crash-durability guarantee.
+Regression coverage retains paths above 300 UTF-16 units, extended URLs,
+replacement failure cleanup, private ACLs, hostile-name no-side-effect checks,
+and ordinary-versus-no-follow reparse behavior.
+
+Commit `2868abe` also replaces Foundation creation of missing state-directory
+components with validated native creation. It captures the error inside the
+UTF-16 closure, tolerates only an already-existing race, then checks the result
+as a non-reparse directory. The explicit state-root boundary and current-user
+ACL application/verification remain unchanged.
+
+Landed creation and post-race guards,
+`Sources/OpenGrokConfig/Paths.swift:506-510,522-528`:
+
+```swift
+let nativePath = nativeAncestry[index + 1]
+let failure = nativePath.withCString(encodedAs: UTF16.self) { path -> DWORD? in
+    guard CreateDirectoryW(path, nil) else { return GetLastError() }
+    return nil
+}
+```
+
+```swift
+guard try inspectWindowsOwnerDirectory(component, nativePath: nativePath) == .directory else {
+    throw windowsOwnerDirectoryError(
+        component,
+        operation: "create session directory",
+        detail: "directory disappeared after creation"
+    )
+}
+```
+
+Reparse/type inspection is at lines343-348; explicit-root containment precedes
+creation at lines480-500; owner security and privacy verification remain at
+lines352-361/530-531. This preserves the existing path-based chain, not a new
+handle-anchored guarantee against every traversal race.
+
+Metadata uses the store's canonical home as explicit state root while retaining
+post-creation path revalidation and owner-only file checks
+(`Sources/OpenGrokCLI/LiveSubagentMetadata.swift:165,225-243,400-404`).
+The native security guard remains:
+
+```swift
+guard native.withCString({ og_directory_secure_current_user($0) }) == 0 else {
+    throw LiveSubagentMetadataError.insecurePath(path.path)
+}
+```
+
+The exact metadata-path fixture independently resolves the existing home's
+casing before save. The broad-DACL fixture creates exactly four long directories
+natively without pre-hardening, shortening, or skipping its privacy assertions.
+The long metadata regression still requires save/update/fresh-store load/resume.
+The Foundation read path at `LiveSubagentMetadata.swift:248-260` remains
+unchanged. Exact-source native Windows stdout records a pass for
+`Long native subagent paths retain private metadata and restart recovery`.
+That unchanged regression performs save, status update, fresh-store load,
+resume recovery, and privacy checks. No speculative Foundation read-path
+fix was needed; the Windows directorySync/no-live-SMB limits above remain.
+
+Rust: `crates/codegen/xai-grok-config/src/paths.rs:178-193,221-230`;
+`crates/codegen/xai-grok-shell-base/src/util/secure_file.rs:50-64,176-214`;
+`agent/subagent/mod.rs:3225-3239`;
+`agent/subagent/handle_request.rs:744-847`.
+**Divergence/cost:** verified Windows ACL/reparse/explicit-root enforcement fails
+visibly on insecure or redirected state instead of best-effort repair.
+Rust's Unix born-0700 behavior is not a Windows ACL-creation guarantee.
+
+### LIVE / DIVERGED — bounded Claude repository ancestor discovery
+
+`Sources/OpenGrokCLI/ClaudeSessionScanner.swift:198-233` now bounds the
+Git-topology walk by initial path depth, tracks canonical visited ancestors,
+and refuses non-shrinking or repeated parents. The directly scoped project
+candidates remain available if topology expansion stops.
+
+Landed guards:
+
+```swift
+var visitedAncestors = Set<String>()
+let maximumAncestors = max(2, checkout.pathComponents.count + 2)
+while visitedAncestors.count < maximumAncestors {
+    let checkoutPath = checkout.resolvingSymlinksInPath().standardizedFileURL.path
+    guard visitedAncestors.insert(checkoutPath).inserted else { return nil }
+```
+
+```swift
+guard candidate.path.count < checkout.path.count else { return nil }
+```
+
+The existing live scan regression covers a non-Git workspace and filesystem root,
+requires the legitimate transcript, and excludes an unrelated project falsely
+claiming that cwd. Nested linked-worktree coverage preserves ordinary ancestor
+discovery (`Tests/OpenGrokCLITests/ClaudeForeignSessionScopeSecurityTests.swift:121-136`).
+No-follow ownership, Git metadata validation, backlink checks, project bounds,
+and candidate filtering remain unchanged.
+
+Pinned Rust `crates/codegen/xai-grok-foreign-sessions/src/claude/projects.rs:7-42`
+uses `git2::Repository::discover`, includes main/linked checkouts, deduplicates/
+bounds candidates, and rejects symlinked project directories.
+**Cost:** Swift can decline topology expansion when Foundation cannot yield a
+bounded genuine ancestor chain; it retains the directly scoped project.
+The unsafe fixed-point assumption is a concrete termination concern, **not
+proof of the macOS CI exit's cause**; no crash/OOM/stack evidence establishes causation.
+
+### Verification history and unresolved platform status
+
+**Earlier checkpoints recorded:** 2026-08-25. The previous full green macOS serial package gate passed **10,053 Swift Testing cases in 1,412 suites across 106 nonempty test-product summaries**, exit 0, in approximately 429 seconds; it predates the newest authentication, writeback, cloud, session-administration, profiling, and platform changes and is not exact-head evidence. An integrated native Linux ARM64 gate passed **498 tests in 24 suites**, exit 0, including AWS profile-owned web-identity federation, Google service-account impersonation, remote-first ACP deletion, durable paginated ACP listing, backend hydration, Rust SQLite interoperability, and updater relaunch. Its subsequent remote-registry integration gate passed **370 tests in 18 suites**, exit 0, including authenticated remote entries through both core and extension ACP session lists. Earlier Linux matrices independently passed **421 tests in 23 suites** and **273 tests in 14 suites**, including **46 adversarial hydration tests**. A subsequent macOS native profiler, writeback, and SQLite interoperability matrix passed **105 tests in 7 suites**, exit 0. Earlier native Windows ARM64 runs independently passed **152 tests in 5 suites** for writeback/cloud/runtime, **47 tests in 3 suites** for remote deletion and portable profiling, **5 tests in 1 suite** for owner-authenticated named pipes and bounded listener shutdown, and **11 tests in 1 suite** for bounded native microphone discovery and real 16-kHz capture, each exit 0. A later SQLite-enabled Windows matrix independently passed all new owner-private foreign-session, genuine overlapped full-duplex pipe, and updater-relaunch regressions; **279 of its 280 tests passed**, with its sole failure isolated to an overlong test-fixture path and corrected. The resumed native Windows ARM64 gate at `f11094dad57a43eacc835c9486390444c1969e38` passed **350 tests in 21 suites**, with `WINDOWS_RESUME_GATE_EXIT=0`; its test phase took 51.190 seconds. The latest preceding Linux integration gate passed **424 tests in 38 suites**, exit 0. These are pre-continuation checkpoints, not current-source evidence. These older checkpoints are not combined exact-head or CI certification.
+
+Older totals below are historical checkpoints unless retained evidence is named;
+they do not certify the current source on all platforms.
+
+| Checkpoint | Result and qualification |
+| --- | --- |
+| Pre-reboot full macOS at `e8942e6` | 11,144 tests, 1,497 suites, 106 products; exit 1 with two stale expectations. Corrected focused run: 57 tests/3 suites, exit 0. Original local raw logs unavailable. |
+| First expanded Windows at `3f0ea58` | 650 tests/106 suites, exit 1 with 16 issues after 491.86 s compile/link. Fixture portability issues plus actual long-path child metadata failures; long live fixtures retained. |
+| Atomic repair `1b5dbc8` | Native compile failed before tests on mixed WinSDK access-mask types. `31094a9` only casts each operand before combination. |
+| Native Windows warm `31094a9` | **715 tests/111 suites, exit 1 with 4 issues**; test phase 48.970 s, source unchanged. **All 30 recovered evidence files pass recorded size/SHA-256 checks.** Failures were metadata casing, long metadata directory creation, durable temporary-sibling directory creation, and broad preexisting-directory fixture creation; `2868abe` addresses them. |
+| Pre-reboot Linux checkpoint recorded in `2868abe` | 729 tests/117 suites, exit 0, unchanged source digest reported. Historical commit record; not a fresh gate. |
+| Post-reboot macOS full attempt at `2868abe` | Intentionally stopped during compilation, exit 143, unchanged source digest, **no tests executed**. |
+| Post-reboot native Windows `2868abe` build-tests | Hit 600 s at 373/406, exit 124, source unchanged, **no tests executed**. Confirmed compiler orphan 13988 was subsequently removed. |
+
+Additional native Windows compilation at `e61d4f5` completed with `buildExitCode: 0` and `testExitCode: null`: reported Swift build 429.12 s, suspension-inflated wall time approximately 570 s. This is **build-only**, not an executed-test checkpoint (`windows/leader-e61d4f5-build/result.json`).
+
+Historical Claude precommit Linux regression: 29 tests/2 suites, exit 0, source digest `f5dba2fdb75dc378be58b1d469366e7b595ac68f0d49ae14852ac4e7a91f9c47`. This is not substituted for the exact-final-source gates above.
+
+The persistence fixture corrections retain the monotonic foreign-provider export
+boundary and rollback assertions; Rust `session/persistence.rs:1898-1933,2115-2125`.
+Remote hydration asserts canonical invocation cwd rather than a raw macOS temp
+alias. No production gate was weakened.
+
+[CI run 32933808318](https://github.com/mweinbach/swift-open-grok/actions/runs/32933808318)
+ran at `2868abe`. Linux/Windows cold test compilation hit their 1,200 s ceilings,
+exit 124, at 1088/1122 and 976/1020 respectively; these were not executed-test
+failures. Commit `e61d4f5` changes **only those two CI cold build-tests overrides
+to 1,800 s** (`.github/workflows/ci.yml:122-129,166-173`).
+**Cost:** a compile hang can take ten minutes longer to report. Local 600 s,
+production-build, test ceilings, and production/test sources remain unchanged.
+
+The separate macOS CI job compiled tests but exited1 abruptly during serial
+testing, before its 2,400 s ceiling, with no emitted failure summary, signal, or
+crash trace. Root cause remains unresolved; the last logged test is not proof
+of causation. CI used Swift 6.2.4 rather than the repository's 6.3.3 pin.
+The earlier CI failure remains unresolved; native evidence above does not certify CI or a release.
+
+The subsequent [CI run 32978814519](https://github.com/mweinbach/swift-open-grok/actions/runs/32978814519)
+at `e6a5e4b` completed macOS and Linux production/test compilation, but both
+serial test jobs failed before their timeout. Both observed the same shortened
+no-wait grace fixture failure in `LiveHeadlessBackgroundWaitParityTests`.
+Linux x86_64 Swift 6.3.3 additionally crashed with signal 11 in the MCP OAuth
+callback worker; macOS Swift 6.2.4 aborted with signal 6 and
+`freed pointer was not the last allocation` during managed-policy launch
+coverage. Neither job emitted a complete test total. These failures remain
+distinct from the passing native matrices above; the retained diagnosis is
+`ci-32978814519-triage.md` under the persistent evidence root. No production
+timeout, permission policy, or authentication policy is relaxed by this record.
+
+Persistent evidence root:
+`/Users/mweinbach/.codex/artifacts/swift-open-grok-resume-20260826/`.
+Retained records: `windows/leader-31094a9-warm/recovery-manifest.json` and
+`result.json`/`stdout.log`; `windows/leader-2868abe-build/result.json` and
+`stdout.log`; `macos-full-serial-2868abe.json`;
+`ci-32933808318-triage.md` and its retained raw job logs/evidence manifest.
+
+<!-- verified-leader-continuation:end -->
 
 ## Exhaustive pinned Rust `.82` parity closure (2026-08-25)
 
@@ -181,10 +598,11 @@ JavaScript teardowns.
   list; first-party owner identity, immutable launch workspace/configuration,
   host-sensitive repository matching, ZDR metadata boundaries, bounded double
   overfetch, and cursor/facet pagination remain enforced. Core `session/load`
-  and `session/resume` still cannot hydrate nonresident durable/remote sessions,
-  and the leader carrier does not yet install its full ACP component bundle
+  and `session/resume` still cannot hydrate nonresident durable/remote sessions.
+  The leader now installs its full ACP component bundle; independent production
+  wire-session bundles and core client MCP installation remain unsupported
   (`Sources/OpenGrokACP/AcpAgentSchema.swift:1629-1748`;
-  `Sources/OpenGrokACPRuntime/ACPRuntimeActor.swift:836-951`; Rust
+  `Sources/OpenGrokACPRuntime/ACPRuntimeActor.swift:772,840,928`; Rust
   `xai-grok-shell/src/agent/handlers/session.rs:292-313,344-366,373-426`;
   pinned `agent-client-protocol-schema-0.11.4/src/agent.rs:1697-1795`).
 
@@ -248,15 +666,16 @@ JavaScript teardowns.
   `aws-config-1.8.8/src/default_provider/credentials.rs:183-193`;
   `aws-config-1.8.8/src/profile/credentials/exec.rs:119-139`).
 
-- **IMPLEMENTED — real overlapped full-duplex Windows leader pipes.** Native
+- **LIVE — real overlapped full-duplex Windows leader pipes.** Native
   named-pipe server/client handles now use `FILE_FLAG_OVERLAPPED`, private
   per-operation events, independent concurrent reads/writes, bounded
   cancelable accepts, and cancellation-safe buffer/event ownership while
   preserving owner-protected security descriptors and mutually authenticated
   peer SIDs. The updater sends a validated best-effort disconnect after its
-  exact acknowledgement so shutdown can drain cleanly. Native Windows
-  compilation succeeded; the expanded Windows security/concurrency suite is
-  still running and this feature cannot yet be called independently verified
+  exact acknowledgement so shutdown can drain cleanly. The exact-source native
+  Windows focused gate passed 730 tests in 112 suites, exit 0;
+  its recorded command/filter and limits appear in the leader continuation.
+  This is scoped native evidence, not complete Windows release certification
   (`Sources/COpenGrokSockets/OpenGrokSockets.c:723-1168`;
   `Sources/OpenGrokCLI/LiveUpdateLeaderRelaunch.swift:273-292`; Rust
   `xai-grok-shell/src/local_ipc.rs:103-171,191-263`).
@@ -748,11 +1167,11 @@ remote-first CLI/ACP deletion, durable core ACP pagination, owner-secured
 leader control sockets, and genuine Unix CPU sampling. Remaining genuine gaps
 are Windows HTTPS enterprise
 root augmentation; dynamic AWS role/SSO/metadata and Google
-metadata/non-file federation credentials; remote ACP-session registry listing
-and core ACP hydration;
+metadata/non-file federation credentials; independent production ACP session
+bundles, core client MCP installation, and core ACP durable/remote hydration;
 authenticated remote fetch for restore-code objects missing locally;
 unsupported explicit plugin
-directories; and full exact-head cross-platform verification. Pinned Rust
+directories; and full cross-platform/remote certification with unresolved CI. Pinned Rust
 itself leaves both advertised standalone reverse terminal/filesystem handlers
 and registry/GCS session archive restoration unimplemented, so their absence
 is not an absent working upstream feature. Forced authentication without an
@@ -871,7 +1290,7 @@ The complete package gate exited successfully before summary reconciliation. Two
 
    Resumed sessions also reconcile canonical and compatibility documents without allowing a weaker sandbox profile or ambiguous equal-rank profile to downgrade the persisted pin (`Sources/OpenGrokCLI/LiveConversationStore.swift:495`).
 
-2. **Durable Rust-compatible session authority:** live turns publish canonical cwd-bucketed session documents and ACP update journals; legacy mirrors migrate safely; interrupted turns preserve acknowledged prompts and tool results; recovery, rewind, fork isolation, hidden subagents, deletion, provider-neutral history, and durable cache-affinity identities are exercised through the live session seam. Atomic persistence still restricts existing directories to `0700`, synchronizes temporary file contents before replacement, and synchronizes the destination directory afterward. It no longer re-flushes unchanged existing directories or the same inode after rename, and directory metadata uses upstream-compatible `fsync` instead of a full hardware-media flush (`Sources/OpenGrokSessionPersistence/RelocationFS.swift:94`; Rust `xai-grok-shell/src/session/storage/relocation/fs.rs:358`).
+2. **Durable Rust-compatible session authority:** live turns publish canonical cwd-bucketed session documents and ACP update journals; legacy mirrors migrate safely; interrupted turns preserve acknowledged prompts and tool results; recovery, rewind, fork isolation, hidden subagents, deletion, provider-neutral history, and durable cache-affinity identities are exercised through the live session seam. On Unix, atomic persistence restricts existing directories to `0700`, synchronizes temporary file contents before replacement, and synchronizes the destination directory afterward. Windows AtomicFile `directorySync` remains a no-op; native file flush is not Unix directory fsync. It no longer re-flushes unchanged existing directories or the same inode after rename, and directory metadata uses upstream-compatible `fsync` instead of a full hardware-media flush (`Sources/OpenGrokSessionPersistence/RelocationFS.swift:94`; Rust `xai-grok-shell/src/session/storage/relocation/fs.rs:358`).
 
 3. **Provider-accurate root and child billing:** production no longer drops `ConversationResponse.usage` or `costUsdTicks`. Each live session owns a real `ChatStateHandle`; root calls and child folds preserve input, output, reasoning, cache-read, cache-creation, per-model, call-count, and cost data. Child accounting is acknowledged exactly once; late children affect the session without contaminating a later prompt; unknown or partial costs remain explicitly incomplete rather than appearing free. Canonical session summaries preserve cumulative bills and resume them without replay or double-counting; forks start a fresh bill. Both `/usage` text surfaces and the pager consume these real snapshots (`Sources/OpenGrokCLI/LiveUsageState.swift:6`, `LiveConversationStore.swift:1186`, `LiveSessionServices.swift:224`).
 
@@ -906,7 +1325,7 @@ The complete package gate exited successfully before summary reconciliation. Two
 
 3. **MCP transport notifications now reach real sessions.** Stdio and HTTP/SSE preserve correlated responses while publishing server tool/resource changes; a bounded dispatcher coalesces notifications, suppresses stale clients, emits actual `x.ai/mcp/server_status`, refreshes tool/resource/search state, and supervises bounded cancellable restarts. Added or removed tools reach both the next real provider request and persistent Code Mode cells without losing JavaScript state or exposing direct-only collaboration tools (`Sources/OpenGrokMCP/McpEventDispatcher.swift:28`; `Sources/OpenGrokCLI/LiveToolExecutor.swift:877`; `Sources/OpenGrokCLI/LiveCodeMode.swift:505`; Rust `xai-grok-shell/src/session/mcp_dispatcher.rs:1`).
 
-4. **Client-provided MCP-over-ACP is live on stdio and WebSocket.** Session metadata registers SDK servers through the exact upstream reverse method `x.ai/mcp/sdk_call` with only `{serverId,message}`; the capability is advertised only when a real reverse sender and lifecycle hooks exist. Numeric/string request IDs, timeout/cancellation, duplicate server names across independent ACP sessions, session-close cleanup, and original-client connection binding are enforced (`Sources/OpenGrokMCP/MCPACPTransport.swift:85`; `Sources/OpenGrokACPRuntime/ACPNotificationGateway.swift:116`; `Sources/OpenGrokCLI/LiveMCPACPHandlers.swift:258`; Rust `xai-grok-mcp/src/acp_transport.rs:30`). Inbound SDK reverse calls remain rejected.
+4. **SDK MCP-over-ACP is live on stdio and WebSocket.** Session metadata registers SDK servers through the exact upstream reverse method `x.ai/mcp/sdk_call` with only `{serverId,message}`; the capability is advertised only when a real reverse sender and lifecycle hooks exist. Numeric/string request IDs, timeout/cancellation, duplicate server names across independent custom/library ACP sessions, session-close cleanup, and original-client connection binding are enforced (`Sources/OpenGrokMCP/MCPACPTransport.swift:85`; `Sources/OpenGrokACPRuntime/ACPNotificationGateway.swift:116`; `Sources/OpenGrokCLI/LiveMCPACPHandlers.swift:258`; Rust `xai-grok-mcp/src/acp_transport.rs:30`). Inbound SDK reverse calls remain rejected. Production binds one independent wire ID per launch; core `mcpServers` declarations remain uninstalled and are refused on new/mutating admission.
 
 5. **Native Messages streaming is live end to end.** Provider response-start IDs/models, uncached/cache-read/cache-creation usage, reasoning signatures, provider message IDs, exact raw stop reasons, matched stop sequences, and terminal usage survive the sampler, shell, pager, and real headless executable. `streaming-messages-json` now emits upstream `system`, `assistant`, `user`, and `result` envelopes; `--include-partial-messages` adds ordered native `stream_event` message/content/signature/delta/stop frames without changing plain or generic streaming JSON (`Sources/OpenGrokSampler/Events.swift:194`; `Sources/OpenGrokCLI/LivePagerOutputs.swift:2280`; Rust `xai-grok-pager/src/headless/reducer/messages/wire.rs:99`).
 
