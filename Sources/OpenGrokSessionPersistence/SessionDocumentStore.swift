@@ -406,6 +406,11 @@ public struct SessionDocumentStore: Sendable {
 
         var sessions: [URL] = []
         for workspace in workspaceDirectories {
+            #if os(Windows)
+            if cwd == nil, !Self.isPotentialWindowsWorkspaceDirectory(workspace) {
+                continue
+            }
+            #endif
             guard try isRealDirectory(workspace) else { continue }
             #if os(Windows)
             let children = try WindowsSessionDirectoryTraversal.contentsOfDirectory(
@@ -429,6 +434,27 @@ public struct SessionDocumentStore: Sendable {
         }
         return sessions
     }
+
+    #if os(Windows)
+    private static func isPotentialWindowsWorkspaceDirectory(_ directory: URL) -> Bool {
+        let name = directory.lastPathComponent
+        if let decoded = OpenGrokPaths.urlDecodePath(name), OpenGrokPaths.isAbsolutePath(decoded) {
+            return true
+        }
+
+        // Legacy scheduler state shares sessions/ but is not an encoded CWD.
+        // Classify hash-backed workspaces by name alone: opening their .cwd
+        // before owner-private/reparse validation would follow attacker paths.
+        guard let separator = name.lastIndex(of: "-"), separator != name.startIndex else {
+            return false
+        }
+        let digest = name[name.index(after: separator)...].utf8
+        guard digest.count == 16 else { return false }
+        return digest.allSatisfy { byte in
+            (48...57).contains(byte) || (97...102).contains(byte)
+        }
+    }
+    #endif
 
     private func isRealDirectory(_ url: URL) throws -> Bool {
         #if os(Windows)

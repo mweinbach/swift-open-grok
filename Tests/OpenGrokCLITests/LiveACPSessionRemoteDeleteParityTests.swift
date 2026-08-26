@@ -825,6 +825,58 @@ struct LiveACPSessionRemoteDeleteParityTests {
         #expect(!FileManager.default.fileExists(atPath: directory.path))
     }
 
+    #if os(Windows)
+    @Test("Windows canonical deletion ignores the real flat scheduler sidecar")
+    func windowsFlatSchedulerSidecarDoesNotHideCanonicalSession() async throws {
+        let fixture = try ACPRemoteDeleteFixture()
+        defer { fixture.cleanup() }
+        try fixture.persist(fixture.account())
+        let directory = try await fixture.seed()
+        let schedulerDirectory = fixture.home
+            .appendingPathComponent("sessions", isDirectory: true)
+            .appendingPathComponent("production-acp-root-\(UUID().uuidString)", isDirectory: true)
+        let scheduler = try #require(LiveSchedulerPersistence.forSessionDirectory(schedulerDirectory))
+        #expect(scheduler.stateFileURL.deletingLastPathComponent() == schedulerDirectory)
+        #expect(try SessionDocumentStore(grokHome: fixture.home).list().map(\.sessionID.rawValue)
+            == [ACPRemoteDeleteFixture.defaultSessionID])
+
+        let backend = MockHTTPTransport(responses: [fixture.response()])
+        let runtime = try await fixture.runtime(transport: backend)
+        let (result, error) = await fixture.call(runtime)
+
+        #expect(error == nil)
+        #expect(result == .object(["success": .bool(true)]))
+        #expect(backend.recordedRequests.count == 1)
+        #expect(!FileManager.default.fileExists(atPath: directory.path))
+        #expect(FileManager.default.fileExists(atPath: schedulerDirectory.path))
+    }
+
+    @Test("Windows still refuses an encoded workspace reparse point beside flat scheduler state")
+    func windowsEncodedWorkspaceReparseStillFailsClosed() async throws {
+        let fixture = try ACPRemoteDeleteFixture()
+        defer { fixture.cleanup() }
+        let directory = try await fixture.seed()
+        let sessions = fixture.home.appendingPathComponent("sessions", isDirectory: true)
+        let schedulerDirectory = sessions.appendingPathComponent(
+            "production-acp-root-\(UUID().uuidString)", isDirectory: true
+        )
+        _ = try #require(LiveSchedulerPersistence.forSessionDirectory(schedulerDirectory))
+
+        let outside = fixture.root.appendingPathComponent("outside", isDirectory: true)
+        try OpenGrokConfig.createDirAllOwnerOnly(outside, stateRoot: fixture.root)
+        let hostileCWD = fixture.root.appendingPathComponent("hostile-workspace").path
+        let redirect = sessions.appendingPathComponent(
+            OpenGrokConfig.encodeCwdDirname(hostileCWD), isDirectory: true
+        )
+        try FileManager.default.createSymbolicLink(at: redirect, withDestinationURL: outside)
+
+        #expect(throws: SessionDocumentStoreError.self) {
+            try SessionDocumentStore(grokHome: fixture.home).list()
+        }
+        #expect(FileManager.default.fileExists(atPath: directory.path))
+    }
+    #endif
+
     @Test("the real live ACP application composes and routes authenticated writeback deletion")
     func realLiveACPCompositionRoutesRemoteDeletion() async throws {
         let fixture = try ACPRemoteDeleteFixture()
@@ -884,6 +936,17 @@ struct LiveACPSessionRemoteDeleteParityTests {
             guard case .response(_, _?, nil)? = initialized.last else {
                 throw CLIApplicationError.failed("production ACP remote-delete failed to initialize")
             }
+
+            #if os(Windows)
+            let schedulerDirectory = fixture.home
+                .appendingPathComponent("sessions", isDirectory: true)
+                .appendingPathComponent(rootSessionID, isDirectory: true)
+            #expect(FileManager.default.fileExists(atPath: schedulerDirectory.path))
+            let visible = try #require(try SessionDocumentStore(grokHome: fixture.home).load(
+                sessionID: targetSessionID
+            ))
+            #expect(visible.summary.sessionID.rawValue == targetSessionID)
+            #endif
 
             let (result, error) = await fixture.call(runtime, sessionID: targetSessionID)
 
