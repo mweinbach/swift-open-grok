@@ -382,7 +382,7 @@ struct LiveProviderIsolationTests {
         let home = try makeTemporaryHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let environment = isolatedEnvironment(home: home, extra: [
-            "FIREWORKS_API_KEY": "fw-key",
+            "XAI_API_KEY": "xai-key",
             "MOONSHOT_API_KEY": "kimi-key",
         ])
         let sessionsPath = home.appendingPathComponent("sessions")
@@ -394,7 +394,7 @@ struct LiveProviderIsolationTests {
             sessionID: "persistence-failure",
             workingDirectory: home
         )
-        let initial = try await resolver.resolve(modelID: "glm-5.2")
+        let initial = try await resolver.resolve(modelID: "grok-4.5")
         var record = LiveConversationRecord.new(sessionID: "persistence-failure", workingDirectory: home)
         record.items = Self.conversation()
         record.currentModelID = initial.sampling.model
@@ -404,6 +404,8 @@ struct LiveProviderIsolationTests {
             record: record,
             store: LiveConversationStore(openGrokHome: home)
         )
+        let boundary = await history.sharedExportBoundary
+        #expect(boundary.allowsXaiExport)
         let coordinator = LiveModelSwitchCoordinator(
             sampling: initial.sampling,
             sampler: SamplerFactorySpy.stubSampler,
@@ -426,7 +428,10 @@ struct LiveProviderIsolationTests {
         #expect(snapshot.configuration == initial.sampling)
         #expect(await history.snapshot() == originalRecord)
         #expect(await history.items == originalRecord.items)
-        #expect((await history.sharedExportBoundary).allowsXaiExport)
+        // Persistence failure retains the route, not the shared export grant.
+        // Keeping this closed can disable export on the retained xAI route;
+        // reopening would break the guard observed by concurrent writeback.
+        #expect(!boundary.allowsXaiExport)
     }
 
     @Test("a refused cross-provider switch leaves history alone")

@@ -2,6 +2,7 @@ import Foundation
 import OpenGrokAuth
 import OpenGrokConfig
 import OpenGrokConfigTypes
+import OpenGrokFileUtils
 import OpenGrokHTTP
 import OpenGrokSamplingTypes
 import OpenGrokSessionPersistence
@@ -490,6 +491,7 @@ struct LiveRemoteSessionHydrationParityTests {
     func hydratesRealConversationAndTools() async throws {
         let fixture = try RemoteSessionHydrationFixture()
         defer { fixture.cleanup() }
+        let expectedWorkspace = try PathSecurity.canonicalize(fixture.workspace).path
         try fixture.persist(fixture.account())
         let id = UUID().uuidString
         let messages = [
@@ -534,7 +536,7 @@ struct LiveRemoteSessionHydrationParityTests {
 
         let state = try #require(try fixture.state(id))
         #expect(state.summary.sessionID.rawValue == id)
-        #expect(state.summary.cwd == fixture.workspace.path)
+        #expect(state.summary.cwd == expectedWorkspace)
         #expect(state.summary.currentModelID == "grok-4.5")
         #expect(state.summary.everUsedCodex == false)
         #expect(state.summary.extra["current_provider"] == .string("xai"))

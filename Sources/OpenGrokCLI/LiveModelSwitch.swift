@@ -633,8 +633,10 @@ actor LiveModelSwitchCoordinator {
 
     /// Rebuild the sampling stack for `modelID`.
     ///
-    /// Resolution, credential lookup and sampler construction all happen before
-    /// any state changes, so a failure leaves the session exactly as it was.
+    /// Resolution, credential lookup and sampler construction leave state
+    /// unchanged on failure. Persistence failure also retains the old route
+    /// and history, but cannot reopen an export boundary already closed for a
+    /// foreign provider. Export can therefore stay disabled on the old route.
     ///
     /// `effort` is a validated reasoning-effort override from
     /// `/model <name> <effort>`. Re-picking the active model is only a no-op
