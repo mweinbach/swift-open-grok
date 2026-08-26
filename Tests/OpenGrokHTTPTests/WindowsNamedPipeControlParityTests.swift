@@ -5,6 +5,25 @@ import Testing
 
 @testable import OpenGrokHTTP
 
+private actor WindowsNamedPipeReadStartProbe {
+    private var started = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func markStarted() {
+        started = true
+        let continuation = waiter
+        waiter = nil
+        continuation?.resume()
+    }
+
+    func waitUntilStarted() async {
+        guard !started else { return }
+        await withCheckedContinuation { continuation in
+            waiter = continuation
+        }
+    }
+}
+
 @Suite("Windows named-pipe cooperative-executor isolation", .serialized)
 struct WindowsNamedPipeControlParityTests {
     @Test("owner-private named pipes authenticate the current user in both directions", .timeLimit(.minutes(1)))
@@ -71,16 +90,22 @@ struct WindowsNamedPipeControlParityTests {
             pipeName: name,
             timeoutSeconds: 2
         )
+        defer {
+            Task { await client.close() }
+        }
         try await client.write(Array("register:grok-pager-update".utf8))
         let registered = try #require(try await client.read())
         #expect(String(decoding: registered, as: UTF8.self) == "registered:1.0.0")
 
+        let readStarted = WindowsNamedPipeReadStartProbe()
         let blockedControlReply = Task {
-            try await client.read()
+            await readStarted.markStarted()
+            return try await client.read()
         }
-        for _ in 0..<8 {
-            await Task.yield()
-        }
+        await readStarted.waitUntilStarted()
+        // The Swift task has entered read(); allow its dedicated native worker
+        // to submit ReadFile before the same HANDLE submits its control write.
+        try await Task.sleep(nanoseconds: 30_000_000)
 
         let started = ContinuousClock.now
         try await client.write(Array("relaunch_for_update:2.0.0".utf8))
@@ -92,6 +117,95 @@ struct WindowsNamedPipeControlParityTests {
         try await client.write(Array("acknowledged".utf8))
         try await server.value
         await client.close()
+    }
+
+    @Test("a parked server read cannot prevent its own shutdown notification", .timeLimit(.minutes(1)))
+    func serverReadAndShutdownWriteAreTrulyFullDuplex() async throws {
+        let path = "C:\\opengrok-pipe-server-full-duplex\\\(UUID().uuidString)\\leader.sock"
+        let name = WindowsNamedPipeName.fullName(forPath: path)
+        let listener = WindowsNamedPipeListener(pipeName: name, ownerOnly: true)
+        try listener.start()
+        defer { listener.close() }
+
+        let accepting = Task { try await listener.accept() }
+        let client = try await WindowsNamedPipeDialer.connect(
+            pipeName: name,
+            timeoutSeconds: 2,
+            requireCurrentUserPeer: true
+        )
+        let server = try await accepting.value
+        defer {
+            Task {
+                await server.close()
+                await client.close()
+            }
+        }
+
+        let readStarted = WindowsNamedPipeReadStartProbe()
+        let blockedServerRead = Task {
+            await readStarted.markStarted()
+            return try await server.read()
+        }
+        await readStarted.waitUntilStarted()
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        let started = ContinuousClock.now
+        try await server.write(Array("shutting_down:auto_update".utf8))
+        let shutdown = try #require(try await client.read())
+        #expect(String(decoding: shutdown, as: UTF8.self) == "shutting_down:auto_update")
+
+        try await client.write(Array("shutdown_acknowledged".utf8))
+        let acknowledgement = try #require(try await blockedServerRead.value)
+        #expect(String(decoding: acknowledgement, as: UTF8.self) == "shutdown_acknowledged")
+        #expect(started.duration(to: .now) < .seconds(2))
+
+        await server.close()
+        await client.close()
+    }
+
+    @Test("closing either overlapped endpoint interrupts its parked native read", .timeLimit(.minutes(1)))
+    func closingOverlappedChannelInterruptsBlockedRead() async throws {
+        for closeServerSide in [false, true] {
+            let path = "C:\\opengrok-pipe-read-close\\\(UUID().uuidString)\\leader.sock"
+            let name = WindowsNamedPipeName.fullName(forPath: path)
+            let listener = WindowsNamedPipeListener(pipeName: name)
+            try listener.start()
+            defer { listener.close() }
+
+            let accepting = Task { try await listener.accept() }
+            let client = try await WindowsNamedPipeDialer.connect(
+                pipeName: name,
+                timeoutSeconds: 2
+            )
+            let server = try await accepting.value
+            let closing = closeServerSide ? server : client
+            let peer = closeServerSide ? client : server
+            defer {
+                Task {
+                    await closing.close()
+                    await peer.close()
+                }
+            }
+
+            let readStarted = WindowsNamedPipeReadStartProbe()
+            let blocked = Task {
+                await readStarted.markStarted()
+                return try await closing.read()
+            }
+            await readStarted.waitUntilStarted()
+            try await Task.sleep(nanoseconds: 30_000_000)
+
+            let started = ContinuousClock.now
+            await closing.close()
+            do {
+                let result = try await blocked.value
+                #expect(result == nil)
+            } catch {
+                #expect(error is WindowsNamedPipeError)
+            }
+            #expect(started.duration(to: .now) < .seconds(1))
+            await peer.close()
+        }
     }
 
     @Test("closing a listener interrupts a native worker parked inside ConnectNamedPipe", .timeLimit(.minutes(1)))

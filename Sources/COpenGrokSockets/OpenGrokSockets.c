@@ -725,12 +725,13 @@ static HANDLE og_named_pipe_create_instance(
     int first,
     int owner_only
 ) {
-    DWORD open_mode = PIPE_ACCESS_DUPLEX;
+    DWORD open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
     if (first) open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
-    /* Listener instances must never park a synchronous ConnectNamedPipe that
-       another thread cannot reliably interrupt. Accepted handles are restored
-       to PIPE_WAIT before either byte-channel implementation receives them. */
-    DWORD pipe_mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT;
+    /* Independent overlapped operations are required for the leader's read
+       loop and notification writer to share a full-duplex pipe. PIPE_WAIT
+       retains blocking byte semantics; overlapped ConnectNamedPipe makes the
+       pending listener independently interruptible by its stop event. */
+    DWORD pipe_mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT;
     SECURITY_ATTRIBUTES *security_attributes = NULL;
     SECURITY_ATTRIBUTES attributes;
     SECURITY_DESCRIPTOR descriptor;
@@ -881,47 +882,93 @@ int og_named_pipe_listener_accept(OGSocketHandle listener, OGSocketHandle *handl
     int connected = 0;
     DWORD failure = ERROR_SUCCESS;
     const char *reason = "could not accept a named-pipe client";
-    for (;;) {
+    HANDLE connection_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (connection_event == NULL) {
+        failure = GetLastError();
+        reason = "could not create named-pipe connection event";
+    }
+
+    while (connection_event != NULL) {
         DWORD stopped = WaitForSingleObject(stop_event, 0);
         if (stopped == WAIT_OBJECT_0) {
             failure = ERROR_OPERATION_ABORTED;
             reason = "named-pipe listener is closed";
             break;
         }
-        if (stopped == WAIT_FAILED) {
-            failure = GetLastError();
+        if (stopped != WAIT_TIMEOUT) {
+            failure = stopped == WAIT_FAILED ? GetLastError() : ERROR_INVALID_HANDLE;
             reason = "could not inspect named-pipe listener stop event";
             break;
         }
 
-        if (ConnectNamedPipe(pending, NULL)) {
+        OVERLAPPED operation;
+        ZeroMemory(&operation, sizeof(operation));
+        operation.hEvent = connection_event;
+        ResetEvent(connection_event);
+        if (ConnectNamedPipe(pending, &operation)) {
             connected = 1;
             break;
         }
+
         DWORD error = GetLastError();
         if (error == ERROR_PIPE_CONNECTED) {
             connected = 1;
             break;
         }
         if (error == ERROR_NO_DATA) {
-            DisconnectNamedPipe(pending);
-        } else if (error != ERROR_PIPE_LISTENING && error != ERROR_PIPE_NOT_CONNECTED) {
+            if (!DisconnectNamedPipe(pending)) {
+                failure = GetLastError();
+                break;
+            }
+            continue;
+        }
+        if (error != ERROR_IO_PENDING) {
             failure = error;
             break;
         }
 
-        DWORD ready = WaitForSingleObject(stop_event, 10);
+        HANDLE events[2] = {stop_event, connection_event};
+        DWORD ready = WaitForMultipleObjects(2, events, FALSE, INFINITE);
         if (ready == WAIT_OBJECT_0) {
+            CancelIoEx(pending, &operation);
+            DWORD ignored = 0;
+            /* OVERLAPPED lives on this stack: cancellation must finish before
+               its event or storage can be released to another operation. */
+            GetOverlappedResult(pending, &operation, &ignored, TRUE);
             failure = ERROR_OPERATION_ABORTED;
             reason = "named-pipe listener is closed";
             break;
         }
-        if (ready != WAIT_TIMEOUT) {
+        if (ready != WAIT_OBJECT_0 + 1) {
             failure = ready == WAIT_FAILED ? GetLastError() : ERROR_INVALID_HANDLE;
-            reason = "could not wait for named-pipe listener stop event";
+            reason = "could not wait for named-pipe connection event";
+            CancelIoEx(pending, &operation);
+            DWORD ignored = 0;
+            GetOverlappedResult(pending, &operation, &ignored, TRUE);
             break;
         }
+
+        DWORD ignored = 0;
+        if (GetOverlappedResult(pending, &operation, &ignored, FALSE)) {
+            connected = 1;
+            break;
+        }
+        error = GetLastError();
+        if (error == ERROR_PIPE_CONNECTED) {
+            connected = 1;
+            break;
+        }
+        if (error == ERROR_NO_DATA) {
+            if (!DisconnectNamedPipe(pending)) {
+                failure = GetLastError();
+                break;
+            }
+            continue;
+        }
+        failure = error;
+        break;
     }
+    if (connection_event != NULL) CloseHandle(connection_event);
 
     if (connected) {
         DWORD mode = PIPE_READMODE_BYTE | PIPE_WAIT;
@@ -1032,7 +1079,7 @@ int og_named_pipe_connect(
         0,
         NULL,
         OPEN_EXISTING,
-        0,
+        FILE_FLAG_OVERLAPPED,
         NULL
     );
     free(wide);
@@ -1060,15 +1107,65 @@ int og_named_pipe_is_ready(const char *pipe_name) {
     return error == ERROR_FILE_NOT_FOUND ? 0 : 1;
 }
 
+static int og_named_pipe_complete_operation(
+    HANDLE pipe,
+    OVERLAPPED *operation,
+    BOOL completed,
+    DWORD *count,
+    DWORD *failure
+) {
+    if (completed) return 0;
+
+    DWORD error = GetLastError();
+    if (error != ERROR_IO_PENDING) {
+        *failure = error;
+        return -1;
+    }
+
+    /* Wait on our private event rather than on the pipe HANDLE. Another
+       thread may CancelIoEx and CloseHandle concurrently; the event remains
+       owned here until the kernel stops using our buffer and OVERLAPPED. */
+    DWORD ready = WaitForSingleObject(operation->hEvent, INFINITE);
+    if (ready != WAIT_OBJECT_0) {
+        *failure = ready == WAIT_FAILED ? GetLastError() : ERROR_INVALID_HANDLE;
+        CancelIoEx(pipe, operation);
+        DWORD ignored = 0;
+        GetOverlappedResult(pipe, operation, &ignored, TRUE);
+        return -1;
+    }
+
+    if (GetOverlappedResult(pipe, operation, count, FALSE)) return 0;
+    *failure = GetLastError();
+    return -1;
+}
+
 int64_t og_named_pipe_read(OGSocketHandle handle, void *buffer, size_t capacity) {
     if (!buffer || capacity == 0) return 0;
-    DWORD count = 0;
-    if (ReadFile((HANDLE)(uintptr_t)handle, buffer, (DWORD)capacity, &count, NULL)) {
-        return (int64_t)count;
+
+    OVERLAPPED operation;
+    ZeroMemory(&operation, sizeof(operation));
+    operation.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (operation.hEvent == NULL) {
+        og_set_windows_error("could not create named-pipe read event");
+        return -1;
     }
-    DWORD error = GetLastError();
-    if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED) return 0;
-    og_set_error((int)error, NULL);
+
+    HANDLE pipe = (HANDLE)(uintptr_t)handle;
+    DWORD requested = capacity > (size_t)MAXDWORD ? MAXDWORD : (DWORD)capacity;
+    DWORD count = 0;
+    DWORD failure = ERROR_SUCCESS;
+    BOOL completed = ReadFile(pipe, buffer, requested, &count, &operation);
+    int result = og_named_pipe_complete_operation(
+        pipe,
+        &operation,
+        completed,
+        &count,
+        &failure
+    );
+    CloseHandle(operation.hEvent);
+    if (result == 0) return (int64_t)count;
+    if (failure == ERROR_BROKEN_PIPE || failure == ERROR_PIPE_NOT_CONNECTED) return 0;
+    og_set_error((int)failure, NULL);
     return -1;
 }
 
@@ -1077,20 +1174,44 @@ int64_t og_named_pipe_write_all(
     const void *buffer,
     size_t length
 ) {
+    if ((!buffer && length != 0) || (uint64_t)length > (uint64_t)INT64_MAX) {
+        og_set_error(ERROR_INVALID_PARAMETER, "invalid named-pipe write buffer or length");
+        return -1;
+    }
+
     size_t written = 0;
     while (written < length) {
+        OVERLAPPED operation;
+        ZeroMemory(&operation, sizeof(operation));
+        operation.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (operation.hEvent == NULL) {
+            og_set_windows_error("could not create named-pipe write event");
+            return -1;
+        }
+
         DWORD count = 0;
+        DWORD failure = ERROR_SUCCESS;
         DWORD chunk = length - written > (size_t)MAXDWORD
             ? MAXDWORD
             : (DWORD)(length - written);
-        if (!WriteFile(
-                (HANDLE)(uintptr_t)handle,
-                (const char *)buffer + written,
-                chunk,
-                &count,
-                NULL
-            )) {
-            og_set_windows_error("named-pipe write failed");
+        HANDLE pipe = (HANDLE)(uintptr_t)handle;
+        BOOL completed = WriteFile(
+            pipe,
+            (const char *)buffer + written,
+            chunk,
+            &count,
+            &operation
+        );
+        int result = og_named_pipe_complete_operation(
+            pipe,
+            &operation,
+            completed,
+            &count,
+            &failure
+        );
+        CloseHandle(operation.hEvent);
+        if (result != 0) {
+            og_set_error((int)failure, "named-pipe write failed");
             return -1;
         }
         if (count == 0) {
