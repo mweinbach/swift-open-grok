@@ -242,6 +242,7 @@ private actor UpdateHalfDuplexLeaderChannel: WebSocketByteChannel {
     private var registrationTypes: [String] = []
     private var commands: [[String: String]] = []
     private var speculativeReads = 0
+    private var disconnects = 0
 
     init(correlatedAcknowledgement: Bool) {
         self.correlatedAcknowledgement = correlatedAcknowledgement
@@ -317,7 +318,12 @@ private actor UpdateHalfDuplexLeaderChannel: WebSocketByteChannel {
             commands.append(command)
             phase = .acknowledged
 
-        case .acp, .ping, .disconnect:
+        case .disconnect:
+            guard phase == .finished else { throw Violation.unexpectedMessage }
+            disconnects += 1
+            phase = .closed
+
+        case .acp, .ping:
             throw Violation.unexpectedMessage
         }
     }
@@ -333,9 +339,10 @@ private actor UpdateHalfDuplexLeaderChannel: WebSocketByteChannel {
     func observed() -> (
         registrations: [String],
         commands: [[String: String]],
-        speculativeReads: Int
+        speculativeReads: Int,
+        disconnects: Int
     ) {
-        (registrationTypes, commands, speculativeReads)
+        (registrationTypes, commands, speculativeReads, disconnects)
     }
 }
 
@@ -464,6 +471,7 @@ struct LiveUpdateLeaderRelaunchParityTests {
                 "to_version": "2.0.0",
             ]])
             #expect(observed.speculativeReads == 0)
+            #expect(observed.disconnects == (correlated ? 1 : 0))
             #expect(out.contents.isEmpty)
             #expect(err.contents == (
                 correlated

@@ -279,6 +279,17 @@ enum LiveUpdateLeaderRelaunch {
                 streams.err(
                     "  ↻ Relaunching shared session (leader \(from) → \(to))…\n"
                 )
+                // A synchronous Windows pipe cannot send shutdown frames
+                // while its server handle is parked in the next client read.
+                // Wake that read before closing; an already-exited leader
+                // must never retract an acknowledgement we have validated.
+                do {
+                    try await channel.write(
+                        ACPLeaderCodec.encode(ACPLeaderClientMessage.disconnect)
+                    )
+                } catch {
+                    // Relaunch remains best-effort after its authenticated ACK.
+                }
             }
         } catch {
             // The leader can legitimately exit between discovery and its ACK.
