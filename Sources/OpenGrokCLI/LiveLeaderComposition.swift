@@ -220,9 +220,9 @@ public enum LiveLeaderComposition {
             )
         }
 
-        let promptDriver: LiveACPPromptDriver
+        let components: LiveACPLaunchComponents
         do {
-            promptDriver = try await services.makePromptDriver(
+            components = try await services.makeComponents(
                 LiveACPLaunch(
                     workingDirectory: cwd,
                     openGrokHome: home,
@@ -235,6 +235,7 @@ public enum LiveLeaderComposition {
             lock.release()
             throw error
         }
+        let promptDriver = components.promptDriver
 
         // One store, one runtime, for the life of the process: that is the
         // whole point of a leader. Every IPC client and the relay all address
@@ -242,10 +243,26 @@ public enum LiveLeaderComposition {
         let store = InMemoryACPSessionStore()
         let workspace = LocalOpenGrokShellWorkspace(root: cwd, openGrokHome: home)
         let runtime = ACPAgentRuntime(
+            configuration: ACPAgentConfiguration(
+                agentCapabilities: components.agentCapabilities,
+                initializationMetadata: OpenGrokInitializeMetadata(
+                    currentWorkingDirectory: cwd.path
+                )
+            ),
             store: store,
             promptDriver: promptDriver,
-            workspaceBoundary: workspace.acpBoundary
+            workspaceBoundary: workspace.acpBoundary,
+            extensionHandler: components.extensionHandler,
+            extensionNotifications: components.extensionNotifications,
+            onSessionOpened: components.onSessionOpened,
+            onSessionClosed: components.onSessionClosed
         )
+        if let gateway = components.notificationGateway {
+            await gateway.attach(runtime)
+        }
+        if let permissionPrompter = components.permissionPrompter {
+            await permissionPrompter.attach(client: ACPRuntimePermissionClient(runtime))
+        }
         await runtime.setCombineQueuedPrompts(
             LiveInteractiveControllerRenderer.resolveUIConfig(
                 workingDirectory: cwd,
@@ -264,7 +281,7 @@ public enum LiveLeaderComposition {
             await manager.configureRefresher(refresher)
         }
         let hubAuth = LeaderComputerHubAuthProvider(manager: manager)
-        let sharedPermissionPipeline = workspace.permissionPipeline
+        let sharedPermissionPipeline = components.permissionPipeline ?? workspace.permissionPipeline
         let hubConnector: ACPWorkspaceExposureConnector = { [hubAuth, sharedPermissionPipeline, environment] hubURL, workspaceCwd in
             let mediation = HubMediation.mediated(
                 LivePermissionHubMediator(pipeline: sharedPermissionPipeline)
@@ -304,8 +321,9 @@ public enum LiveLeaderComposition {
         do {
             channels = try await listener.start()
         } catch {
-            lock.release()
+            await runtime.close()
             await promptDriver.shutdown()
+            lock.release()
             throw CLIApplicationError.failed(
                 "could not bind the leader socket at \(paths.socket.path): \(error)"
             )
@@ -356,14 +374,18 @@ public enum LiveLeaderComposition {
                 "not started: no grok.com session token (BYOK / local-only leader). "
                 + "Run `open-grok login` and restart to enable remote prompts."
         } else if let url = try? WebSocketURL.parse(relay.url) {
+            let relayBridge = ACPLeaderRelayBridge(host: ipc, log: log)
             relayClient = ACPRelayClient(
                 configuration: ACPRelayConfiguration(
                     url: url,
                     origin: relay.origin,
                     authorization: authorization,
+                    clientVersion: OpenGrokCLIVersion.installed(environment: environment),
                     clientMode: "headless"
                 ),
-                makeRuntime: { runtime },
+                serveConnection: { transport in
+                    await relayBridge.serve(transport)
+                },
                 authRecovery: authRecovery,
                 log: log
             )
@@ -416,6 +438,7 @@ public enum LiveLeaderComposition {
                 await relayHandle.stop()
                 await ipcHandle.stop()
                 await listener.stop()
+                await runtime.close()
                 await promptDriver.shutdown()
                 lock.release()
             }

@@ -40,9 +40,24 @@ private actor LiveACPPromptImageSampler {
     }
 }
 
+private actor LiveACPAdmissionProbe {
+    private(set) var notifications: [SessionNotification] = []
+    private(set) var opened: [AcpSessionId] = []
+
+    func emit(_ notification: SessionNotification) {
+        notifications.append(notification)
+    }
+
+    func refuseOpening(_ sessionID: AcpSessionId) throws {
+        opened.append(sessionID)
+        throw ACPRuntimeError.invalidParams("injected session-open failure")
+    }
+}
+
 private struct LiveACPPromptImageFixture {
     let root: URL
     let home: URL
+    let workspace: URL
     let rootSessionID: String
     let runtime: ACPAgentRuntime
     let wireSessionID: AcpSessionId
@@ -61,7 +76,7 @@ private struct LiveACPPromptImageFixture {
         root = URL(fileURLWithPath: "/tmp/ogapi-\(suffix)", isDirectory: true)
         #endif
         home = root.appendingPathComponent("home", isDirectory: true)
-        let workspace = root.appendingPathComponent("workspace", isDirectory: true)
+        workspace = root.appendingPathComponent("workspace", isDirectory: true)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         if installSkill {
@@ -131,11 +146,14 @@ private struct LiveACPPromptImageFixture {
         self.runtime = runtime
         await gateway.attach(runtime)
         await runtime.setReverseSender { _ in }
-        _ = await runtime.handle(.request(
+        let initialized = await runtime.handle(.request(
             id: .string("initialize-prompt-images"),
             method: AgentMethodNames.initialize,
             params: try JSONValue.encode(InitializeRequest(protocolVersion: .v1))
         ))
+        guard case .response(_, _?, nil)? = initialized.last else {
+            throw CLIApplicationError.failed("ACP prompt-image fixture did not initialize")
+        }
         let opened = await runtime.handle(.request(
             id: .string("open-prompt-images"),
             method: AgentMethodNames.sessionNew,
@@ -221,6 +239,195 @@ private func withLiveACPPromptImageFixture(
 
 @Suite("ACP session/prompt genuine provider image delivery", .serialized)
 struct LiveACPPromptImageDeliveryParityTests {
+    @Test("direct production driver calls cannot bypass wire identity or workspace admission with images")
+    func directDriverRejectsUnadmittedImagesBeforeEmissionOrPersistence() async throws {
+        try await withLiveACPPromptImageFixture { fixture in
+            let store = LiveConversationStore(openGrokHome: fixture.home)
+            let before = try await store.load(sessionID: fixture.rootSessionID)
+            let original = ACPSessionSnapshot(
+                sessionId: fixture.wireSessionID,
+                cwd: fixture.workspace.path,
+                createdAt: "2026-08-25T00:00:00Z",
+                updatedAt: "2026-08-25T00:00:00Z"
+            )
+            let foreignID = AcpSessionId("independent-image-session")
+            var foreignIdentity = original
+            foreignIdentity.sessionId = foreignID
+            var differentWorkspace = original
+            differentWorkspace.cwd = fixture.root.path
+            var additionalRoots = original
+            additionalRoots.additionalDirectories = [fixture.root.path]
+            var clientMCP = original
+            clientMCP.mcpServers = [.stdio(McpServerStdio(
+                name: "uninstalled-direct-client-mcp",
+                command: fixture.root.appendingPathComponent("never-launch-client-mcp").path
+            ))]
+            let cases: [(ACPSessionSnapshot, AcpSessionId, String)] = [
+                (foreignIdentity, foreignID, LiveACPSingleSessionBinding.independentSessionMessage),
+                (differentWorkspace, fixture.wireSessionID, LiveACPSingleSessionBinding.workspaceMessage),
+                (additionalRoots, fixture.wireSessionID, LiveACPSingleSessionBinding.additionalDirectoriesMessage),
+                (clientMCP, fixture.wireSessionID, LiveACPSingleSessionBinding.unsupportedClientMCPServersMessage),
+                (original, foreignID, "prompt and session identities do not match"),
+            ]
+            let observations = LiveACPAdmissionProbe()
+            let image = ImageContent(
+                data: liveACPPromptImagePNG().base64EncodedString(),
+                mimeType: "image/png"
+            )
+            for (snapshot, requestSessionID, message) in cases {
+                do {
+                    let response = try await fixture.components.promptDriver.run(
+                        context: ACPPromptContext(
+                            session: snapshot,
+                            request: PromptRequest(
+                                sessionId: requestSessionID,
+                                prompt: [.text("unadmitted image context must never persist"), .image(image)],
+                                messageId: "reused-admission-prompt"
+                            )
+                        ),
+                        emit: { notification, _ in await observations.emit(notification) }
+                    )
+                    Issue.record("unadmitted production prompt returned \(response.stopReason)")
+                } catch let error as ACPRuntimeError {
+                    #expect(error == .invalidParams(message))
+                }
+            }
+            #expect(await observations.notifications.isEmpty)
+            #expect(await fixture.sampler.recorded().isEmpty)
+            let after = try await store.load(sessionID: fixture.rootSessionID)
+            #expect(after.items == before.items)
+
+            let admitted = try await fixture.prompt(
+                id: "reused-admission-prompt",
+                text: "the bound session has no staged image"
+            )
+            #expect(admitted.1 == nil)
+            #expect(admitted.0?.stopReason == .endTurn)
+            let sampled = try #require(try await fixture.waitForSamples(1).first)
+            guard case .user(let user)? = sampled.items.last else {
+                Issue.record("the bound production prompt did not reach its own user item")
+                return
+            }
+            #expect(user.content == [.text(text: "the bound session has no staged image")])
+            #expect(!sampled.items.contains {
+                $0.textContent().contains("unadmitted image context must never persist")
+            })
+        }
+    }
+
+    @Test("failed session-open rollback cannot release an already admitted launch identity")
+    func failedLifecycleRetainsImmutableBinding() async throws {
+        let workspace = FileManager.default.temporaryDirectory
+        let binding = LiveACPSingleSessionBinding(workingDirectory: workspace)
+        let observations = LiveACPAdmissionProbe()
+        let runtime = ACPAgentRuntime(
+            promptDriver: LiveACPPromptDriver(
+                driver: ACPNoopPromptDriver(),
+                sessionAdmission: { try await binding.admit($0) }
+            ),
+            onSessionOpened: { sessionID, _ in try await observations.refuseOpening(sessionID) }
+        )
+        do {
+            let initialized = await runtime.handle(.request(
+                id: .string("initialize-rollback-binding"),
+                method: AgentMethodNames.initialize,
+                params: try JSONValue.encode(InitializeRequest(protocolVersion: .v1))
+            ))
+            guard case .response(_, _?, nil)? = initialized.last else {
+                throw CLIApplicationError.failed("rollback-binding runtime did not initialize")
+            }
+            let failedOpen = await runtime.handle(.request(
+                id: .string("first-rollback-binding"),
+                method: AgentMethodNames.sessionNew,
+                params: try JSONValue.encode(NewSessionRequest(cwd: workspace.path))
+            ))
+            guard case .response(_, nil, let firstError?)? = failedOpen.last else {
+                throw CLIApplicationError.failed("injected opening failure did not reach ACP")
+            }
+            #expect(firstError.message == "injected session-open failure")
+            let firstID = try #require(await observations.opened.first)
+            #expect(await !runtime.sessionExists(firstID))
+
+            let refusedOpen = await runtime.handle(.request(
+                id: .string("second-rollback-binding"),
+                method: AgentMethodNames.sessionNew,
+                params: try JSONValue.encode(NewSessionRequest(cwd: workspace.path))
+            ))
+            guard case .response(_, nil, let refusal?)? = refusedOpen.last else {
+                throw CLIApplicationError.failed("rolled-back launch admitted a different identity")
+            }
+            #expect(refusal.code == .invalidParams)
+            #expect(refusal.message == LiveACPSingleSessionBinding.independentSessionMessage)
+            #expect(await observations.opened.count == 1)
+            await runtime.close()
+        } catch {
+            await runtime.close()
+            throw error
+        }
+    }
+
+    #if os(macOS) || os(Linux)
+    @Test("canonical workspace aliases bind once and invalid or retargeted paths never claim authority")
+    func canonicalWorkspaceAliasesCannotRetargetBinding() async throws {
+        try await withLiveACPPromptImageFixture { fixture in
+            let binding = LiveACPSingleSessionBinding(workingDirectory: fixture.workspace)
+            let original = ACPSessionSnapshot(
+                sessionId: AcpSessionId("accepted-alias-session"),
+                cwd: fixture.workspace.path,
+                createdAt: "2026-08-25T00:00:00Z",
+                updatedAt: "2026-08-25T00:00:00Z"
+            )
+            var invalid = original
+            invalid.sessionId = AcpSessionId("rejected-before-binding")
+            for path in ["relative", fixture.root.path, fixture.workspace.path + "/../workspace"] {
+                invalid.cwd = path
+                do {
+                    try await binding.admit(invalid)
+                    Issue.record("invalid workspace claimed the first session binding")
+                } catch let error as ACPRuntimeError {
+                    #expect(error == .invalidParams(LiveACPSingleSessionBinding.workspaceMessage))
+                }
+            }
+            invalid.cwd = fixture.workspace.path
+            invalid.mcpServers = [.stdio(McpServerStdio(
+                name: "uninstalled-first-client-mcp",
+                command: fixture.root.appendingPathComponent("never-launch-client-mcp").path
+            ))]
+            do {
+                try await binding.admit(invalid)
+                Issue.record("an uninstalled client MCP server claimed the first session binding")
+            } catch let error as ACPRuntimeError {
+                #expect(error == .invalidParams(LiveACPSingleSessionBinding.unsupportedClientMCPServersMessage))
+            }
+            invalid.mcpServers = []
+
+            let alias = fixture.root.appendingPathComponent("workspace-alias", isDirectory: true)
+            try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: fixture.workspace)
+            var aliased = original
+            aliased.cwd = alias.path
+            try await binding.admit(aliased)
+            try await binding.admit(original)
+
+            try FileManager.default.removeItem(at: alias)
+            try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: fixture.home)
+            do {
+                try await binding.admit(aliased)
+                Issue.record("retargeted workspace alias changed the launch authority")
+            } catch let error as ACPRuntimeError {
+                #expect(error == .invalidParams(LiveACPSingleSessionBinding.workspaceMessage))
+            }
+            invalid.cwd = fixture.workspace.path
+            do {
+                try await binding.admit(invalid)
+                Issue.record("a rejected identity replaced the admitted workspace alias")
+            } catch let error as ACPRuntimeError {
+                #expect(error == .invalidParams(LiveACPSingleSessionBinding.independentSessionMessage))
+            }
+            try await binding.admit(original)
+        }
+    }
+    #endif
+
     @Test("authenticated wire-session image reaches the genuine root-provider user item and persistence")
     func imageReachesRealSamplerAndDurableUserMessage() async throws {
         try await withLiveACPPromptImageFixture { fixture in

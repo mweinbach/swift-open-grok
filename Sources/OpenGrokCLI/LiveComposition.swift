@@ -4842,6 +4842,7 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     workingDirectory: foundation.cwd,
                     environment: context.environment
                 ).mouseReportingToggleEnabled
+            let sessionBinding = LiveACPSingleSessionBinding(workingDirectory: foundation.cwd)
             let promptDriver = LiveACPPromptDriver(
                 driver: ProviderBackedACPPromptDriver(
                     providerSession: providerSession,
@@ -4873,6 +4874,11 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                 permissionPrompter: acpPermissionPrompter,
                 turnActivity: { sessionID, active in
                     await acpPeerBridge.turnActivity(sessionID: sessionID, active: active)
+                },
+                supportsIndependentSessions: false,
+                supportsClientMCPServers: false,
+                sessionAdmission: { snapshot in
+                    try await sessionBinding.admit(snapshot)
                 },
                 shutdown: {
                     stack.sessionBusObserver?.cancel()

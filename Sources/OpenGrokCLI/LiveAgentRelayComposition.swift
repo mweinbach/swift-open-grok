@@ -147,9 +147,7 @@ public enum LiveAgentRelayComposition {
             onSessionOpened: components.onSessionOpened,
             onSessionClosed: components.onSessionClosed,
             configuration: ACPAgentConfiguration(
-                agentCapabilities: ACPAgentConfiguration.defaultAgentCapabilities(
-                    supportsEmbeddedContext: true
-                ),
+                agentCapabilities: components.agentCapabilities,
                 initializationMetadata: OpenGrokInitializeMetadata(
                     currentWorkingDirectory: cwd.path
                 )

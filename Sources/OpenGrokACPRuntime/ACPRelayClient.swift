@@ -269,12 +269,13 @@ actor ACPRelayOutcomeBox {
 
 public actor ACPRelayClient {
     public typealias RuntimeProvider = @Sendable () async throws -> ACPAgentRuntime
+    public typealias ConnectionHandler = @Sendable (any ACPTransport) async -> Void
     public typealias AuthRecovery = @Sendable (
         ACPRelayAuthRecoveryReason
     ) async -> ACPRelayAuthRecoveryResult
 
     public let configuration: ACPRelayConfiguration
-    private let makeRuntime: RuntimeProvider
+    private let makeConnectionHandler: @Sendable () async throws -> ConnectionHandler
     private let authRecovery: AuthRecovery?
     private let log: @Sendable (String) -> Void
 
@@ -291,7 +292,30 @@ public actor ACPRelayClient {
         log: @escaping @Sendable (String) -> Void = { _ in }
     ) {
         self.configuration = configuration
-        self.makeRuntime = makeRuntime
+        self.makeConnectionHandler = {
+            let runtime = try await makeRuntime()
+            return { transport in
+                await Self.pump(transport: transport, runtime: runtime)
+            }
+        }
+        self.authRecovery = authRecovery
+        self.log = log
+        self.authorization = configuration.authorization
+    }
+
+    /// A leader already owns the runtime's multiplexed notification and
+    /// reverse-request sinks. Its relay must register another carrier, not
+    /// replace those sinks with a single WebSocket connection.
+    /// See `ACPLeaderRelayBridge` for the pinned Rust channel topology and
+    /// the deliberate owner-scoped routing divergence.
+    public init(
+        configuration: ACPRelayConfiguration,
+        serveConnection: @escaping ConnectionHandler,
+        authRecovery: AuthRecovery? = nil,
+        log: @escaping @Sendable (String) -> Void = { _ in }
+    ) {
+        self.configuration = configuration
+        self.makeConnectionHandler = { serveConnection }
         self.authRecovery = authRecovery
         self.log = log
         self.authorization = configuration.authorization
@@ -304,14 +328,13 @@ public actor ACPRelayClient {
 
     /// Dial, serve, reconnect — until `stop()` or a terminal refusal.
     ///
-    /// The runtime is built once and reused across reconnects: upstream keeps
-    /// one long-lived agent process behind the relay, so session state must
-    /// outlive any single socket (`app.rs:833-835` — remote clients recover by
-    /// re-`initialize`-ing and replaying with `session/load`).
+    /// Standalone runtime construction happens once, so its sessions outlive
+    /// individual sockets. A leader-supplied handler instead binds each new
+    /// socket to a fresh registered carrier on its existing shared runtime.
     public func run() async {
-        let runtime: ACPAgentRuntime
+        let serveConnection: ConnectionHandler
         do {
-            runtime = try await makeRuntime()
+            serveConnection = try await makeConnectionHandler()
         } catch {
             log("relay: agent runtime unavailable: \(error)")
             return
@@ -339,8 +362,9 @@ public actor ACPRelayClient {
                     outcome: outcome,
                     log: log
                 )
-                await Self.pump(transport: transport, runtime: runtime)
+                await serveConnection(transport)
                 keepAlive?.cancel()
+                await transport.close()
                 activeConnection = nil
             } catch {
                 handshakeUnauthorized = Self.isHandshakeUnauthorized(error)
@@ -427,7 +451,7 @@ public actor ACPRelayClient {
     ///
     /// Upstream has no equivalent hazard because its agent is a separate
     /// process the relay merely pipes to (`app.rs:1346-1388`).
-    private static func pump(transport: ACPRelayTransport, runtime: ACPAgentRuntime) async {
+    private static func pump(transport: any ACPTransport, runtime: ACPAgentRuntime) async {
         let writer = ACPRelayTransportWriter(transport: transport)
         await runtime.setNotificationSink { message in
             try? await writer.send(message)
@@ -508,9 +532,9 @@ public actor ACPRelayClient {
 /// An actor because the notification fan-out and the per-message reply tasks
 /// send concurrently, and two interleaved sends would interleave their frames.
 actor ACPRelayTransportWriter {
-    private let transport: ACPRelayTransport
+    private let transport: any ACPTransport
 
-    init(transport: ACPRelayTransport) {
+    init(transport: any ACPTransport) {
         self.transport = transport
     }
 

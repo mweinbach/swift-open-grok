@@ -197,6 +197,73 @@ private struct ACPPeerLiveFixture {
         }
         return await probe.requests
     }
+
+    func exchange(
+        method: String,
+        params: JSONValue
+    ) async throws -> (result: JSONValue?, error: AcpError?) {
+        let response = await runtime.handle(.request(
+            id: .string(UUID().uuidString),
+            method: method,
+            params: params
+        ))
+        guard case .response(_, let result, let error)? = response.last else {
+            throw CLIApplicationError.failed("live ACP peer request did not return a response")
+        }
+        return (result, error)
+    }
+
+    func prompt(text: String, messageID: String) async throws -> PromptResponse {
+        let response = try await exchange(
+            method: AgentMethodNames.sessionPrompt,
+            params: JSONValue.encode(PromptRequest(
+                sessionId: wireSessionID,
+                prompt: [.text(text)],
+                messageId: messageID
+            ))
+        )
+        if let error = response.error { throw error }
+        guard let result = response.result else {
+            throw CLIApplicationError.failed("live ACP peer prompt returned no result")
+        }
+        return try result.decode(PromptResponse.self)
+    }
+
+    func sessionParameters(
+        method: String,
+        cwd: String,
+        additionalDirectories: [String] = [],
+        mcpServers: [McpServer] = [],
+        meta: AcpMeta? = [:]
+    ) throws -> JSONValue {
+        switch method {
+        case AgentMethodNames.sessionNew:
+            return try JSONValue.encode(NewSessionRequest(
+                cwd: cwd,
+                additionalDirectories: additionalDirectories,
+                mcpServers: mcpServers,
+                meta: meta
+            ))
+        case AgentMethodNames.sessionLoad:
+            return try JSONValue.encode(LoadSessionRequest(
+                sessionId: wireSessionID,
+                cwd: cwd,
+                mcpServers: mcpServers,
+                additionalDirectories: additionalDirectories,
+                meta: meta
+            ))
+        case AgentMethodNames.sessionResume:
+            return try JSONValue.encode(ResumeSessionRequest(
+                sessionId: wireSessionID,
+                cwd: cwd,
+                additionalDirectories: additionalDirectories,
+                mcpServers: mcpServers,
+                meta: meta
+            ))
+        default:
+            throw CLIApplicationError.failed("unsupported ACP peer fixture session method")
+        }
+    }
 }
 
 private func withACPPeerFixture<T>(
@@ -470,27 +537,231 @@ struct LiveACPPeerWakeParityTests {
         }
     }
 
-    @Test("ambiguous ACP wire sessions never let a peer choose another client's authority")
-    func ambiguousWireSessionsRejectPeerDelivery() async throws {
+    @Test(
+        "production rejects independent new and forked wire identities without breaking the original peer",
+        arguments: [AgentMethodNames.sessionNew, AgentMethodNames.sessionFork]
+    )
+    func independentWireSessionsCannotShareTheRootDriver(method: String) async throws {
         try await withACPPeerFixture { fixture in
-            let created = await fixture.runtime.handle(.request(
-                id: .string("create-second-acp-wire-session"),
-                method: AgentMethodNames.sessionNew,
-                params: try JSONValue.encode(NewSessionRequest(cwd: fixture.workspace.path))
-            ))
-            guard case .response(_, let payload?, nil)? = created.last else {
-                Issue.record("second real ACP wire session failed to open")
-                return
-            }
-            let second = try payload.decode(NewSessionResponse.self).sessionId
-            #expect(second != fixture.wireSessionID)
+            let params = method == AgentMethodNames.sessionNew
+                ? try JSONValue.encode(NewSessionRequest(cwd: fixture.workspace.path))
+                : try JSONValue.encode(ForkSessionRequest(sessionId: fixture.wireSessionID))
+            let refused = try await fixture.exchange(method: method, params: params)
+            #expect(refused.result == nil)
+            #expect(refused.error?.code == .invalidParams)
+            #expect(refused.error?.message == LiveACPSingleSessionBinding.independentSessionMessage)
+            #expect(await !fixture.runtime.sessionExists(AcpSessionId("wire-acp-2")))
+
+            let unknownPrompt = try await fixture.exchange(
+                method: AgentMethodNames.sessionPrompt,
+                params: JSONValue.encode(PromptRequest(
+                    sessionId: AcpSessionId("wire-acp-2"),
+                    prompt: [.text("do not inherit the original session's conversation")]
+                ))
+            )
+            #expect(unknownPrompt.result == nil)
+            #expect(unknownPrompt.error != nil)
+            #expect(await fixture.probe.requests.isEmpty)
 
             let status = try await fixture.sender.messageSession(
                 sessionID: fixture.rootSessionID,
-                message: "never choose a different client session"
+                message: "the original bound peer remains usable"
             )
-            #expect(status == .rejected)
+            #expect(status == .accepted)
+            let sampled = try #require(try await fixture.awaitRequests(1).first)
+            #expect(sampled.sessionID == fixture.rootSessionID)
+            #expect(sampled.prompt.contains("original bound peer remains usable"))
+        }
+    }
+
+    @Test(
+        "same-ID attach restores live peer authority and history with or without metadata after close",
+        arguments: [AgentMethodNames.sessionLoad, AgentMethodNames.sessionResume], [false, true]
+    )
+    func closeRetainsBindingAndSameSessionCanAttach(method: String, includesMetadata: Bool) async throws {
+        try await withACPPeerFixture { fixture in
+            let gateway = try #require(fixture.components.notificationGateway)
+            let firstText = "private context belonging to the original ACP identity"
+            let first = try await fixture.prompt(text: firstText, messageID: "before-close")
+            #expect(first.stopReason == .endTurn)
+
+            let closed = try await fixture.exchange(
+                method: AgentMethodNames.sessionClose,
+                params: JSONValue.encode(CloseSessionRequest(sessionId: fixture.wireSessionID))
+            )
+            #expect(closed.error == nil)
+            #expect(closed.result != nil)
+            #expect(await !gateway.ownsSession(fixture.wireSessionID))
+            let refused = try await fixture.exchange(
+                method: AgentMethodNames.sessionNew,
+                params: JSONValue.encode(NewSessionRequest(cwd: fixture.workspace.path))
+            )
+            #expect(refused.result == nil)
+            #expect(refused.error?.message == LiveACPSingleSessionBinding.independentSessionMessage)
+            #expect(await !fixture.runtime.sessionExists(AcpSessionId("wire-acp-2")))
+
+            let params = try fixture.sessionParameters(
+                method: method,
+                cwd: fixture.workspace.path,
+                meta: includesMetadata ? [:] : nil
+            )
+            #expect((params["_meta"] != nil) == includesMetadata)
+            let attached = try await fixture.exchange(
+                method: method,
+                params: params
+            )
+            #expect(attached.error == nil)
+            #expect(attached.result != nil)
+            #expect(await gateway.ownsSession(fixture.wireSessionID))
+
+            let peerText = "peer wake after closing and reopening the same ACP identity"
+            let status = try await fixture.sender.messageSession(
+                sessionID: fixture.rootSessionID,
+                message: peerText
+            )
+            #expect(status == .accepted)
+            let peerRequests = try await fixture.awaitRequests(2)
+            let peer = try #require(peerRequests.first { $0.turnID.hasPrefix("peer-message-") })
+            #expect(peer.sessionID == fixture.rootSessionID)
+            #expect(peer.items.contains { $0.textContent() == firstText })
+            #expect(peer.items.contains { item in
+                guard case .user(let user) = item else { return false }
+                return user.syntheticReason == .agentMessage && item.textContent().contains(peerText)
+            })
+
+            let completionDeadline = Date().addingTimeInterval(5)
+            var peerCompleted = false
+            while Date() < completionDeadline, !peerCompleted {
+                let notifications = await fixture.runtime.pollNotifications()
+                peerCompleted = notifications.contains {
+                    $0.method == ACPXaiNotificationMethods.promptComplete
+                        && $0.params?["promptId"]?.stringValue == peer.turnID
+                }
+                if !peerCompleted {
+                    try await Task.sleep(nanoseconds: 10_000_000)
+                }
+            }
+            try #require(peerCompleted)
+            let resumed = try await fixture.prompt(
+                text: "continue the original conversation",
+                messageID: "after-close"
+            )
+            #expect(resumed.stopReason == .endTurn)
+            let requests = await fixture.probe.requests
+            #expect(requests.count == 3)
+            let latest = try #require(requests.last)
+            #expect(latest.items.contains { $0.textContent() == firstText })
+            #expect(latest.sessionID == fixture.rootSessionID)
+        }
+    }
+
+    @Test(
+        "production session admission rejects workspace replacement and unsupported root expansion before mutation",
+        arguments: [
+            AgentMethodNames.sessionNew,
+            AgentMethodNames.sessionLoad,
+            AgentMethodNames.sessionResume,
+        ]
+    )
+    func workspaceRequestsCannotRebindTheLaunch(method: String) async throws {
+        try await withACPPeerFixture { fixture in
+            // The record uses the launch resolver's standardized path, which
+            // can differ from the raw /private/tmp fixture URL on macOS. Pin
+            // that exact original spelling before any hostile request runs.
+            let originalDirectory = try liveResolveWorkingDirectory(fixture.workspace.path)
+            let originalState = try #require(try SessionDocumentStore(grokHome: fixture.home).load(
+                sessionID: fixture.rootSessionID,
+                cwd: originalDirectory.path
+            ))
+            #expect(originalState.summary.cwd == originalDirectory.path)
+            let child = fixture.workspace.appendingPathComponent("child", isDirectory: true)
+            try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+            for cwd in [fixture.sourceWorkspace.path, child.path, "relative-workspace"] {
+                let refused = try await fixture.exchange(
+                    method: method,
+                    params: fixture.sessionParameters(method: method, cwd: cwd)
+                )
+                #expect(refused.result == nil)
+                #expect(refused.error?.code == .invalidParams)
+                #expect(refused.error?.message == LiveACPSingleSessionBinding.workspaceMessage)
+            }
+            if method != AgentMethodNames.sessionResume {
+                let refused = try await fixture.exchange(
+                    method: method,
+                    params: fixture.sessionParameters(
+                        method: method,
+                        cwd: fixture.workspace.path,
+                        additionalDirectories: [fixture.sourceWorkspace.path]
+                    )
+                )
+                #expect(refused.result == nil)
+                #expect(refused.error?.message == LiveACPSingleSessionBinding.additionalDirectoriesMessage)
+            }
             #expect(await fixture.probe.requests.isEmpty)
+
+            let original = try await fixture.prompt(
+                text: "use only the original workspace",
+                messageID: "workspace-still-bound"
+            )
+            #expect(original.stopReason == .endTurn)
+            let persisted = try #require(try SessionDocumentStore(grokHome: fixture.home).load(
+                sessionID: fixture.rootSessionID,
+                cwd: fixture.workspace.path
+            ))
+            #expect(persisted.summary.cwd == originalState.summary.cwd)
+        }
+    }
+
+    @Test(
+        "production explicitly rejects uninstalled core client MCP transports and preserves the original session",
+        arguments: [
+            AgentMethodNames.sessionNew,
+            AgentMethodNames.sessionLoad,
+            AgentMethodNames.sessionResume,
+        ]
+    )
+    func coreClientMCPServersNeverBecomeSilentSnapshotOnlySuccesses(method: String) async throws {
+        try await withACPPeerFixture { fixture in
+            let servers: [McpServer] = [
+                .stdio(McpServerStdio(
+                    name: "unsupported-core-stdio",
+                    command: fixture.root.appendingPathComponent("never-launch-core-mcp").path
+                )),
+                .http(McpServerHttp(
+                    name: "unsupported-core-http",
+                    url: "http://127.0.0.1:1/unsupported-core-mcp"
+                )),
+                .sse(McpServerSse(
+                    name: "unsupported-core-sse",
+                    url: "http://127.0.0.1:1/unsupported-core-mcp"
+                )),
+            ]
+            for server in servers {
+                let refused = try await fixture.exchange(
+                    method: method,
+                    params: fixture.sessionParameters(
+                        method: method,
+                        cwd: fixture.workspace.path,
+                        mcpServers: [server],
+                        meta: nil
+                    )
+                )
+                #expect(refused.result == nil)
+                #expect(refused.error?.code == .invalidParams)
+                #expect(refused.error?.message == LiveACPSingleSessionBinding.unsupportedClientMCPServersMessage)
+            }
+            #expect(await fixture.probe.requests.isEmpty)
+            #expect(await !fixture.runtime.sessionExists(AcpSessionId("wire-acp-2")))
+            let gateway = try #require(fixture.components.notificationGateway)
+            #expect(await gateway.ownsSession(fixture.wireSessionID))
+
+            let original = try await fixture.prompt(
+                text: "the original session remains usable without uninstalled MCP tools",
+                messageID: "after-core-mcp-refusal"
+            )
+            #expect(original.stopReason == .endTurn)
+            let sampled = try #require(await fixture.probe.requests.first)
+            #expect(sampled.sessionID == fixture.rootSessionID)
         }
     }
 

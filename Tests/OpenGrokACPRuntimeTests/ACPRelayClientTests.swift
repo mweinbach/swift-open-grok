@@ -217,6 +217,390 @@ struct ACPRelayHeaderTests {
     }
 }
 
+// MARK: - Registered leader relay bridge
+
+private actor LeaderRelayInbox {
+    private(set) var messages: [ACPMessage] = []
+
+    func record(_ message: ACPMessage) { messages.append(message) }
+
+    func waitFor(
+        _ matches: @Sendable (ACPMessage) -> Bool
+    ) async throws -> ACPMessage {
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            if let message = messages.first(where: matches) { return message }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        throw ACPTransportError.invalidMessage("leader relay message did not arrive")
+    }
+
+    func response(to id: AcpRequestId) async throws -> ACPMessage {
+        try await waitFor { message in
+            if case .response(let responseID, _, _) = message { return responseID == id }
+            return false
+        }
+    }
+}
+
+private struct LeaderRelayConnection: Sendable {
+    let transport: InProcessACPTransport
+    let inbox: LeaderRelayInbox
+    let running: Task<Void, Never>
+    let reading: Task<Void, Never>
+
+    init(host: ACPLeaderIPCHost) {
+        let pair = InProcessACPTransport.makePair()
+        let inbox = LeaderRelayInbox()
+        self.transport = pair.client
+        self.inbox = inbox
+        self.running = Task {
+            await ACPLeaderRelayBridge(host: host).serve(pair.agent)
+        }
+        self.reading = Task {
+            do {
+                while true {
+                    await inbox.record(try await pair.client.receive())
+                }
+            } catch {}
+        }
+    }
+
+    func request(_ message: ACPMessage) async throws -> JSONValue {
+        guard case .request(let id, _, _) = message else {
+            throw ACPTransportError.invalidMessage("expected an ACP request")
+        }
+        try await transport.send(message)
+        let response = try await inbox.response(to: id)
+        guard case .response(_, let result, let error) = response else {
+            throw ACPTransportError.invalidMessage("expected an ACP response")
+        }
+        if let error { throw ACPLeaderClientError.remoteACP(error) }
+        return result ?? .null
+    }
+
+    func close() async {
+        await transport.close()
+        running.cancel()
+        await running.value
+        await reading.value
+    }
+}
+
+private actor LeaderRelayFixture {
+    let reverseRequests: ACPReverseRequestBroker
+    let runtime: ACPAgentRuntime
+    let host: ACPLeaderIPCHost
+    let local: ACPLeaderClient
+    let localInbox: LeaderRelayInbox
+    let localServing: Task<Void, Never>
+    let localReading: Task<Void, Never>
+    private var relays: [LeaderRelayConnection] = []
+
+    private init(
+        reverseRequests: ACPReverseRequestBroker,
+        runtime: ACPAgentRuntime,
+        host: ACPLeaderIPCHost,
+        local: ACPLeaderClient,
+        localInbox: LeaderRelayInbox,
+        localServing: Task<Void, Never>,
+        localReading: Task<Void, Never>
+    ) {
+        self.reverseRequests = reverseRequests
+        self.runtime = runtime
+        self.host = host
+        self.local = local
+        self.localInbox = localInbox
+        self.localServing = localServing
+        self.localReading = localReading
+    }
+
+    static func start() async throws -> LeaderRelayFixture {
+        let reverseRequests = ACPReverseRequestBroker()
+        let runtime = ACPAgentRuntime(
+            promptDriver: RelayEchoPromptDriver(),
+            reverseRequests: reverseRequests
+        )
+        let host = ACPLeaderIPCHost(runtime: runtime)
+        let channel = InMemoryWebSocketChannel.makePair()
+        let local = ACPLeaderClient(channel: channel.a, clientType: "local-relay-test")
+        let serving = Task { await host.serve(channel: channel.b) }
+        do {
+            let registration = try await local.start()
+            #expect(registration.ready)
+            let events = try await local.events()
+            let inbox = LeaderRelayInbox()
+            let reading = Task {
+                do {
+                    for try await message in events { await inbox.record(message) }
+                } catch {}
+            }
+            let initialized = try await local.request(
+                method: AgentMethodNames.initialize,
+                params: try JSONValue.encode(InitializeRequest(protocolVersion: .v1))
+            )
+            #expect(initialized["protocolVersion"]?.int64Value == 1)
+            return LeaderRelayFixture(
+                reverseRequests: reverseRequests,
+                runtime: runtime,
+                host: host,
+                local: local,
+                localInbox: inbox,
+                localServing: serving,
+                localReading: reading
+            )
+        } catch {
+            await local.close()
+            await host.stop()
+            await runtime.close()
+            await serving.value
+            throw error
+        }
+    }
+
+    func connectRelay() -> LeaderRelayConnection {
+        let relay = LeaderRelayConnection(host: host)
+        relays.append(relay)
+        return relay
+    }
+
+    func newLocalSession() async throws -> String {
+        let response = try await local.request(
+            method: AgentMethodNames.sessionNew,
+            params: try JSONValue.encode(NewSessionRequest(
+                cwd: FileManager.default.currentDirectoryPath
+            ))
+        )
+        return try #require(response["sessionId"]?.stringValue)
+    }
+
+    func close() async {
+        for relay in relays { await relay.close() }
+        await local.close()
+        await host.stop()
+        await runtime.close()
+        await localServing.value
+        await localReading.value
+    }
+}
+
+private func withLeaderRelayFixture(
+    _ body: @Sendable (LeaderRelayFixture) async throws -> Void
+) async throws {
+    let fixture = try await LeaderRelayFixture.start()
+    do {
+        try await body(fixture)
+        await fixture.close()
+    } catch {
+        await fixture.close()
+        throw error
+    }
+}
+
+@Suite("Registered leader relay carrier", .serialized)
+struct ACPLeaderRelayBridgeTests {
+    @Test("relay preserves opaque request IDs, ACP errors, and owner-only traffic",
+          .timeLimit(.minutes(1)))
+    func preservesWireIdentityAndPrivateRouting() async throws {
+        try await withLeaderRelayFixture { fixture in
+            let localSessionID = try await fixture.newLocalSession()
+            let relay = await fixture.connectRelay()
+            let initialized = try await relay.request(relayInitialize(id: 1))
+            #expect(initialized["protocolVersion"]?.int64Value == 1)
+            let created = try await relay.request(relayNewSession(
+                id: 2, cwd: FileManager.default.currentDirectoryPath
+            ))
+            let remoteSessionID = try #require(created["sessionId"]?.stringValue)
+            #expect(await fixture.host.connectedClientCount() == 2)
+            #expect(await fixture.host.hasHeadlessClient())
+
+            let opaqueID = AcpRequestId.string("remote/opaque-id")
+            try await relay.transport.send(.request(
+                id: opaqueID,
+                method: "x.ai/relay-test/absent",
+                params: .object([:])
+            ))
+            let missing = try await relay.inbox.response(to: opaqueID)
+            guard case .response(let responseID, let result, let error) = missing else {
+                Issue.record("missing extension did not produce a response")
+                return
+            }
+            #expect(responseID == opaqueID)
+            #expect(result == nil)
+            #expect(error?.code == .methodNotFound)
+
+            let prompted = try await relay.request(relayPrompt(
+                id: 3, sessionId: remoteSessionID, text: "remote prompt"
+            ))
+            #expect(prompted["stopReason"]?.stringValue == "end_turn")
+            let localPrompted = try await fixture.local.request(
+                method: AgentMethodNames.sessionPrompt,
+                params: try JSONValue.encode(PromptRequest(
+                    sessionId: AcpSessionId(localSessionID),
+                    prompt: [.text(TextContent(text: "local prompt"))]
+                ))
+            )
+            #expect(localPrompted["stopReason"]?.stringValue == "end_turn")
+            let remoteUpdate = try await relay.inbox.waitFor {
+                $0.method == ClientMethodNames.sessionUpdate
+            }
+            let localUpdate = try await fixture.localInbox.waitFor {
+                $0.method == ClientMethodNames.sessionUpdate
+            }
+            #expect(remoteUpdate.params?["sessionId"]?.stringValue == remoteSessionID)
+            #expect(localUpdate.params?["sessionId"]?.stringValue == localSessionID)
+            #expect(await !relay.inbox.messages.contains {
+                $0.method == ClientMethodNames.sessionUpdate
+                    && $0.params?["sessionId"]?.stringValue == localSessionID
+            })
+            #expect(await !fixture.localInbox.messages.contains {
+                $0.method == ClientMethodNames.sessionUpdate
+                    && $0.params?["sessionId"]?.stringValue == remoteSessionID
+            })
+
+            try await relay.transport.send(relayPrompt(
+                id: 4, sessionId: localSessionID, text: "foreign mutation"
+            ))
+            let denied = try await relay.inbox.response(to: .number(4))
+            guard case .response(_, nil, let denial?) = denied else {
+                Issue.record("relay controlled a local client's session")
+                return
+            }
+            #expect(denial == ACPRuntimeError.sessionNotFound(
+                AcpSessionId(localSessionID)
+            ).acpError)
+        }
+    }
+
+    @Test("relay cannot forge local reverse replies and can answer its own requests",
+          .timeLimit(.minutes(1)))
+    func reverseRepliesRetainCarrierAuthority() async throws {
+        try await withLeaderRelayFixture { fixture in
+            let localSessionID = try await fixture.newLocalSession()
+            let relay = await fixture.connectRelay()
+            let initialized = try await relay.request(relayInitialize(id: 1))
+            #expect(initialized["protocolVersion"]?.int64Value == 1)
+            let created = try await relay.request(relayNewSession(
+                id: 2, cwd: FileManager.default.currentDirectoryPath
+            ))
+            let remoteSessionID = try #require(created["sessionId"]?.stringValue)
+            let localResult = Task {
+                try await fixture.runtime.requestClient(
+                    method: ClientMethodNames.sessionRequestPermission,
+                    params: .object(["sessionId": .string(localSessionID)])
+                )
+            }
+            defer { localResult.cancel() }
+            let localRequest = try await fixture.localInbox.waitFor {
+                $0.method == ClientMethodNames.sessionRequestPermission
+            }
+            guard case .request(let localID, _, _) = localRequest else {
+                Issue.record("local owner did not receive its reverse request")
+                return
+            }
+            try await relay.transport.send(.response(
+                id: localID, result: .object(["owner": .string("forged")]), error: nil
+            ))
+            let fence = try await relay.request(.request(
+                id: .number(3), method: AgentMethodNames.sessionList, params: .object([:])
+            ))
+            #expect(fence.objectValue != nil)
+            #expect(await fixture.reverseRequests.pendingCount() == 1)
+            #expect(await !relay.inbox.messages.contains {
+                $0.method == ClientMethodNames.sessionRequestPermission
+            })
+            let localAnswer = JSONValue.object(["owner": .string("local")])
+            try await fixture.local.forward(.response(
+                id: localID, result: localAnswer, error: nil
+            ))
+            #expect(try await localResult.value == localAnswer)
+
+            let remoteResult = Task {
+                try await fixture.runtime.requestClient(
+                    method: ClientMethodNames.sessionRequestPermission,
+                    params: .object(["sessionId": .string(remoteSessionID)])
+                )
+            }
+            defer { remoteResult.cancel() }
+            let remoteRequest = try await relay.inbox.waitFor {
+                $0.method == ClientMethodNames.sessionRequestPermission
+            }
+            guard case .request(let remoteID, _, let params) = remoteRequest else {
+                Issue.record("relay owner did not receive its reverse request")
+                return
+            }
+            #expect(params["sessionId"]?.stringValue == remoteSessionID)
+            let remoteAnswer = JSONValue.object(["owner": .string("relay")])
+            try await relay.transport.send(.response(
+                id: remoteID, result: remoteAnswer, error: nil
+            ))
+            #expect(try await remoteResult.value == remoteAnswer)
+            #expect(await fixture.reverseRequests.pendingCount() == 0)
+        }
+    }
+
+    @Test("reconnect reuses wire IDs without inheriting the old carrier's authority",
+          .timeLimit(.minutes(1)))
+    func reconnectAndCancellationLeaveLocalCarrierLive() async throws {
+        try await withLeaderRelayFixture { fixture in
+            let localSessionID = try await fixture.newLocalSession()
+            let first = await fixture.connectRelay()
+            let firstInitialized = try await first.request(relayInitialize(id: 1))
+            #expect(firstInitialized["protocolVersion"]?.int64Value == 1)
+            let firstCreated = try await first.request(relayNewSession(
+                id: 2, cwd: FileManager.default.currentDirectoryPath
+            ))
+            let firstSessionID = try #require(firstCreated["sessionId"]?.stringValue)
+            await first.close()
+            #expect(await fixture.host.connectedClientCount() == 1)
+            #expect(await fixture.runtime.hasConnectedReverseClient())
+
+            let second = await fixture.connectRelay()
+            let secondInitialized = try await second.request(relayInitialize(id: 1))
+            #expect(secondInitialized["protocolVersion"]?.int64Value == 1)
+            try await second.transport.send(relayPrompt(
+                id: 2, sessionId: firstSessionID, text: "implicit ownership transfer"
+            ))
+            let denied = try await second.inbox.response(to: .number(2))
+            guard case .response(_, nil, let error?) = denied else {
+                Issue.record("reconnected relay inherited a disconnected carrier's session")
+                return
+            }
+            #expect(error == ACPRuntimeError.sessionNotFound(
+                AcpSessionId(firstSessionID)
+            ).acpError)
+
+            second.running.cancel()
+            await second.running.value
+            #expect(await fixture.host.connectedClientCount() == 1)
+            #expect(await fixture.runtime.hasConnectedReverseClient())
+            let localPrompted = try await fixture.local.request(
+                method: AgentMethodNames.sessionPrompt,
+                params: try JSONValue.encode(PromptRequest(
+                    sessionId: AcpSessionId(localSessionID),
+                    prompt: [.text(TextContent(text: "still connected"))]
+                ))
+            )
+            #expect(localPrompted["stopReason"]?.stringValue == "end_turn")
+        }
+    }
+
+    @Test("leader shutdown completes the relay bridge without closing the runtime",
+          .timeLimit(.minutes(1)))
+    func leaderShutdownClosesRegisteredRelay() async throws {
+        try await withLeaderRelayFixture { fixture in
+            let relay = await fixture.connectRelay()
+            let initialized = try await relay.request(relayInitialize(id: 1))
+            #expect(initialized["protocolVersion"]?.int64Value == 1)
+            await fixture.host.stop()
+            await relay.running.value
+            await fixture.localServing.value
+            #expect(await fixture.host.connectedClientCount() == 0)
+            #expect(await fixture.runtime.connectionState() != .closed)
+        }
+    }
+}
+
 // MARK: - Live tests
 
 #if canImport(Network)

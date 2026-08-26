@@ -111,6 +111,20 @@ public struct LiveACPLaunchComponents: Sendable {
     /// tests reach it via `@testable import`. Not a carrier/public API.
     let permissionPipeline: PermissionPipeline?
 
+    var agentCapabilities: AgentCapabilities {
+        var capabilities = ACPAgentConfiguration.defaultAgentCapabilities(
+            supportsEmbeddedContext: true,
+            supportsHTTPMCP: promptDriver.supportsClientMCPServers,
+            supportsSSEMCP: promptDriver.supportsClientMCPServers
+        )
+        // A single-spine production driver refuses independent identities, so
+        // advertising a usable session/fork would promise an absent feature.
+        if !promptDriver.supportsIndependentSessions {
+            capabilities.sessionCapabilities.fork = nil
+        }
+        return capabilities
+    }
+
     /// Public construction surface — unchanged from the pre-proof signature.
     /// `permissionPipeline` stays nil here; same-module composition uses the
     /// internal initializer below.
@@ -168,6 +182,9 @@ public struct LiveACPPromptDriver: ACPPromptDriver {
     /// permission prompter so a gated tool call advertises the wire session.
     private let permissionPrompter: LiveACPPermissionPrompter?
     private let turnActivity: (@Sendable (AcpSessionId, Bool) async -> Void)?
+    private let sessionAdmission: (@Sendable (ACPSessionSnapshot) async throws -> Void)?
+    let supportsIndependentSessions: Bool
+    let supportsClientMCPServers: Bool
     public let shutdown: @Sendable () async -> Void
 
     public init(
@@ -176,6 +193,9 @@ public struct LiveACPPromptDriver: ACPPromptDriver {
         skillCatalog: [LiveSkills.SkillCommand] = [],
         permissionPrompter: LiveACPPermissionPrompter? = nil,
         turnActivity: (@Sendable (AcpSessionId, Bool) async -> Void)? = nil,
+        supportsIndependentSessions: Bool = true,
+        supportsClientMCPServers: Bool = true,
+        sessionAdmission: (@Sendable (ACPSessionSnapshot) async throws -> Void)? = nil,
         shutdown: @escaping @Sendable () async -> Void = {}
     ) {
         self.driver = driver
@@ -183,13 +203,27 @@ public struct LiveACPPromptDriver: ACPPromptDriver {
         self.skillCatalog = skillCatalog
         self.permissionPrompter = permissionPrompter
         self.turnActivity = turnActivity
+        self.supportsIndependentSessions = supportsIndependentSessions
+        self.supportsClientMCPServers = supportsClientMCPServers
+        self.sessionAdmission = sessionAdmission
         self.shutdown = shutdown
+    }
+
+    public func admitSession(_ session: ACPSessionSnapshot) async throws {
+        try await sessionAdmission?(session)
+        try await driver.admitSession(session)
     }
 
     public func run(
         context: ACPPromptContext,
         emit: @escaping @Sendable (SessionNotification, ACPNotificationDisposition) async -> Void
     ) async throws -> PromptResponse {
+        guard context.request.sessionId == context.session.sessionId else {
+            throw ACPRuntimeError.invalidParams("prompt and session identities do not match")
+        }
+        // Direct prompt-driver callers must pass the same admission boundary
+        // as transport lifecycle calls, before any commands or turn activity.
+        try await admitSession(context.session)
         // Scope the session to THIS turn, two ways.
         //
         // The task-local is the authoritative one: it rides structured
@@ -386,9 +420,7 @@ public enum LiveACPComposition {
             onSessionOpened: launchComponents.onSessionOpened,
             onSessionClosed: launchComponents.onSessionClosed,
             configuration: ACPAgentConfiguration(
-                agentCapabilities: ACPAgentConfiguration.defaultAgentCapabilities(
-                    supportsEmbeddedContext: true
-                ),
+                agentCapabilities: launchComponents.agentCapabilities,
                 initializationMetadata: OpenGrokInitializeMetadata(
                     currentWorkingDirectory: cwd.path
                 )
