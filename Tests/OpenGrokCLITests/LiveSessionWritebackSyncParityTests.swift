@@ -409,7 +409,7 @@ struct LiveSessionWritebackSyncParityTests {
         #expect(calls.map(\.method) == ["POST", "PUT"])
         #expect(calls.first?.updates.count == 1)
         #expect(calls.first?.sessionID == fixture.sessionID)
-        #expect(calls.first?.metadata?.cwd == fixture.workspace.path)
+        #expect(calls.first?.metadata?.cwd == record.workingDirectory)
         #expect(calls.last?.agentID?.isEmpty == false)
     }
 
