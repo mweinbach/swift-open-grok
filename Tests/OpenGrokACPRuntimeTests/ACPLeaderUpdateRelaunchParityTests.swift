@@ -78,6 +78,97 @@ private func attachUpdateRelaunchClient(
     )
 }
 
+private actor UpdateRelaunchShutdownRaceGate {
+    private var registrationDelivered = false
+    private var registrationReleased = false
+    private var registrationWaiter: CheckedContinuation<Void, Never>?
+    private var shutdownReleased = false
+    private var shutdownWaiter: CheckedContinuation<Void, Never>?
+    private var resumedReading = false
+    private var readWaiter: CheckedContinuation<Bool, Never>?
+    private var closed = false
+
+    func pauseAfterRegistration() async {
+        registrationDelivered = true
+        guard !registrationReleased, !closed else { return }
+        await withCheckedContinuation { registrationWaiter = $0 }
+    }
+
+    func releaseRegistration() {
+        registrationReleased = true
+        registrationWaiter?.resume()
+        registrationWaiter = nil
+    }
+
+    func pauseBeforeShutdown() async {
+        guard !shutdownReleased, !closed else { return }
+        await withCheckedContinuation { shutdownWaiter = $0 }
+    }
+
+    func releaseShutdown() {
+        shutdownReleased = true
+        shutdownWaiter?.resume()
+        shutdownWaiter = nil
+    }
+
+    func recordRead() {
+        guard registrationDelivered else { return }
+        resumedReading = true
+        readWaiter?.resume(returning: true)
+        readWaiter = nil
+    }
+
+    func waitForReadOrClose() async -> Bool {
+        if resumedReading { return true }
+        if closed { return false }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { readWaiter = $0 }
+        } onCancel: {
+            Task { await self.close() }
+        }
+    }
+
+    func close() {
+        closed = true
+        releaseRegistration()
+        releaseShutdown()
+        readWaiter?.resume(returning: resumedReading)
+        readWaiter = nil
+    }
+}
+
+private final class UpdateRelaunchShutdownRaceChannel: WebSocketByteChannel, Sendable {
+    private let channel: InMemoryWebSocketChannel
+    private let gate: UpdateRelaunchShutdownRaceGate
+
+    init(channel: InMemoryWebSocketChannel, gate: UpdateRelaunchShutdownRaceGate) {
+        self.channel = channel
+        self.gate = gate
+    }
+
+    func read() async throws -> [UInt8]? {
+        await gate.recordRead()
+        return try await channel.read()
+    }
+
+    func write(_ bytes: [UInt8]) async throws {
+        var decoder = ACPLeaderFrameDecoder()
+        decoder.append(bytes)
+        guard let body = try decoder.nextFrame() else {
+            throw ACPLeaderProtocolError.connectionClosed
+        }
+        let message = try ACPLeaderCodec.decode(ACPLeaderServerMessage.self, from: body)
+        if case .shuttingDown = message { await gate.pauseBeforeShutdown() }
+        try await channel.write(bytes)
+        if case .registered = message { await gate.pauseAfterRegistration() }
+    }
+
+    func close() async {
+        await gate.close()
+        await channel.close()
+    }
+}
+
 private final class UpdateRelaunchExposure: ACPWorkspaceExposureConnection, @unchecked Sendable {
     private let lock = NSLock()
     private var activeToolCalls: Int
@@ -351,6 +442,44 @@ struct ACPLeaderUpdateRelaunchParityTests {
         #expect(try await client.next() == .shutdown)
         #expect(await host.isStopped())
         await client.close()
+    }
+
+    @Test("shutdown owns final frames when registration completes after stopping begins", .timeLimit(.minutes(1)))
+    func registrationCompletionCannotCloseBeforeShutdownFrames() async throws {
+        let host = makeHost()
+        let channels = InMemoryWebSocketChannel.makePair()
+        let gate = UpdateRelaunchShutdownRaceGate()
+        let carrier = UpdateRelaunchShutdownRaceChannel(channel: channels.a, gate: gate)
+        let client = UpdateRelaunchClient(channel: channels.b)
+        let served = Task { await host.serve(channel: carrier) }
+        defer {
+            served.cancel()
+            Task { await carrier.close() }
+        }
+        let capabilities = try await client.register()
+        #expect(capabilities?.relaunchV1 == true)
+        let stopping = Task { await host.stop() }
+        defer { stopping.cancel() }
+
+        let deadline = Date().addingTimeInterval(2)
+        while await !host.isStopped(), Date() < deadline {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        try #require(await host.isStopped())
+
+        // The registered frame reached the client, but its server-side write
+        // has not returned. Stop is already active, and its first final frame
+        // stays gated until serve either resumes reading or wrongly closes.
+        await gate.releaseRegistration()
+        #expect(await gate.waitForReadOrClose())
+        await gate.releaseShutdown()
+        await stopping.value
+
+        #expect(try await client.next() == .shuttingDown(reason: .manual, delayMilliseconds: 0))
+        #expect(try await client.next() == .shutdown)
+        await client.close()
+        await served.value
+        #expect(await host.connectedClientCount() == 0)
     }
 
     @Test("declined live updates preserve the shared leader and its control channel", .timeLimit(.minutes(1)))

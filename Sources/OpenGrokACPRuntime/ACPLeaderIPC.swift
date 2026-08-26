@@ -452,6 +452,7 @@ public actor ACPLeaderIPCHost {
 
     private func stop(reason: ACPLeaderShutdownReason) async {
         guard !stopped else { return }
+        let shutdownClients = Array(clients.values)
         stopped = true
         relaunchAdmissionClosed = true
         if reason != .autoUpdate {
@@ -469,7 +470,7 @@ public actor ACPLeaderIPCHost {
         for work in clientWork.values.flatMap({ $0.values }) {
             work.task.cancel()
         }
-        for client in clients.values {
+        for client in shutdownClients {
             await client.writer.send(.shuttingDown(reason: reason, delayMilliseconds: 0))
             await client.writer.send(.shutdown)
             await client.writer.close()
@@ -603,7 +604,10 @@ public actor ACPLeaderIPCHost {
         reader: ACPLeaderChannelReader,
         writer: ACPLeaderChannelWriter
     ) async {
-        while !stopped {
+        // stop owns the final frames and channel close. A newly registered
+        // carrier may enter here after stop starts; returning on that flag
+        // would let serve teardown close it before shutdown reaches the wire.
+        while !Task.isCancelled {
             let message: ACPLeaderClientMessage?
             do {
                 message = try await reader.next(ACPLeaderClientMessage.self)
@@ -612,6 +616,10 @@ public actor ACPLeaderIPCHost {
                 return
             }
             guard let message else { return }
+            if stopped {
+                if case .disconnect = message { return }
+                continue
+            }
 
             switch message {
             case .register:
