@@ -25,6 +25,52 @@ private actor ACPSDKLifecycleLog {
     func closures() -> [String] { closed }
 }
 
+enum ACPSDKAttachFailure: String, CaseIterable, Sendable {
+    case openHook
+    case storeUpdate
+}
+
+private actor ACPSDKAttachFault {
+    private var failure: ACPSDKAttachFailure?
+
+    init(_ failure: ACPSDKAttachFailure) {
+        self.failure = failure
+    }
+
+    func check(_ stage: ACPSDKAttachFailure) throws {
+        guard failure == stage else { return }
+        failure = nil
+        throw ACPRuntimeError.transport("fixture \(stage.rawValue) failed")
+    }
+}
+
+private actor ACPSDKAttachStore: ACPSessionStore {
+    private let storage: InMemoryACPSessionStore
+    private let fault: ACPSDKAttachFault
+
+    init(session: ACPSessionSnapshot, fault: ACPSDKAttachFault) {
+        storage = InMemoryACPSessionStore(sessions: [session])
+        self.fault = fault
+    }
+
+    func create(_ session: ACPSessionSnapshot) async throws {
+        try await storage.create(session)
+    }
+
+    func read(_ sessionID: AcpSessionId) async throws -> ACPSessionSnapshot? {
+        await storage.read(sessionID)
+    }
+
+    func update(_ session: ACPSessionSnapshot) async throws {
+        try await fault.check(.storeUpdate)
+        try await storage.update(session)
+    }
+
+    func list(cwd: String?) async throws -> [ACPSessionSnapshot] {
+        await storage.list(cwd: cwd)
+    }
+}
+
 @Suite("ACP client-provided MCP bridge lifecycle")
 struct ACPMCPBridgeLifecycleTests {
     private func initialize(_ runtime: ACPAgentRuntime) async throws -> InitializeResponse {
@@ -37,6 +83,20 @@ struct ACPMCPBridgeLifecycleTests {
             throw ACPRuntimeError.transport("initialize did not produce a successful response")
         }
         return try result.decode(InitializeResponse.self)
+    }
+
+    private func requireSuccess(_ output: [ACPMessage]) throws {
+        guard case .response(_, _?, nil)? = output.last else {
+            throw ACPRuntimeError.transport("expected a successful ACP response: \(output)")
+        }
+    }
+
+    private func metadataFreeAttachParams(method: String, sessionID: AcpSessionId) throws -> JSONValue {
+        let cwd = FileManager.default.temporaryDirectory.path
+        if method == AgentMethodNames.sessionLoad {
+            return try JSONValue.encode(LoadSessionRequest(sessionId: sessionID, cwd: cwd))
+        }
+        return try JSONValue.encode(ResumeSessionRequest(sessionId: sessionID, cwd: cwd))
     }
 
     @Test("SDK capability is truthful and preserves unrelated initialize metadata")
@@ -152,6 +212,124 @@ struct ACPMCPBridgeLifecycleTests {
         #expect(failure.message.contains("client rejected MCP server"))
         #expect(try await store.list(cwd: nil).isEmpty)
         #expect(await log.closures() == ["rejected-session"])
+    }
+
+    @Test(
+        "metadata-free load and resume restore cold or closed lifecycle without reopening an active bridge",
+        arguments: [AgentMethodNames.sessionLoad, AgentMethodNames.sessionResume], [false, true]
+    )
+    func metadataFreeAttachRestoresLifecycle(method: String, closeExisting: Bool) async throws {
+        let sessionID = AcpSessionId("metadata-free-session")
+        let log = ACPSDKLifecycleLog()
+        let store = InMemoryACPSessionStore()
+        let gateway = ACPNotificationGateway()
+        let runtime = ACPAgentRuntime(
+            store: store,
+            onSessionOpened: { sessionID, metadata in
+                await log.open(sessionID, metadata: metadata)
+            },
+            onSessionClosed: { sessionID in
+                await log.close(sessionID)
+            },
+            makeSessionId: { sessionID.rawValue }
+        )
+        await gateway.attach(runtime)
+        await runtime.setReverseSender { _ in }
+        let response = try await initialize(runtime)
+        #expect(response.meta?["x.ai/mcp/sdk"] == .bool(true))
+
+        if closeExisting {
+            try requireSuccess(await runtime.handle(.request(
+                id: .number(2),
+                method: AgentMethodNames.sessionNew,
+                params: try JSONValue.encode(NewSessionRequest(cwd: FileManager.default.temporaryDirectory.path))
+            )))
+            #expect(await gateway.ownsSession(sessionID))
+            try requireSuccess(await runtime.handle(.request(
+                id: .number(3),
+                method: AgentMethodNames.sessionClose,
+                params: try JSONValue.encode(CloseSessionRequest(sessionId: sessionID))
+            )))
+        } else {
+            // A new serve connection can inherit an open stored snapshot without
+            // any local lifecycle. Its persisted closed flag is not sufficient.
+            try await store.create(ACPSessionSnapshot(
+                sessionId: sessionID,
+                cwd: FileManager.default.temporaryDirectory.path,
+                createdAt: "created",
+                updatedAt: "updated"
+            ))
+        }
+        #expect(await gateway.ownsSession(sessionID) == false)
+
+        let params = try metadataFreeAttachParams(method: method, sessionID: sessionID)
+        #expect(params["_meta"] == nil)
+        try requireSuccess(await runtime.handle(.request(id: .number(4), method: method, params: params)))
+        #expect(await gateway.ownsSession(sessionID))
+        #expect(await gateway.ownsConnectedSession(sessionID))
+        #expect(await store.read(sessionID)?.closed == false)
+        let openings = Array(
+            repeating: ACPSDKLifecycleLog.Opened(sessionID: sessionID.rawValue, metadata: nil),
+            count: closeExisting ? 2 : 1
+        )
+        #expect(await log.openings() == openings)
+
+        try requireSuccess(await runtime.handle(.request(id: .number(5), method: method, params: params)))
+        #expect(await log.openings() == openings)
+        #expect(await gateway.ownsSession(sessionID))
+        await runtime.close()
+        #expect(await log.closures() == Array(repeating: sessionID.rawValue, count: closeExisting ? 2 : 1))
+    }
+
+    @Test(
+        "failed metadata-free attach tears down the new lifecycle and permits a clean retry",
+        arguments: [AgentMethodNames.sessionLoad, AgentMethodNames.sessionResume], ACPSDKAttachFailure.allCases
+    )
+    func metadataFreeAttachFailureRollsBackLifecycle(method: String, failure: ACPSDKAttachFailure) async throws {
+        let sessionID = AcpSessionId("failed-metadata-free-session")
+        let original = ACPSessionSnapshot(
+            sessionId: sessionID,
+            cwd: FileManager.default.temporaryDirectory.path,
+            closed: true,
+            createdAt: "created",
+            updatedAt: "updated"
+        )
+        let fault = ACPSDKAttachFault(failure)
+        let store = ACPSDKAttachStore(session: original, fault: fault)
+        let log = ACPSDKLifecycleLog()
+        let runtime = ACPAgentRuntime(
+            store: store,
+            onSessionOpened: { sessionID, metadata in
+                await log.open(sessionID, metadata: metadata)
+                try await fault.check(.openHook)
+            },
+            onSessionClosed: { sessionID in
+                await log.close(sessionID)
+            }
+        )
+        let initialized = try await initialize(runtime)
+        #expect(initialized.protocolVersion == .v1)
+        let params = try metadataFreeAttachParams(method: method, sessionID: sessionID)
+        #expect(params["_meta"] == nil)
+        let rejected = await runtime.handle(.request(id: .number(2), method: method, params: params))
+        guard case .response(_, nil, let error?)? = rejected.last else {
+            Issue.record("the failing lifecycle unexpectedly attached: \(rejected)")
+            await runtime.close()
+            return
+        }
+        #expect(error.message.contains("fixture \(failure.rawValue) failed"))
+        #expect(try await store.read(sessionID) == original)
+        #expect(await runtime.ownsSession(sessionID) == false)
+        #expect(await log.closures() == [sessionID.rawValue])
+
+        try requireSuccess(await runtime.handle(.request(id: .number(3), method: method, params: params)))
+        #expect(await runtime.ownsSession(sessionID))
+        #expect(try await store.read(sessionID)?.closed == false)
+        #expect(await log.openings() == Array(
+            repeating: ACPSDKLifecycleLog.Opened(sessionID: sessionID.rawValue, metadata: nil), count: 2
+        ))
+        await runtime.close()
+        #expect(await log.closures() == [sessionID.rawValue, sessionID.rawValue])
     }
 
     @Test("runtime teardown closes every active bridge session")

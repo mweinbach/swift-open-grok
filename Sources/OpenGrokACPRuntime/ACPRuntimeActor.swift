@@ -780,6 +780,9 @@ public actor ACPAgentRuntime {
             try await promptDriver.admitSession(session)
             try Task.checkCancellation()
             try requireReady()
+            guard openedLifecycleSessions.contains(request.sessionId) else {
+                throw ACPRuntimeError.sessionClosed(request.sessionId)
+            }
             if !noReplay {
                 await replay(session, leaderClientID: request.meta?[ACPLeaderCapabilityInjection.clientIDKey])
             }
@@ -788,24 +791,27 @@ public actor ACPAgentRuntime {
             }
             return try encode(LoadSessionResponse(modes: configuration.modes, models: configuration.models))
         }
+        try await requireLeaderSessionDriver(request.sessionId)
         session.cwd = try await validateWorkspace(request.cwd)
         session.additionalDirectories = request.additionalDirectories
         session.mcpServers = request.mcpServers
         session.closed = false
         session.updatedAt = timestamp()
+        try await requireLeaderSessionDriver(request.sessionId)
         try await promptDriver.admitSession(session)
-        try Task.checkCancellation()
-        try requireReady()
-        if request.meta != nil {
+        try await requireLeaderSessionDriver(request.sessionId)
+        // Cold attachment needs hooks even without metadata. Repeating hooks
+        // for an already-open nil-meta attach can duplicate SDK registration.
+        let opensLifecycle = request.meta != nil || !openedLifecycleSessions.contains(session.sessionId)
+        if opensLifecycle {
             try await openSessionLifecycle(sessionId: session.sessionId, meta: request.meta)
         }
         do {
-            try Task.checkCancellation()
+            try await requireLeaderSessionDriver(request.sessionId)
             try await store.update(session)
-            try Task.checkCancellation()
-            try requireReady()
+            try await requireLeaderSessionDriver(request.sessionId)
         } catch {
-            if request.meta != nil {
+            if opensLifecycle {
                 await closeSessionLifecycle(sessionId: session.sessionId)
             }
             throw error
@@ -842,30 +848,34 @@ public actor ACPAgentRuntime {
             try await promptDriver.admitSession(session)
             try Task.checkCancellation()
             try requireReady()
+            guard openedLifecycleSessions.contains(request.sessionId) else {
+                throw ACPRuntimeError.sessionClosed(request.sessionId)
+            }
             if pendingPromptQueues[session.sessionId] != nil {
                 await publishQueueChanged(sessionID: session.sessionId)
             }
             return try encode(ResumeSessionResponse(modes: configuration.modes, models: configuration.models))
         }
+        try await requireLeaderSessionDriver(request.sessionId)
         session.cwd = try await validateWorkspace(request.cwd)
         if !request.mcpServers.isEmpty {
             session.mcpServers = request.mcpServers
         }
         session.closed = false
         session.updatedAt = timestamp()
+        try await requireLeaderSessionDriver(request.sessionId)
         try await promptDriver.admitSession(session)
-        try Task.checkCancellation()
-        try requireReady()
-        if request.meta != nil {
+        try await requireLeaderSessionDriver(request.sessionId)
+        let opensLifecycle = request.meta != nil || !openedLifecycleSessions.contains(session.sessionId)
+        if opensLifecycle {
             try await openSessionLifecycle(sessionId: session.sessionId, meta: request.meta)
         }
         do {
-            try Task.checkCancellation()
+            try await requireLeaderSessionDriver(request.sessionId)
             try await store.update(session)
-            try Task.checkCancellation()
-            try requireReady()
+            try await requireLeaderSessionDriver(request.sessionId)
         } catch {
-            if request.meta != nil {
+            if opensLifecycle {
                 await closeSessionLifecycle(sessionId: session.sessionId)
             }
             throw error
@@ -1965,6 +1975,23 @@ public actor ACPAgentRuntime {
         } catch {
             return false
         }
+    }
+
+    private func requireLeaderSessionDriver(_ sessionId: AcpSessionId) async throws {
+        // A closed or cold-loaded session has no local lifecycle yet, so
+        // ownsSession cannot distinguish its incumbent driver from an observer.
+        // Reopening must retain the router's driver authority; a reconnect is
+        // allowed after the host has provisionally claimed the ownerless route.
+        // An observer cannot revive a closed session while its driver remains.
+        if let sessionOwnerVerifier {
+            guard let clientID = ACPLeaderRequestAuthority.clientID,
+                  await sessionOwnerVerifier(sessionId, clientID)
+            else {
+                throw ACPRuntimeError.sessionNotFound(sessionId)
+            }
+        }
+        try Task.checkCancellation()
+        try requireReady()
     }
 
     private func mayControlLeaderSession(from params: JSONValue) async -> Bool {

@@ -7,6 +7,12 @@ import Testing
 @testable import OpenGrokACPRuntime
 
 private struct ACPLeaderIsolationDriver: ACPPromptDriver {
+    var admission: (@Sendable (ACPSessionSnapshot) async throws -> Void)? = nil
+
+    func admitSession(_ session: ACPSessionSnapshot) async throws {
+        try await admission?(session)
+    }
+
     func run(
         context: ACPPromptContext,
         emit: @escaping @Sendable (SessionNotification, ACPNotificationDisposition) async -> Void
@@ -297,6 +303,10 @@ private actor ACPLeaderIsolationOwnership {
         revoked = true
     }
 
+    func restore() {
+        revoked = false
+    }
+
     func owns(_ sessionID: AcpSessionId, clientID: String) async -> Bool {
         if let gate = nextVerificationGate {
             nextVerificationGate = nil
@@ -305,6 +315,14 @@ private actor ACPLeaderIsolationOwnership {
         return !revoked && ((sessionID.rawValue == "owner-root" && clientID == "owner")
             || (sessionID.rawValue == "history-target" && clientID == "foreign"))
     }
+}
+
+private actor ACPLeaderIsolationLifecycle {
+    private(set) var opened: [AcpSessionId] = []
+    private(set) var closed: [AcpSessionId] = []
+
+    func open(_ sessionID: AcpSessionId) { opened.append(sessionID) }
+    func close(_ sessionID: AcpSessionId) { closed.append(sessionID) }
 }
 
 private struct ACPLeaderIsolationClosureHandler: ACPAgentExtensionHandler {
@@ -377,16 +395,20 @@ private func initializeLeaderAuthorityRuntime(_ runtime: ACPAgentRuntime) async 
 private func makeLeaderHistoryRuntime(
     handler: any ACPAgentExtensionHandler,
     store: any ACPSessionStore = InMemoryACPSessionStore(),
+    promptDriver: any ACPPromptDriver = ACPNoopPromptDriver(),
     ownership: ACPLeaderIsolationOwnership = ACPLeaderIsolationOwnership(),
-    onSessionOpened: ACPAgentRuntime.SessionOpenedHook? = nil
+    onSessionOpened: ACPAgentRuntime.SessionOpenedHook? = nil,
+    onSessionClosed: ACPAgentRuntime.SessionClosedHook? = nil
 ) async throws -> ACPAgentRuntime {
     let identifiers = ACPLeaderIsolationSessionIDs([
         "owner-root", "history-target", "history-target", "history-target",
     ])
     let runtime = ACPAgentRuntime(
         store: store,
+        promptDriver: promptDriver,
         extensionHandler: handler,
         onSessionOpened: onSessionOpened,
+        onSessionClosed: onSessionClosed,
         makeSessionId: { identifiers.next() }
     )
     await runtime.setSessionOwnerVerifier { sessionID, clientID in
@@ -866,13 +888,91 @@ struct ACPLeaderAuthorityBoundaryTests {
         }
         await runtime.close()
     }
+
+    @Test(
+        "load and resume recheck driver authority after suspended admission or lifecycle hooks",
+        arguments: [AgentMethodNames.sessionLoad, AgentMethodNames.sessionResume], [false, true]
+    )
+    func reopeningRechecksDriverAfterAwait(method: String, pauseAdmission: Bool) async throws {
+        let sessionID = AcpSessionId("history-target")
+        let original = ACPSessionSnapshot(
+            sessionId: sessionID,
+            cwd: FileManager.default.temporaryDirectory.path,
+            closed: true,
+            createdAt: "created",
+            updatedAt: "updated"
+        )
+        let gate = ACPLeaderIsolationGate()
+        let store = ACPLeaderIsolationStore()
+        try await store.create(original)
+        let ownership = ACPLeaderIsolationOwnership()
+        let lifecycle = ACPLeaderIsolationLifecycle()
+        let runtime = try await makeLeaderHistoryRuntime(
+            handler: ACPExtensionMethodRouter(),
+            store: store,
+            promptDriver: ACPLeaderIsolationDriver(admission: { session in
+                if session.sessionId == sessionID, pauseAdmission { await gate.suspend() }
+            }),
+            ownership: ownership,
+            onSessionOpened: { openedID, _ in
+                guard openedID == sessionID else { return }
+                await lifecycle.open(openedID)
+                if !pauseAdmission { await gate.suspend() }
+            },
+            onSessionClosed: { closedID in
+                if closedID == sessionID { await lifecycle.close(closedID) }
+            }
+        )
+        let params: JSONValue
+        if method == AgentMethodNames.sessionLoad {
+            params = try JSONValue.encode(LoadSessionRequest(sessionId: sessionID, cwd: original.cwd))
+        } else {
+            params = try JSONValue.encode(ResumeSessionRequest(sessionId: sessionID, cwd: original.cwd))
+        }
+        #expect(params["_meta"] == nil)
+        let reopening = Task {
+            await leaderAuthorityRequest(runtime, clientID: "foreign", id: 3, method: method, params: params)
+        }
+        do {
+            try await gate.waitUntilEntered()
+            await ownership.revoke()
+            await gate.release()
+            expectLeaderSessionDenied(await reopening.value, sessionID: sessionID.rawValue)
+            #expect(try await store.read(sessionID) == original)
+            #expect(await lifecycle.opened == (pauseAdmission ? [] : [sessionID]))
+            #expect(await lifecycle.closed == (pauseAdmission ? [] : [sessionID]))
+
+            await ownership.restore()
+            let retried = await leaderAuthorityRequest(
+                runtime, clientID: "foreign", id: 4, method: method, params: params
+            )
+            expectLeaderSuccess(retried)
+            #expect(try await store.read(sessionID)?.closed == false)
+            let ownsSession = await ACPLeaderRequestAuthority.$clientID.withValue("foreign") {
+                await runtime.ownsSession(sessionID)
+            }
+            #expect(ownsSession)
+        } catch {
+            await gate.release()
+            reopening.cancel()
+            #expect(await reopening.value.id == .number(3))
+            await runtime.close()
+            throw error
+        }
+        await runtime.close()
+        #expect(await lifecycle.opened == Array(repeating: sessionID, count: pauseAdmission ? 1 : 2))
+        #expect(await lifecycle.closed == Array(repeating: sessionID, count: pauseAdmission ? 1 : 2))
+    }
 }
 
 #if os(macOS) || os(Linux)
 
 private struct ACPLeaderIsolationFixture {
     let directory: URL
+    let store: InMemoryACPSessionStore
+    let lifecycle: ACPLeaderIsolationLifecycle
     let runtime: ACPAgentRuntime
+    let router: ACPLeaderRouter
     let host: ACPLeaderIPCHost
     let listener: ACPLeaderSocketListener
     let acceptTask: Task<Void, Never>
@@ -906,13 +1006,19 @@ private struct ACPLeaderIsolationFixture {
             .register(exact: "x.ai/yolo_mode_changed", handler: notificationHandler)
             .register(exact: "x.ai/permissions/reset", handler: notificationHandler)
         let identifiers = ACPLeaderIsolationSessionIDs(["leader-isolated-root"])
+        let store = InMemoryACPSessionStore()
+        let lifecycle = ACPLeaderIsolationLifecycle()
         let runtime = ACPAgentRuntime(
+            store: store,
             promptDriver: ACPLeaderIsolationDriver(),
             extensionHandler: extensions,
             extensionNotifications: notifications,
+            onSessionOpened: { sessionID, _ in await lifecycle.open(sessionID) },
+            onSessionClosed: { sessionID in await lifecycle.close(sessionID) },
             makeSessionId: { identifiers.next() }
         )
-        let host = ACPLeaderIPCHost(runtime: runtime)
+        let router = ACPLeaderRouter()
+        let host = ACPLeaderIPCHost(runtime: runtime, router: router)
         let listener = ACPLeaderSocketListener(path: directory.appendingPathComponent("leader.sock"))
         let channels = try await listener.start()
         let acceptTask = Task {
@@ -941,7 +1047,10 @@ private struct ACPLeaderIsolationFixture {
         )
 
         self.directory = directory
+        self.store = store
+        self.lifecycle = lifecycle
         self.runtime = runtime
+        self.router = router
         self.host = host
         self.listener = listener
         self.acceptTask = acceptTask
@@ -998,6 +1107,98 @@ private func leaderIsolationReplayMetadata(_ message: ACPMessage) -> [String: JS
 
 @Suite("Leader ACP authenticated client ownership and private replay", .serialized)
 struct ACPLeaderClientIsolationParityTests {
+    @Test(
+        "a closed session retains its driver gate while an ownerless reconnect may claim it",
+        arguments: [AgentMethodNames.sessionLoad, AgentMethodNames.sessionResume]
+    )
+    func closedSessionAttachRequiresDriverUntilOwnerDisconnects(method: String) async throws {
+        try await withLeaderIsolationFixture { fixture in
+            let sessionID = try await fixture.createSession()
+            let hostileDirectory = fixture.directory.appendingPathComponent("observer-workspace")
+            try FileManager.default.createDirectory(at: hostileDirectory, withIntermediateDirectories: true)
+            func attachParams(cwd: String) throws -> JSONValue {
+                if method == AgentMethodNames.sessionLoad {
+                    return try JSONValue.encode(LoadSessionRequest(sessionId: sessionID, cwd: cwd))
+                }
+                return try JSONValue.encode(ResumeSessionRequest(sessionId: sessionID, cwd: cwd))
+            }
+            let ownerParams = try attachParams(cwd: fixture.directory.path)
+            #expect(ownerParams["_meta"] == nil)
+            let observed = try await fixture.observer.response(id: 100, method: method, params: ownerParams)
+            expectLeaderSuccess(observed)
+            #expect(await fixture.lifecycle.opened == [sessionID])
+            #expect(await fixture.router.isDriver(clientID: String(fixture.observerID), for: sessionID) == false)
+
+            let closeParams = try JSONValue.encode(CloseSessionRequest(sessionId: sessionID))
+            expectLeaderSuccess(try await fixture.owner.response(
+                id: 101, method: AgentMethodNames.sessionClose, params: closeParams
+            ))
+            let closedSnapshot = await fixture.store.read(sessionID)
+            #expect(closedSnapshot?.closed == true)
+            let refused = try await fixture.observer.response(
+                id: 102, method: method, params: try attachParams(cwd: hostileDirectory.path)
+            )
+            expectLeaderSessionDenied(refused, sessionID: sessionID.rawValue)
+            #expect(await fixture.store.read(sessionID) == closedSnapshot)
+            #expect(await fixture.lifecycle.opened == [sessionID])
+            #expect(await fixture.lifecycle.closed == [sessionID])
+
+            expectLeaderSuccess(try await fixture.owner.response(id: 103, method: method, params: ownerParams))
+            #expect(await fixture.lifecycle.opened == [sessionID, sessionID])
+            let ownerAuthorized = await ACPLeaderRequestAuthority.$clientID.withValue(String(fixture.ownerID)) {
+                await fixture.runtime.ownsSession(sessionID)
+            }
+            #expect(ownerAuthorized)
+            let observerAuthorized = await ACPLeaderRequestAuthority.$clientID.withValue(String(fixture.observerID)) {
+                await fixture.runtime.ownsSession(sessionID)
+            }
+            #expect(!observerAuthorized)
+            let promptParams = try JSONValue.encode(PromptRequest(
+                sessionId: sessionID, prompt: [.text("only the current driver may prompt after reopening")]
+            ))
+            let promptDenied = try await fixture.observer.response(
+                id: 104, method: AgentMethodNames.sessionPrompt, params: promptParams
+            )
+            expectLeaderSessionDenied(promptDenied, sessionID: sessionID.rawValue)
+            let ownerPrompt = try await fixture.owner.request(
+                id: 105, method: AgentMethodNames.sessionPrompt, params: promptParams
+            )
+            #expect(try ownerPrompt.decode(PromptResponse.self).stopReason == .endTurn)
+            expectLeaderSuccess(try await fixture.owner.response(
+                id: 106, method: AgentMethodNames.sessionClose, params: closeParams
+            ))
+
+            // Failed observer attachment released its provisional subscription.
+            // Wait for the actual transport teardown, not just the local close,
+            // before checking the host's legitimate ownerless-driver claim.
+            await fixture.owner.close()
+            let deadline = Date().addingTimeInterval(2)
+            while !(await fixture.router.sessionRecipients(sessionID)).isEmpty, Date() < deadline {
+                try await Task.sleep(nanoseconds: 1_000_000)
+            }
+            guard await fixture.router.sessionRecipients(sessionID).isEmpty else {
+                throw ACPLeaderIsolationError.timedOut
+            }
+            #expect(await fixture.host.connectedClientCount() == 1)
+            expectLeaderSuccess(try await fixture.observer.response(id: 107, method: method, params: ownerParams))
+            #expect(await fixture.router.isDriver(clientID: String(fixture.observerID), for: sessionID))
+            #expect(await fixture.store.read(sessionID)?.closed == false)
+            #expect(await fixture.lifecycle.opened == [sessionID, sessionID, sessionID])
+            let reconnected = await ACPLeaderRequestAuthority.$clientID.withValue(String(fixture.observerID)) {
+                await fixture.runtime.ownsSession(sessionID)
+            }
+            #expect(reconnected)
+            let reconnectPrompt = try await fixture.observer.request(
+                id: 108, method: AgentMethodNames.sessionPrompt, params: promptParams
+            )
+            #expect(try reconnectPrompt.decode(PromptResponse.self).stopReason == .endTurn)
+            expectLeaderSuccess(try await fixture.observer.response(
+                id: 109, method: AgentMethodNames.sessionClose, params: closeParams
+            ))
+            #expect(await fixture.lifecycle.closed == [sessionID, sessionID, sessionID])
+        }
+    }
+
     @Test("leader history administration requires an owned root and never controls another live or closed session")
     func historicalAdministrationPreservesTransportOwnership() async throws {
         try await withLeaderIsolationFixture { fixture in
