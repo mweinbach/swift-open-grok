@@ -166,7 +166,10 @@ enum LiveACPExtensionRouter {
                 gateway: persistentSessions.gateway ?? sessionAdmin?.gateway,
                 environment: persistentSessions.environment,
                 searchGate: persistentSessions.searchGate,
-                enabledAtLaunch: persistentSessions.enabledAtLaunch
+                enabledAtLaunch: persistentSessions.enabledAtLaunch,
+                workingDirectory: persistentSessions.workingDirectory,
+                transport: persistentSessions.transport,
+                remoteRegistryEnabled: persistentSessions.remoteRegistryEnabled
             )
             for method in LivePersistentSessionACPHandler.methods {
                 router = router.register(exact: method, handler: sessions)

@@ -5050,7 +5050,12 @@ public struct OpenGrokLiveApplicationLauncher: Sendable {
                     openGrokHome: foundation.openGrokHome,
                     gateway: gateway,
                     environment: launch.environment,
-                    enabledAtLaunch: foundation.sessionSearchEnabled
+                    enabledAtLaunch: foundation.sessionSearchEnabled,
+                    workingDirectory: foundation.cwd,
+                    transport: dependencies.makeImageTransport(),
+                    remoteRegistryEnabled: dependencies.remoteSettingsSnapshot
+                        .map(AllowlistedRemoteSettings.init(projecting:))?
+                        .sessionRegistryEnabled
                 ),
                 interjection: LiveACPInterjectionHandler(
                     gateway: gateway,

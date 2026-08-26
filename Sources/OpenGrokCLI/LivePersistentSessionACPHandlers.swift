@@ -1,7 +1,9 @@
 import Foundation
 import OpenGrokACP
 import OpenGrokACPRuntime
+import struct OpenGrokCLIChatProxyTypes.SessionReplicaResponse
 import OpenGrokConfig
+import OpenGrokHTTP
 import OpenGrokSessionPersistence
 import OpenGrokShellSessionSupport
 import OpenGrokShared
@@ -30,19 +32,40 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
     let environment: [String: String]
     let searchGate: SessionSearchGate
     let enabledAtLaunch: Bool
+    let workingDirectory: URL?
+    let transport: (any HTTPTransport)?
+    let remoteRegistryEnabled: Bool?
+    private let remoteRegistry: LivePersistentSessionRemoteRegistry?
 
     init(
         openGrokHome: URL,
         gateway: ACPNotificationGateway? = nil,
         environment: [String: String]? = nil,
         searchGate: SessionSearchGate = .shared,
-        enabledAtLaunch: Bool = true
+        enabledAtLaunch: Bool = true,
+        workingDirectory: URL? = nil,
+        transport: (any HTTPTransport)? = nil,
+        remoteRegistryEnabled: Bool? = nil
     ) {
         self.openGrokHome = openGrokHome.standardizedFileURL
         self.gateway = gateway
         self.environment = environment ?? ["OPENGROK_HOME": openGrokHome.path]
         self.searchGate = searchGate
         self.enabledAtLaunch = enabledAtLaunch
+        self.workingDirectory = workingDirectory?.standardizedFileURL
+        self.transport = transport
+        self.remoteRegistryEnabled = remoteRegistryEnabled
+        if let workingDirectory, let transport {
+            self.remoteRegistry = LivePersistentSessionRemoteRegistry(
+                home: self.openGrokHome,
+                workingDirectory: workingDirectory,
+                environment: self.environment,
+                transport: transport,
+                remoteRegistryEnabled: remoteRegistryEnabled
+            )
+        } else {
+            self.remoteRegistry = nil
+        }
     }
 
     func handle(method: String, params: JSONValue) async throws -> JSONValue {
@@ -51,7 +74,7 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
         }
         switch method {
         case "x.ai/session/list":
-            return try unifiedList(params)
+            return try await unifiedList(params)
         case "x.ai/session/updates":
             return try await sessionUpdates(params)
         case "x.ai/session/search":
@@ -67,7 +90,7 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
         }
     }
 
-    private func unifiedList(_ params: JSONValue) throws -> JSONValue {
+    private func unifiedList(_ params: JSONValue) async throws -> JSONValue {
         let request: ListRequest
         do {
             request = try params.decode(ListRequest.self)
@@ -85,9 +108,9 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
         let filters = metadata?["x.ai/facetFilters"]?.objectValue ?? [:]
         var entries = try loadEntries()
         var relaxed = false
+        let workspace = try request.cwd.map { try validatedWorkspace($0, field: "cwd") }
 
-        if let cwd = request.cwd {
-            let workspace = try validatedWorkspace(cwd, field: "cwd")
+        if let workspace {
             let exact = entries.filter { matchesWorkspace($0.listing.workingDirectory, workspace) }
             if exact.isEmpty && request.allowRelax == true {
                 relaxed = true
@@ -104,13 +127,28 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
                         .lowercased().contains(needle)
             }
         }
+
+        let buildAllowed = matchesBuildKind(filters)
+        if !buildAllowed {
+            entries.removeAll()
+        } else if limit > 0, let remoteRegistry, remoteRegistry.enabled {
+            let replicas = await remoteRegistry.search(query: query, limit: limit)
+            if !replicas.isEmpty {
+                entries = mergedEntries(
+                    local: entries,
+                    remote: replicas,
+                    workspace: workspace,
+                    registry: remoteRegistry
+                )
+            }
+        }
         entries.removeAll { !matchesFacets($0, filters: filters) }
 
-        let facetSummary = makeFacetSummary(entries)
         if let boundary = decodedCursor(request.cursor) {
             entries.removeAll { !followsBoundary($0, boundary: boundary) }
         }
         let page = Array(entries.prefix(limit))
+        let facetSummary = makeFacetSummary(page)
         var payload: [String: JSONValue] = [
             "sessions": .array(page.map(makeUnifiedRow)),
             "_meta": .object([
@@ -126,6 +164,65 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
             payload["nextCursor"] = .string(encodeCursor(last))
         }
         return .object(["result": .object(payload)])
+    }
+
+    private func matchesBuildKind(_ filters: [String: JSONValue]) -> Bool {
+        guard let kind = filters["kind"] else { return true }
+        let values = kind.arrayValue ?? [kind]
+        return values.isEmpty || values.contains(.string("build"))
+    }
+
+    private func mergedEntries(
+        local: [Entry],
+        remote: [SessionReplicaResponse],
+        workspace: URL?,
+        registry: LivePersistentSessionRemoteRegistry
+    ) -> [Entry] {
+        let remotes: [String]
+        if let workspace {
+            if matchesRemoteWorkspace(registry.workingDirectory.path, workspace) {
+                remotes = registry.repositoryRemotes
+            } else {
+                remotes = local.flatMap { entry in
+                    entry.summary["git_remotes"]?.arrayValue?
+                        .compactMap(\.stringValue) ?? []
+                }
+            }
+        } else {
+            remotes = []
+        }
+
+        let scopedRemote: [SessionReplicaResponse]
+        if let workspace, remotes.isEmpty {
+            scopedRemote = remote.filter { matchesRemoteWorkspace($0.cwd, workspace) }
+        } else {
+            scopedRemote = remote
+        }
+        let localByID = Dictionary(local.map { ($0.listing.sessionID, $0) }) { first, _ in first }
+        let replicaByID = Dictionary(scopedRemote.map { ($0.sessionId, $0) }) { _, latest in latest }
+        return LiveRemoteSessionMerge.merge(
+            local: local.map(\.listing),
+            remote: scopedRemote,
+            repositoryRemotes: remotes,
+            limit: LiveRemoteSessionMerge.maximumRows
+        ).map { merged in
+            Entry(
+                listing: merged.listing,
+                summary: localByID[merged.listing.sessionID]?.summary
+                    ?? legacySummary(merged.listing),
+                source: merged.source,
+                firstPrompt: merged.firstPrompt,
+                hostname: replicaByID[merged.listing.sessionID]?.hostname
+            )
+        }
+    }
+
+    private func matchesRemoteWorkspace(_ raw: String, _ expected: URL) -> Bool {
+        // Registry-supplied paths are labels, not authority to follow local links.
+        pathsMatch(
+            URL(fileURLWithPath: raw).standardizedFileURL.path,
+            expected.standardizedFileURL.path
+        )
     }
 
     private func workspaceSessions(_ params: JSONValue) throws -> JSONValue {
@@ -682,7 +779,7 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
             "updatedAt": .string(formatTimestamp(listing.lastActivityAt)),
             "createdAt": .string(formatTimestamp(listing.createdAt)),
             "cwd": .string(listing.workingDirectory),
-            "source": .string("local"),
+            "source": .string(entry.source.rawValue),
             "numMessages": .number(.uint64(UInt64(listing.messageCount))),
             "title": .string(listing.title ?? ""),
             "_meta": .object([
@@ -694,6 +791,12 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
         ]
         if let model = listing.model {
             row["modelId"] = .string(model)
+        }
+        if let firstPrompt = entry.firstPrompt {
+            row["firstPrompt"] = .string(firstPrompt)
+        }
+        if let hostname = entry.hostname {
+            row["hostname"] = .string(hostname)
         }
         if let lastActive = entry.summary["last_active_at"]?.stringValue {
             row["lastActiveAt"] = .string(lastActive)
@@ -900,6 +1003,9 @@ struct LivePersistentSessionACPHandler: ACPAgentExtensionHandler, Sendable {
     private struct Entry: Sendable {
         let listing: LiveSessionListing
         let summary: JSONValue
+        var source: LiveRemoteSessionMerge.Source = .local
+        var firstPrompt: String? = nil
+        var hostname: String? = nil
     }
 
     private struct UpdatesRequest: Decodable {
